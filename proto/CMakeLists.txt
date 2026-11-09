@@ -1,6 +1,6 @@
 add_library(cbmp_proto STATIC)
 target_include_directories(cbmp_proto PUBLIC include)
-target_sources(cbmp_proto PRIVATE src/bitstream.cpp)
-add_executable(cbmp_proto_tests tests/test_smoke.cpp)
+target_sources(cbmp_proto PRIVATE src/bitstream.cpp src/messages.cpp)
+add_executable(cbmp_proto_tests tests/test_bitstream.cpp tests/test_messages.cpp)
 target_link_libraries(cbmp_proto_tests PRIVATE cbmp_proto Catch2::Catch2WithMain)
 catch_discover_tests(cbmp_proto_tests)
