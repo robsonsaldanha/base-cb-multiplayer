@@ -29,6 +29,7 @@ O jogo é só a base (mundo, personagens, animações). Instalação, conexão, 
 | Publicação | chave secreta do servidor + heartbeat 30 s |
 | Download de resources | do **próprio servidor**, cache por sha256 |
 | UI do Hub | launcher para jogadores + painel web pequeno para donos |
+| Launcher | **Tauri 2** (decisão do Robson) |
 | Releases | GitHub Releases do repo privado (repo/releases públicos decididos antes do lançamento) |
 | Segurança | itens S1–S6 abaixo |
 | Teste | tudo que não exige o jogo deve ser testável sem ele (bots, cliente falso) |
@@ -39,7 +40,7 @@ Fora do escopo: anti-cheat em nível de kernel; voz (decidir depois); loja/monet
 
 ```
                      ┌────────────── VPS da plataforma ──────────────┐
- Launcher (Electron) │ Hub (Node 22 + TS + Fastify + SQLite)          │
+ Launcher (Tauri)   │ Hub (Node 22 + TS + Fastify + SQLite)          │
   - login Discord ───┼─► OAuth Discord, tickets Ed25519, lista,       │
   - lista/filtros    │   heartbeats, painel de donos, bans globais    │
   - download/cache   └────────────────────────────────────────────────┘
@@ -177,13 +178,13 @@ Portas padrão: jogo `30500/udp`, HTTP `30500/tcp`, admin `30510/tcp` (configur�
 - Simula N jogadores com tickets dev: andam, mudam de estado, enviam eventos e casts.
 - Mede RTT, taxa de snapshots, banda, erros.
 
-## Launcher (Electron + TS)
+## Launcher (Tauri 2: backend Rust + UI web em TS)
 
-- Login Discord via navegador do sistema + deep link `cbmp://`; tokens guardados com `safeStorage`.
+- Login Discord via navegador do sistema + deep link `cbmp://`; tokens guardados no cofre do sistema (Windows Credential Manager via plugin keyring do Tauri).
 - Lista: filtros (nome, tags, idioma, ocupação), favoritos, ping (`/info`).
 - Conectar: ticket → manifest → diff com cache → download paralelo com progresso → verificação → localizar jogo (Steam/Epic, lógica equivalente ao `GameLocator` do launcher atual) → instalar/atualizar mod → abrir jogo. Endereço + ticket passados por arquivo temporário com ACL do usuário, nunca por linha de comando.
 - Auto-update do launcher e do mod via GitHub Releases (token de leitura em testes enquanto o repo for privado).
-- Segurança Electron: `contextIsolation`, sem `nodeIntegration` no renderer, CSP, nunca executa conteúdo baixado.
+- Segurança Tauri: capabilities mínimas (sem shell/fs livres para a UI), CSP estrita, download, hash, cache e abertura do jogo feitos no backend Rust; nunca executa conteúdo baixado.
 
 ## Estrutura do repositório
 
@@ -194,7 +195,7 @@ server/              cb-server (C++)
 bots/                cb-bots (C++)
 packages/contracts/  @cbmp/contracts (TS): tipos da API, ticket sign/verify, vetores de teste
 hub/                 Hub (TS)
-launcher/            Launcher (Electron/TS)
+launcher/            Launcher (Tauri 2: Rust + UI TS)
 tools/  package/  docs/
 ```
 
@@ -227,3 +228,7 @@ Cada subprojeto tem spec detalhada (quando necessário) e plano próprios. Subpr
 - Nome/domínio públicos da plataforma e do Hub (dev usa `localhost`).
 - Onde hospedar o Hub (VPS atual do CB ou nova).
 - Voz (proximidade) — se entra e quando.
+
+## Relação com o castelo-mp
+
+`castelobruxo/castelo-mp` (reconstrução do ArcaneMP sobre o MafiaHub Framework) é um projeto **separado**, por decisão do Robson (2026-11-09). Esta plataforma não lê, copia nem se baseia no código ou nas análises dele, para continuar independente da MafiaHub e do ArcaneMP.
