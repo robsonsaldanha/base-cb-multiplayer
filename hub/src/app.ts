@@ -9,6 +9,7 @@ import type { KeyRing } from './keyring';
 import type { DiscordClient } from './discord';
 import type { ProbeFn } from './probe';
 import { HttpError } from './errors';
+import { authRoutes } from './routes/auth';
 
 export interface HubDeps {
   config: HubConfig;
@@ -32,6 +33,7 @@ export async function buildApp(deps: HubDeps): Promise<FastifyInstance> {
     bodyLimit: 64 * 1024,
   });
   app.decorate('deps', deps);
+  app.decorateRequest('cachedUser', undefined);
   await app.register(cookie);
   await app.register(formbody);
   await app.register(rateLimit, {
@@ -57,6 +59,7 @@ export async function buildApp(deps: HubDeps): Promise<FastifyInstance> {
   app.setNotFoundHandler((_req, reply) => reply.status(404).send({ error: 'not_found', message: 'rota não encontrada' }));
 
   app.get('/health', async () => ({ ok: true }));
+  await app.register(authRoutes);
   // Tasks seguintes registram rotas aqui.
   return app;
 }
