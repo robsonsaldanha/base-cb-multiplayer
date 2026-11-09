@@ -14,6 +14,7 @@ import { ownerRoutes } from './routes/owner';
 import { ticketRoutes } from './routes/tickets';
 import { serverRoutes } from './routes/servers';
 import { banRoutes } from './routes/bans';
+import { panelRoutes } from './routes/panel';
 
 export interface HubDeps {
   config: HubConfig;
@@ -68,6 +69,7 @@ export async function buildApp(deps: HubDeps): Promise<FastifyInstance> {
   await app.register(ticketRoutes);
   await app.register(serverRoutes);
   await app.register(banRoutes);
+  await app.register(panelRoutes);
   // Tasks seguintes registram rotas aqui.
   return app;
 }
