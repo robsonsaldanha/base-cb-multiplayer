@@ -52,6 +52,21 @@ describe('ticket', () => {
     const t = signTicket({ ...base, v: 2 as 1 }, priv);
     expect(verifyTicket(t, { publicKeys: keys, audience: 'srv_abc', nowSeconds: base.iat })).toEqual({ ok: false, error: 'bad_version' });
   });
+  it('rejeita base64url não canônico e tamanho inválido', () => {
+    const t = signTicket(base, priv);
+    const [b, sg] = t.split('.') as [string, string];
+    const alt = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+    const nc = b + '.' + sg.slice(0, -1) + alt[alt.indexOf(sg.at(-1)!) ^ 1];
+    expect(Buffer.from(nc.split('.')[1]!, 'base64url').equals(Buffer.from(sg, 'base64url'))).toBe(true);
+    const o = { publicKeys: keys, audience: 'srv_abc', nowSeconds: base.iat };
+    expect(verifyTicket(nc, o)).toEqual({ ok: false, error: 'malformed' });
+    expect(verifyTicket(b + 'A.' + sg, o)).toEqual({ ok: false, error: 'malformed' });
+  });
+  it('rejeita iat/exp não inteiros ou inseguros', () => {
+    const o = { publicKeys: keys, audience: 'srv_abc', nowSeconds: base.iat };
+    expect(verifyTicket(signTicket({ ...base, iat: 1.5 }, priv), o)).toEqual({ ok: false, error: 'malformed' });
+    expect(verifyTicket(signTicket({ ...base, exp: 2 ** 60 }, priv), o)).toEqual({ ok: false, error: 'malformed' });
+  });
   it.each(['', 'abc', 'a.b.c', '!!.??', `${Buffer.from('não é json').toString('base64url')}.AAAA`])('rejeita malformado %j', (t) => {
     expect(verifyTicket(t, { publicKeys: keys, audience: 'srv_abc', nowSeconds: base.iat })).toEqual({ ok: false, error: 'malformed' });
   });

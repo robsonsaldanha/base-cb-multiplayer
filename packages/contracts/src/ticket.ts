@@ -58,12 +58,12 @@ function isPayloadShape(p: unknown): p is TicketPayload {
   const o = p as Record<string, unknown>;
   return typeof o.v === 'number'
     && ['kid', 'sub', 'did', 'name', 'aud', 'jti'].every((k) => typeof o[k] === 'string')
-    && Number.isInteger(o.iat) && Number.isInteger(o.exp);
+    && Number.isSafeInteger(o.iat) && Number.isSafeInteger(o.exp);
 }
 
 /**
  * Ordem das checagens (o validador C++ deve seguir a mesma):
- * formato → JSON/forma → versão → kid → assinatura → audience → iat futuro → expiração.
+ * formato/charset → base64url canônico → JSON → forma (inteiros seguros) → versão → kid → assinatura → audience → iat futuro → expiração.
  */
 export function verifyTicket(
   ticket: string,
@@ -73,6 +73,7 @@ export function verifyTicket(
   if (parts.length !== 2 || !B64URL.test(parts[0]!) || !B64URL.test(parts[1]!)) return { ok: false, error: 'malformed' };
   const body = Buffer.from(parts[0]!, 'base64url');
   const sig = Buffer.from(parts[1]!, 'base64url');
+  if (body.toString('base64url') !== parts[0] || sig.toString('base64url') !== parts[1]) return { ok: false, error: 'malformed' };
   let payload: unknown;
   try {
     payload = JSON.parse(body.toString('utf8'));
