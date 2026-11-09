@@ -29,7 +29,7 @@ export function serverView(server: ServerRow, status: StatusRow | null, now: num
     useGlobalBans: server.useGlobalBans, createdAt: server.createdAt,
     online, verified: status?.verified ?? false, players: status?.players ?? 0, maxPlayers: status?.maxPlayers ?? 0,
     host: status?.ip ?? null, gamePort: status?.gamePort ?? null, httpPort: status?.httpPort ?? null,
-    version: status?.version ?? null, lastHeartbeat: status?.lastHeartbeat ?? null,
+    version: status?.version ?? null, protocol: status?.protocol ?? null, lastHeartbeat: status?.lastHeartbeat ?? null,
   };
 }
 

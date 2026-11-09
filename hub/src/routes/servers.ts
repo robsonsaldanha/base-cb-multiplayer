@@ -2,20 +2,26 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { HeartbeatBody, type ServerListing } from '@cbmp/contracts';
 import { HttpError } from '../errors';
+import { createHash } from 'node:crypto';
 import { bearer } from '../auth';
-import { normalizeIp } from '../probe';
+import { isPublicIp, normalizeIp } from '../probe';
 import { serverView } from './owner';
 
 export const HEARTBEAT_INTERVAL = 30;
 export const PROBE_INTERVAL = 600;
 export const LIST_CACHE_SECONDS = 5;
+export const PROBE_BACKOFF = 120;
 
 export async function serverRoutes(app: FastifyInstance) {
-  const { store, probe, now } = app.deps;
+  const { config, store, probe, now } = app.deps;
+  const inflight = new Map<string, Promise<boolean>>();
   let cache: { at: number; body: ServerListing[] } | null = null;
 
   app.post('/v1/servers/heartbeat', {
-    config: { rateLimit: { max: 10, timeWindow: '1 minute', keyGenerator: (req) => req.headers.authorization ?? req.ip } },
+    config: { rateLimit: { max: 10, timeWindow: '1 minute', keyGenerator: (req) => {
+      const k = bearer(req, 'sk_');
+      return k ? 'sk:' + createHash('sha256').update(k).digest('hex') : 'ip:' + req.ip;
+    } } },
   }, async (req) => {
     const key = bearer(req, 'sk_');
     if (!key) throw new HttpError(401, 'no_key', 'informe a chave do servidor');
@@ -26,12 +32,25 @@ export async function serverRoutes(app: FastifyInstance) {
     const t = now();
     const prev = store.getStatus(server.id);
     store.recordHeartbeat(server.id, hb, ip, t);
-    let verified = prev?.verified ?? false;
-    const needsProbe = !prev || !prev.verified || prev.ip !== ip || prev.httpPort !== hb.httpPort || t - prev.verifiedAt >= PROBE_INTERVAL;
+    const sameEndpoint = !!prev && prev.ip === ip && prev.httpPort === hb.httpPort;
+    const failedRecently = sameEndpoint && !prev!.verified && prev!.verifiedAt > 0 && t - prev!.verifiedAt < PROBE_BACKOFF;
+    if (!config.allowPrivateServers && !isPublicIp(ip)) {
+      store.setVerified(server.id, false, t);
+      return { ok: true, listed: false, nextHeartbeatSeconds: HEARTBEAT_INTERVAL, reason: 'private_ip' };
+    }
+    let verified = sameEndpoint ? prev!.verified : false;
+    const needsProbe = !sameEndpoint || (!prev!.verified && !failedRecently) || (prev!.verified && t - prev!.verifiedAt >= PROBE_INTERVAL);
     if (needsProbe) {
-      const info = await probe(ip, hb.httpPort);
-      verified = info?.serverId === server.id;
-      store.setVerified(server.id, verified, t);
+      let p = inflight.get(server.id);
+      if (!p) {
+        p = probe(ip, hb.httpPort).then((info) => {
+          const ok = info?.serverId === server.id;
+          store.setVerified(server.id, ok, now());
+          return ok;
+        }).finally(() => inflight.delete(server.id));
+        inflight.set(server.id, p);
+      }
+      verified = await p;
     }
     return verified
       ? { ok: true, listed: true, nextHeartbeatSeconds: HEARTBEAT_INTERVAL }
@@ -57,7 +76,7 @@ export async function serverRoutes(app: FastifyInstance) {
     const v = serverView(server, store.getStatus(id), now());
     return {
       id: v.id, name: v.name, description: v.description, tags: v.tags, locale: v.locale, online: v.online,
-      ...(v.online ? { players: v.players, maxPlayers: v.maxPlayers, host: v.host, gamePort: v.gamePort, httpPort: v.httpPort, version: v.version } : {}),
+      ...(v.online ? { players: v.players, maxPlayers: v.maxPlayers, host: v.host, gamePort: v.gamePort, httpPort: v.httpPort, version: v.version, protocol: v.protocol } : {}),
     };
   });
 }

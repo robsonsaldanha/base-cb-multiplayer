@@ -1,3 +1,21 @@
+import { isIP } from 'node:net';
+
+/** Lista de proxies confiáveis (IPs/CIDRs); vazio ou 0 → desligado. Nunca aceita booleano. */
+function parseTrustProxy(raw: string | undefined): string | false {
+  const v = (raw ?? '').trim();
+  if (v === '' || v === '0') return false;
+  const items = v.split(',').map((s) => s.trim()).filter(Boolean);
+  for (const it of items) {
+    const [addr, bits, extra] = it.split('/');
+    const max = addr && isIP(addr) === 6 ? 128 : 32;
+    const okBits = bits === undefined || (/^[0-9]{1,3}$/.test(bits) && Number(bits) <= max);
+    if (!addr || !isIP(addr) || !okBits || extra !== undefined) {
+      throw new Error(`HUB_TRUST_PROXY deve ser uma lista de IPs/CIDRs dos proxies confiáveis (ex.: 127.0.0.1,::1), não um booleano: "${it}"`);
+    }
+  }
+  return items.join(',');
+}
+
 export interface HubConfig {
   port: number;
   host: string;
@@ -7,7 +25,8 @@ export interface HubConfig {
   discordClientSecret: string;
   platformAdmins: string[];
   devLogin: boolean;
-  trustProxy: boolean;
+  trustProxy: string | false;
+  allowPrivateServers: boolean;
   rateLimit: boolean;
   logLevel: string;
 }
@@ -25,7 +44,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
     discordClientSecret: env.DISCORD_CLIENT_SECRET ?? '',
     platformAdmins: (env.HUB_PLATFORM_ADMINS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
     devLogin,
-    trustProxy: env.HUB_TRUST_PROXY === '1',
+    trustProxy: parseTrustProxy(env.HUB_TRUST_PROXY),
+    allowPrivateServers: env.HUB_ALLOW_PRIVATE_SERVERS === '1',
     rateLimit: env.HUB_RATE_LIMIT !== '0',
     logLevel: env.HUB_LOG_LEVEL ?? 'info',
   };

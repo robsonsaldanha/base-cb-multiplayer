@@ -179,7 +179,8 @@ export class Store {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(server_id) DO UPDATE SET ip = excluded.ip, game_port = excluded.game_port, http_port = excluded.http_port,
           players = excluded.players, max_players = excluded.max_players, version = excluded.version,
-          protocol = excluded.protocol, last_heartbeat = excluded.last_heartbeat`)
+          protocol = excluded.protocol, last_heartbeat = excluded.last_heartbeat,
+          verified = CASE WHEN server_status.ip != excluded.ip OR server_status.http_port != excluded.http_port THEN 0 ELSE server_status.verified END`)
         .run(serverId, ip, hb.gamePort, hb.httpPort, hb.players, hb.maxPlayers, hb.version, hb.protocol, now);
       this.db.prepare('UPDATE servers SET name = ?, description = ?, tags = ?, locale = ? WHERE id = ?')
         .run(hb.name, hb.description, JSON.stringify(hb.tags), hb.locale, serverId);

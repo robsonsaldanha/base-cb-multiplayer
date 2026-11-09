@@ -20,7 +20,7 @@ describe('heartbeat e lista', () => {
     expect((await app.inject({ method: 'GET', url: '/v1/servers' })).json()).toEqual([]);
 
     probeAnswers.set('203.0.113.7:30500', server.id);
-    clock.t += 30;
+    clock.t += 120;
     const r2 = await send(app, key);
     expect(r2.json()).toEqual({ ok: true, listed: true, nextHeartbeatSeconds: 30 });
     clock.t += 5; // vence o cache de 5 s
@@ -84,7 +84,7 @@ describe('heartbeat e lista', () => {
     probeAnswers.set('203.0.113.7:30500', server.id);
     await send(app, key);
     const on = (await app.inject({ method: 'GET', url: `/v1/servers/${server.id}` })).json();
-    expect(on).toMatchObject({ id: server.id, online: true, players: 12, host: '203.0.113.7' });
+    expect(on).toMatchObject({ id: server.id, online: true, players: 12, host: '203.0.113.7', protocol: 1 });
     expect(JSON.stringify(on)).not.toContain('useGlobalBans');
     expect((await app.inject({ method: 'GET', url: '/v1/servers/srv_nada' })).statusCode).toBe(404);
   });

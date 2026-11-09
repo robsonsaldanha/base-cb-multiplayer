@@ -8,7 +8,8 @@ export async function banRoutes(app: FastifyInstance) {
 
   app.get('/v1/bans/global', async (req) => {
     const key = bearer(req, 'sk_');
-    if (!key || !store.getServerByKey(key)) throw new HttpError(401, 'bad_key', 'chave do servidor inválida');
+    if (!key) throw new HttpError(401, 'no_key', 'informe a chave do servidor');
+    if (!store.getServerByKey(key)) throw new HttpError(401, 'bad_key', 'chave do servidor inválida');
     return store.listGlobalBans();
   });
 

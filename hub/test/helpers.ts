@@ -13,7 +13,7 @@ export function testConfig(over: Partial<HubConfig> = {}): HubConfig {
   return {
     port: 8787, host: '127.0.0.1', publicUrl: 'http://localhost:8787', dataDir: ':memory:',
     discordClientId: 'cid', discordClientSecret: 'secret', platformAdmins: ['999'],
-    devLogin: false, trustProxy: false, rateLimit: false, logLevel: 'silent', ...over,
+    devLogin: false, trustProxy: false, allowPrivateServers: true, rateLimit: false, logLevel: 'silent', ...over,
   };
 }
 
