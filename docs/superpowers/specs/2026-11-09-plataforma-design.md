@@ -4,7 +4,7 @@ Data: 2026-11-09
 Status: aprovado em conversa (partes 1–3), aguardando revisão da spec
 Repo: `robsonsaldanha/base-cb-multiplayer` (privado)
 
-Substitui as partes "servidor em C++ com runtime Node" e "launcher Tauri" da spec
+Substitui a parte "servidor em C++ com runtime Node" da spec
 `2026-11-09-cb-mp-spike-design.md`. O spike in-game daquela spec continua válido e aguarda teste.
 
 ## Visão
