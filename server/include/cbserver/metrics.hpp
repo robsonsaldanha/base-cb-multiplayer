@@ -19,7 +19,7 @@ class Metrics {
   void addBytesOut(uint16_t playerId, size_t bytes);
   nlohmann::json snapshot() const;
 
-  std::atomic<int64_t> players{0}, pending{0}, corrections{0}, kicks{0}, droppedEvents{0};
+  std::atomic<int64_t> players{0}, pending{0}, corrections{0}, kicks{0}, droppedEvents{0}, decodeErrors{0};
 
  private:
   mutable std::mutex mu_;

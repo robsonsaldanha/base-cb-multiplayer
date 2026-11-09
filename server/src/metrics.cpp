@@ -112,6 +112,7 @@ nlohmann::json Metrics::snapshot() const {
           {"corrections", corrections.load()},
           {"kicks", kicks.load()},
           {"droppedEvents", droppedEvents.load()},
+          {"decodeErrors", decodeErrors.load()},
           {"avgKbpsPerPlayer", avgKbps},
           {"maxKbpsPerPlayer", maxKbps},
           {"rssBytes", static_cast<uint64_t>(rssBytes())},

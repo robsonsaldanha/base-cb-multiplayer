@@ -125,7 +125,20 @@ ServerConfig ServerConfig::fromJson(const json& j) {
     getInt(*s, "tickHz", "sim.", 1, 60, c.tickHz);
     getNum(*s, "streamRadiusM", "sim.", 50, 2000, c.streamRadiusM);
     getInt(*s, "maxVisible", "sim.", 8, 256, c.maxVisible);
+    if (const json* sp = sub(*s, "spawn", "sim.")) {
+      if (!sp->is_object()) fail("sim.spawn", "deve ser um objeto como {\"mode\":\"origin\"}");
+      std::string mode = "origin";
+      getStr(*sp, "mode", "sim.spawn.", mode);
+      if (mode == "origin")
+        c.spawnMode = SpawnMode::Origin;
+      else if (mode == "devTrustFirstInput")
+        c.spawnMode = SpawnMode::DevTrustFirstInput;
+      else
+        fail("sim.spawn.mode", "deve ser 'origin' ou 'devTrustFirstInput'");
+    }
   }
+  if (c.spawnMode == SpawnMode::DevTrustFirstInput && (!c.devPublicKey || c.hub))
+    fail("sim.spawn.mode", "'devTrustFirstInput' só é permitido em modo dev (auth.devPublicKey definido e hub null)");
   if (const json* m = sub(j, "movement", "")) {
     getNum(*m, "tolerance", "movement.", 0, 1, c.tolerance);
     if (const json* sp = sub(*m, "maxSpeedCmS", "movement.")) {

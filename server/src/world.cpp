@@ -1,6 +1,7 @@
 #include "cbserver/world.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <utility>
 
 #include "cbserver/snapshots.hpp"
@@ -63,8 +64,12 @@ std::optional<EntityId> World::addPlayer(std::string sub, std::string did, std::
     clampName(p->name);
     p->state = spawn;
     p->lastInputTime = now;
-    grid_.upsert(p->id, p->state.pos);
-    sendCorrection(*p, 0, now);
+    if (cfg_.spawnMode == SpawnMode::DevTrustFirstInput) {
+      p->awaitingSpawn = true;  // fora da grade e sem Correction até o primeiro Input
+    } else {
+      grid_.upsert(p->id, p->state.pos);
+      sendCorrection(*p, 0, now);
+    }
     active_.insert(std::lower_bound(active_.begin(), active_.end(), p->id), p->id);
     slots_[i] = std::move(p);
     return static_cast<EntityId>(i);
@@ -99,6 +104,7 @@ void World::setState(EntityId id, const cbmp::PlayerState& s, double now) {
   if (!p) return;
   p->state = s;
   p->lastInputTime = now;
+  p->awaitingSpawn = false;  // posicionamento do servidor também conta como spawn
   grid_.upsert(id, s.pos);
   sendCorrection(*p, p->lastInputSeq, now);
 }
@@ -115,13 +121,32 @@ void World::orderKick(PlayerSlot& s, const char* reason) {
   pendingKicks_.push_back(KickOrder{s.id, reason});
 }
 
+double World::maxSpeedOf(cbmp::MoveState a, cbmp::MoveState b) const {
+  auto speed = [this](cbmp::MoveState s) {
+    const auto i = static_cast<size_t>(s);
+    return i < limits_.maxSpeedCmS.size() ? limits_.maxSpeedCmS[i] : 0.0;
+  };
+  return std::max(speed(a), speed(b));
+}
+
 void World::onInput(EntityId id, const cbmp::Input& in, double now) {
   PlayerSlot* p = slot(id);
   if (!p || p->kicked || in.seq <= p->lastInputSeq) return;
   p->lastInputSeq = in.seq;
+  if (p->awaitingSpawn) {  // SpawnMode::DevTrustFirstInput: a posição do primeiro input vira o spawn
+    p->awaitingSpawn = false;
+    p->state = in.s;
+    p->lastInputTime = now;
+    grid_.upsert(id, in.s.pos);
+    return;
+  }
   if (p->correcting) {
-    const auto slack = static_cast<int64_t>(limits_.slackCm);
-    if (now - p->correctionSince >= kCorrectionWindowSec || distSq(in.s.pos, p->state.pos) <= slack * slack)
+    // Desde a Correction o cliente pode ter andado legalmente a partir da posição corrigida.
+    const double elapsed = now - p->correctionSince;
+    const double reach = limits_.slackCm + maxSpeedOf(p->state.state, in.s.state) * std::max(0.0, elapsed) *
+                                               (1.0 + limits_.tolerance);
+    const double d = std::sqrt(static_cast<double>(distSq(in.s.pos, p->state.pos)));
+    if (elapsed >= kCorrectionWindowSec || d <= reach)
       p->correcting = false;  // cliente aplicou a correção (ou a janela venceu): valida normalmente
     else
       return;  // input ainda baseado na posição antiga (latência): ignorado, sem novo incidente
@@ -178,6 +203,11 @@ void World::tick(double now, SnapshotBuilder& builder, std::vector<Outgoing>& ou
   activeSlots_.clear();
   for (EntityId id : active_) {
     PlayerSlot& s = *slots_[id];
+    if (s.awaitingSpawn) {  // ainda sem posição: não vê ninguém, mas recebe snapshot (vazio)
+      s.baselineFresh = false;
+      activeSlots_.push_back(&s);
+      continue;
+    }
     VisibleSet next = computeVisible(id, s.state.pos, s.visible, grid_, posOf, vis_, scratch_);
     const auto& prev = s.visible.ids;
     size_t i = 0, j = 0;

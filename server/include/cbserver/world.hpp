@@ -50,6 +50,7 @@ struct PlayerSlot {
   double lastAckTime = 0;
   bool baselineFresh = false;  // calculado pelo World antes de montar snapshots (ack ≤ 1 s)
   bool kicked = false;         // KickOrder já emitida; ignora novos inputs/eventos
+  bool awaitingSpawn = false;  // SpawnMode::DevTrustFirstInput: fora da grade até o primeiro Input
 };
 
 struct Outgoing {
@@ -70,6 +71,7 @@ class World {
   ~World();
 
   // Ocupa o menor id livre; aplica `spawn` e enfileira Correction{seq 0, pos, vel} para o próprio jogador.
+  // Em SpawnMode::DevTrustFirstInput ignora `spawn`: o jogador fica pendente (invisível, sem Correction).
   std::optional<EntityId> addPlayer(std::string sub, std::string did, std::string name, double now,
                                     const cbmp::PlayerState& spawn = cbmp::PlayerState{});
   // Remove o jogador; os que o viam recebem EntityLeave no próximo tick.
@@ -77,8 +79,10 @@ class World {
   // Posicionamento autoritativo (spawn/teleporte do servidor): aplica o estado e envia Correction.
   void setState(EntityId id, const cbmp::PlayerState& s, double now);
 
-  // Ignora seq ≤ último. Com Correction pendente (janela de 1 s), ignora inputs longe (> slack) da posição
-  // corrigida; um input perto dela fecha a janela. Cada Correction é um incidente; > 10 em 10 s → kick.
+  // Ignora seq ≤ último. Com Correction pendente (janela de 1 s), ignora inputs longe da posição corrigida;
+  // fecha a janela um input a ≤ slack + maxSpeed(estado) × (now − correctionSince) × (1+tol) dela (o cliente
+  // pode ter andado legalmente desde a correção). Cada Correction é um incidente; > 10 em 10 s → kick.
+  // Com SpawnMode::DevTrustFirstInput, o primeiro input define o spawn sem validação.
   void onInput(EntityId id, const cbmp::Input& in, double now);
   bool onEvent(EntityId id, const cbmp::Event& ev, double now);  // false = descartado
   void onSnapshotAck(EntityId id, uint32_t tick, double now);
@@ -98,6 +102,7 @@ class World {
   void orderKick(PlayerSlot& s, const char* reason);
   void forget(PlayerSlot& viewer, EntityId gone);  // tira `gone` das baselines do viewer
   void sendCorrection(PlayerSlot& p, uint32_t seq, double now);  // enfileira e abre a janela
+  double maxSpeedOf(cbmp::MoveState a, cbmp::MoveState b) const;  // maior limite entre os dois estados
 
   ServerConfig cfg_;
   MovementLimits limits_;

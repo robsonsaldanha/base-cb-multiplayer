@@ -95,3 +95,24 @@ TEST_CASE("config validates hub-compatible name description tags locale") {
   j = base(); j["locale"] = "pt_BR"; requireRejects(j, "locale");
   j = base(); j["locale"] = "en"; REQUIRE(ServerConfig::fromJson(j).locale == "en");
 }
+
+TEST_CASE("config sim.spawn defaults to origin and accepts origin explicitly") {
+  REQUIRE(ServerConfig::fromJson(base()).spawnMode == cbserver::SpawnMode::Origin);
+  auto j = base();
+  j["sim"]["spawn"] = {{"mode", "origin"}};
+  REQUIRE(ServerConfig::fromJson(j).spawnMode == cbserver::SpawnMode::Origin);
+  j["sim"]["spawn"] = {{"mode", "aleatorio"}};
+  requireRejects(j, "sim.spawn");
+  j["sim"]["spawn"] = "origin";
+  requireRejects(j, "sim.spawn");
+}
+
+TEST_CASE("config devTrustFirstInput only in dev mode without hub") {
+  auto j = base();
+  j["sim"]["spawn"] = {{"mode", "devTrustFirstInput"}};
+  requireRejects(j, "sim.spawn");  // sem devPublicKey
+  j["auth"]["devPublicKey"] = std::string(43, 'A');
+  REQUIRE(ServerConfig::fromJson(j).spawnMode == cbserver::SpawnMode::DevTrustFirstInput);
+  j["hub"] = {{"url", "https://hub.exemplo"}, {"serverId", "srv_abc"}, {"key", "sk_x"}};
+  requireRejects(j, "sim.spawn");  // com hub
+}

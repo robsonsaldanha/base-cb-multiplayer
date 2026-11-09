@@ -173,3 +173,28 @@ TEST_CASE("JtiCache purga entradas vencidas") {
   CHECK(c.size() <= 5000 + 1024);
   CHECK(c.seenOrInsert("new0", 1'000'000, 500'001));
 }
+
+TEST_CASE("ticket longer than 4096 bytes is malformed even if the signature is valid") {
+  REQUIRE(sodium_init() >= 0);
+  const auto v = loadVectors();
+  const PublicKeys keys = vectorKeys(v);
+  const auto seed = fromHex(v["seedHex"].get<std::string>());
+  std::array<uint8_t, crypto_sign_PUBLICKEYBYTES> pk{};
+  std::array<uint8_t, crypto_sign_SECRETKEYBYTES> sk{};
+  crypto_sign_seed_keypair(pk.data(), sk.data(), seed.data());
+  auto make = [&](size_t nameLen) {
+    const std::string json = R"({"v":1,"kid":"test-1","sub":"u","did":"d","name":")" + std::string(nameLen, 'x') +
+                             R"(","aud":"srv_test","iat":1800000000,"exp":1800000300,"jti":"j"})";
+    const std::vector<uint8_t> body(json.begin(), json.end());
+    std::array<uint8_t, crypto_sign_BYTES> sig{};
+    crypto_sign_detached(sig.data(), nullptr, body.data(), body.size(), sk.data());
+    return base64urlEncode(body) + "." + base64urlEncode(sig);
+  };
+  const std::string small = make(100);
+  REQUIRE(verifyTicket(small, keys, "srv_test", 1800000010));
+  const std::string big = make(3000);
+  REQUIRE(big.size() > 4096);
+  auto r = verifyTicket(big, keys, "srv_test", 1800000010);
+  REQUIRE_FALSE(r);
+  CHECK(r.error() == TicketError::Malformed);
+}

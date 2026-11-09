@@ -1,4 +1,7 @@
 #include <algorithm>
+#include <array>
+#include <map>
+#include <set>
 #include <cmath>
 #include <cstdio>
 #include <atomic>
@@ -235,6 +238,77 @@ TEST_CASE("task pool covers every index exactly once") {
   }
 }
 
+namespace {
+// Cliente simulado: decodifica todas as partes, mantém anel de 32 ticks, perde partes (rng próprio), só confirma
+// ticks completos e confere que o estado reconstruído é igual ao registro do servidor daquele tick.
+struct Mirror {
+  struct Rec {
+    uint32_t tick = 0;
+    uint8_t got = 0, count = 0;
+    bool complete = false;
+    std::map<uint16_t, cbmp::PlayerState> ents;
+  };
+  cbserver::EntityId id = 0;
+  std::array<Rec, cbserver::kSnapshotRing> ring{};
+  std::set<uint16_t> visible;
+  size_t completed = 0, dropped = 0;
+
+  void process(const std::vector<cbserver::Outgoing>& out, const cbserver::World& world, uint32_t& rng) {
+    for (const auto& o : out) {
+      if (o.to != id) continue;
+      if (const auto* en = std::get_if<cbmp::EntityEnter>(&o.msg)) visible.insert(en->id);
+      if (const auto* lv = std::get_if<cbmp::EntityLeave>(&o.msg)) visible.erase(lv->id);
+      const auto* part = std::get_if<cbmp::Snapshot>(&o.msg);
+      if (!part) continue;
+      rng = rng * 1664525u + 1013904223u;
+      if ((rng >> 8) % 100 < 10) {  // perde 10% das partes
+        ++dropped;
+        continue;
+      }
+      // decodifica do fio, como o cliente
+      const auto bytes = cbmp::encode(o.msg);
+      const auto s = std::get<cbmp::Snapshot>(cbmp::decode(bytes));
+      Rec& r = ring[s.tick % cbserver::kSnapshotRing];
+      if (r.tick != s.tick) {
+        r = Rec{};
+        r.tick = s.tick;
+        r.count = s.partCount;
+        if (s.baselineTick != 0) {
+          const Rec& b = ring[s.baselineTick % cbserver::kSnapshotRing];
+          REQUIRE(b.tick == s.baselineTick);
+          REQUIRE(b.complete);
+          for (const auto& [eid, st] : b.ents)
+            if (visible.count(eid)) r.ents.emplace(eid, st);
+        }
+      }
+      REQUIRE(s.partCount == r.count);
+      for (const auto& e : s.ents) {
+        auto it = r.ents.find(e.id);
+        r.ents[e.id] = cbmp::applySnapshotEntity(it == r.ents.end() ? cbmp::PlayerState{} : it->second, e);
+      }
+      r.got = static_cast<uint8_t>(r.got | (1u << s.partIndex));
+      if (r.got == (1u << r.count) - 1u) {
+        r.complete = true;
+        ++completed;
+        const auto& rec = world.find(id)->sent[s.tick % cbserver::kSnapshotRing];
+        REQUIRE(rec.tick == s.tick);
+        REQUIRE(rec.ents.size() == r.ents.size());
+        size_t k = 0;
+        for (const auto& [eid, st] : r.ents) {
+          REQUIRE(rec.ents[k].id == eid);
+          REQUIRE(rec.ents[k].s == st);
+          ++k;
+        }
+      }
+    }
+  }
+  bool completeAt(uint32_t tick) const {
+    const Rec& r = ring[tick % cbserver::kSnapshotRing];
+    return r.tick == tick && r.complete;
+  }
+};
+}  // namespace
+
 TEST_CASE("snapshot bandwidth in CI-like crowd stays under 50 kbps per player") {
   Harness h;
   constexpr int kPlayers = 256, kCluster = 77, kTicks = 120;
@@ -260,6 +334,12 @@ TEST_CASE("snapshot bandwidth in CI-like crowd stays under 50 kbps per player") 
   }
   std::vector<uint64_t> bytes(kPlayers + 1, 0);
   size_t maxPart = 0;
+  std::vector<Mirror> mirrors;
+  for (int i : {0, 10, 20, 40, 76, 77, 150, 255}) {
+    mirrors.emplace_back();
+    mirrors.back().id = m[static_cast<size_t>(i)].id;
+  }
+  uint32_t dropRng = 99;
   for (int t = 1; t <= kTicks; ++t) {
     for (auto& p : m) {  // anda a 400 cm/s mudando de direção todo tick
       p.heading += (rnd() - 0.5) * 0.6;
@@ -282,8 +362,19 @@ TEST_CASE("snapshot bandwidth in CI-like crowd stays under 50 kbps per player") 
         maxPart = std::max(maxPart, n);
         (void)s;
       }
-    if (t > 3)  // acks chegam 3 ticks atrasados
-      for (const auto& p : m) h.world.onSnapshotAck(p.id, static_cast<uint32_t>(t - 3), h.now);
+    for (auto& mi : mirrors) mi.process(h.out, h.world, dropRng);
+    if (t > 3)  // acks chegam 3 ticks atrasados; os espelhos só confirmam ticks completos
+      for (const auto& p : m) {
+        const auto ackTick = static_cast<uint32_t>(t - 3);
+        auto mi = std::find_if(mirrors.begin(), mirrors.end(), [&](const Mirror& x) { return x.id == p.id; });
+        if (mi != mirrors.end() && !mi->completeAt(ackTick)) continue;
+        h.world.onSnapshotAck(p.id, ackTick, h.now);
+      }
+  }
+  for (const auto& mi : mirrors) {
+    INFO("espelho " << mi.id);
+    REQUIRE(mi.dropped > 0);
+    REQUIRE(mi.completed > kTicks / 2);
   }
   const double secs = kTicks / 20.0;
   double total = 0, cluster = 0;

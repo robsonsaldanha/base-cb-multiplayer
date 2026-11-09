@@ -312,7 +312,8 @@ Message decode(std::span<const uint8_t> bytes) {
     case MsgType::Snapshot: {
       Snapshot s; s.tick = r.readU32(); s.ackInputSeq = r.readU32();
       const auto age = static_cast<uint32_t>(r.readBits(5));
-      if (age > s.tick) throw DecodeError("idade da baseline inválida");
+      // age == tick daria baselineTick 0, ambíguo com "sem baseline"
+      if (age != 0 && age >= s.tick) throw DecodeError("idade da baseline inválida");
       s.baselineTick = age == 0 ? 0 : s.tick - age;
       s.partIndex = static_cast<uint8_t>(r.readBits(3));
       s.partCount = static_cast<uint8_t>(r.readBits(3) + 1);

@@ -13,6 +13,10 @@ struct HubConfig {
   std::string url, serverId, key;
 };
 
+// sim.spawn: onde um jogador novo aparece. DevTrustFirstInput só em modo dev (devPublicKey e sem hub): o jogador
+// fica pendente até o primeiro Input, cuja posição vira o spawn sem validação de movimento.
+enum class SpawnMode { Origin, DevTrustFirstInput };
+
 struct ServerConfig {
   std::string name = "Meu servidor";
   std::string description;
@@ -26,6 +30,7 @@ struct ServerConfig {
   int tickHz = 20;
   double streamRadiusM = 300;
   int maxVisible = 128;
+  SpawnMode spawnMode = SpawnMode::Origin;
   double speedIdle = 50, speedWalk = 400, speedRun = 900, speedBroom = 4000, speedSwim = 400, speedFall = 6000,
          speedApparate = 0;
   double tolerance = 0.2;

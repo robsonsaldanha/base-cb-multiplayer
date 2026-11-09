@@ -254,3 +254,68 @@ TEST_CASE("world long names are truncated to protocol limit") {
   auto id = h.world.addPlayer("s", "d", std::string(100, 'x'), 0);
   REQUIRE(h.world.find(*id)->name.size() == cbmp::kMaxName);
 }
+
+TEST_CASE("world correction window closes when a broom flies away at legal speed") {
+  Harness h;
+  auto a = h.add("ana");
+  h.step(0);  // descarta a Correction do spawn
+  h.world.onInput(a, input(1, {0, 0, 0}, cbmp::MoveState::Broom), 0.05);  // fecha a janela do spawn
+  h.world.onInput(a, input(2, {100'000, 0, 0}, cbmp::MoveState::Broom), 0.1);  // teleporte → Correction
+  REQUIRE(h.world.find(a)->correcting);
+  // longe demais mesmo para a vassoura: continua ignorado, sem novo incidente
+  h.world.onInput(a, input(3, {5'000, 0, 0}, cbmp::MoveState::Broom), 0.4);
+  REQUIRE(h.world.find(a)->state.pos.x == 0);
+  REQUIRE(h.world.find(a)->correcting);
+  // 12 m em 0,3 s: dentro de slack + 4000 × 0,3 × 1,2 = 14,9 m → fecha a janela e valida normalmente
+  h.world.onInput(a, input(4, {1'200, 0, 0}, cbmp::MoveState::Broom), 0.4);
+  REQUIRE_FALSE(h.world.find(a)->correcting);
+  REQUIRE(h.world.find(a)->state.pos.x == 1'200);
+  REQUIRE(h.world.find(a)->correctionTimes.size() == 1);
+}
+
+TEST_CASE("world origin spawn mode places new players at the origin") {
+  Harness h;
+  REQUIRE(h.cfg.spawnMode == cbserver::SpawnMode::Origin);
+  auto id = h.world.addPlayer("s", "d", "n", 0.0);
+  h.step();
+  auto c = h.msgs<Correction>(*id);
+  REQUIRE(c.size() == 1);
+  REQUIRE(c[0].seq == 0);
+  REQUIRE(c[0].pos == cbmp::Vec3i{0, 0, 0});
+}
+
+TEST_CASE("world devTrustFirstInput spawns at the first input position") {
+  ServerConfig cfg;
+  cfg.spawnMode = cbserver::SpawnMode::DevTrustFirstInput;
+  Harness h(cfg);
+  auto a = h.add("ana");
+  auto b = h.add("bia");
+  h.step();
+  // pendentes: nenhuma Correction, ninguém se vê, mas recebem snapshot (vazio)
+  REQUIRE(h.msgs<Correction>(a).empty());
+  REQUIRE(h.msgs<EntityEnter>(a).empty());
+  REQUIRE(h.msgs<EntityEnter>(b).empty());
+  REQUIRE(h.snaps(a).size() == 1);
+  REQUIRE(h.world.find(a)->awaitingSpawn);
+  // primeiro input: posição aceita sem validação de movimento
+  h.world.onInput(b, input(1, {500'000, 0, 0}, cbmp::MoveState::Walk), h.now);
+  REQUIRE_FALSE(h.world.find(b)->awaitingSpawn);
+  REQUIRE(h.world.find(b)->state.pos.x == 500'000);
+  REQUIRE(h.world.find(b)->lastInputSeq == 1);
+  h.step();
+  REQUIRE(h.msgs<Correction>(b).empty());
+  REQUIRE(h.msgs<EntityEnter>(a).empty());  // a ainda pendente: não vê nem é visto
+  REQUIRE(h.msgs<EntityEnter>(b).empty());
+  h.world.onInput(a, input(1, {499'000, 0, 0}), h.now);
+  h.step();
+  auto ea = h.msgs<EntityEnter>(a);
+  REQUIRE(ea.size() == 1);
+  REQUIRE(ea[0].id == b);
+  REQUIRE(ea[0].s.pos.x == 500'000);
+  REQUIRE(h.msgs<EntityEnter>(b).size() == 1);
+  // depois do spawn, inputs seguintes são validados normalmente
+  h.world.onInput(b, input(2, {900'000, 0, 0}, cbmp::MoveState::Walk), h.now + 0.05);
+  REQUIRE(h.world.find(b)->state.pos.x == 500'000);
+  REQUIRE(h.world.find(b)->correctionTimes.size() == 1);
+  h.world.removePlayer(a);  // remover pendente/spawnado não quebra
+}

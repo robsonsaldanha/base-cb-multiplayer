@@ -289,6 +289,8 @@ std::string_view toString(TicketError e) {
 std::expected<TicketPayload, TicketError> verifyTicket(std::string_view ticket, const PublicKeys& keys,
                                                        std::string_view audience, int64_t nowSeconds) {
   using std::unexpected;
+  // tamanho: antes de qualquer cópia (o Hello já limita a 2048; isto protege outros chamadores)
+  if (ticket.size() > kMaxTicketBytes) return unexpected(TicketError::Malformed);
   // formato/charset
   const size_t dot = ticket.find('.');
   if (dot == std::string_view::npos || ticket.find('.', dot + 1) != std::string_view::npos)

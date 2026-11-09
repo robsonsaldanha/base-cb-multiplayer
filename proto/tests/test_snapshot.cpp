@@ -154,6 +154,16 @@ TEST_CASE("snapshot decoder rejects malformed input with DecodeError only") {
   w2.writeU8(static_cast<uint8_t>(MsgType::Snapshot));
   w2.writeU32(3); w2.writeU32(0); w2.writeBits(5, 5); w2.writeBits(0, 3); w2.writeBits(0, 3); w2.writeBits(0, 8);
   CHECK_THROWS_AS(decode(w2.finish()), DecodeError);
+  // idade == tick (baseline 0 seria ambígua com "sem baseline")
+  BitWriter w2b;
+  w2b.writeU8(static_cast<uint8_t>(MsgType::Snapshot));
+  w2b.writeU32(5); w2b.writeU32(0); w2b.writeBits(5, 5); w2b.writeBits(0, 3); w2b.writeBits(0, 3); w2b.writeBits(0, 8);
+  CHECK_THROWS_AS(decode(w2b.finish()), DecodeError);
+  // idade < tick continua válida
+  BitWriter w2c;
+  w2c.writeU8(static_cast<uint8_t>(MsgType::Snapshot));
+  w2c.writeU32(5); w2c.writeU32(0); w2c.writeBits(4, 5); w2c.writeBits(0, 3); w2c.writeBits(0, 3); w2c.writeBits(0, 8);
+  CHECK(std::get<Snapshot>(decode(w2c.finish())).baselineTick == 1);
   // id explícito não crescente (1, depois 16 bits = 1)
   BitWriter w3;
   w3.writeU8(static_cast<uint8_t>(MsgType::Snapshot));

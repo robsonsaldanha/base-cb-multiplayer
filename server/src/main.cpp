@@ -1,16 +1,233 @@
-// Placeholder: a Task 6 escreve o laço real. Por ora só carrega e mostra a configuração.
+// cb-server [--config server.cfg]: carrega a config, sobe rede (UDP) e HTTP (TCP) na mesma porta e roda o tick.
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <exception>
+#include <filesystem>
+#include <memory>
+#include <string>
+#include <thread>
+#include <vector>
 
+#include <nlohmann/json.hpp>
+#include <spdlog/sinks/daily_file_sink.h>
+#include <spdlog/sinks/rotating_file_sink.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+#include <cbmp/messages.hpp>
+
+#include "cbserver/auth.hpp"
 #include "cbserver/config.hpp"
+#include "cbserver/http.hpp"
+#include "cbserver/manifest.hpp"
+#include "cbserver/metrics.hpp"
+#include "cbserver/net.hpp"
+#include "cbserver/pool.hpp"
+#include "cbserver/snapshots.hpp"
+#include "cbserver/world.hpp"
+
+namespace {
+
+constexpr const char* kVersion = "0.1.0";
+constexpr const char* kDevServerId = "srv_dev";
+
+std::atomic<bool> gStop{false};
+
+#ifdef _WIN32
+BOOL WINAPI onConsoleCtrl(DWORD type) {
+  switch (type) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+      gStop = true;
+      return TRUE;
+    default:
+      return FALSE;
+  }
+}
+#else
+extern "C" void onSignal(int) { gStop = true; }
+#endif
+
+void installStopHandlers() {
+#ifdef _WIN32
+  SetConsoleCtrlHandler(onConsoleCtrl, TRUE);
+#else
+  std::signal(SIGINT, onSignal);
+  std::signal(SIGTERM, onSignal);
+#endif
+}
+
+int64_t unixNow() {
+  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+void setupLogs(const std::filesystem::path& dir) {
+  std::filesystem::create_directories(dir);
+  auto console = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
+  auto file = std::make_shared<spdlog::sinks::rotating_file_sink_mt>((dir / "server.log").string(), 10 * 1024 * 1024, 5);
+  auto logger = std::make_shared<spdlog::logger>("server", spdlog::sinks_init_list{console, file});
+  spdlog::set_default_logger(logger);
+  spdlog::flush_every(std::chrono::seconds(2));
+}
+
+std::shared_ptr<spdlog::logger> makeAnticheatLogger(const std::filesystem::path& dir) {
+  auto sink = std::make_shared<spdlog::sinks::daily_file_format_sink_mt>((dir / "anticheat-%Y-%m-%d.jsonl").string(), 0, 0);
+  auto logger = std::make_shared<spdlog::logger>("anticheat", sink);
+  logger->set_pattern("%v");
+  logger->flush_on(spdlog::level::info);
+  return logger;
+}
+
+void anticheat(spdlog::logger& log, const cbserver::World& world, cbserver::EntityId id, nlohmann::json line) {
+  const auto* p = world.find(id);
+  line["ts"] = unixNow();
+  line["id"] = id;
+  if (p) {
+    line["did"] = p->did;
+    line["sub"] = p->sub;
+  }
+  log.info("{}", line.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+}
+
+int run(const std::string& cfgPath) {
+  auto cfg = cbserver::ServerConfig::load(cfgPath);
+  setupLogs(cfg.logsDir);
+  auto acLog = makeAnticheatLogger(cfg.logsDir);
+  spdlog::info("cb-server {}: '{}' porta {}, até {} jogadores", kVersion, cfg.name, cfg.port, cfg.maxPlayers);
+
+  auto store = cbserver::ResourceStore::scan(cfg.resourcesDir);
+
+  std::unique_ptr<cbserver::KeyProvider> keys;
+  if (cfg.devPublicKey) {
+    keys = std::make_unique<cbserver::StaticKeys>(cbserver::StaticKeys::fromDevKey(*cfg.devPublicKey));
+    spdlog::warn("modo dev: aceitando tickets assinados pela chave dev (kid 'dev'), sem Hub");
+  } else if (cfg.hub) {
+    spdlog::error("integração com o Hub ainda não disponível nesta versão; configure auth.devPublicKey");
+    return 1;
+  } else {
+    spdlog::error("configure 'hub' ou 'auth.devPublicKey' para validar tickets");
+    return 1;
+  }
+  const std::string serverId = cfg.hub ? cfg.hub->serverId : kDevServerId;
+
+  cbserver::Metrics metrics;
+  cbserver::Authenticator auth(*keys, serverId, unixNow);
+  cbserver::World world(cfg);
+  cbserver::TaskPool pool(cbserver::TaskPool::defaultThreads());
+  cbserver::SnapshotBuilder builder(pool);
+  cbserver::NetServer net(cfg, auth, world, metrics);
+
+  std::string err;
+  if (!net.start(static_cast<uint16_t>(cfg.port), err)) {
+    spdlog::error("rede: {}", err);
+    return 1;
+  }
+  cbserver::HttpServer http(cfg, store, metrics, [&cfg, &metrics, serverId] {
+    return nlohmann::json{{"serverId", serverId},          {"name", cfg.name},
+                          {"players", metrics.players.load()}, {"maxPlayers", cfg.maxPlayers},
+                          {"protocol", cbmp::kProtocolVersion}, {"version", kVersion}};
+  });
+  try {
+    http.start("0.0.0.0", cfg.port);
+  } catch (const std::exception& e) {
+    spdlog::error("{}", e.what());
+    net.stop();
+    return 1;
+  }
+  spdlog::info("ouvindo em UDP/TCP {} (serverId {}, {} threads de snapshot)", cfg.port, serverId, pool.workers());
+
+  installStopHandlers();
+  using Clock = std::chrono::steady_clock;
+  const auto period = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(1.0 / cfg.tickHz));
+  const auto t0 = Clock::now();
+  auto next = t0;
+  std::vector<cbserver::Inbound> in;
+  std::vector<cbserver::Outgoing> out;
+  std::vector<cbserver::KickOrder> kicks;
+  while (!gStop) {
+    const auto start = Clock::now();
+    const double now = std::chrono::duration<double>(start - t0).count();
+    in.clear();
+    out.clear();
+    kicks.clear();
+
+    net.pump(now, in);
+    for (auto& m : in) {
+      if (const auto* x = std::get_if<cbmp::Input>(&m.msg)) {
+        world.onInput(m.from, *x, now);
+      } else if (const auto* a = std::get_if<cbmp::SnapshotAck>(&m.msg)) {
+        world.onSnapshotAck(m.from, a->tick, now);
+      } else if (const auto* e = std::get_if<cbmp::Event>(&m.msg)) {
+        if (!world.onEvent(m.from, *e, now)) ++metrics.droppedEvents;
+      }
+    }
+    world.tick(now, builder, out, kicks);
+    for (const auto& o : out)
+      if (const auto* c = std::get_if<cbmp::Correction>(&o.msg); c && c->seq != 0) {
+        ++metrics.corrections;
+        anticheat(*acLog, world, o.to,
+                  {{"type", "correction"}, {"seq", c->seq}, {"pos", {c->pos.x, c->pos.y, c->pos.z}}});
+      }
+    net.send(out);
+    for (const auto& k : kicks) {
+      anticheat(*acLog, world, k.who, {{"type", "kick"}, {"reason", k.reason}});
+      net.kick(k.who, k.reason);  // também remove do mundo
+    }
+    metrics.recordTick(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start));
+
+    next += period;
+    const auto after = Clock::now();
+    if (after > next + 5 * period) next = after;  // atraso grande: não tenta compensar ticks perdidos
+    std::this_thread::sleep_until(next);
+  }
+
+  spdlog::info("encerrando...");
+  http.stop();
+  net.stop();
+  spdlog::info("servidor parado");
+  return 0;
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+  SetConsoleOutputCP(CP_UTF8);  // logs em UTF-8 (pt-BR)
+#endif
+  std::string cfgPath = "server.cfg";
+  for (int i = 1; i < argc; ++i) {
+    const std::string a = argv[i];
+    if (a == "--config" && i + 1 < argc) {
+      cfgPath = argv[++i];
+    } else if (a == "--help" || a == "-h") {
+      std::printf("uso: cb-server [--config server.cfg]\n");
+      return 0;
+    } else {
+      std::fprintf(stderr, "argumento desconhecido: %s\nuso: cb-server [--config server.cfg]\n", a.c_str());
+      return 2;
+    }
+  }
   try {
-    auto cfg = cbserver::ServerConfig::load(argc > 1 ? argv[1] : "server.cfg");
-    std::printf("cb-server: '%s' porta %d, até %d jogadores\n", cfg.name.c_str(), cfg.port, cfg.maxPlayers);
-    return 0;
+    const int rc = run(cfgPath);
+    spdlog::shutdown();
+    return rc;
   } catch (const std::exception& e) {
+    spdlog::error("{}", e.what());
     std::fprintf(stderr, "%s\n", e.what());
+    spdlog::shutdown();
     return 1;
   }
 }
