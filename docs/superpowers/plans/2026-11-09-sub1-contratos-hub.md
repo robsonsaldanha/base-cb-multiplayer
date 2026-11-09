@@ -2406,8 +2406,10 @@ DISCORD_CLIENT_SECRET=
 HUB_PLATFORM_ADMINS=
 # 1 = permite /v1/auth/dev-login (somente com HUB_HOST=127.0.0.1, para testes sem Discord)
 HUB_DEV_LOGIN=0
-# 1 = confiar em X-Forwarded-For (ligar quando estiver atrás do nginx)
-HUB_TRUST_PROXY=0
+# Proxies confiáveis (lista de IPs/CIDRs separados por vírgula), ex. 127.0.0.1,::1 quando atrás do nginx. Vazio = não confiar em X-Forwarded-For. "1" é recusado.
+HUB_TRUST_PROXY=
+# 1 = permite listar servidores em IPs privados/locais (só para testes locais)
+HUB_ALLOW_PRIVATE_SERVERS=0
 HUB_RATE_LIMIT=1
 HUB_LOG_LEVEL=info
 ```
