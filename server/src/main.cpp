@@ -29,6 +29,7 @@
 #include "cbserver/auth.hpp"
 #include "cbserver/config.hpp"
 #include "cbserver/http.hpp"
+#include "cbserver/hub.hpp"
 #include "cbserver/manifest.hpp"
 #include "cbserver/metrics.hpp"
 #include "cbserver/net.hpp"
@@ -121,8 +122,9 @@ int run(const std::string& cfgPath) {
     keys = std::make_unique<cbserver::StaticKeys>(cbserver::StaticKeys::fromDevKey(*cfg.devPublicKey));
     spdlog::warn("modo dev: aceitando tickets assinados pela chave dev (kid 'dev'), sem Hub");
   } else if (cfg.hub) {  // hub e devPublicKey são mutuamente exclusivos (validado na config)
-    spdlog::error("integração com o Hub ainda não disponível nesta versão; use auth.devPublicKey sem hub");
-    return 1;
+    keys = std::make_unique<cbserver::HubKeys>(cfg.hub->url, [] {
+      return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    });
   } else {
     spdlog::error("configure 'hub' ou 'auth.devPublicKey' para validar tickets");
     return 1;
@@ -160,6 +162,23 @@ int run(const std::string& cfgPath) {
     return 1;
   }
   spdlog::info("ouvindo em UDP/TCP {} (serverId {}, {} threads de snapshot)", cfg.port, serverId, pool.workers());
+
+  std::unique_ptr<cbserver::Heartbeat> heartbeat;
+  if (cfg.hub) {
+    cbserver::HeartbeatInfo hi;
+    hi.name = cfg.name;
+    hi.description = cfg.description;
+    hi.maxPlayers = cfg.maxPlayers;
+    hi.gamePort = cfg.port;
+    hi.httpPort = cfg.port;
+    hi.version = kVersion;
+    hi.protocol = cbmp::kProtocolVersion;
+    hi.tags = cfg.tags;
+    hi.locale = cfg.locale;
+    heartbeat = std::make_unique<cbserver::Heartbeat>(
+        cfg.hub->url, cfg.hub->key, std::move(hi),
+        [&metrics] { return static_cast<uint32_t>(std::max<int64_t>(0, metrics.players.load())); });
+  }
 
   installStopHandlers();
   using Clock = std::chrono::steady_clock;
@@ -207,6 +226,7 @@ int run(const std::string& cfgPath) {
   }
 
   spdlog::info("encerrando...");
+  if (heartbeat) heartbeat->stop();
   http.stop();
   net.stop();
   spdlog::info("servidor parado");
