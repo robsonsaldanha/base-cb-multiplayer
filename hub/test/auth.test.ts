@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createHash, randomBytes } from 'node:crypto';
 import { makeTestApp, loginAs } from './helpers';
 
@@ -187,5 +187,18 @@ describe('auth', () => {
     const code = new URL(l.headers.location as string).searchParams.get('code')!;
     const ex = await on.app.inject({ method: 'POST', url: '/v1/auth/exchange', payload: { code, codeVerifier: verifier } });
     expect(ex.statusCode).toBe(200);
+  });
+  it('falha do Discord no callback é logada (warn) com a causa, sem o código', async () => {
+    const { app, discord } = await makeTestApp();
+    const { HttpError } = await import('../src/errors');
+    discord.exchangeCode = async () => { throw new HttpError(502, 'discord_error', 'falha ao validar login no Discord', { service: 'discord', endpoint: 'oauth2/token', status: 503 }); };
+    const warn = vi.spyOn(app.log, 'warn');
+    const { state, cookie } = await startLogin(app, 'panel');
+    const res = await callback(app, 'codigo-secreto', state, cookie.value);
+    expect(res.statusCode).toBe(502);
+    expect(warn).toHaveBeenCalled();
+    const logged = JSON.stringify(warn.mock.calls);
+    expect(logged).toContain('503');
+    expect(logged).not.toContain('codigo-secreto');
   });
 });

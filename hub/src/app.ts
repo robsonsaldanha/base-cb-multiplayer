@@ -47,7 +47,11 @@ export async function buildApp(deps: HubDeps): Promise<FastifyInstance> {
   });
 
   app.setErrorHandler((err: FastifyError | Error, req, reply) => {
-    if (err instanceof HttpError) return reply.status(err.status).send({ error: err.code, message: err.message });
+    if (err instanceof HttpError) {
+      // Falhas de serviços externos (5xx) são logadas só com o detalhe seguro (status/tipo), nunca tokens/códigos.
+      if (err.status >= 500) req.log.warn({ code: err.code, upstream: err.upstream }, err.message);
+      return reply.status(err.status).send({ error: err.code, message: err.message });
+    }
     if (err instanceof ZodError) {
       return reply.status(400).send({
         error: 'invalid_body',

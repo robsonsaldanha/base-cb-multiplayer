@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { openDb } from '../src/db';
-import { Store } from '../src/store';
+import { LAUNCHER_ACCESS_TTL, LAUNCHER_REFRESH_TTL, LOGIN_CODE_TTL, OAUTH_STATE_TTL, PANEL_ACCESS_TTL, Store } from '../src/store';
 
 let store: Store;
 const T = 1_800_000_000;
@@ -89,5 +89,30 @@ describe('Store', () => {
     const { server } = store.createServer(u.id, { name: 'Meu', description: 'd', tags: ['rp'], locale: 'pt-BR', useGlobalBans: true }, T);
     const up = store.updateServer(server.id, u.id, { name: undefined, description: 'novo', useGlobalBans: undefined })!;
     expect(up).toMatchObject({ name: 'Meu', description: 'novo', useGlobalBans: true, tags: ['rp'] });
+  });
+
+  it('purgeExpired remove states, códigos e sessões vencidas e mantém o resto', () => {
+    const db = openDb(':memory:');
+    const st = new Store(db);
+    const count = (t: string) => (db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get() as { n: number }).n;
+    const u = st.upsertUserFromDiscord({ discordId: '1', name: 'A', avatar: null }, T);
+    const now = T + 100_000;
+    st.createOauthState('panel', now - OAUTH_STATE_TTL - 1);      // vencido
+    const keepState = st.createOauthState('panel', now - OAUTH_STATE_TTL); // no limite: fica
+    st.createLoginCode(u.id, now - LOGIN_CODE_TTL - 1, 'x');        // vencido
+    const keepCode = st.createLoginCode(u.id, now - 10, 'x');
+    const panelOld = st.createSession(u.id, 'panel', now - PANEL_ACCESS_TTL - 1);   // access vencido, sem refresh → sai
+    const panelNew = st.createSession(u.id, 'panel', now - 10);
+    const launcherRefreshOk = st.createSession(u.id, 'launcher', now - LAUNCHER_ACCESS_TTL - 1); // access vencido, refresh válido → fica
+    st.createSession(u.id, 'launcher', now - LAUNCHER_REFRESH_TTL - 1); // ambos vencidos → sai
+    st.purgeExpired(now);
+    expect(count('oauth_states')).toBe(1);
+    expect(st.consumeOauthState(keepState, now)).not.toBeNull();
+    expect(count('login_codes')).toBe(1);
+    expect(st.consumeLoginCode(keepCode, now)).not.toBeNull();
+    expect(count('sessions')).toBe(2);
+    expect(st.findUserByAccess(panelOld.access, now - PANEL_ACCESS_TTL - 1)).toBeNull();
+    expect(st.findUserByAccess(panelNew.access, now)).not.toBeNull();
+    expect(st.refreshSession(launcherRefreshOk.refresh!, now)).not.toBeNull();
   });
 });

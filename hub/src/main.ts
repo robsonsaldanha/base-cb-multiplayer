@@ -13,11 +13,20 @@ mkdirSync(config.dataDir, { recursive: true });
 const store = new Store(openDb(join(config.dataDir, 'hub.sqlite')));
 const keyring = loadOrCreateKeyRing(join(config.dataDir, 'keys'));
 const discord = createDiscordClient(config.discordClientId, config.discordClientSecret);
-const app = await buildApp({ config, store, keyring, discord, probe: httpProbe, now: () => Math.floor(Date.now() / 1000) });
+const now = () => Math.floor(Date.now() / 1000);
+const app = await buildApp({ config, store, keyring, discord, probe: httpProbe, now });
+const PURGE_INTERVAL_MS = 10 * 60 * 1000;
+function purge(): void {
+  try { store.purgeExpired(now()); } catch (err) { app.log.error(err); }
+}
+purge();
+const purgeTimer = setInterval(purge, PURGE_INTERVAL_MS);
+purgeTimer.unref();
 try {
   await app.listen({ port: config.port, host: config.host });
 } catch (err) {
   app.log.error(err);
+  clearInterval(purgeTimer);
   store.close();
   process.exit(1);
 }
@@ -28,6 +37,7 @@ async function shutdown(signal: string): Promise<void> {
   if (closing) return;
   closing = true;
   app.log.info(`${signal} recebido, encerrando`);
+  clearInterval(purgeTimer);
   try {
     await app.close();
     store.close();

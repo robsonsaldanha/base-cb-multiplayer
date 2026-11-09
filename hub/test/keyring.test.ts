@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { generateKeyPairSync } from 'node:crypto';
 import { mkdtempSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -36,5 +37,11 @@ describe('keyring', () => {
     expect(b.publicKeys().map((k) => k.kid)).toEqual([a.active.kid]);
     writeFileSync(join(dir, 'k20990101000000.pem'), 'corrompida');
     expect(() => loadOrCreateKeyRing(dir)).toThrow(/k20990101000000\.pem/);
+  });
+  it('recusa chave que não é Ed25519, citando o arquivo', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cbmp-keys-'));
+    const ec = generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).privateKey;
+    writeFileSync(join(dir, 'k20990101000000.pem'), ec.export({ format: 'pem', type: 'pkcs8' }));
+    expect(() => loadOrCreateKeyRing(dir)).toThrow(/k20990101000000\.pem.*ed25519/i);
   });
 });

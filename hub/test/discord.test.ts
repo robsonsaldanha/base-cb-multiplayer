@@ -31,4 +31,16 @@ describe('createDiscordClient', () => {
     await expect(c.exchangeCode('c', 'x')).rejects.toMatchObject({ status: 502, code: 'discord_error' });
     await expect(c.getUser('t')).rejects.toMatchObject({ status: 502, code: 'discord_error' });
   });
+  it('falha carrega causa do upstream (status/tipo) sem segredos', async () => {
+    const st = client(async () => json({ error: 'invalid_grant' }, 400));
+    const e1 = await st.exchangeCode('codigo-secreto', 'http://x').catch((e) => e);
+    expect(e1.upstream).toMatchObject({ service: 'discord', endpoint: 'oauth2/token', status: 400 });
+    const net = client(async () => { throw new TypeError('fetch failed'); });
+    const e2 = await net.getUser('token-secreto').catch((e) => e);
+    expect(e2.upstream).toMatchObject({ service: 'discord', endpoint: 'users/@me', error: 'TypeError' });
+    for (const e of [e1, e2]) {
+      const dump = JSON.stringify(e.upstream);
+      for (const secret of ['codigo-secreto', 'token-secreto', 'sec', 'cid']) expect(dump).not.toContain(secret);
+    }
+  });
 });

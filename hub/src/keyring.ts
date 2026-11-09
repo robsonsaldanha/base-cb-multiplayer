@@ -28,7 +28,9 @@ export function loadOrCreateKeyRing(dir: string, nowDate: Date = new Date()): Ke
 
 function loadKey(path: string, name: string): KeyObject {
   try {
-    return createPrivateKey(readFileSync(path));
+    const key = createPrivateKey(readFileSync(path));
+    if (key.asymmetricKeyType !== 'ed25519') throw new Error(`tipo ${key.asymmetricKeyType ?? 'desconhecido'}, esperado ed25519`);
+    return key;
   } catch (e) {
     throw new Error(`chave inválida em ${name}: ${(e as Error).message}`);
   }

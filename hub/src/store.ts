@@ -94,6 +94,15 @@ export class Store {
     this.db.prepare('DELETE FROM sessions WHERE access_hash = ?').run(sha256(access));
   }
 
+  /** Apaga states/códigos vencidos e sessões cujo access e refresh (se houver) já expiraram. */
+  purgeExpired(now: number): void {
+    this.db.transaction(() => {
+      this.db.prepare('DELETE FROM oauth_states WHERE created_at < ?').run(now - OAUTH_STATE_TTL);
+      this.db.prepare('DELETE FROM login_codes WHERE created_at < ?').run(now - LOGIN_CODE_TTL);
+      this.db.prepare('DELETE FROM sessions WHERE access_exp < ? AND (refresh_exp IS NULL OR refresh_exp < ?)').run(now, now);
+    })();
+  }
+
   // ---- OAuth state e códigos de login (uso único)
   createOauthState(client: ClientKind, now: number, codeChallenge?: string): string {
     const state = randomBytes(24).toString('base64url');
