@@ -27,4 +27,14 @@ describe('keyring', () => {
     expect(verifyTicket(t, { publicKeys: keys, audience: 'a', nowSeconds: 2 }).ok).toBe(true);
     expect(ring.publicKeys()[1]!.publicKey).toBe(publicKeyToRaw(nova));
   });
+  it('ignora arquivos fora do padrão e falha citando o arquivo corrompido', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cbmp-keys-'));
+    const a = loadOrCreateKeyRing(dir, new Date('2026-01-01T00:00:00Z'));
+    writeFileSync(join(dir, 'zz-backup.pem'), 'lixo');
+    const b = loadOrCreateKeyRing(dir);
+    expect(b.active.kid).toBe(a.active.kid);
+    expect(b.publicKeys().map((k) => k.kid)).toEqual([a.active.kid]);
+    writeFileSync(join(dir, 'k20990101000000.pem'), 'corrompida');
+    expect(() => loadOrCreateKeyRing(dir)).toThrow(/k20990101000000\.pem/);
+  });
 });

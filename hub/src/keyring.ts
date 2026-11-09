@@ -13,14 +13,23 @@ export interface KeyRing {
  * Rotação: gerar novo .pem com kid maior; as antigas continuam publicadas até serem removidas.
  */
 export function loadOrCreateKeyRing(dir: string, nowDate: Date = new Date()): KeyRing {
-  mkdirSync(dir, { recursive: true });
-  let files = readdirSync(dir).filter((f) => f.endsWith('.pem')).sort();
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // Só arquivos k + 14 dígitos + .pem são chaves; qualquer outro (backups etc.) é ignorado.
+  let files = readdirSync(dir).filter((f) => /^k[0-9]{14}\.pem$/.test(f)).sort();
   if (files.length === 0) {
     const kid = 'k' + nowDate.toISOString().replace(/\D/g, '').slice(0, 14);
     writeFileSync(join(dir, `${kid}.pem`), generatePrivateKey().export({ format: 'pem', type: 'pkcs8' }), { mode: 0o600 });
     files = [`${kid}.pem`];
   }
-  const entries = files.map((f) => ({ kid: f.slice(0, -4), privateKey: createPrivateKey(readFileSync(join(dir, f))) }));
+  const entries = files.map((f) => ({ kid: f.slice(0, -4), privateKey: loadKey(join(dir, f), f) }));
   const published = entries.map((e) => ({ kid: e.kid, publicKey: publicKeyToRaw(e.privateKey) }));
   return { active: entries[entries.length - 1]!, publicKeys: () => published };
+}
+
+function loadKey(path: string, name: string): KeyObject {
+  try {
+    return createPrivateKey(readFileSync(path));
+  } catch (e) {
+    throw new Error(`chave inválida em ${name}: ${(e as Error).message}`);
+  }
 }

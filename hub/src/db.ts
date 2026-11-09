@@ -31,6 +31,10 @@ const MIGRATIONS: string[] = [
     discord_id TEXT PRIMARY KEY, reason TEXT NOT NULL, created_by TEXT NOT NULL, created_at INTEGER NOT NULL
   );
   `,
+  `
+  ALTER TABLE oauth_states ADD COLUMN code_challenge TEXT;
+  ALTER TABLE login_codes ADD COLUMN code_challenge TEXT;
+  `,
 ];
 
 export function openDb(file: string): DB {

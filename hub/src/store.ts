@@ -84,33 +84,37 @@ export class Store {
     return this.createSession(s.user_id as string, 'launcher', now);
   }
 
+  deleteSessionByRefresh(refresh: string): void {
+    this.db.prepare('DELETE FROM sessions WHERE refresh_hash = ?').run(sha256(refresh));
+  }
+
   deleteSessionByAccess(access: string): void {
     this.db.prepare('DELETE FROM sessions WHERE access_hash = ?').run(sha256(access));
   }
 
   // ---- OAuth state e códigos de login (uso único)
-  createOauthState(client: ClientKind, now: number): string {
+  createOauthState(client: ClientKind, now: number, codeChallenge?: string): string {
     const state = randomBytes(24).toString('base64url');
-    this.db.prepare('INSERT INTO oauth_states (state, client, created_at) VALUES (?, ?, ?)').run(state, client, now);
+    this.db.prepare('INSERT INTO oauth_states (state, client, created_at, code_challenge) VALUES (?, ?, ?, ?)').run(state, client, now, codeChallenge ?? null);
     return state;
   }
 
-  consumeOauthState(state: string, now: number): ClientKind | null {
-    const r = this.db.prepare('DELETE FROM oauth_states WHERE state = ? RETURNING client, created_at').get(state) as Raw | undefined;
+  consumeOauthState(state: string, now: number): { client: ClientKind; codeChallenge: string | null } | null {
+    const r = this.db.prepare('DELETE FROM oauth_states WHERE state = ? RETURNING client, created_at, code_challenge').get(state) as Raw | undefined;
     if (!r || now - (r.created_at as number) > OAUTH_STATE_TTL) return null;
-    return r.client as ClientKind;
+    return { client: r.client as ClientKind, codeChallenge: (r.code_challenge as string | null) ?? null };
   }
 
-  createLoginCode(userId: string, now: number): string {
+  createLoginCode(userId: string, now: number, codeChallenge: string): string {
     const code = randomBytes(24).toString('base64url');
-    this.db.prepare('INSERT INTO login_codes (code_hash, user_id, created_at) VALUES (?, ?, ?)').run(sha256(code), userId, now);
+    this.db.prepare('INSERT INTO login_codes (code_hash, user_id, created_at, code_challenge) VALUES (?, ?, ?, ?)').run(sha256(code), userId, now, codeChallenge);
     return code;
   }
 
-  consumeLoginCode(code: string, now: number): string | null {
-    const r = this.db.prepare('DELETE FROM login_codes WHERE code_hash = ? RETURNING user_id, created_at').get(sha256(code)) as Raw | undefined;
+  consumeLoginCode(code: string, now: number): { userId: string; codeChallenge: string } | null {
+    const r = this.db.prepare('DELETE FROM login_codes WHERE code_hash = ? RETURNING user_id, created_at, code_challenge').get(sha256(code)) as Raw | undefined;
     if (!r || now - (r.created_at as number) > LOGIN_CODE_TTL) return null;
-    return r.user_id as string;
+    return { userId: r.user_id as string, codeChallenge: (r.code_challenge as string | null) ?? '' };
   }
 
   // ---- servidores

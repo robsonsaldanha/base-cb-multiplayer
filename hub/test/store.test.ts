@@ -38,15 +38,15 @@ describe('Store', () => {
   });
 
   it('oauth state e login code são de uso único e expiram', () => {
-    const st = store.createOauthState('launcher', T);
-    expect(store.consumeOauthState(st, T + 1)).toBe('launcher');
+    const st = store.createOauthState('launcher', T, 'CH');
+    expect(store.consumeOauthState(st, T + 1)).toEqual({ client: 'launcher', codeChallenge: 'CH' });
     expect(store.consumeOauthState(st, T + 2)).toBeNull();
     expect(store.consumeOauthState(store.createOauthState('panel', T), T + 601)).toBeNull();
     const u = store.upsertUserFromDiscord({ discordId: '1', name: 'A', avatar: null }, T);
-    const code = store.createLoginCode(u.id, T);
-    expect(store.consumeLoginCode(code, T + 59)).toBe(u.id);
+    const code = store.createLoginCode(u.id, T, 'CH');
+    expect(store.consumeLoginCode(code, T + 59)).toEqual({ userId: u.id, codeChallenge: 'CH' });
     expect(store.consumeLoginCode(code, T + 59)).toBeNull();
-    expect(store.consumeLoginCode(store.createLoginCode(u.id, T), T + 61)).toBeNull();
+    expect(store.consumeLoginCode(store.createLoginCode(u.id, T, 'CH'), T + 61)).toBeNull();
   });
 
   it('servidor: cria com chave, acha por chave, gira chave, apaga só do dono', () => {
