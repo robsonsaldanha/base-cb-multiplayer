@@ -113,6 +113,17 @@ TEST_CASE("config devTrustFirstInput only in dev mode without hub") {
   requireRejects(j, "sim.spawn");  // sem devPublicKey
   j["auth"]["devPublicKey"] = std::string(43, 'A');
   REQUIRE(ServerConfig::fromJson(j).spawnMode == cbserver::SpawnMode::DevTrustFirstInput);
+  j["auth"]["devPublicKey"] = nullptr;
   j["hub"] = {{"url", "https://hub.exemplo"}, {"serverId", "srv_abc"}, {"key", "sk_x"}};
-  requireRejects(j, "sim.spawn");  // com hub
+  requireRejects(j, "sim.spawn");  // com hub (e sem chave dev)
+}
+
+TEST_CASE("config hub and devPublicKey are mutually exclusive") {
+  auto j = base();
+  j["hub"] = {{"url", "https://hub.exemplo"}, {"serverId", "srv_abc"}, {"key", "sk_x"}};
+  j["auth"]["devPublicKey"] = std::string(43, 'A');
+  requireRejects(j, "hub");
+  requireRejects(j, "auth.devPublicKey");
+  j["auth"]["devPublicKey"] = nullptr;
+  REQUIRE(ServerConfig::fromJson(j).hub.has_value());
 }

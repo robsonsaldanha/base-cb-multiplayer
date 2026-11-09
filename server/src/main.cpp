@@ -42,16 +42,22 @@ constexpr const char* kVersion = "0.1.0";
 constexpr const char* kDevServerId = "srv_dev";
 
 std::atomic<bool> gStop{false};
+std::atomic<bool> gStopped{false};  // parada limpa concluída (rede/HTTP fechados, logs gravados)
 
 #ifdef _WIN32
 BOOL WINAPI onConsoleCtrl(DWORD type) {
   switch (type) {
     case CTRL_C_EVENT:
     case CTRL_BREAK_EVENT:
-    case CTRL_CLOSE_EVENT:
-    case CTRL_SHUTDOWN_EVENT:
       gStop = true;
       return TRUE;
+    case CTRL_CLOSE_EVENT:
+    case CTRL_SHUTDOWN_EVENT: {
+      // O Windows encerra o processo assim que o handler retorna: espera a parada limpa (até 4 s).
+      gStop = true;
+      for (int i = 0; i < 400 && !gStopped; ++i) Sleep(10);
+      return TRUE;
+    }
     default:
       return FALSE;
   }
@@ -114,8 +120,8 @@ int run(const std::string& cfgPath) {
   if (cfg.devPublicKey) {
     keys = std::make_unique<cbserver::StaticKeys>(cbserver::StaticKeys::fromDevKey(*cfg.devPublicKey));
     spdlog::warn("modo dev: aceitando tickets assinados pela chave dev (kid 'dev'), sem Hub");
-  } else if (cfg.hub) {
-    spdlog::error("integração com o Hub ainda não disponível nesta versão; configure auth.devPublicKey");
+  } else if (cfg.hub) {  // hub e devPublicKey são mutuamente exclusivos (validado na config)
+    spdlog::error("integração com o Hub ainda não disponível nesta versão; use auth.devPublicKey sem hub");
     return 1;
   } else {
     spdlog::error("configure 'hub' ou 'auth.devPublicKey' para validar tickets");
@@ -129,6 +135,12 @@ int run(const std::string& cfgPath) {
   cbserver::TaskPool pool(cbserver::TaskPool::defaultThreads());
   cbserver::SnapshotBuilder builder(pool);
   cbserver::NetServer net(cfg, auth, world, metrics);
+  net.setViolationSink([&acLog](cbserver::EntityId id, const std::string& sub, const std::string& did,
+                                const std::string& reason) {
+    nlohmann::json line{{"type", "net_close"}, {"ts", unixNow()}, {"id", id},
+                        {"sub", sub},          {"did", did},       {"reason", reason}};
+    acLog->info("{}", line.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+  });
 
   std::string err;
   if (!net.start(static_cast<uint16_t>(cfg.port), err)) {
@@ -223,11 +235,13 @@ int main(int argc, char** argv) {
   try {
     const int rc = run(cfgPath);
     spdlog::shutdown();
+    gStopped = true;
     return rc;
   } catch (const std::exception& e) {
     spdlog::error("{}", e.what());
     std::fprintf(stderr, "%s\n", e.what());
     spdlog::shutdown();
+    gStopped = true;
     return 1;
   }
 }

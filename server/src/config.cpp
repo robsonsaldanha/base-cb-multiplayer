@@ -116,6 +116,9 @@ ServerConfig ServerConfig::fromJson(const json& j) {
     }
   }
 
+  if (c.hub && c.devPublicKey)
+    fail("hub", "e 'auth.devPublicKey' são mutuamente exclusivos: use o Hub ou a chave dev, não os dois");
+
   if (const json* n = sub(j, "net", "")) {
     getInt(*n, "pendingPerIp", "net.", 1, 1024, c.pendingPerIp);
     getInt(*n, "pendingGlobal", "net.", 1, 65536, c.pendingGlobal);

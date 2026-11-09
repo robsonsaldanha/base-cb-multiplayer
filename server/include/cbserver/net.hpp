@@ -1,6 +1,8 @@
 #pragma once
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -25,7 +27,17 @@ struct Inbound {
 struct NetOptions {
   double helloTimeoutSec = 5.0;  // prazo para o Hello após a conexão
   size_t maxHelloBytes = 4096;
+  std::string bindAddress;           // vazio = todas as interfaces; testes usam "127.0.0.1"
+  size_t maxMessagesPerPump = 4096;  // o que sobrar fica para o próximo pump
+  int sendBufferBytes = 0;           // 0 = padrão do GNS; testes reduzem para forçar LimitExceeded
 };
+
+// Chave do limite de pendentes por IP: IPv4 (inclusive mapeado) inteiro; IPv6 agrupado pelo prefixo /64.
+std::string pendingIpKey(const std::array<uint8_t, 16>& ipv6);
+
+// Encerramento de um jogador autenticado pela rede (DecodeError / tipo proibido): id, sub, did, motivo.
+using ViolationSink =
+    std::function<void(EntityId, const std::string& sub, const std::string& did, const std::string& reason)>;
 
 // Inicializa o GameNetworkingSockets uma vez por processo (chamadas seguintes devolvem o mesmo resultado).
 bool initNetworking(std::string& err);
@@ -38,6 +50,11 @@ bool initNetworking(std::string& err);
 // Protocolo diferente → Reject{"protocolo incompatível"}; ticket inválido → Reject{razão}; `sub` já conectado →
 // a sessão anterior recebe Kick{"conectado em outro lugar"}; mundo cheio → Reject{"servidor cheio"}; senão Welcome.
 // Mensagem de quem não autenticou, tipo que só o servidor envia ou DecodeError (contado em Metrics) → fecha.
+// Limites de recepção do GNS no listen socket (herdados pelas conexões): mensagem ≤ 8 KiB, buffer 64 KiB /
+// 256 mensagens, 32 segmentos por pacote — mensagens maiores derrubam a conexão no próprio GNS.
+// Welcome.serverTimeMs = ms monotônicos desde o início do servidor (o `now` do loop), não horário Unix.
+// Envio confiável recusado por LimitExceeded → kick "conexão lenta demais"; falhas de envio contam em
+// Metrics::sendFailures. Em stop(), o Kick{"servidor encerrando"} é melhor esforço (pode não chegar).
 class NetServer {
  public:
   NetServer(const ServerConfig& cfg, Authenticator& auth, World& world, Metrics& metrics, NetOptions opt = {});
@@ -56,6 +73,7 @@ class NetServer {
   void send(const std::vector<Outgoing>& out);
   // Envia Kick, fecha com linger e remove o jogador do mundo.
   void kick(EntityId id, const std::string& reason);
+  void setViolationSink(ViolationSink sink) { violations_ = std::move(sink); }
 
   size_t pendingCount() const { return pending_.size(); }
   size_t sessionCount() const { return sessions_.size(); }
@@ -67,14 +85,16 @@ class NetServer {
   };
   struct Session {
     EntityId id = 0;
-    std::string sub;
+    std::string sub, did;
   };
 
   static void statusThunk(SteamNetConnectionStatusChangedCallback_t* info);
   void onStatus(SteamNetConnectionStatusChangedCallback_t* info);
   void onMessage(uint32_t conn, const uint8_t* data, size_t size, std::vector<Inbound>& in);
   void onHello(uint32_t conn, const cbmp::Hello& h);
-  void sendTo(uint32_t conn, const cbmp::Message& m);
+  // Bytes enviados, -2 = LimitExceeded, -1 = outra falha (ambas contam em Metrics::sendFailures).
+  int sendTo(uint32_t conn, const cbmp::Message& m);
+  void violation(const Session& s, const std::string& reason);
   void closeConn(uint32_t conn, const std::string& reason, bool linger);
   void dropPending(uint32_t conn);
   void reject(uint32_t conn, const std::string& reason);
@@ -95,6 +115,8 @@ class NetServer {
   std::unordered_map<uint32_t, Session> sessions_;
   std::unordered_map<EntityId, uint32_t> connOf_;
   std::unordered_map<std::string, uint32_t> connBySub_;
+  ViolationSink violations_;
+  std::vector<EntityId> slow_;  // reaproveitado em send()
 };
 
 }  // namespace cbserver

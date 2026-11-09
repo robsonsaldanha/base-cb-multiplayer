@@ -1,5 +1,7 @@
 #include "cbserver/net.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -24,6 +26,12 @@ constexpr int kEndLimits = k_ESteamNetConnectionEnd_App_Min + 2;
 constexpr int kEndProtocol = k_ESteamNetConnectionEnd_App_Min + 3;
 constexpr int kEndKicked = k_ESteamNetConnectionEnd_App_Min + 4;
 constexpr int kMaxBatch = 256;
+constexpr int kRecvMaxMessageSize = 8192;   // Hello ≤ 4 KiB, Event ≤ 4 KiB + cabeçalho
+constexpr int kRecvBufferSize = 64 * 1024;
+constexpr int kRecvBufferMessages = 256;
+constexpr int kRecvMaxSegmentsPerPacket = 32;
+constexpr int kPortMin = 20000, kPortMax = 32767;  // start(0): fora da faixa efêmera dos SOs
+constexpr int kPortAttempts = 20;
 
 // listen socket → servidor dono (o callback do GNS é uma função livre).
 std::mutex gServersMu;
@@ -34,6 +42,24 @@ bool clientMayAuthSend(cbmp::MsgType t) {
 }
 
 }  // namespace
+
+std::string pendingIpKey(const std::array<uint8_t, 16>& ip) {
+  SteamNetworkingIPAddr a;
+  a.SetIPv6(ip.data(), 0);
+  if (a.IsIPv4()) {
+    char buf[SteamNetworkingIPAddr::k_cchMaxString];
+    a.ToString(buf, sizeof(buf), false);
+    return buf;
+  }
+  static const char* kHex = "0123456789abcdef";
+  std::string k;
+  for (size_t i = 0; i < 8; ++i) {
+    k += kHex[ip[i] >> 4];
+    k += kHex[ip[i] & 15];
+    if (i % 2 == 1) k += ':';
+  }
+  return k + ":/64";
+}
 
 bool initNetworking(std::string& err) {
   static std::once_flag once;
@@ -66,26 +92,41 @@ bool NetServer::start(uint16_t port, std::string& err) {
     return false;
   }
   auto* sockets = SteamNetworkingSockets();
-  SteamNetworkingConfigValue_t opt;
   // ponteiro de função → void* sem cast entre função/objeto (aviso no GCC -Wpedantic)
   FnSteamNetConnectionStatusChanged fn = &NetServer::statusThunk;
   void* fnPtr = nullptr;
   static_assert(sizeof(fn) == sizeof(fnPtr));
   std::memcpy(&fnPtr, &fn, sizeof(fnPtr));
-  opt.SetPtr(k_ESteamNetworkingConfig_Callback_ConnectionStatusChanged, fnPtr);
+  // Configurações do listen socket, herdadas pelas conexões aceitas nele.
+  std::vector<SteamNetworkingConfigValue_t> opts(5);
+  opts[0].SetPtr(k_ESteamNetworkingConfig_Callback_ConnectionStatusChanged, fnPtr);
+  opts[1].SetInt32(k_ESteamNetworkingConfig_RecvMaxMessageSize, kRecvMaxMessageSize);
+  opts[2].SetInt32(k_ESteamNetworkingConfig_RecvBufferSize, kRecvBufferSize);
+  opts[3].SetInt32(k_ESteamNetworkingConfig_RecvBufferMessages, kRecvBufferMessages);
+  opts[4].SetInt32(k_ESteamNetworkingConfig_RecvMaxSegmentsPerPacket, kRecvMaxSegmentsPerPacket);
+  if (opt_.sendBufferBytes > 0) {
+    opts.emplace_back();
+    opts.back().SetInt32(k_ESteamNetworkingConfig_SendBufferSize, opt_.sendBufferBytes);
+  }
+  SteamNetworkingIPAddr base;
+  base.Clear();
+  if (!opt_.bindAddress.empty() && !base.ParseString(opt_.bindAddress.c_str())) {
+    err = "endereço de escuta inválido: " + opt_.bindAddress;
+    return false;
+  }
   auto listenOn = [&](uint16_t p) {
-    SteamNetworkingIPAddr addr;
-    addr.Clear();
+    SteamNetworkingIPAddr addr = base;
     addr.m_port = p;
-    return sockets->CreateListenSocketIP(addr, 1, &opt);
+    return sockets->CreateListenSocketIP(addr, static_cast<int>(opts.size()), opts.data());
   };
   HSteamListenSocket ls = k_HSteamListenSocket_Invalid;
   if (port != 0) {
     ls = listenOn(port);
-  } else {  // o GNS exige porta explícita: sorteia na faixa efêmera até achar uma livre
+  } else {  // o GNS exige porta explícita: sorteia fora da faixa efêmera (onde os clientes se ligam)
     std::mt19937 rng(std::random_device{}());
-    std::uniform_int_distribution<int> dist(49152, 65535);
-    for (int i = 0; i < 64 && ls == k_HSteamListenSocket_Invalid; ++i) ls = listenOn(static_cast<uint16_t>(dist(rng)));
+    std::uniform_int_distribution<int> dist(kPortMin, kPortMax);
+    for (int i = 0; i < kPortAttempts && ls == k_HSteamListenSocket_Invalid; ++i)
+      ls = listenOn(static_cast<uint16_t>(dist(rng)));
   }
   if (ls == k_HSteamListenSocket_Invalid) {
     err = "não foi possível abrir a porta UDP " + std::to_string(port);
@@ -152,9 +193,9 @@ void NetServer::onStatus(SteamNetConnectionStatusChangedCallback_t* info) {
   switch (info->m_info.m_eState) {
     case k_ESteamNetworkingConnectionState_Connecting: {
       if (info->m_eOldState != k_ESteamNetworkingConnectionState_None) break;
-      char buf[SteamNetworkingIPAddr::k_cchMaxString];
-      info->m_info.m_addrRemote.ToString(buf, sizeof(buf), false);
-      std::string ip(buf);
+      std::array<uint8_t, 16> raw{};
+      std::memcpy(raw.data(), info->m_info.m_addrRemote.m_ipv6, raw.size());
+      std::string ip = pendingIpKey(raw);
       auto byIp = pendingByIp_.find(ip);
       const int fromIp = byIp == pendingByIp_.end() ? 0 : byIp->second;
       if (pending_.size() >= static_cast<size_t>(cfg_.pendingGlobal) || fromIp >= cfg_.pendingPerIp) {
@@ -195,15 +236,18 @@ void NetServer::pump(double now, std::vector<Inbound>& in) {
   auto* sockets = SteamNetworkingSockets();
   sockets->RunCallbacks();
   SteamNetworkingMessage_t* msgs[kMaxBatch];
-  for (;;) {
-    const int n = sockets->ReceiveMessagesOnPollGroup(poll_, msgs, kMaxBatch);
+  size_t budget = opt_.maxMessagesPerPump;  // o resto fica na fila do GNS para o próximo pump
+  while (budget > 0) {
+    const int want = static_cast<int>(std::min<size_t>(budget, kMaxBatch));
+    const int n = sockets->ReceiveMessagesOnPollGroup(poll_, msgs, want);
     if (n <= 0) break;
+    budget -= static_cast<size_t>(n);
     for (int i = 0; i < n; ++i) {
       onMessage(msgs[i]->m_conn, static_cast<const uint8_t*>(msgs[i]->m_pData), static_cast<size_t>(msgs[i]->m_cbSize),
                 in);
       msgs[i]->Release();
     }
-    if (n < kMaxBatch) break;
+    if (n < want) break;
   }
   // prazo do Hello
   std::vector<uint32_t> expired;
@@ -246,10 +290,12 @@ void NetServer::onMessage(uint32_t conn, const uint8_t* data, size_t size, std::
     m = cbmp::decode(std::span<const uint8_t>(data, size));
   } catch (const cbmp::DecodeError&) {
     ++metrics_.decodeErrors;
+    violation(it->second, "mensagem inválida");
     endSession(conn, "mensagem inválida", false);
     return;
   }
   if (!clientMayAuthSend(cbmp::typeOf(m))) {
+    violation(it->second, "mensagem não permitida");
     endSession(conn, "mensagem não permitida", false);
     return;
   }
@@ -273,7 +319,7 @@ void NetServer::onHello(uint32_t conn, const cbmp::Hello& h) {
     reject(conn, "servidor cheio");
     return;
   }
-  sessions_.emplace(conn, Session{*id, t->sub});
+  sessions_.emplace(conn, Session{*id, t->sub, t->did});
   connOf_[*id] = conn;
   connBySub_[t->sub] = conn;
   cbmp::Welcome w;
@@ -284,25 +330,35 @@ void NetServer::onHello(uint32_t conn, const cbmp::Hello& h) {
   spdlog::info("jogador {} entrou (id {}, did {})", t->name, *id, t->did);
 }
 
-void NetServer::sendTo(uint32_t conn, const cbmp::Message& m) {
+int NetServer::sendTo(uint32_t conn, const cbmp::Message& m) {
   const auto bytes = cbmp::encode(m);
   const int flags = cbmp::isReliable(cbmp::typeOf(m)) ? k_nSteamNetworkingSend_Reliable
                                                        : k_nSteamNetworkingSend_UnreliableNoDelay;
-  SteamNetworkingSockets()->SendMessageToConnection(conn, bytes.data(), static_cast<uint32_t>(bytes.size()), flags,
-                                                    nullptr);
+  const EResult r = SteamNetworkingSockets()->SendMessageToConnection(
+      conn, bytes.data(), static_cast<uint32_t>(bytes.size()), flags, nullptr);
+  if (r == k_EResultOK) return static_cast<int>(bytes.size());
+  ++metrics_.sendFailures;
+  return r == k_EResultLimitExceeded ? -2 : -1;
 }
 
 void NetServer::send(const std::vector<Outgoing>& out) {
-  auto* sockets = SteamNetworkingSockets();
+  slow_.clear();
   for (const auto& o : out) {
     auto it = connOf_.find(o.to);
     if (it == connOf_.end()) continue;
-    const auto bytes = cbmp::encode(o.msg);
-    const int flags = cbmp::isReliable(cbmp::typeOf(o.msg)) ? k_nSteamNetworkingSend_Reliable
-                                                             : k_nSteamNetworkingSend_UnreliableNoDelay;
-    sockets->SendMessageToConnection(it->second, bytes.data(), static_cast<uint32_t>(bytes.size()), flags, nullptr);
-    metrics_.addBytesOut(o.to, bytes.size());
+    const int n = sendTo(it->second, o.msg);
+    if (n >= 0) {
+      metrics_.addBytesOut(o.to, static_cast<size_t>(n));
+    } else if (n == -2 && cbmp::isReliable(cbmp::typeOf(o.msg)) &&
+               std::find(slow_.begin(), slow_.end(), o.to) == slow_.end()) {
+      slow_.push_back(o.to);  // fila confiável cheia: o cliente não acompanha
+    }
   }
+  for (EntityId id : slow_) kick(id, "conexão lenta demais");
+}
+
+void NetServer::violation(const Session& s, const std::string& reason) {
+  if (violations_) violations_(s.id, s.sub, s.did, reason);
 }
 
 void NetServer::kick(EntityId id, const std::string& reason) {
