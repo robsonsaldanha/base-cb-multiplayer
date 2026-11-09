@@ -61,6 +61,9 @@ Fora do escopo: anti-cheat em nível de kernel; voz (decidir depois); loja/monet
 - Payload: `{ "v": 1, "kid": "<id da chave>", "sub": "<id do usuário no Hub>", "did": "<discord id>", "name": "<nome exibido>", "aud": "<serverId>", "iat": <unix s>, "exp": <unix s>, "jti": "<uuid>" }`.
 - Validade: `exp - iat = 300` s. Servidor aceita relógio com ±60 s de tolerância.
 - `cb-server` valida offline com as chaves públicas do Hub (`GET /v1/keys/public`, cache; recarrega quando aparece `kid` desconhecido, no máximo 1x/min). Rejeita `aud` diferente do próprio `serverId`, expirado, ou `jti` já visto (cache de `jti` até expirar).
+- Chave pública: 32 bytes raw da chave Ed25519 em **base64url** (sem padding).
+- Regras de formato (qualquer desvio → `malformed`): payload em JSON **compacto** (nenhum espaço/tab/quebra de linha fora de strings); cada chave `v/kid/sub/did/name/aud/iat/exp/jti` aparece exatamente uma vez (contar ocorrências de `"<chave>":` no corpo == 1); as duas partes em base64url **canônico** (sem padding; reencodar os bytes decodificados dá o mesmo texto); `v`, `iat` e `exp` são literais inteiros simples (sem `1.0`, sem expoente) e inteiros seguros.
+- Ordem das checagens (TS e C++ iguais): formato/charset → base64url canônico → JSON (válido, compacto, sem chave duplicada) → forma (tipos, inteiros) → `v` (`bad_version`) → `kid` (`unknown_kid`) → assinatura de 64 bytes (`bad_signature`) → `aud` (`wrong_audience`) → `iat > now+60` (`not_yet_valid`) → `exp+60 < now` (`expired`).
 - Vetores de teste (payload, chave, assinatura esperada) ficam em `packages/contracts/test-vectors/` e são usados pelos testes TS **e** C++.
 - Modo dev do servidor: aceita tickets assinados por uma chave dev local (config `auth.devPublicKey`), sem Hub.
 
@@ -68,22 +71,27 @@ Fora do escopo: anti-cheat em nível de kernel; voz (decidir depois); loja/monet
 
 | Método | Rota | Auth | Uso |
 |---|---|---|---|
-| GET | `/v1/auth/discord/login?client=launcher\|panel` | — | inicia OAuth |
-| GET | `/v1/auth/discord/callback` | — | fim do OAuth; launcher recebe via `cbmp://auth?...` |
-| POST | `/v1/auth/refresh` | refresh token | renova sessão |
-| GET | `/v1/me` | sessão | perfil |
+| GET | `/v1/auth/discord/login?client=launcher\|panel` | — | inicia OAuth; launcher exige `code_challenge` + `code_challenge_method=S256` |
+| GET | `/v1/auth/discord/callback` | — | fim do OAuth; launcher recebe `cbmp://auth?code=…` ou `cbmp://auth?error=access_denied`; painel recebe cookie |
+| POST | `/v1/auth/exchange` `{code, codeVerifier}` | — | launcher troca o código (uso único, 60 s) por `{accessToken, accessExpiresAt, refreshToken, refreshExpiresAt}` |
+| POST | `/v1/auth/refresh` `{refreshToken}` | refresh token | renova sessão (gira os dois tokens) |
+| POST | `/v1/auth/logout` | sessão (Bearer ou cookie) | encerra sessão; aceita `{refreshToken}` |
+| GET | `/v1/me` | sessão (Bearer ou cookie) | perfil |
 | POST | `/v1/tickets` `{serverId}` | sessão | emite ticket p/ aquele servidor; recusa (`banned_global`) só se o usuário está na lista global **e** aquele servidor optou por usá-la |
-| GET | `/v1/keys/public` | — | `[{kid, publicKey(base64)}]` |
+| GET | `/v1/keys/public` | — | `[{kid, publicKey}]`, `publicKey` = 32 bytes raw em base64url |
 | GET | `/v1/servers` | — | lista pública (cache 5 s) |
-| GET | `/v1/servers/:id` | — | detalhe |
+| GET | `/v1/servers/:id` | — | detalhe (`ServerDetail`: online → campos de conexão incl. `protocol`; offline → id/name/description/tags/locale) |
 | POST | `/v1/servers/heartbeat` | `Bearer <chave do servidor>` | anúncio do servidor |
 | GET/POST/PATCH/DELETE | `/v1/owner/servers[...]` | sessão | painel: criar, listar, editar descrição, girar chave, apagar |
-| GET | `/v1/bans/global` | chave do servidor | lista global (servidores opt-in) |
+| GET | `/v1/bans/global` | chave do servidor | `[{discordId, reason, createdAt}]`; só se o servidor tem `useGlobalBans` (senão 403 `not_opted_in`) |
 | POST/DELETE | `/v1/admin/bans/global` | sessão de admin da plataforma | gerenciar lista global |
 
 Regras:
 - Chave do servidor: 32 bytes aleatórios, mostrada uma única vez; Hub guarda só `sha256`.
-- Heartbeat: `{ serverId, name, description, players, maxPlayers, gamePort, httpPort, version, protocol, tags[], locale }`. O IP vem da conexão (não do corpo). Antes de listar a 1ª vez (e a cada 10 min), o Hub chama `http://IP:httpPort/info` e confere `serverId`. Sem heartbeat por 90 s → sai da lista.
+- Heartbeat: corpo exatamente `HeartbeatBody` de `@cbmp/contracts`: `{ name, description, players, maxPlayers, gamePort, httpPort, version, protocol, tags[], locale }` (sem `serverId`: o servidor é identificado pela chave; `name` é aparado). O IP vem da conexão (não do corpo) e pode ser IPv6 (o launcher usa `[host]:porta`). Antes de listar a 1ª vez, quando IP/porta HTTP mudam e a cada 10 min, o Hub chama `http://IP:httpPort/info` e confere `serverId`; probe falho espera 120 s antes de nova tentativa no mesmo endpoint. Sem heartbeat por 90 s → sai da lista.
+- Probe: IPs privados/reservados (v4 e v6) são recusados (`reason: private_ip`, sem probe) salvo `HUB_ALLOW_PRIVATE_SERVERS=1`. Atrás de proxy, `HUB_TRUST_PROXY` é a **lista** de IPs/CIDRs dos proxies confiáveis (nunca booleano); vazio = IP direto da conexão.
+- Autenticação da API: `Authorization: Bearer at_…` em todas as rotas de sessão. O cookie `cbmp_session` (HttpOnly, SameSite=Lax) só vale no painel (`/panel`, com checagem de Origin/Sec-Fetch-Site), em `GET /v1/me` e em `POST /v1/auth/logout`. Formulários (`application/x-www-form-urlencoded`) só são aceitos no painel.
+- OAuth: `state` de uso único (10 min) amarrado ao navegador pelo cookie `cbmp_oauth`; callback com `state` diferente do cookie → `bad_state`. Launcher é cliente público: PKCE S256 obrigatório, `codeVerifier` com 43–128 chars `[A-Za-z0-9._~-]`.
 - Rate limit por IP e por chave/sessão. Erros com código estável (`{error: "codigo", message}`).
 - Banco interno do Hub: SQLite (não exposto). MySQL é o banco dos servidores de jogo.
 - Chave privada de assinatura só na VPS, com `kid` para rotação.
