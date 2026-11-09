@@ -131,4 +131,13 @@ describe('painel', () => {
     expect(res.statusCode).toBe(400);
     expect(res.body).toContain('name');
   });
+
+  it('rate limit no painel responde 429 em HTML', async () => {
+    const { app } = await makeTestApp({ config: { rateLimit: true } });
+    let last;
+    for (let i = 0; i < 121; i++) last = await app.inject({ method: 'GET', url: '/panel', remoteAddress: '203.0.113.9' });
+    expect(last!.statusCode).toBe(429);
+    expect(last!.headers['content-type']).toContain('text/html');
+    expect(last!.body).toContain('href="/panel"');
+  });
 });

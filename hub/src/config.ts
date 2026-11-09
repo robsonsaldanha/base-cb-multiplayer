@@ -53,8 +53,21 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
   if (!devLogin && (!cfg.discordClientId || !cfg.discordClientSecret)) {
     throw new Error('DISCORD_CLIENT_ID e DISCORD_CLIENT_SECRET são obrigatórios (ou HUB_DEV_LOGIN=1 para testes locais)');
   }
-  if (devLogin && host !== '127.0.0.1' && host !== 'localhost') {
-    throw new Error('HUB_DEV_LOGIN=1 só é permitido com HUB_HOST=127.0.0.1');
-  }
+  if (devLogin) assertDevLoginSafe(cfg);
   return cfg;
+}
+
+/** Login de teste só em máquina local: escuta local, URL pública local e sem proxy na frente. */
+function assertDevLoginSafe(cfg: HubConfig): void {
+  if (!['127.0.0.1', 'localhost', '::1'].includes(cfg.host)) {
+    throw new Error(`HUB_DEV_LOGIN=1 só é permitido com HUB_HOST local (127.0.0.1, localhost ou ::1); recebido "${cfg.host}"`);
+  }
+  let hostname = '';
+  try { hostname = new URL(cfg.publicUrl).hostname; } catch { /* inválida → recusada abaixo */ }
+  if (!['localhost', '127.0.0.1', '[::1]'].includes(hostname)) {
+    throw new Error(`HUB_DEV_LOGIN=1 só é permitido com HUB_PUBLIC_URL local (localhost, 127.0.0.1 ou [::1]); recebido "${cfg.publicUrl}"`);
+  }
+  if (cfg.trustProxy !== false) {
+    throw new Error('HUB_DEV_LOGIN=1 não pode ser usado com HUB_TRUST_PROXY (o hub estaria atrás de um proxy, logo exposto)');
+  }
 }

@@ -1,4 +1,5 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import formbody from '@fastify/formbody';
 import { z, ZodError } from 'zod';
 import { HttpError } from '../errors';
 import { SESSION_COOKIE, currentUser } from '../auth';
@@ -23,6 +24,9 @@ table{width:100%;border-collapse:collapse}td,th{padding:.4rem;border-bottom:1px 
 export async function panelRoutes(app: FastifyInstance) {
   const { config, store, now } = app.deps;
   const origin = new URL(config.publicUrl).origin;
+  // Formulários HTML só no painel; a API JSON não aceita application/x-www-form-urlencoded.
+  await app.register(formbody);
+  const sessionUser = (req: FastifyRequest) => currentUser(req, { allowCookie: true });
 
   // Cabeçalhos de segurança em toda resposta /panel (hook encapsulado neste plugin).
   app.addHook('onSend', async (_req, reply) => {
@@ -47,9 +51,10 @@ export async function panelRoutes(app: FastifyInstance) {
       if (err.status === 401) return send(401, page('Painel', `<h1>Painel de servidores</h1><p class="err">Faça login para continuar.</p><p>${loginLink}</p>`));
       if (err.status === 403) return send(403, page('Ação bloqueada', `<h1>Ação bloqueada</h1><p class="err">Ação bloqueada (origem inválida). Recarregue o painel e tente de novo.</p><p><a href="/panel">Voltar ao painel</a></p>`));
       if (err.status === 404) return send(404, page('Não encontrado', `<h1>Servidor não encontrado</h1><p><a href="/panel">Voltar ao painel</a></p>`));
+      if (err.status < 500) return send(err.status, page('Erro', `<h1>Não foi possível concluir</h1><p class="err">${esc(err.message)}</p><p><a href="/panel">Voltar ao painel</a></p>`));
     }
     if (err instanceof ZodError) {
-      const u = currentUser(req);
+      const u = sessionUser(req);
       const msg = err.issues.map((i) => `${i.path.join('.') || '(corpo)'}: ${i.message}`).join('; ');
       if (!u) return send(401, page('Painel', `<h1>Painel de servidores</h1><p class="err">Faça login para continuar.</p><p>${loginLink}</p>`));
       return send(400, dashboard(u, `<p class="err">${esc(msg)}</p>`));
@@ -62,7 +67,7 @@ export async function panelRoutes(app: FastifyInstance) {
 
   function requirePanelUser(req: FastifyRequest): UserRow {
     checkOrigin(req);
-    const u = currentUser(req);
+    const u = sessionUser(req);
     if (!u) throw new HttpError(401, 'unauthorized', 'faça login');
     return u;
   }
@@ -95,7 +100,7 @@ export async function panelRoutes(app: FastifyInstance) {
   const sendHtml = (reply: FastifyReply, html: string, status = 200) => reply.status(status).type('text/html; charset=utf-8').send(html);
 
   app.get('/panel', async (req, reply) => {
-    const u = currentUser(req);
+    const u = sessionUser(req);
     if (!u) {
       const dev = config.devLogin
         ? `<p><a href="/v1/auth/dev-login?client=panel&amp;discordId=1&amp;name=Dev">Entrar como Dev (somente local)</a></p>` : '';

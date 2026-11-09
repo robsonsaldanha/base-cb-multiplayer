@@ -19,8 +19,9 @@ export async function serverRoutes(app: FastifyInstance) {
 
   app.post('/v1/servers/heartbeat', {
     config: { rateLimit: { max: 10, timeWindow: '1 minute', keyGenerator: (req) => {
+      // Só chave válida ganha balde próprio; chaves inventadas caem no balde do IP.
       const k = bearer(req, 'sk_');
-      return k ? 'sk:' + createHash('sha256').update(k).digest('hex') : 'ip:' + req.ip;
+      return k && store.getServerByKey(k) ? 'sk:' + createHash('sha256').update(k).digest('hex') : 'ip:' + req.ip;
     } } },
   }, async (req) => {
     const key = bearer(req, 'sk_');

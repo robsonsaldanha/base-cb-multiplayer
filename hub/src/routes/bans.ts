@@ -9,8 +9,10 @@ export async function banRoutes(app: FastifyInstance) {
   app.get('/v1/bans/global', async (req) => {
     const key = bearer(req, 'sk_');
     if (!key) throw new HttpError(401, 'no_key', 'informe a chave do servidor');
-    if (!store.getServerByKey(key)) throw new HttpError(401, 'bad_key', 'chave do servidor inválida');
-    return store.listGlobalBans();
+    const server = store.getServerByKey(key);
+    if (!server) throw new HttpError(401, 'bad_key', 'chave do servidor inválida');
+    if (!server.useGlobalBans) throw new HttpError(403, 'not_opted_in', 'ative useGlobalBans no servidor para usar a lista global');
+    return store.listGlobalBans().map(({ discordId, reason, createdAt }) => ({ discordId, reason, createdAt }));
   });
 
   const requireAdmin = (req: Parameters<typeof requireUser>[0]) => {

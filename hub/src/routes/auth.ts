@@ -114,7 +114,7 @@ export async function authRoutes(app: FastifyInstance) {
   });
 
   app.get('/v1/me', async (req) => {
-    const u = requireUser(req);
+    const u = requireUser(req, { allowCookie: true });
     return { id: u.id, discordId: u.discordId, name: u.name, avatar: u.avatar, isPlatformAdmin: isPlatformAdmin(config, u) };
   });
 }

@@ -39,6 +39,17 @@ describe('endurecimento do heartbeat', () => {
     expect((await from(t.app, t.key, '203.0.113.7')).statusCode).toBe(429);
   });
 
+  it('chaves inválidas aleatórias do mesmo IP dividem o balde do IP (11º → 429)', async () => {
+    const t = await mk(async () => null, { rateLimit: true });
+    const codes: number[] = [];
+    for (let i = 0; i < 11; i++) {
+      const fake = 'sk_' + Math.random().toString(36).slice(2) + i;
+      codes.push((await from(t.app, fake, '203.0.113.50')).statusCode);
+    }
+    expect(codes.slice(0, 10).every((c) => c === 401)).toBe(true);
+    expect(codes[10]).toBe(429);
+  });
+
   it('probe em andamento para o mesmo servidor não é duplicado', async () => {
     let calls = 0; let release!: () => void;
     const gate = new Promise<void>((r) => { release = r; });

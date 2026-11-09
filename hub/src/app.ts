@@ -1,6 +1,5 @@
 import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
 import cookie from '@fastify/cookie';
-import formbody from '@fastify/formbody';
 import rateLimit from '@fastify/rate-limit';
 import { ZodError } from 'zod';
 import type { HubConfig } from './config';
@@ -40,7 +39,6 @@ export async function buildApp(deps: HubDeps): Promise<FastifyInstance> {
   app.decorate('deps', deps);
   app.decorateRequest('cachedUser', undefined);
   await app.register(cookie);
-  await app.register(formbody);
   await app.register(rateLimit, {
     global: deps.config.rateLimit,
     max: 120,
