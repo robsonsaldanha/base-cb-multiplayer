@@ -6,6 +6,7 @@
 
 #include "cbserver/http.hpp"
 
+static const int kSodiumInit = sodium_init();
 namespace fs = std::filesystem;
 using namespace cbserver;
 
@@ -64,4 +65,48 @@ TEST_CASE("http serves info manifest files and metrics") {
   srv.stop();
   std::error_code ec;
   fs::remove_all(dir, ec);
+}
+
+TEST_CASE("http serves large file in chunks with identical bytes") {
+  fs::path dir = fs::temp_directory_path() / ("cbhttpbig_" + std::to_string(randombytes_random()));
+  fs::create_directories(dir / "r/files");
+  std::ofstream(dir / "r/resource.json") << R"({"name":"r","version":"1"})";
+  std::string big(3 * 1024 * 1024 + 123, '\0');
+  for (size_t i = 0; i < big.size(); ++i) big[i] = static_cast<char>((i * 31 + (i >> 8)) & 0xff);
+  { std::ofstream o(dir / "r/files/big.png", std::ios::binary); o.write(big.data(), static_cast<std::streamsize>(big.size())); }
+  auto store = ResourceStore::scan(dir);
+  auto cfg = ServerConfig::fromJson(nlohmann::json::object());
+  Metrics m;
+  HttpServer srv(cfg, store, m, [] { return nlohmann::json{{"serverId", "srv_t"}}; });
+  srv.start("127.0.0.1", 0);
+  httplib::Client cli("127.0.0.1", srv.boundPort());
+  std::string sha = store.manifestJson("srv_t", 1)["resources"][0]["files"][0]["sha256"];
+  auto r = cli.Get("/cb/files/" + sha);
+  REQUIRE(r);
+  REQUIRE(r->status == 200);
+  REQUIRE(r->body.size() == big.size());
+  REQUIRE(r->body == big);
+  // hex maiusculo tambem acha o arquivo
+  std::string up = sha;
+  for (auto& c : up) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  auto r2 = cli.Get("/cb/files/" + up);
+  REQUIRE(r2);
+  REQUIRE(r2->status == 200);
+  srv.stop();
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
+TEST_CASE("metricsAllowed rules") {
+  using std::nullopt;
+  const std::optional<std::string> tok = "s3cret";
+  REQUIRE(metricsAllowed("127.0.0.1", nullopt, nullopt));
+  REQUIRE(metricsAllowed("::1", nullopt, nullopt));
+  REQUIRE(metricsAllowed("::ffff:127.0.0.1", nullopt, nullopt));
+  REQUIRE(!metricsAllowed("10.0.0.1", nullopt, nullopt));
+  REQUIRE(metricsAllowed("10.0.0.1", std::string("Bearer s3cret"), tok));
+  REQUIRE(!metricsAllowed("10.0.0.1", std::string("Bearer wrong"), tok));
+  REQUIRE(!metricsAllowed("10.0.0.1", std::string("Bearer s3cre"), tok));
+  REQUIRE(!metricsAllowed("10.0.0.1", nullopt, tok));
+  REQUIRE(!metricsAllowed("10.0.0.1", std::string("Bearer s3cret"), nullopt));
 }

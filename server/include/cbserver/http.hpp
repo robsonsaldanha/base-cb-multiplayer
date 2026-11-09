@@ -1,6 +1,7 @@
 #pragma once
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -13,6 +14,10 @@
 namespace httplib { class Server; }
 
 namespace cbserver {
+
+// 127.0.0.1/::1 sempre; senão só com "Bearer <token>" correto (comparação em tempo constante).
+bool metricsAllowed(const std::string& remoteAddr, const std::optional<std::string>& authHeader,
+                    const std::optional<std::string>& token);
 
 class HttpServer {
  public:
@@ -35,6 +40,7 @@ class HttpServer {
   std::unique_ptr<httplib::Server> svr_;
   std::thread thread_;
   int boundPort_ = 0;
+  std::string manifestBody_;  // imutável: calculado uma vez
 };
 
 }  // namespace cbserver

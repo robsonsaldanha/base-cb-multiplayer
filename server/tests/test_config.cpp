@@ -83,3 +83,15 @@ TEST_CASE("config devPublicKey validation") {
 TEST_CASE("config load of missing file throws") {
   REQUIRE_THROWS_AS(ServerConfig::load("nao/existe.cfg"), std::runtime_error);
 }
+
+TEST_CASE("config validates hub-compatible name description tags locale") {
+  auto j = base(); j["name"] = "ab"; requireRejects(j, "name");
+  j = base(); j["name"] = "  ab  "; requireRejects(j, "name");
+  j = base(); j["name"] = std::string(65, 'x'); requireRejects(j, "name");
+  j = base(); j["description"] = std::string(501, 'x'); requireRejects(j, "description");
+  j = base(); j["tags"] = json::array({"ok", "Mai"}); requireRejects(j, "tags");
+  j = base(); j["tags"] = json::array({std::string(25, 'a')}); requireRejects(j, "tags");
+  j = base(); j["tags"] = json::array({"a","b","c","d","e","f","g","h","i","j","k"}); requireRejects(j, "tags");
+  j = base(); j["locale"] = "pt_BR"; requireRejects(j, "locale");
+  j = base(); j["locale"] = "en"; REQUIRE(ServerConfig::fromJson(j).locale == "en");
+}

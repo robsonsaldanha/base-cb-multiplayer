@@ -4,6 +4,8 @@
 #include <regex>
 #include <stdexcept>
 
+#include <spdlog/spdlog.h>
+
 #include "cbmp/base64url.hpp"
 
 namespace cbserver {
@@ -53,9 +55,25 @@ void getStr(const json& obj, const char* key, const std::string& path, std::stri
 ServerConfig ServerConfig::fromJson(const json& j) {
   if (!j.is_object()) fail("(raiz)", "deve ser um objeto JSON");
   ServerConfig c;
+  static const char* kKnown[] = {"name",   "description", "tags",     "locale",       "maxPlayers", "port",
+                                 "hub",    "auth",        "net",      "sim",          "movement",   "events",
+                                 "metrics", "resourcesDir", "logsDir"};
+  for (auto it = j.begin(); it != j.end(); ++it) {
+    bool known = false;
+    for (auto* k : kKnown) known = known || it.key() == k;
+    if (!known) spdlog::warn("Configuração: chave desconhecida '{}' ignorada", it.key());
+  }
   getStr(j, "name", "", c.name);
+  {
+    auto b = c.name.find_first_not_of(" \t\r\n");
+    auto e = c.name.find_last_not_of(" \t\r\n");
+    c.name = b == std::string::npos ? std::string() : c.name.substr(b, e - b + 1);
+    if (c.name.size() < 3 || c.name.size() > 64) fail("name", "deve ter entre 3 e 64 caracteres (sem espaços nas pontas)");
+  }
   getStr(j, "description", "", c.description);
+  if (c.description.size() > 500) fail("description", "deve ter no máximo 500 caracteres");
   getStr(j, "locale", "", c.locale);
+  if (!std::regex_match(c.locale, std::regex("^[a-z]{2}(-[A-Z]{2})?$"))) fail("locale", "deve ser como 'pt-BR' ou 'en'");
   getStr(j, "resourcesDir", "", c.resourcesDir);
   getStr(j, "logsDir", "", c.logsDir);
   if (const json* t = sub(j, "tags", "")) {
@@ -63,8 +81,11 @@ ServerConfig ServerConfig::fromJson(const json& j) {
     c.tags.clear();
     for (auto& e : *t) {
       if (!e.is_string()) fail("tags", "deve ser uma lista de textos");
+      if (!std::regex_match(e.get<std::string>(), std::regex("^[a-z0-9-]{1,24}$")))
+        fail("tags", "cada tag deve casar com [a-z0-9-] de 1 a 24 caracteres");
       c.tags.push_back(e.get<std::string>());
     }
+    if (c.tags.size() > 10) fail("tags", "deve ter no máximo 10 itens");
   }
   getInt(j, "maxPlayers", "", 1, 2048, c.maxPlayers);
   getInt(j, "port", "", 1, 65535, c.port);

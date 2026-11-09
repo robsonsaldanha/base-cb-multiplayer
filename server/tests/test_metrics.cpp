@@ -40,6 +40,7 @@ TEST_CASE("metrics counters bandwidth and process stats") {
   REQUIRE(s["corrections"] == 3);
   REQUIRE(s["maxKbpsPerPlayer"].get<double>() >= s["avgKbpsPerPlayer"].get<double>());
   REQUIRE(s["maxKbpsPerPlayer"].get<double>() > 0);
+  REQUIRE(s["rssBytes"].is_number_unsigned());
   REQUIRE(s["rssBytes"].get<double>() > 0);
 }
 

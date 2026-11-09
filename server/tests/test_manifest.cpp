@@ -20,6 +20,8 @@ static std::string sha(const std::string& s) {
   return hex;
 }
 
+static const int kSodiumInit = sodium_init();
+
 struct TmpDir {
   fs::path p = fs::temp_directory_path() / ("cbsrv_" + std::to_string(randombytes_random()));
   TmpDir() { fs::create_directories(p); }
@@ -105,4 +107,68 @@ TEST_CASE("manifest of missing dir is empty") {
   auto j = ResourceStore::scan(fs::temp_directory_path() / "cbsrv_nao_existe_xyz").manifestJson("srv_a", 1);
   REQUIRE(j["resources"].empty());
   REQUIRE(j["totalSize"] == 0);
+}
+
+TEST_CASE("manifest rejects non ascii published path naming resource and path") {
+  TmpDir t;
+  makeRes(t.p);
+  put(t.p / "res1/files" / fs::path(u8"ação.png"), "x");
+  try {
+    (void)ResourceStore::scan(t.p);
+    FAIL("deveria lancar");
+  } catch (const std::runtime_error& e) {
+    std::string m = e.what();
+    REQUIRE(m.find("res1") != std::string::npos);
+    REQUIRE(m.find("files/") != std::string::npos);
+  }
+}
+
+TEST_CASE("manifest rejects unsafe resource folder name") {
+  TmpDir t;
+  put(t.p / "res 1/resource.json", R"({"name":"r","version":"1"})");
+  REQUIRE_THROWS_AS(ResourceStore::scan(t.p), std::runtime_error);
+}
+
+TEST_CASE("manifest rejects symlinks") {
+  TmpDir t;
+  makeRes(t.p);
+  put(t.p / "outside.lua", "x");
+  std::error_code ec;
+  fs::create_symlink(t.p / "outside.lua", t.p / "res1/client/link.lua", ec);
+  if (ec) SKIP("sem privilegio para criar symlink: " << ec.message());
+  REQUIRE_THROWS_AS(ResourceStore::scan(t.p), std::runtime_error);
+}
+
+TEST_CASE("manifest rejects uppercase native extensions") {
+  for (const char* name : {"res1/client/x.DLL", "res1/server/y.Exe", "res1/z.SO"}) {
+    TmpDir t;
+    makeRes(t.p);
+    put(t.p / name, "MZ");
+    REQUIRE_THROWS_AS(ResourceStore::scan(t.p), std::runtime_error);
+  }
+}
+
+TEST_CASE("manifest does not publish capitalized Client folder") {
+  TmpDir t;
+  makeRes(t.p);
+  put(t.p / "res2/resource.json", R"({"name":"res2","version":"1"})");
+  put(t.p / "res2/Client/extra.lua", "x");
+  auto j = ResourceStore::scan(t.p).manifestJson("srv_a", 1);
+  REQUIRE(j["resources"].size() == 2);
+  REQUIRE(j["resources"][1]["files"].empty());
+}
+
+TEST_CASE("manifest rejects duplicate resource names") {
+  TmpDir t;
+  makeRes(t.p);
+  put(t.p / "res2/resource.json", R"({"name":"res1","version":"2"})");
+  REQUIRE_THROWS_AS(ResourceStore::scan(t.p), std::runtime_error);
+}
+
+TEST_CASE("manifest protocol comes from argument and json is stable") {
+  TmpDir t;
+  makeRes(t.p);
+  auto s = ResourceStore::scan(t.p);
+  REQUIRE(s.manifestJson("srv_a", 1) == s.manifestJson("srv_a", 1));
+  REQUIRE(s.manifestJson("srv_a", 7)["protocol"] == 7);
 }

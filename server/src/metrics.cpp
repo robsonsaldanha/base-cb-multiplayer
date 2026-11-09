@@ -114,7 +114,7 @@ nlohmann::json Metrics::snapshot() const {
           {"droppedEvents", droppedEvents.load()},
           {"avgKbpsPerPlayer", avgKbps},
           {"maxKbpsPerPlayer", maxKbps},
-          {"rssBytes", rssBytes()},
+          {"rssBytes", static_cast<uint64_t>(rssBytes())},
           {"cpuPercent", cpu}};
 }
 
