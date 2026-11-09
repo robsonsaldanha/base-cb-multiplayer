@@ -41,14 +41,15 @@ export async function serverRoutes(app: FastifyInstance) {
     let verified = sameEndpoint ? prev!.verified : false;
     const needsProbe = !sameEndpoint || (!prev!.verified && !failedRecently) || (prev!.verified && t - prev!.verifiedAt >= PROBE_INTERVAL);
     if (needsProbe) {
-      let p = inflight.get(server.id);
+      const flightKey = `${server.id}|${ip}|${hb.httpPort}`;
+      let p = inflight.get(flightKey);
       if (!p) {
         p = probe(ip, hb.httpPort).then((info) => {
           const ok = info?.serverId === server.id;
-          store.setVerified(server.id, ok, now());
+          store.setVerifiedFor(server.id, ip, hb.httpPort, ok, now());
           return ok;
-        }).finally(() => inflight.delete(server.id));
-        inflight.set(server.id, p);
+        }).finally(() => inflight.delete(flightKey));
+        inflight.set(flightKey, p);
       }
       verified = await p;
     }

@@ -94,4 +94,31 @@ describe('endurecimento do heartbeat', () => {
     await from(t.app, t.key, '203.0.113.7');
     expect(calls).toBe(2);
   });
+
+  it("probe de A em voo não verifica o endpoint B (IPs diferentes, mesmo servidor)", async () => {
+    let id = "";
+    const t = await mk(async (h) => {
+      if (h === "203.0.113.7") { await new Promise((r) => setTimeout(r, 60)); return { serverId: id }; }
+      return null;
+    });
+    id = t.server.id;
+    const a = from(t.app, t.key, "203.0.113.7");
+    await new Promise((r) => setTimeout(r, 15));
+    const b = from(t.app, t.key, "203.0.113.8");
+    const [, rb] = await Promise.all([a, b]);
+    expect(rb.json().listed).toBe(false);
+    expect(t.store.listOnline(t.clock.t)).toHaveLength(0);
+  });
+
+  it("probe lento de A não lista depois um endpoint privado", async () => {
+    let id = "";
+    const t = await mk(async () => { await new Promise((r) => setTimeout(r, 60)); return { serverId: id }; }, { allowPrivateServers: false });
+    id = t.server.id;
+    const a = from(t.app, t.key, "8.8.8.8");
+    await new Promise((r) => setTimeout(r, 15));
+    const priv = await from(t.app, t.key, "10.0.0.5");
+    expect(priv.json().reason).toBe("private_ip");
+    await a;
+    expect(t.store.listOnline(t.clock.t)).toHaveLength(0);
+  });
 });

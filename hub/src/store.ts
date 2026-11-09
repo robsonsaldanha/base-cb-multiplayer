@@ -191,6 +191,12 @@ export class Store {
     this.db.prepare('UPDATE server_status SET verified = ?, verified_at = ? WHERE server_id = ?').run(verified ? 1 : 0, now, serverId);
   }
 
+  /** Resultado de probe: só vale se o endpoint ainda for o sondado. */
+  setVerifiedFor(serverId: string, ip: string, httpPort: number, verified: boolean, now: number): void {
+    this.db.prepare('UPDATE server_status SET verified = ?, verified_at = ? WHERE server_id = ? AND ip = ? AND http_port = ?')
+      .run(verified ? 1 : 0, now, serverId, ip, httpPort);
+  }
+
   listOnline(now: number): { server: ServerRow; status: StatusRow }[] {
     const rows = this.db.prepare(`SELECT s.*, st.* FROM servers s JOIN server_status st ON st.server_id = s.id
       WHERE st.verified = 1 AND st.last_heartbeat >= ? ORDER BY st.players DESC, s.name`).all(now - ONLINE_WINDOW) as Raw[];

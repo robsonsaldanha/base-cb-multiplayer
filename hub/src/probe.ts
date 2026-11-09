@@ -15,7 +15,7 @@ for (const [net, bits] of [
   ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['198.51.100.0', 24],
   ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4],
 ] as const) nonPublic.addSubnet(net, bits, 'ipv4');
-for (const [net, bits] of [['fc00::', 7], ['fe80::', 10], ['ff00::', 8], ['64:ff9b::', 96], ['2001:db8::', 32]] as const) {
+for (const [net, bits] of [['fc00::', 7], ['fe80::', 10], ['ff00::', 8], ['64:ff9b::', 96], ['2001:db8::', 32], ['::', 96], ['2002::', 16], ['2001::', 32], ['100::', 64], ['fec0::', 10]] as const) {
   nonPublic.addSubnet(net, bits, 'ipv6');
 }
 nonPublic.addAddress('::', 'ipv6');
