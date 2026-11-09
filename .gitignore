@@ -4,3 +4,4 @@ client/deps/
 .superpowers/
 *.dmp
 *.log
+node_modules/

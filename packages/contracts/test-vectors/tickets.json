@@ -1,0 +1,75 @@
+{
+  "description": "Vetores de ticket CB-MP. Ordem das checagens: formato, JSON, versão, kid, assinatura, audience, iat futuro (>now+60), expiração (exp+60<now).",
+  "seedHex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+  "publicKeys": [
+    {
+      "kid": "test-1",
+      "publicKey": "ebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ"
+    }
+  ],
+  "cases": [
+    {
+      "name": "valido",
+      "ticket": "eyJ2IjoxLCJraWQiOiJ0ZXN0LTEiLCJzdWIiOiJ1c3JfdGVzdCIsImRpZCI6IjExMTExMTExMTExMTExMTExMSIsIm5hbWUiOiJKb2dhZG9yIMOHw6NvIiwiYXVkIjoic3J2X3Rlc3QiLCJpYXQiOjE4MDAwMDAwMDAsImV4cCI6MTgwMDAwMDMwMCwianRpIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIn0.rW_H66hQJA0ihq76iofbltYhvDuB92-FMiwwVwl5BBo4krxuObh2oKhDLQg1CJZyRXnKsEbyjubcuMlXt-hzBA",
+      "audience": "srv_test",
+      "nowSeconds": 1800000010,
+      "expected": "ok"
+    },
+    {
+      "name": "limite_expiracao",
+      "ticket": "eyJ2IjoxLCJraWQiOiJ0ZXN0LTEiLCJzdWIiOiJ1c3JfdGVzdCIsImRpZCI6IjExMTExMTExMTExMTExMTExMSIsIm5hbWUiOiJKb2dhZG9yIMOHw6NvIiwiYXVkIjoic3J2X3Rlc3QiLCJpYXQiOjE4MDAwMDAwMDAsImV4cCI6MTgwMDAwMDMwMCwianRpIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIn0.rW_H66hQJA0ihq76iofbltYhvDuB92-FMiwwVwl5BBo4krxuObh2oKhDLQg1CJZyRXnKsEbyjubcuMlXt-hzBA",
+      "audience": "srv_test",
+      "nowSeconds": 1800000360,
+      "expected": "ok"
+    },
+    {
+      "name": "expirado",
+      "ticket": "eyJ2IjoxLCJraWQiOiJ0ZXN0LTEiLCJzdWIiOiJ1c3JfdGVzdCIsImRpZCI6IjExMTExMTExMTExMTExMTExMSIsIm5hbWUiOiJKb2dhZG9yIMOHw6NvIiwiYXVkIjoic3J2X3Rlc3QiLCJpYXQiOjE4MDAwMDAwMDAsImV4cCI6MTgwMDAwMDMwMCwianRpIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIn0.rW_H66hQJA0ihq76iofbltYhvDuB92-FMiwwVwl5BBo4krxuObh2oKhDLQg1CJZyRXnKsEbyjubcuMlXt-hzBA",
+      "audience": "srv_test",
+      "nowSeconds": 1800000361,
+      "expected": "expired"
+    },
+    {
+      "name": "futuro",
+      "ticket": "eyJ2IjoxLCJraWQiOiJ0ZXN0LTEiLCJzdWIiOiJ1c3JfdGVzdCIsImRpZCI6IjExMTExMTExMTExMTExMTExMSIsIm5hbWUiOiJKb2dhZG9yIMOHw6NvIiwiYXVkIjoic3J2X3Rlc3QiLCJpYXQiOjE4MDAwMDAwMDAsImV4cCI6MTgwMDAwMDMwMCwianRpIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIn0.rW_H66hQJA0ihq76iofbltYhvDuB92-FMiwwVwl5BBo4krxuObh2oKhDLQg1CJZyRXnKsEbyjubcuMlXt-hzBA",
+      "audience": "srv_test",
+      "nowSeconds": 1799999939,
+      "expected": "not_yet_valid"
+    },
+    {
+      "name": "audience_errada",
+      "ticket": "eyJ2IjoxLCJraWQiOiJ0ZXN0LTEiLCJzdWIiOiJ1c3JfdGVzdCIsImRpZCI6IjExMTExMTExMTExMTExMTExMSIsIm5hbWUiOiJKb2dhZG9yIMOHw6NvIiwiYXVkIjoic3J2X3Rlc3QiLCJpYXQiOjE4MDAwMDAwMDAsImV4cCI6MTgwMDAwMDMwMCwianRpIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIn0.rW_H66hQJA0ihq76iofbltYhvDuB92-FMiwwVwl5BBo4krxuObh2oKhDLQg1CJZyRXnKsEbyjubcuMlXt-hzBA",
+      "audience": "srv_outro",
+      "nowSeconds": 1800000000,
+      "expected": "wrong_audience"
+    },
+    {
+      "name": "adulterado",
+      "ticket": "eyJ2IjoxLCJraWQiOiJ0ZXN0LTEiLCJzdWIiOiJ1c3JfdGVzdCIsImRpZCI6IjExMTExMTExMTExMTExMTExMSIsIm5hbWUiOiJPdXRybyIsImF1ZCI6InNydl90ZXN0IiwiaWF0IjoxODAwMDAwMDAwLCJleHAiOjE4MDAwMDAzMDAsImp0aSI6IjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMSJ9.rW_H66hQJA0ihq76iofbltYhvDuB92-FMiwwVwl5BBo4krxuObh2oKhDLQg1CJZyRXnKsEbyjubcuMlXt-hzBA",
+      "audience": "srv_test",
+      "nowSeconds": 1800000000,
+      "expected": "bad_signature"
+    },
+    {
+      "name": "kid_desconhecido",
+      "ticket": "eyJ2IjoxLCJraWQiOiJ0ZXN0LTIiLCJzdWIiOiJ1c3JfdGVzdCIsImRpZCI6IjExMTExMTExMTExMTExMTExMSIsIm5hbWUiOiJKb2dhZG9yIMOHw6NvIiwiYXVkIjoic3J2X3Rlc3QiLCJpYXQiOjE4MDAwMDAwMDAsImV4cCI6MTgwMDAwMDMwMCwianRpIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIn0.62WnQ5mn1zFiSKXtmXmlbjXqaYmmq8YHQTQfszbKKwEg04PfJpLwU3DzA0En8pAzQbkel1BFPS6z77s24s3tDA",
+      "audience": "srv_test",
+      "nowSeconds": 1800000000,
+      "expected": "unknown_kid"
+    },
+    {
+      "name": "versao_2",
+      "ticket": "eyJ2IjoyLCJraWQiOiJ0ZXN0LTEiLCJzdWIiOiJ1c3JfdGVzdCIsImRpZCI6IjExMTExMTExMTExMTExMTExMSIsIm5hbWUiOiJKb2dhZG9yIMOHw6NvIiwiYXVkIjoic3J2X3Rlc3QiLCJpYXQiOjE4MDAwMDAwMDAsImV4cCI6MTgwMDAwMDMwMCwianRpIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIn0.p8BbowQMt_56_9b3-QyuVLK490Byum2GsKoPZeXRRyDs5iAUZ4dF3yW86r8xxK-s2t5iTR_PCrQoPun9UuBBBQ",
+      "audience": "srv_test",
+      "nowSeconds": 1800000000,
+      "expected": "bad_version"
+    },
+    {
+      "name": "malformado",
+      "ticket": "abc",
+      "audience": "srv_test",
+      "nowSeconds": 1800000000,
+      "expected": "malformed"
+    }
+  ]
+}
