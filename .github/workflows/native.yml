@@ -9,34 +9,59 @@ concurrency:
   cancel-in-progress: true
 env:
   VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.vcpkg-cache,readwrite"
+  VCPKG_COMMIT: ec48c11eae9448c8c6e7739d93e06fa2433aa95f
 jobs:
   linux:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
+        id: restore
         with:
           path: .vcpkg-cache
-          key: vcpkg-linux-${{ hashFiles('vcpkg.json') }}
-          restore-keys: vcpkg-linux-
-      - run: sudo apt-get update && sudo apt-get install -y ninja-build
-      - run: mkdir -p .vcpkg-cache && echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> $GITHUB_ENV
+          key: vcpkg-linux-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-linux-${{ hashFiles('vcpkg.json') }}-
+            vcpkg-linux-
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build pkg-config autoconf autoconf-archive automake libtool
+      - run: |
+          mkdir -p .vcpkg-cache
+          git clone https://github.com/microsoft/vcpkg "$GITHUB_WORKSPACE/vcpkg"
+          git -C "$GITHUB_WORKSPACE/vcpkg" checkout "$VCPKG_COMMIT"
+          "$GITHUB_WORKSPACE/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$GITHUB_WORKSPACE/vcpkg" >> $GITHUB_ENV
       - run: cmake --preset linux-asan && cmake --build --preset linux-asan
       - run: ctest --test-dir build-native/linux-asan --output-on-failure
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-linux-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
   windows:
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
+        id: restore
         with:
           path: .vcpkg-cache
-          key: vcpkg-win-${{ hashFiles('vcpkg.json') }}
-          restore-keys: vcpkg-win-
+          key: vcpkg-win-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-win-${{ hashFiles('vcpkg.json') }}-
+            vcpkg-win-
       - run: |
           New-Item -ItemType Directory -Force .vcpkg-cache | Out-Null
-          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append
+          git clone https://github.com/microsoft/vcpkg "$env:GITHUB_WORKSPACE/vcpkg"
+          git -C "$env:GITHUB_WORKSPACE/vcpkg" checkout $env:VCPKG_COMMIT
+          & "$env:GITHUB_WORKSPACE/vcpkg/bootstrap-vcpkg.bat" -disableMetrics
+          "VCPKG_ROOT=$env:GITHUB_WORKSPACE/vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append
         shell: pwsh
-      - run: cmake --preset windows-release -G "Visual Studio 17 2022" && cmake --build --preset windows-release
+      - run: cmake --preset windows-ci && cmake --build --preset windows-ci
         shell: pwsh
-      - run: ctest --test-dir build-native/windows-release -C Release --output-on-failure
+      - run: ctest --test-dir build-native/windows-ci -C Release --output-on-failure
         shell: pwsh
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-win-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
