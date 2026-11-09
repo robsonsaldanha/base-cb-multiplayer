@@ -1,0 +1,11 @@
+{
+  "name": "base-cb-multiplayer",
+  "private": true,
+  "type": "module",
+  "workspaces": ["packages/*", "hub"],
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "npm test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  }
+}
