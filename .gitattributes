@@ -4,4 +4,5 @@
 *.pem text eol=lf
 *.bat text eol=crlf
 *.ps1 text eol=crlf
+package/*.txt text eol=crlf
 *.dll binary

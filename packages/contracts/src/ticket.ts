@@ -61,6 +61,12 @@ function isPayloadShape(p: unknown): p is TicketPayload {
     && Number.isSafeInteger(o.iat) && Number.isSafeInteger(o.exp);
 }
 
+/** v, iat e exp precisam ser literais inteiros simples no JSON (sem 1.0, sem expoente). */
+function plainIntegerLiterals(text: string): boolean {
+  return ['v', 'iat', 'exp'].every((k) => new RegExp(`"${k}":-?\\d+[,}]`).test(text)
+    && !new RegExp(`"${k}":-?\\d+[.eE]`).test(text));
+}
+
 /**
  * Ordem das checagens (o validador C++ deve seguir a mesma):
  * formato/charset → base64url canônico → JSON → forma (inteiros seguros) → versão → kid → assinatura → audience → iat futuro → expiração.
@@ -80,7 +86,7 @@ export function verifyTicket(
   } catch {
     return { ok: false, error: 'malformed' };
   }
-  if (!isPayloadShape(payload)) return { ok: false, error: 'malformed' };
+  if (!isPayloadShape(payload) || !plainIntegerLiterals(body.toString('utf8'))) return { ok: false, error: 'malformed' };
   if (payload.v !== 1) return { ok: false, error: 'bad_version' };
   const key = opts.publicKeys.get(payload.kid);
   if (!key) return { ok: false, error: 'unknown_kid' };

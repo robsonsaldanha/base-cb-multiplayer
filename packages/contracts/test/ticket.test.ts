@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createPublicKey } from 'node:crypto';
+import { createPublicKey, sign } from 'node:crypto';
 import {
   CLOCK_SKEW_SECONDS, TICKET_TTL_SECONDS, privateKeyFromSeed, publicKeyFromRaw, publicKeyToRaw,
   signTicket, verifyTicket, type TicketPayload,
@@ -60,12 +60,23 @@ describe('ticket', () => {
     expect(Buffer.from(nc.split('.')[1]!, 'base64url').equals(Buffer.from(sg, 'base64url'))).toBe(true);
     const o = { publicKeys: keys, audience: 'srv_abc', nowSeconds: base.iat };
     expect(verifyTicket(nc, o)).toEqual({ ok: false, error: 'malformed' });
-    expect(verifyTicket(b + 'A.' + sg, o)).toEqual({ ok: false, error: 'malformed' });
+    let bad = b;
+    while (bad.length % 4 !== 1) bad += 'A';
+    expect(bad.length % 4).toBe(1);
+    expect(verifyTicket(bad + '.' + sg, o)).toEqual({ ok: false, error: 'malformed' });
   });
   it('rejeita iat/exp não inteiros ou inseguros', () => {
     const o = { publicKeys: keys, audience: 'srv_abc', nowSeconds: base.iat };
     expect(verifyTicket(signTicket({ ...base, iat: 1.5 }, priv), o)).toEqual({ ok: false, error: 'malformed' });
     expect(verifyTicket(signTicket({ ...base, exp: 2 ** 60 }, priv), o)).toEqual({ ok: false, error: 'malformed' });
+  });
+  it('rejeita literal float/expoente em iat', () => {
+    const o = { publicKeys: keys, audience: 'srv_abc', nowSeconds: base.iat };
+    for (const lit of ['1800000000.0', '18e8']) {
+      const body = Buffer.from(JSON.stringify(base).replace('"iat":1800000000', '"iat":' + lit), 'utf8');
+      const t = body.toString('base64url') + '.' + sign(null, body, priv).toString('base64url');
+      expect(verifyTicket(t, o)).toEqual({ ok: false, error: 'malformed' });
+    }
   });
   it.each(['', 'abc', 'a.b.c', '!!.??', `${Buffer.from('não é json').toString('base64url')}.AAAA`])('rejeita malformado %j', (t) => {
     expect(verifyTicket(t, { publicKeys: keys, audience: 'srv_abc', nowSeconds: base.iat })).toEqual({ ok: false, error: 'malformed' });

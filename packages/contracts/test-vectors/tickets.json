@@ -1,5 +1,5 @@
 {
-  "description": "Vetores de ticket CB-MP. Ordem das checagens: formato/charset, base64url canônico, JSON, forma (incluindo inteiros seguros), versão, kid, assinatura (64 bytes + verificação), audience, iat > now+60 (not_yet_valid), exp+60 < now (expired).",
+  "description": "Vetores de ticket CB-MP. Ordem das checagens: formato/charset, base64url canônico, JSON, forma (incluindo inteiros seguros; v, iat e exp devem ser literais inteiros simples no JSON: sem 1.0, sem expoente), versão, kid, assinatura (64 bytes + verificação), audience, iat > now+60 (not_yet_valid), exp+60 < now (expired).",
   "seedHex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
   "publicKeys": [
     {
@@ -129,7 +129,14 @@
     },
     {
       "name": "b64_tamanho_invalido",
-      "ticket": "eyJ2IjoxLCJraWQiOiJ0ZXN0LTEiLCJzdWIiOiJ1c3JfdGVzdCIsImRpZCI6IjExMTExMTExMTExMTExMTExMSIsIm5hbWUiOiJKb2dhZG9yIMOHw6NvIiwiYXVkIjoic3J2X3Rlc3QiLCJpYXQiOjE4MDAwMDAwMDAsImV4cCI6MTgwMDAwMDMwMCwianRpIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIn0A.rW_H66hQJA0ihq76iofbltYhvDuB92-FMiwwVwl5BBo4krxuObh2oKhDLQg1CJZyRXnKsEbyjubcuMlXt-hzBA",
+      "ticket": "eyJ2IjoxLCJraWQiOiJ0ZXN0LTEiLCJzdWIiOiJ1c3JfdGVzdCIsImRpZCI6IjExMTExMTExMTExMTExMTExMSIsIm5hbWUiOiJKb2dhZG9yIMOHw6NvIiwiYXVkIjoic3J2X3Rlc3QiLCJpYXQiOjE4MDAwMDAwMDAsImV4cCI6MTgwMDAwMDMwMCwianRpIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIn0AA.rW_H66hQJA0ihq76iofbltYhvDuB92-FMiwwVwl5BBo4krxuObh2oKhDLQg1CJZyRXnKsEbyjubcuMlXt-hzBA",
+      "audience": "srv_test",
+      "nowSeconds": 1800000000,
+      "expected": "malformed"
+    },
+    {
+      "name": "iat_literal_float",
+      "ticket": "eyJ2IjoxLCJraWQiOiJ0ZXN0LTEiLCJzdWIiOiJ1c3JfdGVzdCIsImRpZCI6IjExMTExMTExMTExMTExMTExMSIsIm5hbWUiOiJKb2dhZG9yIMOHw6NvIiwiYXVkIjoic3J2X3Rlc3QiLCJpYXQiOjE4MDAwMDAwMDAuMCwiZXhwIjoxODAwMDAwMzAwLCJqdGkiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEifQ.SR_gFoDZbt1XeDND57NXQPJ3S7QfN6HDQLkdcaOzPzWSiMefxFm1ros4LaNpNdQht8wn8Q0J6BCrvhdgvqbODQ",
       "audience": "srv_test",
       "nowSeconds": 1800000000,
       "expected": "malformed"
