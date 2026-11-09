@@ -7,7 +7,7 @@ add_library(cbserver_core STATIC src/config.cpp src/metrics.cpp src/manifest.cpp
 target_include_directories(cbserver_core PUBLIC include)
 find_package(Threads REQUIRED)
 target_link_libraries(cbserver_core PUBLIC cbmp_proto spdlog::spdlog httplib::httplib Threads::Threads
-  GameNetworkingSockets::GameNetworkingSockets)
+  ${CBMP_GNS_TARGET})
 if(WIN32)
   target_link_libraries(cbserver_core PUBLIC psapi)
 endif()

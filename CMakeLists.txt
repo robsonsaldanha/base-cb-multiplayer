@@ -16,6 +16,15 @@ find_package(Catch2 3 CONFIG REQUIRED)
 include(Catch)
 # Aqui (e não em server/ e bots/): o config do GNS cria ALIAS globais e não pode ser carregado duas vezes.
 find_package(GameNetworkingSockets CONFIG REQUIRED)
+# Triplets dinâmicos (x64-windows) exportam GameNetworkingSockets::GameNetworkingSockets;
+# estáticos (x64-linux) exportam GameNetworkingSockets::GameNetworkingSockets_s.
+if(TARGET GameNetworkingSockets::GameNetworkingSockets)
+  set(CBMP_GNS_TARGET GameNetworkingSockets::GameNetworkingSockets)
+elseif(TARGET GameNetworkingSockets::GameNetworkingSockets_s)
+  set(CBMP_GNS_TARGET GameNetworkingSockets::GameNetworkingSockets_s)
+else()
+  message(FATAL_ERROR "GameNetworkingSockets: nenhum target conhecido exportado pelo pacote")
+endif()
 
 add_subdirectory(proto)
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/server/CMakeLists.txt)
