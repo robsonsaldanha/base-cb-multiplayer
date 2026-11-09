@@ -41,7 +41,12 @@ struct PlayerSlot {
   std::deque<double> correctionTimes;  // um registro por incidente (não por Correction repetida)
   bool correcting = false;             // janela após Correction: inputs longe da posição corrigida são ignorados
   double correctionSince = 0;
-  int ignoredWindows = 0;  // janelas de correção seguidas que venceram com o cliente ainda longe (≥ 5 → kick)
+  int ignoredWindows = 0;
+  // Janela aberta pelo servidor (spawn/setState): carência de carregamento, inputs longe ignorados em silêncio,
+  // nunca conta para kick; após kServerGraceSec sem alcance, a Correction é reenviada uma vez.
+  bool serverCorrection = false;
+  bool serverCorrectionResent = false;
+  uint32_t correctionSeq = 0;  // janelas de correção seguidas que venceram com o cliente ainda longe (≥ 5 → kick)
   VisibleSet visible;
   std::unordered_map<std::string, TokenBucket> eventBuckets;
   std::deque<double> eventViolations;
@@ -84,6 +89,8 @@ class World {
   // fecha a janela um input a ≤ slack + maxSpeed(estado) × (now − correctionSince) × (1+tol) dela (o cliente
   // pode ter andado legalmente desde a correção; alcance limitado a 1 s). Cada Correction é um incidente; > 10 em
   // 10 s → kick. Janela que vence com o input ainda longe = janela ignorada; 5 seguidas → kick (alcance zera).
+  // Janelas do servidor (spawn/setState) têm carência de carregamento: sem incidente, sem kick, reenvio único
+  // da Correction após 30 s.
   // Com SpawnMode::DevTrustFirstInput, o primeiro input define o spawn sem validação.
   void onInput(EntityId id, const cbmp::Input& in, double now);
   bool onEvent(EntityId id, const cbmp::Event& ev, double now);  // false = descartado
@@ -103,7 +110,8 @@ class World {
   PlayerSlot* slot(EntityId id);
   void orderKick(PlayerSlot& s, const char* reason);
   void forget(PlayerSlot& viewer, EntityId gone);  // tira `gone` das baselines do viewer
-  void sendCorrection(PlayerSlot& p, uint32_t seq, double now);  // enfileira e abre a janela
+  // Enfileira e abre a janela; byServer = spawn/setState (carência, não conta para kick).
+  void sendCorrection(PlayerSlot& p, uint32_t seq, double now, bool byServer = false);
   double maxSpeedOf(cbmp::MoveState a, cbmp::MoveState b) const;  // maior limite entre os dois estados
 
   ServerConfig cfg_;

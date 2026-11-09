@@ -14,6 +14,7 @@ constexpr size_t kMaxCorrections = 10;   // > 10 em 10 s → kick
 constexpr double kMaxMoveDtSec = 1.0;    // dt do validador nunca passa disso
 constexpr double kBaselineMaxAgeSec = 1.0;
 constexpr double kCorrectionWindowSec = 1.0;  // após uma Correction, não envia/conta outra por até 1 s
+constexpr double kServerGraceSec = 30.0;       // carência das janelas do servidor antes de reenviar a Correction
 constexpr int kMaxIgnoredWindows = 5;          // janelas de correção seguidas vencidas com o cliente longe → kick
 
 void trimWindow(std::deque<double>& q, double now) {
@@ -69,7 +70,7 @@ std::optional<EntityId> World::addPlayer(std::string sub, std::string did, std::
       p->awaitingSpawn = true;  // fora da grade e sem Correction até o primeiro Input
     } else {
       grid_.upsert(p->id, p->state.pos);
-      sendCorrection(*p, 0, now);
+      sendCorrection(*p, 0, now, true);
     }
     active_.insert(std::lower_bound(active_.begin(), active_.end(), p->id), p->id);
     slots_[i] = std::move(p);
@@ -107,13 +108,18 @@ void World::setState(EntityId id, const cbmp::PlayerState& s, double now) {
   p->lastInputTime = now;
   p->awaitingSpawn = false;  // posicionamento do servidor também conta como spawn
   grid_.upsert(id, s.pos);
-  sendCorrection(*p, p->lastInputSeq, now);
+  p->ignoredWindows = 0;  // reposicionamento do servidor zera o histórico de anti-cheat
+  p->correctionTimes.clear();
+  sendCorrection(*p, p->lastInputSeq, now, true);
 }
 
-void World::sendCorrection(PlayerSlot& p, uint32_t seq, double now) {
+void World::sendCorrection(PlayerSlot& p, uint32_t seq, double now, bool byServer) {
   pending_.push_back(Outgoing{p.id, cbmp::Correction{seq, p.state.pos, p.state.vel}});
   p.correcting = true;
   p.correctionSince = now;
+  p.correctionSeq = seq;
+  p.serverCorrection = byServer;
+  p.serverCorrectionResent = false;
 }
 
 void World::orderKick(PlayerSlot& s, const char* reason) {
@@ -150,7 +156,15 @@ void World::onInput(EntityId id, const cbmp::Input& in, double now) {
     const double d = std::sqrt(static_cast<double>(distSq(in.s.pos, p->state.pos)));
     if (d <= reach) {
       p->correcting = false;  // cliente aplicou a correção: valida normalmente
+      p->serverCorrection = false;
       p->ignoredWindows = 0;
+    } else if (p->serverCorrection) {
+      // Carência de carregamento (spawn/teleporte do servidor): ignora em silêncio, sem incidente nem kick.
+      if (elapsed >= kServerGraceSec && !p->serverCorrectionResent) {
+        p->serverCorrectionResent = true;
+        pending_.push_back(Outgoing{id, cbmp::Correction{p->correctionSeq, p->state.pos, p->state.vel}});
+      }
+      return;
     } else if (elapsed >= kCorrectionWindowSec) {
       // A janela inteira passou e o cliente continua longe: ignorou a Correction. Valida (e corrige) de novo;
       // kMaxIgnoredWindows seguidas → kick (incidentes a ≥ 1 s nunca passariam de 10 em 10 s).

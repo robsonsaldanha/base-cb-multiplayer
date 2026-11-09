@@ -122,6 +122,82 @@ TEST_CASE("world persistent cheater is kicked after 5 consecutive ignored correc
   REQUIRE(h.kicks.empty());  // ordem emitida uma única vez
 }
 
+namespace {
+// Roda inputs na posição `pos` de t0 até t1 (20/s), avançando ticks; devolve kicks e Corrections vistas.
+struct Run {
+  size_t kicks = 0, corrections = 0;
+};
+Run staleInputs(Harness& h, cbserver::EntityId a, uint32_t& seq, cbmp::Vec3i pos, double t0, double t1) {
+  Run r;
+  for (double t = t0; t < t1; t += 0.05) {
+    h.world.onInput(a, input(seq++, pos), t);
+    h.now = t - 0.05;
+    h.step();
+    r.kicks += h.kicks.size();
+    r.corrections += h.msgs<Correction>(a).size();
+  }
+  return r;
+}
+}  // namespace
+
+TEST_CASE("world spawn correction has a loading grace and never counts toward kick") {
+  Harness h;
+  auto a = h.add("ana");  // Correction do spawn (servidor) em x = 0
+  h.step(0);
+  REQUIRE(h.msgs<Correction>(a).size() == 1);
+  uint32_t seq = 1;
+  // cliente ainda carregando: reporta a posição antiga por 12 s
+  auto r = staleInputs(h, a, seq, {100'000, 0, 0}, 0.05, 12.0);
+  REQUIRE(r.kicks == 0);
+  REQUIRE(r.corrections == 0);  // sem spam de Correction
+  REQUIRE(h.world.find(a)->ignoredWindows == 0);
+  REQUIRE(h.world.find(a)->correctionTimes.empty());
+  // alcança a posição do spawn e joga normalmente
+  h.world.onInput(a, input(seq++, {10, 0, 0}), 12.0);
+  REQUIRE_FALSE(h.world.find(a)->correcting);
+  REQUIRE(h.world.find(a)->state.pos.x == 10);
+  h.world.onInput(a, input(seq++, {30, 0, 0}), 12.1);
+  REQUIRE(h.world.find(a)->state.pos.x == 30);
+}
+
+TEST_CASE("world server correction is resent once after 30 s without catch-up") {
+  Harness h;
+  auto a = h.add("ana");
+  h.step(0);
+  uint32_t seq = 1;
+  auto r = staleInputs(h, a, seq, {100'000, 0, 0}, 0.05, 45.0);
+  REQUIRE(r.kicks == 0);
+  REQUIRE(r.corrections == 1);  // reenviada uma única vez
+  REQUIRE(h.world.find(a)->correcting);
+  REQUIRE(h.world.find(a)->correctionTimes.empty());
+}
+
+TEST_CASE("world setState teleport tolerates stale inputs and resets kick counters") {
+  Harness h;
+  auto a = h.add("ana");
+  h.step(0);
+  uint32_t seq = 1;
+  h.world.onInput(a, input(seq++, {0, 0, 0}), 0.0);  // fecha a janela do spawn
+  // duas janelas ignoradas causadas pelo jogador
+  auto cheat = staleInputs(h, a, seq, {100'000, 0, 0}, 0.05, 2.2);
+  REQUIRE(cheat.corrections >= 2);
+  REQUIRE(h.world.find(a)->ignoredWindows == 2);
+  REQUIRE_FALSE(h.world.find(a)->correctionTimes.empty());
+  cbmp::PlayerState tp;
+  tp.pos = {500'000, 0, 0};
+  h.world.setState(a, tp, 2.2);
+  REQUIRE(h.world.find(a)->ignoredWindows == 0);
+  REQUIRE(h.world.find(a)->correctionTimes.empty());
+  // cliente ainda na posição antiga por 8 s (carregando a área nova)
+  auto r = staleInputs(h, a, seq, {0, 0, 0}, 2.25, 10.25);
+  REQUIRE(r.kicks == 0);
+  REQUIRE(r.corrections == 1);  // só a do setState
+  REQUIRE(h.world.find(a)->correctionTimes.empty());
+  h.world.onInput(a, input(seq++, {500'010, 0, 0}), 10.3);
+  REQUIRE_FALSE(h.world.find(a)->correcting);
+  REQUIRE(h.world.find(a)->state.pos.x == 500'010);
+}
+
 TEST_CASE("world laggy honest client that catches up is never kicked") {
   Harness h;
   auto a = h.add("ana");

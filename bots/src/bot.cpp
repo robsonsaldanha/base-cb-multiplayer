@@ -255,7 +255,7 @@ struct Swarm {
       ++b.snapshots;
       if (s->tick < b.snapTick) return;  // parte atrasada de um tick antigo: não reinicia a montagem
       if (s->tick != b.snapTick) {
-        if (b.lastSnapAt >= 0) recordGap(b, t - b.lastSnapAt);
+        recordGap(b, t - (b.lastSnapAt >= 0 ? b.lastSnapAt : b.welcomeAt));  // 1º: desde o Welcome
         b.lastSnapAt = t;
         b.snapTick = s->tick;
         b.partsMask = 0;

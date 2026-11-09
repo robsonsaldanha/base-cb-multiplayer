@@ -68,6 +68,7 @@ Estados de movimento (u4): 0 parado, 1 andando, 2 correndo, 3 vassoura, 4 nadand
 - Velocidade máxima por estado no `server.cfg` (padrões folgados, calibrados no subprojeto 5) com tolerância
   de 20%. Posição impossível → `Correction` + linha no log de anti-cheat; > 10 correções em 10 s **ou** 5 janelas
   de correção seguidas ignoradas → `Kick`.
+  Correções iniciadas pelo servidor (spawn/teleporte) têm carência de carregamento e não contam para kick.
 - Limite de eventos: token bucket por cliente e por nome de evento (padrão 20/s, rajada 40); excesso > 3x
   em 10 s → `Kick`.
 - Banda máxima de saída por cliente (padrão 256 kbps); se excedida, reduz frequência dos mais distantes.
