@@ -31,7 +31,7 @@ jobs:
           git -C "$GITHUB_WORKSPACE/vcpkg" checkout "$VCPKG_COMMIT"
           "$GITHUB_WORKSPACE/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
           echo "VCPKG_ROOT=$GITHUB_WORKSPACE/vcpkg" >> $GITHUB_ENV
-      - run: cmake --preset linux-asan && cmake --build --preset linux-asan
+      - run: cmake --preset linux-asan && cmake --build --preset linux-asan -- -k 0
       - run: ctest --test-dir build-native/linux-asan --output-on-failure
       - uses: actions/cache/save@v4
         if: always()
@@ -127,7 +127,7 @@ jobs:
           git -C "$GITHUB_WORKSPACE/vcpkg" checkout "$VCPKG_COMMIT"
           "$GITHUB_WORKSPACE/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
           echo "VCPKG_ROOT=$GITHUB_WORKSPACE/vcpkg" >> $GITHUB_ENV
-      - run: cmake --preset linux-release && cmake --build --preset linux-release --target cb-server cb-bots
+      - run: cmake --preset linux-release && cmake --build --preset linux-release --target cb-server cb-bots -- -k 0
       - run: python3 tools/loadtest.py --count 256 --duration 120 --cluster 0.3 --assert --out-dir loadtest-out
       - uses: actions/upload-artifact@v4
         if: always()

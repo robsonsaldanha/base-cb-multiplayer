@@ -55,12 +55,16 @@ struct HeartbeatInfo {
   std::string locale = "pt-BR";
 };
 
+// Fora da classe: o GCC não aceita `Options opt = {}` como argumento padrão quando a struct aninhada
+// tem inicializadores de membro (eles só ficam completos no fim da classe que a contém).
+struct HeartbeatOptions {
+  std::chrono::milliseconds interval{30000}, maxBackoff{120000};
+};
+
 // POST {hub}/v1/servers/heartbeat a cada `interval`; em erro, espera interval, 2x, 4x... até maxBackoff.
 class Heartbeat {
  public:
-  struct Options {
-    std::chrono::milliseconds interval{30000}, maxBackoff{120000};
-  };
+  using Options = HeartbeatOptions;
   Heartbeat(std::string hubUrl, std::string key, HeartbeatInfo info, std::function<uint32_t()> players,
             Options opt = {});
   ~Heartbeat();
