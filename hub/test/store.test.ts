@@ -83,4 +83,11 @@ describe('Store', () => {
     expect(store.removeGlobalBan('9')).toBe(true);
     expect(store.isGloballyBanned('9')).toBe(false);
   });
+
+  it('updateServer ignora undefined no patch', () => {
+    const u = store.upsertUserFromDiscord({ discordId: '1', name: 'A', avatar: null }, T);
+    const { server } = store.createServer(u.id, { name: 'Meu', description: 'd', tags: ['rp'], locale: 'pt-BR', useGlobalBans: true }, T);
+    const up = store.updateServer(server.id, u.id, { name: undefined, description: 'novo', useGlobalBans: undefined })!;
+    expect(up).toMatchObject({ name: 'Meu', description: 'novo', useGlobalBans: true, tags: ['rp'] });
+  });
 });

@@ -149,7 +149,8 @@ export class Store {
   updateServer(id: string, ownerId: string, patch: ServerPatch): ServerRow | null {
     const cur = this.getServer(id);
     if (!cur || cur.ownerId !== ownerId) return null;
-    const next = { ...cur, ...patch };
+    const defined = Object.fromEntries(Object.entries(patch).filter(([, v]) => v !== undefined));
+    const next = { ...cur, ...defined };
     this.db.prepare('UPDATE servers SET name = ?, description = ?, tags = ?, locale = ?, use_global_bans = ? WHERE id = ?')
       .run(next.name, next.description, JSON.stringify(next.tags), next.locale, next.useGlobalBans ? 1 : 0, id);
     return this.getServer(id);

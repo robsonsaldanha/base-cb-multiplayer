@@ -10,6 +10,8 @@ import type { DiscordClient } from './discord';
 import type { ProbeFn } from './probe';
 import { HttpError } from './errors';
 import { authRoutes } from './routes/auth';
+import { ownerRoutes } from './routes/owner';
+import { ticketRoutes } from './routes/tickets';
 
 export interface HubDeps {
   config: HubConfig;
@@ -60,6 +62,8 @@ export async function buildApp(deps: HubDeps): Promise<FastifyInstance> {
 
   app.get('/health', async () => ({ ok: true }));
   await app.register(authRoutes);
+  await app.register(ownerRoutes);
+  await app.register(ticketRoutes);
   // Tasks seguintes registram rotas aqui.
   return app;
 }
