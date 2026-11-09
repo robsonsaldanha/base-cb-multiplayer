@@ -41,10 +41,17 @@ export function buildVectors(): TicketVectors {
   while (badLenBody.length % 4 !== 1) badLenBody += 'A';
   const floatBody = Buffer.from(JSON.stringify(payload).replace('"iat":1800000000', '"iat":1800000000.0'), 'utf8');
   const floatTicket = floatBody.toString('base64url') + '.' + sign(null, floatBody, priv).toString('base64url');
+  const signRaw = (text: string) => {
+    const b = Buffer.from(text, 'utf8');
+    return b.toString('base64url') + '.' + sign(null, b, priv).toString('base64url');
+  };
+  const json = JSON.stringify(payload);
+  const spacedTicket = signRaw(json.replace('"name":', '"name": '));
+  const dupAudTicket = signRaw(json.replace('"aud":"srv_test"', '"aud":"srv_outro","aud":"srv_test"'));
   const at = (name: string, ticket: string, expected: 'ok' | TicketError, extra: Partial<TicketVectorCase> = {}): TicketVectorCase =>
     ({ name, ticket, audience: 'srv_test', nowSeconds: payload.iat, expected, ...extra });
   return {
-    description: 'Vetores de ticket CB-MP. Ordem das checagens: formato/charset, base64url canônico, JSON, forma (incluindo inteiros seguros; v, iat e exp devem ser literais inteiros simples no JSON: sem 1.0, sem expoente), versão, kid, assinatura (64 bytes + verificação), audience, iat > now+60 (not_yet_valid), exp+60 < now (expired).',
+    description: 'Vetores de ticket CB-MP. Ordem das checagens: formato/charset, base64url canônico, JSON (válido; compacto: nenhum espaço/tab/quebra de linha fora de strings; cada chave v/kid/sub/did/name/aud/iat/exp/jti aparece exatamente uma vez, contando ocorrências de "<chave>": no corpo), forma (incluindo inteiros seguros; v, iat e exp devem ser literais inteiros simples no JSON: sem 1.0, sem expoente), versão, kid, assinatura (64 bytes + verificação), audience, iat > now+60 (not_yet_valid), exp+60 < now (expired).',
     seedHex: seed.toString('hex'),
     publicKeys: [{ kid: 'test-1', publicKey: publicKeyToRaw(priv) }],
     cases: [
@@ -67,6 +74,8 @@ export function buildVectors(): TicketVectors {
       at('b64_nao_canonico', nonCanonical, 'malformed'),
       at('b64_tamanho_invalido', badLenBody + '.' + goodSig, 'malformed'),
       at('iat_literal_float', floatTicket, 'malformed'),
+      at('json_com_espacos', spacedTicket, 'malformed'),
+      at('chave_duplicada', dupAudTicket, 'malformed'),
     ],
   };
 }

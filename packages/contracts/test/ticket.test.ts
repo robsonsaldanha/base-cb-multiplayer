@@ -82,3 +82,27 @@ describe('ticket', () => {
     expect(verifyTicket(t, { publicKeys: keys, audience: 'srv_abc', nowSeconds: base.iat })).toEqual({ ok: false, error: 'malformed' });
   });
 });
+
+describe('ticket: JSON compacto e sem chaves duplicadas', () => {
+  const signRaw = (text: string) => {
+    const body = Buffer.from(text, 'utf8');
+    return body.toString('base64url') + '.' + sign(null, body, priv).toString('base64url');
+  };
+  const opts = { publicKeys: keys, audience: 'srv_abc', nowSeconds: base.iat };
+  it('espaço fora de string → malformed; espaço dentro de string é ok', () => {
+    const json = JSON.stringify(base);
+    expect(verifyTicket(signRaw(json.replace('"name":', '"name": ')), opts)).toEqual({ ok: false, error: 'malformed' });
+    expect(verifyTicket(signRaw(json + '\n'), opts)).toEqual({ ok: false, error: 'malformed' });
+    expect(verifyTicket(signTicket({ ...base, name: 'Nome Com Espaço' }, priv), opts).ok).toBe(true);
+  });
+  it('chave duplicada → malformed', () => {
+    const json = JSON.stringify(base);
+    for (const k of ['v', 'kid', 'sub', 'did', 'name', 'aud', 'iat', 'exp', 'jti'] as const) {
+      const dup = json.replace('{', `{"${k}":${JSON.stringify(base[k])},`);
+      expect(verifyTicket(signRaw(dup), opts), k).toEqual({ ok: false, error: 'malformed' });
+    }
+  });
+  it('string com "aud": escapado não conta como chave', () => {
+    expect(verifyTicket(signTicket({ ...base, name: 'x"aud":y' }, priv), opts).ok).toBe(true);
+  });
+});

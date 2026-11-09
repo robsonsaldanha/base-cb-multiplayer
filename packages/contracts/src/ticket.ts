@@ -67,9 +67,31 @@ function plainIntegerLiterals(text: string): boolean {
     && !new RegExp(`"${k}":-?\\d+[.eE]`).test(text));
 }
 
+/** JSON compacto: nenhum espaço/tab/quebra de linha fora de strings. */
+function isCompactJson(text: string): boolean {
+  let inStr = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (inStr) {
+      if (c === '\\') i++;
+      else if (c === '"') inStr = false;
+    } else if (c === '"') inStr = true;
+    else if (c === ' ' || c === '\t' || c === '\n' || c === '\r') return false;
+  }
+  return true;
+}
+
+const PAYLOAD_KEYS = ['v', 'kid', 'sub', 'did', 'name', 'aud', 'iat', 'exp', 'jti'] as const;
+
+/** Cada chave do payload aparece exatamente uma vez como `"<chave>":` no corpo (aspas em strings vêm escapadas). */
+function noDuplicateKeys(text: string): boolean {
+  return PAYLOAD_KEYS.every((k) => text.split(`"${k}":`).length === 2);
+}
+
 /**
  * Ordem das checagens (o validador C++ deve seguir a mesma):
- * formato/charset → base64url canônico → JSON → forma (inteiros seguros) → versão → kid → assinatura → audience → iat futuro → expiração.
+ * formato/charset → base64url canônico → JSON (válido, compacto, sem chaves duplicadas) → forma (inteiros seguros,
+ * literais inteiros simples) → versão → kid → assinatura → audience → iat futuro → expiração.
  */
 export function verifyTicket(
   ticket: string,
@@ -80,13 +102,15 @@ export function verifyTicket(
   const body = Buffer.from(parts[0]!, 'base64url');
   const sig = Buffer.from(parts[1]!, 'base64url');
   if (body.toString('base64url') !== parts[0] || sig.toString('base64url') !== parts[1]) return { ok: false, error: 'malformed' };
+  const text = body.toString('utf8');
   let payload: unknown;
   try {
-    payload = JSON.parse(body.toString('utf8'));
+    payload = JSON.parse(text);
   } catch {
     return { ok: false, error: 'malformed' };
   }
-  if (!isPayloadShape(payload) || !plainIntegerLiterals(body.toString('utf8'))) return { ok: false, error: 'malformed' };
+  if (!isCompactJson(text) || !noDuplicateKeys(text)) return { ok: false, error: 'malformed' };
+  if (!isPayloadShape(payload) || !plainIntegerLiterals(text)) return { ok: false, error: 'malformed' };
   if (payload.v !== 1) return { ok: false, error: 'bad_version' };
   const key = opts.publicKeys.get(payload.kid);
   if (!key) return { ok: false, error: 'unknown_kid' };

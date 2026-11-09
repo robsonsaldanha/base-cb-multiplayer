@@ -17,3 +17,10 @@ describe('vetores de ticket', () => {
     }
   });
 });
+
+describe('vetores de JSON não compacto / chave duplicada', () => {
+  it('existem e são malformed', () => {
+    const byName = new Map(buildVectors().cases.map((c) => [c.name, c] as const));
+    for (const n of ['json_com_espacos', 'chave_duplicada']) expect(byName.get(n)?.expected, n).toBe('malformed');
+  });
+});

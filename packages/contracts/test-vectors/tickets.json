@@ -1,5 +1,5 @@
 {
-  "description": "Vetores de ticket CB-MP. Ordem das checagens: formato/charset, base64url canônico, JSON, forma (incluindo inteiros seguros; v, iat e exp devem ser literais inteiros simples no JSON: sem 1.0, sem expoente), versão, kid, assinatura (64 bytes + verificação), audience, iat > now+60 (not_yet_valid), exp+60 < now (expired).",
+  "description": "Vetores de ticket CB-MP. Ordem das checagens: formato/charset, base64url canônico, JSON (válido; compacto: nenhum espaço/tab/quebra de linha fora de strings; cada chave v/kid/sub/did/name/aud/iat/exp/jti aparece exatamente uma vez, contando ocorrências de \"<chave>\": no corpo), forma (incluindo inteiros seguros; v, iat e exp devem ser literais inteiros simples no JSON: sem 1.0, sem expoente), versão, kid, assinatura (64 bytes + verificação), audience, iat > now+60 (not_yet_valid), exp+60 < now (expired).",
   "seedHex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
   "publicKeys": [
     {
@@ -137,6 +137,20 @@
     {
       "name": "iat_literal_float",
       "ticket": "eyJ2IjoxLCJraWQiOiJ0ZXN0LTEiLCJzdWIiOiJ1c3JfdGVzdCIsImRpZCI6IjExMTExMTExMTExMTExMTExMSIsIm5hbWUiOiJKb2dhZG9yIMOHw6NvIiwiYXVkIjoic3J2X3Rlc3QiLCJpYXQiOjE4MDAwMDAwMDAuMCwiZXhwIjoxODAwMDAwMzAwLCJqdGkiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEifQ.SR_gFoDZbt1XeDND57NXQPJ3S7QfN6HDQLkdcaOzPzWSiMefxFm1ros4LaNpNdQht8wn8Q0J6BCrvhdgvqbODQ",
+      "audience": "srv_test",
+      "nowSeconds": 1800000000,
+      "expected": "malformed"
+    },
+    {
+      "name": "json_com_espacos",
+      "ticket": "eyJ2IjoxLCJraWQiOiJ0ZXN0LTEiLCJzdWIiOiJ1c3JfdGVzdCIsImRpZCI6IjExMTExMTExMTExMTExMTExMSIsIm5hbWUiOiAiSm9nYWRvciDDh8OjbyIsImF1ZCI6InNydl90ZXN0IiwiaWF0IjoxODAwMDAwMDAwLCJleHAiOjE4MDAwMDAzMDAsImp0aSI6IjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMSJ9.nqR7wJu_1yBkCrR11l_VMwrTRTqL3SkazsN5Ao4lLeucQLybl72z7Rbmbp-A7sawOOYcCKjMmFT1LGFqRYQCAw",
+      "audience": "srv_test",
+      "nowSeconds": 1800000000,
+      "expected": "malformed"
+    },
+    {
+      "name": "chave_duplicada",
+      "ticket": "eyJ2IjoxLCJraWQiOiJ0ZXN0LTEiLCJzdWIiOiJ1c3JfdGVzdCIsImRpZCI6IjExMTExMTExMTExMTExMTExMSIsIm5hbWUiOiJKb2dhZG9yIMOHw6NvIiwiYXVkIjoic3J2X291dHJvIiwiYXVkIjoic3J2X3Rlc3QiLCJpYXQiOjE4MDAwMDAwMDAsImV4cCI6MTgwMDAwMDMwMCwianRpIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIn0.Chru36eNZ1WQsSdy10yWKYQNWFXg8abnseLRzSPUiO5wBYZL9pyWyWcmkNySZmuSqqFufp4FkxBMZCyG0RPxDg",
       "audience": "srv_test",
       "nowSeconds": 1800000000,
       "expected": "malformed"

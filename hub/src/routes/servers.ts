@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { HeartbeatBody, type ServerListing } from '@cbmp/contracts';
+import { HeartbeatBody, type ServerDetail, type ServerListing } from '@cbmp/contracts';
 import { HttpError } from '../errors';
 import { createHash } from 'node:crypto';
 import { bearer } from '../auth';
@@ -70,14 +70,16 @@ export async function serverRoutes(app: FastifyInstance) {
     return body;
   });
 
-  app.get('/v1/servers/:id', async (req) => {
+  app.get('/v1/servers/:id', async (req): Promise<ServerDetail> => {
     const { id } = z.object({ id: z.string().min(1).max(64) }).parse(req.params);
     const server = store.getServer(id);
     if (!server) throw new HttpError(404, 'not_found', 'servidor não encontrado');
-    const v = serverView(server, store.getStatus(id), now());
+    const status = store.getStatus(id);
+    const base = { id: server.id, name: server.name, description: server.description, tags: server.tags, locale: server.locale };
+    if (!status || !serverView(server, status, now()).online) return { ...base, online: false };
     return {
-      id: v.id, name: v.name, description: v.description, tags: v.tags, locale: v.locale, online: v.online,
-      ...(v.online ? { players: v.players, maxPlayers: v.maxPlayers, host: v.host, gamePort: v.gamePort, httpPort: v.httpPort, version: v.version, protocol: v.protocol } : {}),
+      ...base, online: true, players: status.players, maxPlayers: status.maxPlayers, host: status.ip,
+      gamePort: status.gamePort, httpPort: status.httpPort, version: status.version, protocol: status.protocol,
     };
   });
 }

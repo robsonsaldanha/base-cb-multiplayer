@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import { z } from 'zod';
+import { ExchangeRequest, RefreshRequest, type TokenResponse } from '@cbmp/contracts';
 import { HttpError } from '../errors';
 import { SESSION_COOKIE, bearer, isPlatformAdmin, requireUser } from '../auth';
 import type { ClientKind, SessionTokens } from '../store';
@@ -26,7 +27,7 @@ const escapeHtml = (v: string) => v.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', 
 const deniedPage = (reason: string) => `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><title>Login cancelado</title></head>
 <body><h1>Login cancelado no Discord</h1><p>Não foi possível concluir o login (${escapeHtml(reason)}).</p><p><a href="/panel">Tentar de novo</a></p></body></html>`;
 
-const tokenResponse = (s: SessionTokens) => ({
+const tokenResponse = (s: SessionTokens): TokenResponse => ({
   accessToken: s.access, accessExpiresAt: s.accessExpiresAt, refreshToken: s.refresh, refreshExpiresAt: s.refreshExpiresAt,
 });
 
@@ -88,7 +89,7 @@ export async function authRoutes(app: FastifyInstance) {
   }
 
   app.post('/v1/auth/exchange', async (req) => {
-    const { code, codeVerifier } = z.object({ code: z.string().min(1), codeVerifier: z.string().regex(/^[A-Za-z0-9._~-]{43,128}$/) }).parse(req.body);
+    const { code, codeVerifier } = ExchangeRequest.parse(req.body);
     const c = store.consumeLoginCode(code, now()); // consumido mesmo se o verifier falhar
     if (!c || createHash('sha256').update(codeVerifier).digest('base64url') !== c.codeChallenge) {
       throw new HttpError(400, 'bad_code', 'código de login inválido ou expirado');
@@ -97,7 +98,7 @@ export async function authRoutes(app: FastifyInstance) {
   });
 
   app.post('/v1/auth/refresh', async (req) => {
-    const { refreshToken } = z.object({ refreshToken: z.string().min(1) }).parse(req.body);
+    const { refreshToken } = RefreshRequest.parse(req.body);
     const s = store.refreshSession(refreshToken, now());
     if (!s) throw new HttpError(401, 'bad_refresh', 'sessão expirada, faça login de novo');
     return tokenResponse(s);
