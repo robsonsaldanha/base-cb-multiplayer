@@ -13,6 +13,7 @@ env:
 jobs:
   linux:
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4
@@ -39,6 +40,7 @@ jobs:
           key: vcpkg-linux-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
   windows:
     runs-on: windows-2025
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4
@@ -67,6 +69,7 @@ jobs:
           key: vcpkg-win-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
   fuzz:
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4
@@ -88,7 +91,7 @@ jobs:
       - name: fuzz (120 s)
         run: |
           build-native/linux-fuzz/proto/proto_fuzz_replay --write-corpus fuzz-corpus
-          build-native/linux-fuzz/proto/proto_fuzz fuzz-corpus -max_total_time=120 -max_len=4096 -print_final_stats=1
+          build-native/linux-fuzz/proto/proto_fuzz fuzz-corpus -max_total_time=120 -timeout=10 -max_len=4096 -print_final_stats=1
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
@@ -106,6 +109,7 @@ jobs:
           key: vcpkg-linux-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}-fuzz
   load:
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4

@@ -66,7 +66,8 @@ Estados de movimento (u4): 0 parado, 1 andando, 2 correndo, 3 vassoura, 4 nadand
 ## Autoridade e segurança
 
 - Velocidade máxima por estado no `server.cfg` (padrões folgados, calibrados no subprojeto 5) com tolerância
-  de 20%. Posição impossível → `Correction` + linha no log de anti-cheat; > 10 correções em 10 s → `Kick`.
+  de 20%. Posição impossível → `Correction` + linha no log de anti-cheat; > 10 correções em 10 s **ou** 5 janelas
+  de correção seguidas ignoradas → `Kick`.
 - Limite de eventos: token bucket por cliente e por nome de evento (padrão 20/s, rajada 40); excesso > 3x
   em 10 s → `Kick`.
 - Banda máxima de saída por cliente (padrão 256 kbps); se excedida, reduz frequência dos mais distantes.
@@ -127,6 +128,9 @@ não derrubam o servidor; log com back-off. Sem `hub.url` configurado → não a
 
 Tick p50/p99/máximo (janela de 60 s), bytes enviados por cliente (média/máx), jogadores, conexões pendentes,
 correções, kicks, eventos descartados, RSS, CPU do processo.
+Banda por jogador (média/máx em kbps): bytes de payload das mensagens GNS enviadas à conexão (sem cabeçalhos
+IP/UDP/GNS) ÷ tempo conectado, média/máximo entre os jogadores conectados; a estimativa "no fio" do GNS
+(`m_flOutBytesPerSec`) é só informativa.
 
 ## Bots (`cb-bots`)
 

@@ -14,6 +14,7 @@ constexpr size_t kMaxCorrections = 10;   // > 10 em 10 s → kick
 constexpr double kMaxMoveDtSec = 1.0;    // dt do validador nunca passa disso
 constexpr double kBaselineMaxAgeSec = 1.0;
 constexpr double kCorrectionWindowSec = 1.0;  // após uma Correction, não envia/conta outra por até 1 s
+constexpr int kMaxIgnoredWindows = 5;          // janelas de correção seguidas vencidas com o cliente longe → kick
 
 void trimWindow(std::deque<double>& q, double now) {
   while (!q.empty() && q.front() < now - kWindowSec) q.pop_front();
@@ -140,20 +141,24 @@ void World::onInput(EntityId id, const cbmp::Input& in, double now) {
     grid_.upsert(id, in.s.pos);
     return;
   }
-  bool ignoredCorrection = false;
   if (p->correcting) {
     // Desde a Correction o cliente pode ter andado legalmente a partir da posição corrigida.
+    // Alcance limitado ao mesmo dt máximo do validador: quem fecha a janela por alcance também passa na validação.
     const double elapsed = now - p->correctionSince;
-    const double reach = limits_.slackCm + maxSpeedOf(p->state.state, in.s.state) * std::max(0.0, elapsed) *
-                                               (1.0 + limits_.tolerance);
+    const double reach = limits_.slackCm + maxSpeedOf(p->state.state, in.s.state) *
+                                               std::clamp(elapsed, 0.0, kMaxMoveDtSec) * (1.0 + limits_.tolerance);
     const double d = std::sqrt(static_cast<double>(distSq(in.s.pos, p->state.pos)));
     if (d <= reach) {
       p->correcting = false;  // cliente aplicou a correção: valida normalmente
+      p->ignoredWindows = 0;
     } else if (elapsed >= kCorrectionWindowSec) {
-      // A janela inteira passou e o cliente continua longe: ignorou a Correction (trapaceiro persistente).
-      // Conta um incidente extra; sem isso, um incidente por janela (≥ 1 s) nunca passaria de 10 em 10 s.
+      // A janela inteira passou e o cliente continua longe: ignorou a Correction. Valida (e corrige) de novo;
+      // kMaxIgnoredWindows seguidas → kick (incidentes a ≥ 1 s nunca passariam de 10 em 10 s).
       p->correcting = false;
-      ignoredCorrection = true;
+      if (++p->ignoredWindows >= kMaxIgnoredWindows) {
+        orderKick(*p, "movimento inválido");
+        return;
+      }
     } else {
       return;  // input ainda baseado na posição antiga (latência): ignorado, sem novo incidente
     }
@@ -167,7 +172,6 @@ void World::onInput(EntityId id, const cbmp::Input& in, double now) {
   }
   sendCorrection(*p, in.seq, now);
   p->correctionTimes.push_back(now);
-  if (ignoredCorrection) p->correctionTimes.push_back(now);
   trimWindow(p->correctionTimes, now);
   if (p->correctionTimes.size() > kMaxCorrections) orderKick(*p, "movimento inválido");
 }

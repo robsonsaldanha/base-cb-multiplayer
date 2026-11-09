@@ -41,6 +41,7 @@ struct PlayerSlot {
   std::deque<double> correctionTimes;  // um registro por incidente (não por Correction repetida)
   bool correcting = false;             // janela após Correction: inputs longe da posição corrigida são ignorados
   double correctionSince = 0;
+  int ignoredWindows = 0;  // janelas de correção seguidas que venceram com o cliente ainda longe (≥ 5 → kick)
   VisibleSet visible;
   std::unordered_map<std::string, TokenBucket> eventBuckets;
   std::deque<double> eventViolations;
@@ -81,8 +82,8 @@ class World {
 
   // Ignora seq ≤ último. Com Correction pendente (janela de 1 s), ignora inputs longe da posição corrigida;
   // fecha a janela um input a ≤ slack + maxSpeed(estado) × (now − correctionSince) × (1+tol) dela (o cliente
-  // pode ter andado legalmente desde a correção). Cada Correction é um incidente; se a janela inteira passa e o
-  // input continua longe (Correction ignorada), conta um incidente extra. > 10 em 10 s → kick.
+  // pode ter andado legalmente desde a correção; alcance limitado a 1 s). Cada Correction é um incidente; > 10 em
+  // 10 s → kick. Janela que vence com o input ainda longe = janela ignorada; 5 seguidas → kick (alcance zera).
   // Com SpawnMode::DevTrustFirstInput, o primeiro input define o spawn sem validação.
   void onInput(EntityId id, const cbmp::Input& in, double now);
   bool onEvent(EntityId id, const cbmp::Event& ev, double now);  // false = descartado

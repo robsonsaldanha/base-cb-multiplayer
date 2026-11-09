@@ -1,5 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+
 #include "world_harness.hpp"
 
 using cbmp::Correction;
@@ -89,48 +91,101 @@ TEST_CASE("world correction window ends after 1 s and counts a new incident") {
   h.world.onInput(a, input(1, {0, 0, 0}), 0.0625);
   h.world.onInput(a, input(2, {100'000, 0, 0}), 0.125);
   h.world.onInput(a, input(3, {100'000, 0, 0}), 1.0);    // ainda na janela: ignorado
-  h.world.onInput(a, input(4, {100'000, 0, 0}), 1.125);  // janela venceu ainda longe: novo incidente + extra
+  h.world.onInput(a, input(4, {100'000, 0, 0}), 1.125);  // janela venceu: novo incidente
   h.step();
   REQUIRE(h.msgs<Correction>(a).size() == 2);
-  REQUIRE(h.world.find(a)->correctionTimes.size() == 3);
+  REQUIRE(h.world.find(a)->correctionTimes.size() == 2);
 }
 
-TEST_CASE("world correction window ending near the corrected position is a single incident") {
-  Harness h;
-  auto a = h.add("ana");
-  h.step(0);
-  h.world.onInput(a, input(1, {0, 0, 0}), 0.0625);
-  h.world.onInput(a, input(2, {100'000, 0, 0}), 0.125);  // incidente
-  h.world.onInput(a, input(3, {100, 0, 0}), 1.25);       // depois da janela, mas perto do corrigido: aceito
-  h.step();
-  REQUIRE(h.msgs<Correction>(a).size() == 1);
-  REQUIRE(h.world.find(a)->correctionTimes.size() == 1);
-  REQUIRE(h.world.find(a)->state.pos.x == 100);
-}
-
-TEST_CASE("world continuous cheater ignoring Correction is kicked after 11 incidents") {
+TEST_CASE("world persistent cheater is kicked after 5 consecutive ignored correction windows") {
   Harness h;
   auto a = h.add("ana");
   h.step(0);  // descarta a Correction do spawn
   h.world.onInput(a, input(1, {0, 0, 0}), 0.0);
-  // 16 inputs/s (passo exato em binário) sempre teleportados: 1 incidente na 1ª Correction e 2 a cada janela
-  // ignorada (a cada 1 s) → 11 incidentes na 6ª Correction (~5 s). Sem o extra, janelas ≥ 1 s nunca passam de 10.
+  // 16 inputs/s (passo exato em binário) sempre na posição teleportada: Correction em 0,0625 e a cada janela
+  // vencida (1 s); cada janela vencida ainda longe é uma janela ignorada seguida.
   uint32_t seq = 2;
   double t = 0.0625;
   for (; t < 5.0; t += 0.0625) h.world.onInput(a, input(seq++, {100'000, 0, 0}), t);
   h.step();
-  REQUIRE(h.msgs<Correction>(a).size() == 5);
-  REQUIRE(h.world.find(a)->correctionTimes.size() == 9);
+  REQUIRE(h.world.find(a)->ignoredWindows == 4);
   REQUIRE(h.kicks.empty());
   for (; t <= 5.0625; t += 0.0625) h.world.onInput(a, input(seq++, {100'000, 0, 0}), t);
+  REQUIRE(h.world.find(a)->ignoredWindows == 5);
   h.step();
-  REQUIRE(h.msgs<Correction>(a).size() == 1);
   REQUIRE(h.kicks.size() == 1);
   REQUIRE(h.kicks[0].who == a);
   REQUIRE(h.kicks[0].reason == "movimento inválido");
+  REQUIRE(h.world.find(a)->correctionTimes.size() <= 10);  // foi a regra das janelas, não a de incidentes
   h.world.onInput(a, input(seq++, {100'000, 0, 0}), 12.0);
   h.step();
   REQUIRE(h.kicks.empty());  // ordem emitida uma única vez
+}
+
+TEST_CASE("world laggy honest client that catches up is never kicked") {
+  Harness h;
+  auto a = h.add("ana");
+  h.step(0);
+  uint32_t seq = 1;
+  h.world.onInput(a, input(seq++, {0, 0, 0}, cbmp::MoveState::Walk), 0.0);
+  // Ciclos de 2 s por 20 s: um input inválido gera Correction; com RTT de 400 ms o cliente ainda manda posições
+  // erradas e só alcança a posição corrigida em 0,95 / 1,05 / 1,4 s, a uma distância logo abaixo do alcance.
+  // No caso de 1,4 s a janela vence antes (input longe em 1,05 s: janela ignorada + nova Correction), mas o
+  // alcance seguinte zera o contador. Alcance = slack + Walk×1,2×min(decorrido, 1 s) (mesmo teto do validador).
+  const double catchUps[] = {0.95, 1.05, 1.4};
+  constexpr double kReachPerS = 400.0 * 1.2;  // Walk com 20% de tolerância
+  for (int k = 0; k < 10; ++k) {
+    const double t0 = 2.0 * k + 0.25;
+    const int32_t base = h.world.find(a)->state.pos.x;
+    h.world.onInput(a, input(seq++, {base + 100'000, 0, 0}, cbmp::MoveState::Walk), t0);  // incidente
+    for (double dt = 0.05; dt < 0.4; dt += 0.05)
+      h.world.onInput(a, input(seq++, {base + 100'000, 0, 0}, cbmp::MoveState::Walk), t0 + dt);  // em voo
+    const double c = catchUps[k % 3];
+    double since = t0;
+    if (c > 1.0 + 0.1) {
+      h.world.onInput(a, input(seq++, {base + 100'000, 0, 0}, cbmp::MoveState::Walk), t0 + 1.05);  // vence longe
+      REQUIRE(h.world.find(a)->ignoredWindows == 1);
+      since = t0 + 1.05;
+    }
+    const double reach = 50.0 + kReachPerS * std::min(1.0, t0 + c - since);
+    const int32_t corrected = h.world.find(a)->state.pos.x;
+    h.world.onInput(a, input(seq++, {corrected + static_cast<int32_t>(reach) - 5, 0, 0}, cbmp::MoveState::Walk),
+                    t0 + c);
+    REQUIRE(h.world.find(a)->ignoredWindows == 0);
+    REQUIRE_FALSE(h.world.find(a)->correcting);
+    h.step(0);
+    REQUIRE(h.kicks.empty());
+  }
+}
+
+TEST_CASE("world catch-up just beyond reach after the window counts as ignored") {
+  for (int extra : {-5, 5}) {
+    Harness h;
+    auto a = h.add("ana");
+    h.step(0);
+    h.world.onInput(a, input(1, {0, 0, 0}, cbmp::MoveState::Walk), 0.0);
+    h.world.onInput(a, input(2, {100'000, 0, 0}, cbmp::MoveState::Walk), 0.25);  // Correction em x = 0
+    const double reach = 50.0 + 400.0 * 1.2 * 1.0;  // decorrido 1,05 s, alcance limitado a 1 s
+    h.world.onInput(a, input(3, {static_cast<int32_t>(reach) + extra, 0, 0}, cbmp::MoveState::Walk), 1.30);
+    REQUIRE(h.world.find(a)->ignoredWindows == (extra > 0 ? 1 : 0));
+  }
+}
+
+TEST_CASE("world converging teleports every 0.9 s still hit the 10-in-10 s incident rule") {
+  Harness h;
+  auto a = h.add("ana");
+  h.step(0);
+  uint32_t seq = 1;
+  h.world.onInput(a, input(seq++, {0, 0, 0}), 0.0);
+  for (int k = 1; k <= 11; ++k) {
+    const double t = 0.9 * k;
+    h.world.onInput(a, input(seq++, {100'000, 0, 0}), t);
+    h.world.onInput(a, input(seq++, {0, 0, 0}), t + 0.3);  // volta ao corrigido: zera as janelas ignoradas
+    REQUIRE(h.world.find(a)->ignoredWindows == 0);
+  }
+  h.step(10.0);
+  REQUIRE(h.kicks.size() == 1);
+  REQUIRE(h.kicks[0].reason == "movimento inválido");
 }
 
 TEST_CASE("world isolated teleports every 1.125 s count one incident each") {

@@ -1,4 +1,5 @@
 #include "bot.hpp"
+#include "gaps.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -37,7 +38,6 @@ constexpr double kTeleportJumpCm = 10000;  // 100 m por teleporte
 constexpr int kFloodPerInput = 25;       // 25 a cada 50 ms = 500 eventos/s
 constexpr int kEndKicked = k_ESteamNetConnectionEnd_App_Min + 4;   // mesmo código do cb-server
 constexpr int kEndRejected = k_ESteamNetConnectionEnd_App_Min + 1;
-constexpr size_t kGapBuckets = 10001;    // histograma de 1 ms até 10 s
 
 enum class Phase { Waiting, Connecting, Handshake, Playing, Done };
 
@@ -78,7 +78,7 @@ struct Swarm {
   HSteamNetPollGroup poll = k_HSteamNetPollGroup_Invalid;
   std::vector<Bot> bots;
   std::unordered_map<HSteamNetConnection, Bot*> byConn;
-  std::vector<uint64_t> gapHist = std::vector<uint64_t>(kGapBuckets, 0);
+  GapStats gaps;
   std::mt19937_64 rng;
   Clock::time_point t0 = Clock::now();
   std::map<std::string, int> rejectReasons, kickReasons, closeReasons;
@@ -214,10 +214,9 @@ struct Swarm {
     b.phase = Phase::Done;
   }
 
-  void recordGap(const Bot& b, double gapSec) {
-    if (!countsForStats(b)) return;
-    const auto ms = static_cast<size_t>(std::llround(gapSec * 1000.0));
-    ++gapHist[std::min(ms, kGapBuckets - 1)];
+  void recordGap(Bot& b, double gapSec) {
+    b.maxGap = std::max(b.maxGap, gapSec);
+    if (countsForStats(b)) gaps.add(gapSec);
   }
 
   void onMessage(Bot& b, const uint8_t* data, size_t size, double t) {
@@ -254,12 +253,9 @@ struct Swarm {
       }
     } else if (const auto* s = std::get_if<cbmp::Snapshot>(&m)) {
       ++b.snapshots;
+      if (s->tick < b.snapTick) return;  // parte atrasada de um tick antigo: não reinicia a montagem
       if (s->tick != b.snapTick) {
-        if (b.lastSnapAt >= 0) {
-          const double gap = t - b.lastSnapAt;
-          b.maxGap = std::max(b.maxGap, gap);
-          recordGap(b, gap);
-        }
+        if (b.lastSnapAt >= 0) recordGap(b, t - b.lastSnapAt);
         b.lastSnapAt = t;
         b.snapTick = s->tick;
         b.partsMask = 0;
@@ -401,12 +397,16 @@ struct Swarm {
     uint64_t bytesIn = 0, corrections = 0, snapshots = 0;
     double rttSum = 0, maxGap = 0, kbpsSum = 0;
     uint64_t rttN = 0;
-    int kbpsN = 0;
-    for (const auto& b : bots) {
+    int kbpsN = 0, withoutSnapshots = 0;
+    for (auto& b : bots) {
       if (!countsForStats(b)) continue;
       if (b.welcomed) {
         ++connected;
-        const double secs = std::max(1e-3, (b.endAt >= 0 ? b.endAt : end) - b.welcomeAt);
+        const double until = b.endAt >= 0 ? b.endAt : end;
+        // Intervalo final (último snapshot, ou Welcome, até o fim): pega bot que parou de receber ou nunca recebeu.
+        recordGap(b, GapStats::tailGap(b.welcomeAt, b.lastSnapAt, until));
+        if (b.snapshots == 0) ++withoutSnapshots;
+        const double secs = std::max(1e-3, until - b.welcomeAt);
         kbpsSum += static_cast<double>(b.bytesIn) * 8.0 / 1000.0 / secs;
         ++kbpsN;
       } else {
@@ -433,20 +433,6 @@ struct Swarm {
       rttN += b.rttN;
       maxGap = std::max(maxGap, b.maxGap);
     }
-    uint64_t total = 0;
-    for (auto c : gapHist) total += c;
-    double p99 = 0;
-    if (total > 0) {
-      const auto target = static_cast<uint64_t>(std::ceil(0.99 * static_cast<double>(total)));
-      uint64_t acc = 0;
-      for (size_t ms = 0; ms < gapHist.size(); ++ms) {
-        acc += gapHist[ms];
-        if (acc >= target) {
-          p99 = static_cast<double>(ms);
-          break;
-        }
-      }
-    }
     nlohmann::json r{{"count", static_cast<int>(bots.size())},
                      {"connected", connected},
                      {"failedToConnect", failed},
@@ -454,7 +440,8 @@ struct Swarm {
                      {"disconnected", disconnected},
                      {"kicked", kicked},
                      {"maxSnapshotGapMs", maxGap * 1000.0},
-                     {"p99SnapshotGapMs", p99},
+                     {"p99SnapshotGapMs", gaps.p99Ms()},
+                     {"botsWithoutSnapshots", withoutSnapshots},
                      {"avgRttMs", rttN ? rttSum / static_cast<double>(rttN) * 1000.0 : 0.0},
                      {"bytesIn", bytesIn},
                      {"avgKbpsInPerBot", kbpsN ? kbpsSum / kbpsN : 0.0},

@@ -48,6 +48,7 @@ SERVER_ID = "srv_dev"  # serverId do cb-server em modo dev (sem hub)
 # Todos os bots saem do mesmo IP e a rampa (50/s) abre ~2–3 conexões por tick; o padrão de 4 pendentes por IP
 # recusaria parte delas entre dois pumps. O limite por IP é testado nos testes unitários do net.
 PENDING_PER_IP = 64
+KICK_REASONS = {"teleport": "movimento inválido", "flood": "flood de eventos"}
 
 
 def log(msg: str) -> None:
@@ -239,6 +240,10 @@ def load_violations(r: dict, count: int) -> list[str]:
         v.append(f"{b['disconnected']} bot(s) caíram")
     if b["kicked"]:
         v.append(f"{b['kicked']} bot(s) expulsos: {b.get('kickReasons')}")
+    if b.get("botsWithoutSnapshots", 0):
+        v.append(f"{b['botsWithoutSnapshots']} bot(s) sem nenhum snapshot")
+    if r.get("serverExit") not in (0, None):
+        v.append(f"cb-server saiu com código {r['serverExit']}")
     if b["maxSnapshotGapMs"] > LIMITS["maxSnapshotGapMs"]:
         v.append(f"bot sem snapshot por {b['maxSnapshotGapMs']:.0f} ms > {LIMITS['maxSnapshotGapMs']:.0f}")
     return v
@@ -281,21 +286,28 @@ def security_scenario(name: str, server_bin: Path, bots_bin: Path, out_dir: Path
         bots = run_bots(bots_bin, srv.port, bots_seed, work / "bots-report.json", count, duration, 1.0, 200, extra)
         metrics = srv.metrics_now() or {}
     finally:
-        srv.stop()
-    return {"name": name, "bots": bots, "serverKicks": metrics.get("kicks"), "serverCorrections": metrics.get("corrections"),
-            "droppedEvents": metrics.get("droppedEvents")}
+        rc = srv.stop()
+    return {"name": name, "bots": bots, "serverExit": rc, "serverKicks": metrics.get("kicks"),
+            "serverCorrections": metrics.get("corrections"), "droppedEvents": metrics.get("droppedEvents")}
 
 
 def check_security(r: dict) -> list[str]:
     v = []
+    if r.get("error"):
+        return [r["error"]]
     b = r["bots"]
+    if r.get("serverExit") not in (0, None):
+        v.append(f"cb-server saiu com código {r['serverExit']}")
     others = b["count"] - (1 if "scenarioBot" in b else 0)
     if r["name"] in ("teleport", "flood"):
         sb = b.get("scenarioBot", {})
+        expected = KICK_REASONS[r["name"]]
         if not sb.get("welcomed"):
             v.append("bot 0 não entrou")
         if not sb.get("kicked"):
             v.append("bot 0 não foi expulso")
+        elif sb.get("reason") != expected:
+            v.append(f"motivo do kick '{sb.get('reason')}' (esperado '{expected}')")
         if r["name"] == "teleport":
             if sb.get("correctionsReceived", 0) < 1:
                 v.append("bot 0 não recebeu Correction")
@@ -320,8 +332,15 @@ def run_security(server_bin: Path, bots_bin: Path, out_dir: Path) -> list[dict]:
     results = []
     for name, count, duration, extra, wrong in scenarios:
         log(f"segurança: {name}")
-        r = security_scenario(name, server_bin, bots_bin, out_dir, count, duration, extra, wrong)
+        try:
+            r = security_scenario(name, server_bin, bots_bin, out_dir, count, duration, extra, wrong)
+        except Exception as e:  # registra e segue para os próximos cenários
+            r = {"name": name, "error": f"erro: {e}", "bots": {}}
         r["violations"] = check_security(r)
+        if r.get("error"):
+            log(f"  {name}: FALHOU — {r['error']}")
+            results.append(r)
+            continue
         sb = r["bots"].get("scenarioBot")
         detail = (f"bot 0: expulso={sb['kicked']} motivo='{sb['reason']}' correções={sb['correctionsReceived']} "
                   f"kick após {sb['kickAfterS']:.2f} s") if sb else (
@@ -354,25 +373,34 @@ def main() -> int:
     log(f"cb-bots:   {bots_bin}")
 
     report: dict = {"args": vars(args), "limits": LIMITS, "load": [], "security": []}
-    ok = True
-    if not args.skip_load:
-        r = load_round(args, server_bin, bots_bin, out_dir, 1)
-        print_load(r)
-        report["load"].append(r)
-        if r["violations"] and args.do_assert:
-            log("violação na carga: repetindo 1x")
-            r = load_round(args, server_bin, bots_bin, out_dir, 2)
-            print_load(r)
-            report["load"].append(r)
-        ok = ok and not r["violations"]
-    if not args.skip_security:
-        sec = run_security(server_bin, bots_bin, out_dir)
-        report["security"] = sec
-        ok = ok and all(not s["violations"] for s in sec)
-
-    report["ok"] = ok
     path = out_dir / "report.json"
-    path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    ok = False
+    try:
+        ok = True
+        if not args.skip_load:
+            for attempt in (1, 2):
+                try:
+                    r = load_round(args, server_bin, bots_bin, out_dir, attempt)
+                    print_load(r)
+                except Exception as e:  # erro na rodada (servidor não subiu, bots falharam...) conta como violação
+                    r = {"attempt": attempt, "error": f"erro: {e}", "violations": [f"erro: {e}"]}
+                    log(f"carga #{attempt}: {r['error']}")
+                report["load"].append(r)
+                if not r["violations"] or not args.do_assert or attempt == 2:
+                    break
+                log("violação na carga: repetindo 1x")
+            ok = ok and not r["violations"]
+        if not args.skip_security:
+            sec = run_security(server_bin, bots_bin, out_dir)
+            report["security"] = sec
+            ok = ok and all(not s["violations"] for s in sec)
+    except BaseException as e:
+        ok = False
+        report["error"] = f"{type(e).__name__}: {e}"
+        log(f"erro: {report['error']}")
+    finally:
+        report["ok"] = ok
+        path.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     log(f"relatório: {path}")
     log("RESULTADO: " + ("OK" if ok else "FALHOU"))
     return 1 if (args.do_assert and not ok) else 0
