@@ -12,6 +12,8 @@ import { HttpError } from './errors';
 import { authRoutes } from './routes/auth';
 import { ownerRoutes } from './routes/owner';
 import { ticketRoutes } from './routes/tickets';
+import { serverRoutes } from './routes/servers';
+import { banRoutes } from './routes/bans';
 
 export interface HubDeps {
   config: HubConfig;
@@ -64,6 +66,8 @@ export async function buildApp(deps: HubDeps): Promise<FastifyInstance> {
   await app.register(authRoutes);
   await app.register(ownerRoutes);
   await app.register(ticketRoutes);
+  await app.register(serverRoutes);
+  await app.register(banRoutes);
   // Tasks seguintes registram rotas aqui.
   return app;
 }

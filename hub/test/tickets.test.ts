@@ -50,3 +50,19 @@ describe('tickets', () => {
     expect(r2.statusCode).toBe(200);
   });
 });
+
+describe('rate limit de tickets', () => {
+  it('limita por usuário: 31º → 429; outro usuário no mesmo IP segue 200', async () => {
+    const t = await makeTestApp({ config: { rateLimit: true } });
+    const owner = loginAs(t.store, '1');
+    const { server } = t.store.createServer(owner.user.id, { name: 'Srv', description: '', tags: [], locale: 'pt-BR', useGlobalBans: false }, T0);
+    const a = loginAs(t.store, '77', 'A');
+    const b = loginAs(t.store, '78', 'B');
+    const req = (u: typeof a) => t.app.inject({ method: 'POST', url: '/v1/tickets', headers: u.auth, payload: { serverId: server.id }, remoteAddress: '203.0.113.9' });
+    for (let i = 0; i < 30; i++) expect((await req(a)).statusCode).toBe(200);
+    const r = await req(a);
+    expect(r.statusCode).toBe(429);
+    expect(r.json().error).toBe('rate_limited');
+    expect((await req(b)).statusCode).toBe(200);
+  });
+});
