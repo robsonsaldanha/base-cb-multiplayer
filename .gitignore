@@ -1,0 +1,6 @@
+build/
+dist/
+client/deps/
+.superpowers/
+*.dmp
+*.log

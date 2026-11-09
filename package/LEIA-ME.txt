@@ -1,0 +1,42 @@
+﻿CB-MP spike 0.1.0 - teste de injeção (Castelo Bruxo RP)
+
+1. Feche o jogo (ele precisa estar fechado ao instalar e ao desinstalar).
+2. Ache a pasta do jogo:
+   Steam: biblioteca > botão direito no jogo > Gerenciar > Procurar arquivos locais
+   Epic:  biblioteca > ... > Gerenciar > ícone de pasta
+   Entre em Phoenix\Binaries\Win64 (tem o HogwartsLegacy.exe).
+3. Extraia TODO o conteúdo deste zip ali dentro. Atenção: o "Extrair tudo" do
+   Windows sugere criar uma subpasta "cb-mp-spike\" no caminho. Tire essa
+   subpasta do caminho antes de extrair (ou mova os arquivos para fora dela
+   depois). Os arquivos (INSTALAR.bat, payload\ etc.) devem ficar DIRETO em
+   Phoenix\Binaries\Win64, ao lado do HogwartsLegacy.exe.
+4. Rode INSTALAR.bat. Se o jogo está em C:\Program Files... (comum na Epic),
+   clique com o botão direito no INSTALAR.bat > "Executar como administrador".
+5. Abra o jogo, carregue um save.
+6. Ande uns 10 segundos.
+7. Aperte F8 (deve aparecer um clone do bruxo 2 m à frente). Espere 5 s.
+   Não troque de área nem use viagem rápida entre os dois F8.
+8. Aperte F8 de novo (clone some). Saia do jogo.
+9. Conte o que aconteceu: o jogo fechou sozinho, travou (congelou) ou mostrou
+   alguma janela de erro? Se aparecer uma caixa do UE4SS dizendo
+   "Crashdump written", clique OK.
+10. Mande estes arquivos (de dentro de Phoenix\Binaries\Win64):
+    - ue4ss\Mods\cb-mp\cb-mp.log
+    - ue4ss\UE4SS.log
+    - qualquer arquivo .dmp em ue4ss\ e em ue4ss\Mods\cb-mp\
+    - se existir a pasta %LOCALAPPDATA%\Hogwarts Legacy\Saved\Crashes, a
+      subpasta mais recente dela (cole o caminho na barra do Explorer)
+    Se o cb-mp.log não estiver na pasta do mod, procure em
+    %LOCALAPPDATA%\CasteloBruxo\cb-mp\
+    Se não houver cb-mp.log em lugar nenhum, diga se a janela preta de console
+    do UE4SS apareceu ao abrir o jogo.
+    Faça isso ANTES de desinstalar. (O DESINSTALAR.bat também copia os logs,
+    como cb-mp-ultimo.log e UE4SS-ultimo.log, e os .dmp para ao lado dele, por
+    segurança.)
+11. Para remover tudo: feche o jogo e rode DESINSTALAR.bat (também como
+    administrador se o jogo está em Program Files).
+12. Depois de desinstalar (e de mandar os arquivos), pode apagar payload\, os
+    .bat, este LEIA-ME e os *-ultimo.log.
+
+Uma janela preta de console do UE4SS abre junto com o jogo. É esperado. Não
+feche essa janela durante o teste.
