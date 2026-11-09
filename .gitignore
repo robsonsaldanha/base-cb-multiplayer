@@ -6,3 +6,5 @@ client/deps/
 *.log
 node_modules/
 hub/data/
+build-native/
+vcpkg_installed/

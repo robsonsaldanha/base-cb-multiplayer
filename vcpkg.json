@@ -1,0 +1,13 @@
+{
+  "name": "cbmp-native",
+  "version-string": "0.1.0",
+  "builtin-baseline": "ec48c11eae9448c8c6e7739d93e06fa2433aa95f",
+  "dependencies": [
+    "gamenetworkingsockets",
+    "libsodium",
+    { "name": "cpp-httplib", "features": ["openssl"] },
+    "nlohmann-json",
+    "spdlog",
+    "catch2"
+  ]
+}

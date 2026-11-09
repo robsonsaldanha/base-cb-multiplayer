@@ -1,0 +1,42 @@
+name: native
+on:
+  push:
+    paths: ['proto/**', 'server/**', 'bots/**', 'CMakeLists.txt', 'CMakePresets.json', 'vcpkg.json', 'packages/contracts/test-vectors/**', '.github/workflows/native.yml']
+  pull_request:
+    paths: ['proto/**', 'server/**', 'bots/**', 'CMakeLists.txt', 'CMakePresets.json', 'vcpkg.json', 'packages/contracts/test-vectors/**', '.github/workflows/native.yml']
+concurrency:
+  group: native-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.vcpkg-cache,readwrite"
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-linux-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-linux-
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - run: mkdir -p .vcpkg-cache && echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> $GITHUB_ENV
+      - run: cmake --preset linux-asan && cmake --build --preset linux-asan
+      - run: ctest --test-dir build-native/linux-asan --output-on-failure
+  windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-win-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-win-
+      - run: |
+          New-Item -ItemType Directory -Force .vcpkg-cache | Out-Null
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append
+        shell: pwsh
+      - run: cmake --preset windows-release -G "Visual Studio 17 2022" && cmake --build --preset windows-release
+        shell: pwsh
+      - run: ctest --test-dir build-native/windows-release -C Release --output-on-failure
+        shell: pwsh
