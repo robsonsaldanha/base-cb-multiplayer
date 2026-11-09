@@ -44,6 +44,8 @@ const toStatus = (r: Raw): StatusRow => ({
 export class Store {
   constructor(private readonly db: DB) {}
 
+  close(): void { this.db.close(); }
+
   // ---- usuários
   upsertUserFromDiscord(u: { discordId: string; name: string; avatar: string | null }, now: number): UserRow {
     this.db.prepare(`INSERT INTO users (id, discord_id, name, avatar, created_at) VALUES (?, ?, ?, ?, ?)

@@ -29,7 +29,8 @@ describe('painel', () => {
     ]) {
       expect(res.headers['content-security-policy']).toBe("default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
       expect(res.headers['x-frame-options']).toBe('DENY');
-      expect(res.headers['referrer-policy']).toBe('no-referrer');
+      expect(res.headers['referrer-policy']).toBe('same-origin');
+      expect(res.headers['cache-control']).toBe('no-store');
     }
   });
 
@@ -58,8 +59,69 @@ describe('painel', () => {
     const { server } = store.createServer(user.id, { name: 'Srv', description: '', tags: [], locale: 'pt-BR', useGlobalBans: false }, T0);
     const rot = await app.inject({ method: 'POST', url: `/panel/servers/${server.id}/rotate`, cookies, headers: ORIGIN });
     expect(rot.body).toMatch(/sk_[A-Za-z0-9_-]{43}/);
-    const del = await app.inject({ method: 'POST', url: `/panel/servers/${server.id}/delete`, cookies, headers: ORIGIN });
+    const del = await app.inject({ method: 'POST', url: `/panel/servers/${server.id}/delete`, cookies, headers: FORM, payload: 'confirm=1' });
     expect(del.statusCode).toBe(303);
+    expect(store.listServersByOwner(user.id)).toHaveLength(0);
+  });
+
+  it('CSRF: Origin null + Sec-Fetch-Site same-origin passa; sem Sec-Fetch-Site ou cross-site é 403', async () => {
+    const { app, cookies } = await panelSession();
+    const h = (extra: Record<string, string>) => ({ 'content-type': 'application/x-www-form-urlencoded', ...extra });
+    const ok = await app.inject({ method: 'POST', url: '/panel/servers', cookies, headers: h({ origin: 'null', 'sec-fetch-site': 'same-origin' }), payload: 'name=Castelo' });
+    expect(ok.statusCode).toBe(200);
+    const ok2 = await app.inject({ method: 'POST', url: '/panel/servers', cookies, headers: h({ 'sec-fetch-site': 'same-origin' }), payload: 'name=Castelo2' });
+    expect(ok2.statusCode).toBe(200);
+    expect((await app.inject({ method: 'POST', url: '/panel/servers', cookies, headers: h({ origin: 'null' }), payload: 'name=Castelo3' })).statusCode).toBe(403);
+    expect((await app.inject({ method: 'POST', url: '/panel/servers', cookies, headers: h({ origin: 'null', 'sec-fetch-site': 'cross-site' }), payload: 'name=Castelo3' })).statusCode).toBe(403);
+  });
+
+  it('erros do painel são HTML', async () => {
+    const { app, cookies } = await panelSession();
+    const r401 = await app.inject({ method: 'POST', url: '/panel/servers', headers: FORM, payload: 'name=Castelo' });
+    expect(r401.statusCode).toBe(401);
+    expect(r401.headers['content-type']).toContain('text/html');
+    expect(r401.body).toContain('/v1/auth/discord/login?client=panel');
+    const r403 = await app.inject({ method: 'POST', url: '/panel/servers', cookies, headers: { origin: 'https://evil.example', 'content-type': 'application/x-www-form-urlencoded' }, payload: 'name=Castelo' });
+    expect(r403.statusCode).toBe(403);
+    expect(r403.headers['content-type']).toContain('text/html');
+    expect(r403.body).toContain('Ação bloqueada (origem inválida). Recarregue o painel e tente de novo.');
+    const r404 = await app.inject({ method: 'POST', url: '/panel/servers/nope/rotate', cookies, headers: ORIGIN });
+    expect(r404.statusCode).toBe(404);
+    expect(r404.headers['content-type']).toContain('text/html');
+    expect(r404.body).toContain('Servidor não encontrado');
+    expect(r404.body).toContain('href="/panel"');
+    const r400 = await app.inject({ method: 'POST', url: '/panel/servers', cookies, headers: ORIGIN });
+    expect(r400.statusCode).toBe(400);
+    expect(r400.headers['content-type']).toContain('text/html');
+    expect(r400.body).toContain('Seus servidores');
+    const api = await app.inject({ method: 'GET', url: '/v1/me' });
+    expect(api.headers['content-type']).toContain('application/json');
+  });
+
+  it('HTML válido: link-botão, sem form dentro de p, & escapado', async () => {
+    const t = await makeTestApp({ config: { devLogin: true } });
+    const anon = await t.app.inject({ method: 'GET', url: '/panel' });
+    expect(anon.body).toContain('class="btn"');
+    expect(anon.body).not.toContain('<button>Entrar');
+    expect(anon.body).toContain('client=panel&amp;discordId=1&amp;name=Dev');
+    const { app, cookies } = await panelSession();
+    const res = await app.inject({ method: 'GET', url: '/panel', cookies });
+    expect(res.body).not.toMatch(/<p>[^]*?<form[^]*?<\/p>/);
+  });
+
+  it('apagar pede confirmação sem JS', async () => {
+    const { app, cookies, store, user } = await panelSession();
+    const { server } = store.createServer(user.id, { name: 'Srv <i>', description: '', tags: [], locale: 'pt-BR', useGlobalBans: false }, T0);
+    const url = `/panel/servers/${server.id}/delete`;
+    const ask = await app.inject({ method: 'POST', url, cookies, headers: ORIGIN });
+    expect(ask.statusCode).toBe(200);
+    expect(ask.body).toContain('Srv &lt;i&gt;');
+    expect(ask.body).toContain('name="confirm" value="1"');
+    expect(ask.body).toContain('href="/panel"');
+    expect(store.listServersByOwner(user.id)).toHaveLength(1);
+    const del = await app.inject({ method: 'POST', url, cookies, headers: FORM, payload: 'confirm=1' });
+    expect(del.statusCode).toBe(303);
+    expect(del.headers.location).toBe('/panel');
     expect(store.listServersByOwner(user.id)).toHaveLength(0);
   });
 

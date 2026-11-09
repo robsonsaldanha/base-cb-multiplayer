@@ -15,6 +15,7 @@ a,button{color:#d9b45a}button{background:#2a2238;border:1px solid #d9b45a;paddin
 input,textarea{width:100%;padding:.4rem;background:#1e1829;color:inherit;border:1px solid #4a3d63;border-radius:6px}
 table{width:100%;border-collapse:collapse}td,th{padding:.4rem;border-bottom:1px solid #2f2642;text-align:left}
 .key{font-family:monospace;background:#0c0a12;padding:.6rem;border:1px solid #d9b45a;word-break:break-all}
+.btn{display:inline-block;text-decoration:none;background:#2a2238;border:1px solid #d9b45a;padding:.35rem .8rem;border-radius:6px}
 .err{color:#ff8a8a}.ok{color:#8affb0}form.inline{display:inline}
 </style></head><body>${body}</body></html>`;
 }
@@ -27,11 +28,40 @@ export async function panelRoutes(app: FastifyInstance) {
   app.addHook('onSend', async (_req, reply) => {
     reply.header('content-security-policy', "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
     reply.header('x-frame-options', 'DENY');
-    reply.header('referrer-policy', 'no-referrer');
+    reply.header('referrer-policy', 'same-origin');
+    reply.header('cache-control', 'no-store');
+  });
+
+  /** CSRF: Origin igual ao publicUrl, ou Origin ausente/"null" com Sec-Fetch-Site same-origin. */
+  function checkOrigin(req: FastifyRequest): void {
+    const o = req.headers.origin;
+    const ok = o === origin || ((o === undefined || o === 'null') && req.headers['sec-fetch-site'] === 'same-origin');
+    if (!ok) throw new HttpError(403, 'bad_origin', 'origem inválida');
+  }
+
+  const loginLink = '<a class="btn" href="/v1/auth/discord/login?client=panel">Entrar com Discord</a>';
+
+  app.setErrorHandler((err, req, reply) => {
+    const send = (status: number, html: string) => reply.status(status).type('text/html; charset=utf-8').send(html);
+    if (err instanceof HttpError) {
+      if (err.status === 401) return send(401, page('Painel', `<h1>Painel de servidores</h1><p class="err">Faça login para continuar.</p><p>${loginLink}</p>`));
+      if (err.status === 403) return send(403, page('Ação bloqueada', `<h1>Ação bloqueada</h1><p class="err">Ação bloqueada (origem inválida). Recarregue o painel e tente de novo.</p><p><a href="/panel">Voltar ao painel</a></p>`));
+      if (err.status === 404) return send(404, page('Não encontrado', `<h1>Servidor não encontrado</h1><p><a href="/panel">Voltar ao painel</a></p>`));
+    }
+    if (err instanceof ZodError) {
+      const u = currentUser(req);
+      const msg = err.issues.map((i) => `${i.path.join('.') || '(corpo)'}: ${i.message}`).join('; ');
+      if (!u) return send(401, page('Painel', `<h1>Painel de servidores</h1><p class="err">Faça login para continuar.</p><p>${loginLink}</p>`));
+      return send(400, dashboard(u, `<p class="err">${esc(msg)}</p>`));
+    }
+    const status = (err as { statusCode?: number }).statusCode;
+    if (status && status >= 400 && status < 500) return send(status, page('Erro', `<h1>Requisição inválida</h1><p class="err">${esc((err as Error).message)}</p><p><a href="/panel">Voltar ao painel</a></p>`));
+    req.log.error(err);
+    return send(500, page('Erro', '<h1>Erro interno</h1><p><a href="/panel">Voltar ao painel</a></p>'));
   });
 
   function requirePanelUser(req: FastifyRequest): UserRow {
-    if (req.headers.origin !== origin) throw new HttpError(403, 'bad_origin', 'origem inválida');
+    checkOrigin(req);
     const u = currentUser(req);
     if (!u) throw new HttpError(401, 'unauthorized', 'faça login');
     return u;
@@ -48,7 +78,7 @@ export async function panelRoutes(app: FastifyInstance) {
     }).join('');
     return page('Painel - servidores', `
       <h1>Seus servidores</h1>
-      <p>Logado como <b>${esc(user.name)}</b> <form class="inline" method="post" action="/panel/logout"><button>Sair</button></form></p>
+      <div>Logado como <b>${esc(user.name)}</b> <form class="inline" method="post" action="/panel/logout"><button>Sair</button></form></div>
       ${extra}
       <table><tr><th>Servidor</th><th>Estado</th><th></th></tr>${rows || '<tr><td colspan="3">Nenhum servidor ainda.</td></tr>'}</table>
       <h2>Novo servidor (máx. ${MAX_SERVERS_PER_OWNER})</h2>
@@ -68,8 +98,8 @@ export async function panelRoutes(app: FastifyInstance) {
     const u = currentUser(req);
     if (!u) {
       const dev = config.devLogin
-        ? `<p><a href="/v1/auth/dev-login?client=panel&discordId=1&name=Dev">Entrar como Dev (somente local)</a></p>` : '';
-      return sendHtml(reply, page('Painel', `<h1>Painel de servidores</h1><p><a href="/v1/auth/discord/login?client=panel"><button>Entrar com Discord</button></a></p>${dev}`));
+        ? `<p><a href="/v1/auth/dev-login?client=panel&amp;discordId=1&amp;name=Dev">Entrar como Dev (somente local)</a></p>` : '';
+      return sendHtml(reply, page('Painel', `<h1>Painel de servidores</h1><p>${loginLink}</p>${dev}`));
     }
     return sendHtml(reply, dashboard(u));
   });
@@ -104,12 +134,20 @@ export async function panelRoutes(app: FastifyInstance) {
   app.post('/panel/servers/:id/delete', async (req, reply) => {
     const u = requirePanelUser(req);
     const { id } = z.object({ id: z.string().max(64) }).parse(req.params);
+    const srv = store.getServer(id);
+    if (!srv || srv.ownerId !== u.id) throw new HttpError(404, 'not_found', 'servidor não encontrado');
+    const confirm = (req.body as { confirm?: unknown } | undefined)?.confirm;
+    if (confirm !== '1') {
+      return sendHtml(reply, page('Apagar servidor', `<h1>Apagar servidor</h1><p>Apagar <b>${esc(srv.name)}</b>? Isso não pode ser desfeito.</p>
+        <form method="post" action="/panel/servers/${esc(srv.id)}/delete"><input type="hidden" name="confirm" value="1"><button>Sim, apagar</button></form>
+        <p><a href="/panel">Cancelar</a></p>`));
+    }
     if (!store.deleteServer(id, u.id)) throw new HttpError(404, 'not_found', 'servidor não encontrado');
     return reply.redirect('/panel', 303);
   });
 
   app.post('/panel/logout', async (req, reply) => {
-    if (req.headers.origin !== origin) throw new HttpError(403, 'bad_origin', 'origem inválida');
+    checkOrigin(req);
     const token = req.cookies[SESSION_COOKIE];
     if (token) store.deleteSessionByAccess(token);
     reply.clearCookie(SESSION_COOKIE, { path: '/' });
