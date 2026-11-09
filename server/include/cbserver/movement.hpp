@@ -15,6 +15,8 @@ enum class MoveVerdict { Ok, Corrected };
 
 // Distância 3D desde a última posição aceita > maxSpeed(maior entre o estado anterior e o novo)
 // * (1+tol) * dt + slack → Corrected. maxSpeed 0 (aparatar) → só slack. Estado fora da tabela → Corrected.
+// Se algum dos estados é queda: horizontal e subida limitados pelo maior estado que não é queda (corrida se
+// ambos são queda); só a descida usa o limite de queda.
 MoveVerdict validateMove(const cbmp::PlayerState& last, const cbmp::PlayerState& next, double dtSec,
                          const MovementLimits& limits);
 

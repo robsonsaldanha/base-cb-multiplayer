@@ -27,6 +27,8 @@ VisibleSet computeVisible(EntityId viewer, const cbmp::Vec3i& viewerPos, const V
                           const Grid& grid, const std::function<const cbmp::Vec3i&(EntityId)>& posOf,
                           const VisibilityParams& p, std::vector<EntityId>& scratch) {
   // Buffer reaproveitado por thread: sem alocação por entidade em regime.
+  // .first = distância² usada para o teto: quem já era visível ganha 10% de distância (×0,81 no quadrado),
+  // para não piscar quando há muitos candidatos perto do 128º.
   thread_local std::vector<std::pair<int64_t, EntityId>> cand;
   cand.clear();
   const int64_t enter2 = sq(p.enterCm), exit2 = sq(std::max(p.enterCm, p.exitCm));
@@ -34,8 +36,9 @@ VisibleSet computeVisible(EntityId viewer, const cbmp::Vec3i& viewerPos, const V
   for (EntityId id : scratch) {
     if (id == viewer) continue;
     const int64_t d2 = distSq(viewerPos, posOf(id));
-    if (d2 < enter2 || (d2 <= exit2 && std::binary_search(previous.ids.begin(), previous.ids.end(), id)))
-      cand.emplace_back(d2, id);
+    if (d2 > exit2) continue;
+    const bool was = std::binary_search(previous.ids.begin(), previous.ids.end(), id);
+    if (d2 < enter2 || was) cand.emplace_back(was ? d2 * 81 / 100 : d2, id);
   }
   if (cand.size() > p.maxVisible) {
     std::nth_element(cand.begin(), cand.begin() + static_cast<std::ptrdiff_t>(p.maxVisible), cand.end());

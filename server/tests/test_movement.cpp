@@ -55,3 +55,31 @@ TEST_CASE("movement uses 3D distance and huge jumps do not overflow") {
   far.pos.y = INT32_MIN;
   REQUIRE(validateMove(at(INT32_MIN, MoveState::Walk), far, 0.05, limits()) == MoveVerdict::Corrected);
 }
+
+TEST_CASE("movement fall limit applies only to downward displacement") {
+  PlayerState a = at(0, MoveState::Fall);
+  PlayerState b = a;
+  b.pos.z = -3000;  // queda: 6000 * 1.2 * 0.5 + 50 = 3650
+  REQUIRE(validateMove(a, b, 0.5, limits()) == MoveVerdict::Ok);
+  b.pos.z = 3000;  // "cair" para cima
+  REQUIRE(validateMove(a, b, 0.5, limits()) == MoveVerdict::Corrected);
+  // horizontal declarando queda: limitado pela corrida (900 * 1.2 * 0.5 + 50 = 590)
+  b = a;
+  b.pos.x = 3000;
+  REQUIRE(validateMove(a, b, 0.5, limits()) == MoveVerdict::Corrected);
+  b.pos.x = 500;
+  REQUIRE(validateMove(a, b, 0.5, limits()) == MoveVerdict::Ok);
+  // parado → "caindo" não vira 6000 cm/s em 3D
+  PlayerState idle = at(0, MoveState::Idle);
+  PlayerState fall = at(2500, MoveState::Fall);
+  fall.pos.y = 2500;
+  fall.pos.z = -100;
+  REQUIRE(validateMove(idle, fall, 0.5, limits()) == MoveVerdict::Corrected);
+  // andando → caindo: horizontal pelo maior não-queda (andar) — 400 * 1.2 * 0.5 + 50 = 290
+  PlayerState walk = at(0, MoveState::Walk);
+  PlayerState fall2 = at(280, MoveState::Fall);
+  fall2.pos.z = -2000;
+  REQUIRE(validateMove(walk, fall2, 0.5, limits()) == MoveVerdict::Ok);
+  fall2.pos.x = 400;
+  REQUIRE(validateMove(walk, fall2, 0.5, limits()) == MoveVerdict::Corrected);
+}

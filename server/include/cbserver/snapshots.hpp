@@ -15,20 +15,21 @@ namespace cbserver {
 // logo é idêntico para qualquer número de workers.
 //
 // Regras por slot: baseline = sent[lastAckTick] se baselineFresh e ainda no anel; senão vazia (baselineTick 0).
-// Para cada id visível cujo tier "toca" no tick (tick % tier == id % tier): máscara = campos diferentes
-// da baseline (kMaskAll se ausente); inclui se máscara != 0. O registro deste tick = baseline (restrita
-// aos visíveis) mesclada com o que foi enviado. Sempre envia um Snapshot (mesmo vazio).
+// Para cada id visível cujo tier "toca" no tick (tick % tier == id % tier): cbmp::makeSnapshotEntity contra o
+// estado conhecido pelo cliente (completo se ausente); inclui se houver mudança. O registro deste tick =
+// baseline (restrita aos visíveis) + cbmp::applySnapshotEntity do que foi enviado — o mesmo cálculo do cliente.
+// Sempre envia um Snapshot (mesmo vazio); acima de kMaxSnapshotBytes, divide em partes do mesmo tick.
 class SnapshotBuilder {
  public:
   explicit SnapshotBuilder(TaskPool& pool) : pool_(pool) {}
   void build(uint32_t tick, std::vector<PlayerSlot*>& slots,
              const std::function<const cbmp::PlayerState&(EntityId)>& stateOf, std::vector<Outgoing>& out);
 
-  static uint8_t diffMask(const cbmp::PlayerState& a, const cbmp::PlayerState& b);
 
  private:
   TaskPool& pool_;
   std::vector<cbmp::Snapshot> results_;
+  std::vector<std::vector<cbmp::Snapshot>> parts_;  // só quando o snapshot passa de kMaxSnapshotBytes
 };
 
 }  // namespace cbserver

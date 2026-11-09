@@ -38,7 +38,9 @@ struct PlayerSlot {
   cbmp::PlayerState state;
   uint32_t lastInputSeq = 0;
   double lastInputTime = 0;  // instante do último input aceito (ou do último setState)
-  std::deque<double> correctionTimes;
+  std::deque<double> correctionTimes;  // um registro por incidente (não por Correction repetida)
+  bool correcting = false;             // janela após Correction: inputs longe da posição corrigida são ignorados
+  double correctionSince = 0;
   VisibleSet visible;
   std::unordered_map<std::string, TokenBucket> eventBuckets;
   std::deque<double> eventViolations;
@@ -67,12 +69,16 @@ class World {
   explicit World(const ServerConfig& cfg);
   ~World();
 
-  std::optional<EntityId> addPlayer(std::string sub, std::string did, std::string name, double now);
+  // Ocupa o menor id livre; aplica `spawn` e enfileira Correction{seq 0, pos, vel} para o próprio jogador.
+  std::optional<EntityId> addPlayer(std::string sub, std::string did, std::string name, double now,
+                                    const cbmp::PlayerState& spawn = cbmp::PlayerState{});
   // Remove o jogador; os que o viam recebem EntityLeave no próximo tick.
   void removePlayer(EntityId id);
   // Posicionamento autoritativo (spawn/teleporte do servidor): aplica o estado e envia Correction.
   void setState(EntityId id, const cbmp::PlayerState& s, double now);
 
+  // Ignora seq ≤ último. Com Correction pendente (janela de 1 s), ignora inputs longe (> slack) da posição
+  // corrigida; um input perto dela fecha a janela. Cada Correction é um incidente; > 10 em 10 s → kick.
   void onInput(EntityId id, const cbmp::Input& in, double now);
   bool onEvent(EntityId id, const cbmp::Event& ev, double now);  // false = descartado
   void onSnapshotAck(EntityId id, uint32_t tick, double now);
@@ -91,6 +97,7 @@ class World {
   PlayerSlot* slot(EntityId id);
   void orderKick(PlayerSlot& s, const char* reason);
   void forget(PlayerSlot& viewer, EntityId gone);  // tira `gone` das baselines do viewer
+  void sendCorrection(PlayerSlot& p, uint32_t seq, double now);  // enfileira e abre a janela
 
   ServerConfig cfg_;
   MovementLimits limits_;

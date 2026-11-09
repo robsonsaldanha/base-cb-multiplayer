@@ -59,38 +59,118 @@ TEST_CASE("world input with repeated or older seq is ignored") {
   REQUIRE(h.world.find(a)->lastInputSeq == 5);
 }
 
-TEST_CASE("world teleport yields Correction and 11 in 10 s yield KickOrder") {
+TEST_CASE("world lag spike after one teleport is a single incident without kick") {
   Harness h;
   auto a = h.add("ana");
+  h.world.onInput(a, input(1, {0, 0, 0}), 0.05);  // fecha a janela do spawn
   h.step();
   h.out.clear();
-  for (uint32_t i = 1; i <= 10; ++i) h.world.onInput(a, input(i, {100'000, 0, 0}), h.now + 0.05 * i);
+  // 1 teleporte + 5 inputs ainda baseados na posição errada (RTT 250 ms)
+  for (uint32_t i = 2; i <= 7; ++i)
+    h.world.onInput(a, input(i, {100'000 + 20 * static_cast<int32_t>(i), 0, 0}), 0.05 + 0.05 * i);
   REQUIRE(h.world.find(a)->state.pos.x == 0);
-  h.step(0.6);
+  REQUIRE(h.world.find(a)->lastInputSeq == 7);
+  // cliente aplicou a Correction e volta perto da posição corrigida
+  h.world.onInput(a, input(8, {10, 0, 0}), 0.45);
+  REQUIRE(h.world.find(a)->state.pos.x == 10);
+  h.step();
   auto c = h.msgs<Correction>(a);
-  REQUIRE(c.size() == 10);
-  REQUIRE(c[0].seq == 1);
-  REQUIRE(c[9].seq == 10);
-  REQUIRE(c[9].pos.x == 0);
+  REQUIRE(c.size() == 1);
+  REQUIRE(c[0].seq == 2);
+  REQUIRE(c[0].pos.x == 0);
+  REQUIRE(h.world.find(a)->correctionTimes.size() == 1);
   REQUIRE(h.kicks.empty());
+}
 
-  h.world.onInput(a, input(11, {100'000, 0, 0}), h.now);
+TEST_CASE("world correction window ends after 1 s and counts a new incident") {
+  Harness h;
+  auto a = h.add("ana");
+  h.step(0);  // descarta a Correction do spawn
+  h.world.onInput(a, input(1, {0, 0, 0}), 0.0625);
+  h.world.onInput(a, input(2, {100'000, 0, 0}), 0.125);
+  h.world.onInput(a, input(3, {100'000, 0, 0}), 1.0);    // ainda na janela: ignorado
+  h.world.onInput(a, input(4, {100'000, 0, 0}), 1.125);  // janela venceu: novo incidente
+  h.step();
+  REQUIRE(h.msgs<Correction>(a).size() == 2);
+  REQUIRE(h.world.find(a)->correctionTimes.size() == 2);
+}
+
+TEST_CASE("world continuous cheater is kicked after 11 incidents in 10 s") {
+  Harness h;
+  auto a = h.add("ana");
+  h.step(0);  // descarta a Correction do spawn
+  h.world.onInput(a, input(1, {0, 0, 0}), 0.0);
+  // 16 inputs/s (passo exato em binário) sempre teleportados: um incidente por segundo
+  uint32_t seq = 2;
+  double t = 0.0625;
+  for (; t < 10.0; t += 0.0625) h.world.onInput(a, input(seq++, {100'000, 0, 0}), t);
+  h.step();
+  REQUIRE(h.msgs<Correction>(a).size() == 10);
+  REQUIRE(h.kicks.empty());
+  for (; t <= 10.0625; t += 0.0625) h.world.onInput(a, input(seq++, {100'000, 0, 0}), t);
   h.step();
   REQUIRE(h.msgs<Correction>(a).size() == 1);
   REQUIRE(h.kicks.size() == 1);
   REQUIRE(h.kicks[0].who == a);
   REQUIRE(h.kicks[0].reason == "movimento inválido");
+  h.world.onInput(a, input(seq++, {100'000, 0, 0}), 12.0);
   h.step();
   REQUIRE(h.kicks.empty());  // ordem emitida uma única vez
 }
 
-TEST_CASE("world corrections older than 10 s do not count toward kick") {
+TEST_CASE("world isolated teleports every 1.125 s count one incident each") {
   Harness h;
   auto a = h.add("ana");
-  for (uint32_t i = 1; i <= 10; ++i) h.world.onInput(a, input(i, {100'000, 0, 0}), 0.1 * i);
-  h.world.onInput(a, input(11, {100'000, 0, 0}), 11.0);
-  h.step(11.0);
+  h.step(0);  // descarta a Correction do spawn
+  uint32_t seq = 1;
+  h.world.onInput(a, input(seq++, {0, 0, 0}), 0.0);
+  for (int k = 1; k <= 11; ++k) {
+    const double t = 1.125 * k;
+    h.world.onInput(a, input(seq++, {100'000, 0, 0}), t);
+    h.world.onInput(a, input(seq++, {0, 0, 0}), t + 0.5);  // volta ao corrigido: fecha a janela
+  }
+  h.step(13.0);
+  REQUIRE(h.msgs<Correction>(a).size() == 11);
+  // > 10 em 10 s exige período < 1 s; com 1,125 s cabem no máximo 9 na janela
   REQUIRE(h.kicks.empty());
+}
+
+TEST_CASE("world spawn sets state and queues Correction with seq 0") {
+  Harness h;
+  cbmp::PlayerState sp;
+  sp.pos = {5000, -300, 120};
+  sp.vel = {10, 0, 0};
+  auto id = h.world.addPlayer("s", "d", "nome", 0.0, sp);
+  REQUIRE(id.has_value());
+  REQUIRE(h.world.find(*id)->state == sp);
+  h.step();
+  auto c = h.msgs<Correction>(*id);
+  REQUIRE(c.size() == 1);
+  REQUIRE(c[0].seq == 0);
+  REQUIRE(c[0].pos == sp.pos);
+  REQUIRE(c[0].vel == sp.vel);
+  // inputs atrasados da posição antiga (origem) são ignorados sem contar incidente
+  h.world.onInput(*id, input(1, {0, 0, 0}), 0.06);
+  REQUIRE(h.world.find(*id)->state.pos == sp.pos);
+  REQUIRE(h.world.find(*id)->correctionTimes.empty());
+}
+
+TEST_CASE("world setState queues Correction and opens a window") {
+  Harness h;
+  auto a = h.add("ana");
+  h.world.onInput(a, input(3, {0, 0, 0}), 0.05);
+  h.step();
+  cbmp::PlayerState t;
+  t.pos = {90'000, 0, 0};
+  h.world.setState(a, t, h.now);
+  h.world.onInput(a, input(4, {20, 0, 0}), h.now + 0.05);  // ainda da posição antiga
+  h.step();
+  auto c = h.msgs<Correction>(a);
+  REQUIRE(c.size() == 1);
+  REQUIRE(c[0].seq == 3);
+  REQUIRE(c[0].pos.x == 90'000);
+  REQUIRE(h.world.find(a)->state.pos.x == 90'000);
+  REQUIRE(h.world.find(a)->correctionTimes.empty());
 }
 
 TEST_CASE("world event flood yields KickOrder") {

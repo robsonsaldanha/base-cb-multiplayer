@@ -31,10 +31,9 @@ struct Harness {
   }
 
   cbserver::EntityId add(const std::string& name, cbmp::Vec3i pos = {}) {
-    auto id = world.addPlayer("sub-" + name, "did-" + name, name, now);
     cbmp::PlayerState s;
     s.pos = pos;
-    world.setState(*id, s, now);
+    auto id = world.addPlayer("sub-" + name, "did-" + name, name, now, s);
     return *id;
   }
 
@@ -46,6 +45,9 @@ struct Harness {
         if (const T* p = std::get_if<T>(&o.msg)) r.push_back(*p);
     return r;
   }
+
+  // Partes do snapshot deste tick para o destinatário, na ordem.
+  std::vector<cbmp::Snapshot> snaps(cbserver::EntityId to) const { return msgs<cbmp::Snapshot>(to); }
 
   const cbmp::SnapshotEntity* entityIn(cbserver::EntityId to, cbserver::EntityId id) const {
     for (const auto& o : out)

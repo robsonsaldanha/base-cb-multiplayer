@@ -88,3 +88,28 @@ TEST_CASE("visibility tier by distance") {
   REQUIRE(tierFor(sq(100)) == Tier::Mid);
   REQUIRE(tierFor(sq(200)) == Tier::Far);
 }
+
+TEST_CASE("visibility cap gives already visible entities a 10 percent distance bonus") {
+  Fixture f;
+  f.put(1, {0, 0, 0});
+  // 127 bem perto + o 128º visível a 100 m + desafiante a 98 m (2% mais perto)
+  for (EntityId i = 0; i < 127; ++i) f.put(static_cast<EntityId>(10 + i), {0, 100 + i, 0});
+  f.put(500, {10'000, 0, 0});
+  f.put(501, {0, 9'800, 0});
+  auto first = f.run(1, {});
+  REQUIRE(first.ids.size() == 128);
+  REQUIRE(has(first, 501));  // sem histórico: o mais perto entra
+  VisibleSet prev;
+  for (EntityId i = 0; i < 127; ++i) prev.ids.push_back(static_cast<EntityId>(10 + i));
+  prev.ids.push_back(500);
+  // estável por vários ticks: nada pisca
+  for (int k = 0; k < 3; ++k) {
+    auto v = f.run(1, prev);
+    REQUIRE(v.ids == prev.ids);
+  }
+  // desafiante bem mais perto (20%) troca
+  f.put(501, {0, 8'000, 0});
+  auto v = f.run(1, prev);
+  REQUIRE(has(v, 501));
+  REQUIRE_FALSE(has(v, 500));
+}

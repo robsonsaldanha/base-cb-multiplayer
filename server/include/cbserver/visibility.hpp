@@ -27,7 +27,8 @@ struct VisibleSet {
 };
 
 // Novo conjunto visível: candidatos da grade; entra quem está < enter; quem já estava visível fica até
-// > exit; limita a maxVisible pelos mais próximos (desempate por id); nunca inclui o próprio viewer.
+// > exit; limita a maxVisible pelos mais próximos (quem já era visível conta 10% mais perto; desempate por id);
+// nunca inclui o próprio viewer.
 VisibleSet computeVisible(EntityId viewer, const cbmp::Vec3i& viewerPos, const VisibleSet& previous,
                           const Grid& grid, const std::function<const cbmp::Vec3i&(EntityId)>& posOf,
                           const VisibilityParams& p, std::vector<EntityId>& scratch);

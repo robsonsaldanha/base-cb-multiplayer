@@ -12,6 +12,7 @@ constexpr double kWindowSec = 10.0;      // janela de correções/violações
 constexpr size_t kMaxCorrections = 10;   // > 10 em 10 s → kick
 constexpr double kMaxMoveDtSec = 1.0;    // dt do validador nunca passa disso
 constexpr double kBaselineMaxAgeSec = 1.0;
+constexpr double kCorrectionWindowSec = 1.0;  // após uma Correction, não envia/conta outra por até 1 s
 
 void trimWindow(std::deque<double>& q, double now) {
   while (!q.empty() && q.front() < now - kWindowSec) q.pop_front();
@@ -50,7 +51,8 @@ PlayerSlot* World::slot(EntityId id) { return id < slots_.size() ? slots_[id].ge
 
 const PlayerSlot* World::find(EntityId id) const { return id < slots_.size() ? slots_[id].get() : nullptr; }
 
-std::optional<EntityId> World::addPlayer(std::string sub, std::string did, std::string name, double now) {
+std::optional<EntityId> World::addPlayer(std::string sub, std::string did, std::string name, double now,
+                                         const cbmp::PlayerState& spawn) {
   for (size_t i = 1; i < slots_.size(); ++i) {
     if (slots_[i]) continue;
     auto p = std::make_unique<PlayerSlot>();
@@ -59,8 +61,10 @@ std::optional<EntityId> World::addPlayer(std::string sub, std::string did, std::
     p->did = std::move(did);
     p->name = std::move(name);
     clampName(p->name);
+    p->state = spawn;
     p->lastInputTime = now;
     grid_.upsert(p->id, p->state.pos);
+    sendCorrection(*p, 0, now);
     active_.insert(std::lower_bound(active_.begin(), active_.end(), p->id), p->id);
     slots_[i] = std::move(p);
     return static_cast<EntityId>(i);
@@ -96,7 +100,13 @@ void World::setState(EntityId id, const cbmp::PlayerState& s, double now) {
   p->state = s;
   p->lastInputTime = now;
   grid_.upsert(id, s.pos);
-  pending_.push_back(Outgoing{id, cbmp::Correction{p->lastInputSeq, s.pos, s.vel}});
+  sendCorrection(*p, p->lastInputSeq, now);
+}
+
+void World::sendCorrection(PlayerSlot& p, uint32_t seq, double now) {
+  pending_.push_back(Outgoing{p.id, cbmp::Correction{seq, p.state.pos, p.state.vel}});
+  p.correcting = true;
+  p.correctionSince = now;
 }
 
 void World::orderKick(PlayerSlot& s, const char* reason) {
@@ -109,6 +119,13 @@ void World::onInput(EntityId id, const cbmp::Input& in, double now) {
   PlayerSlot* p = slot(id);
   if (!p || p->kicked || in.seq <= p->lastInputSeq) return;
   p->lastInputSeq = in.seq;
+  if (p->correcting) {
+    const auto slack = static_cast<int64_t>(limits_.slackCm);
+    if (now - p->correctionSince >= kCorrectionWindowSec || distSq(in.s.pos, p->state.pos) <= slack * slack)
+      p->correcting = false;  // cliente aplicou a correção (ou a janela venceu): valida normalmente
+    else
+      return;  // input ainda baseado na posição antiga (latência): ignorado, sem novo incidente
+  }
   const double dt = std::clamp(now - p->lastInputTime, minDt_, kMaxMoveDtSec);
   if (validateMove(p->state, in.s, dt, limits_) == MoveVerdict::Ok) {
     p->state = in.s;
@@ -116,7 +133,7 @@ void World::onInput(EntityId id, const cbmp::Input& in, double now) {
     grid_.upsert(id, in.s.pos);
     return;
   }
-  pending_.push_back(Outgoing{id, cbmp::Correction{in.seq, p->state.pos, p->state.vel}});
+  sendCorrection(*p, in.seq, now);
   p->correctionTimes.push_back(now);
   trimWindow(p->correctionTimes, now);
   if (p->correctionTimes.size() > kMaxCorrections) orderKick(*p, "movimento inválido");
