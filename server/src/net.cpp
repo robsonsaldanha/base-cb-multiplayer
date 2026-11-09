@@ -158,6 +158,7 @@ void NetServer::stop() {
     sendTo(conn, cbmp::Kick{"servidor encerrando"});
     sockets->CloseConnection(conn, kEndKicked, "servidor encerrando", true);
     world_.removePlayer(s.id);
+    metrics_.removePlayer(s.id);
   }
   for (auto& [conn, p] : pending_) sockets->CloseConnection(conn, kEndKicked, "servidor encerrando", false);
   sessions_.clear();
@@ -218,6 +219,7 @@ void NetServer::onStatus(SteamNetConnectionStatusChangedCallback_t* info) {
       } else if (auto it = sessions_.find(conn); it != sessions_.end()) {
         spdlog::info("jogador {} desconectou", it->second.id);
         world_.removePlayer(it->second.id);
+        metrics_.removePlayer(it->second.id);
         connOf_.erase(it->second.id);
         connBySub_.erase(it->second.sub);
         sessions_.erase(it);
@@ -257,7 +259,27 @@ void NetServer::pump(double now, std::vector<Inbound>& in) {
     dropPending(conn);
     closeConn(conn, "tempo esgotado para Hello", false);
   }
+  if (now - lastWireSample_ >= 1.0) {
+    lastWireSample_ = now;
+    sampleWire();
+  }
   updateGauges();
+}
+
+void NetServer::sampleWire() {
+  auto* sockets = SteamNetworkingSockets();
+  double sum = 0, mx = 0;
+  size_t n = 0;
+  for (const auto& [conn, s] : sessions_) {
+    (void)s;
+    SteamNetConnectionRealTimeStatus_t st{};
+    if (sockets->GetConnectionRealTimeStatus(conn, &st, 0, nullptr) != k_EResultOK) continue;
+    const double kbps = static_cast<double>(st.m_flOutBytesPerSec) * 8.0 / 1000.0;
+    sum += kbps;
+    mx = std::max(mx, kbps);
+    ++n;
+  }
+  metrics_.setWireOut(n ? sum / static_cast<double>(n) : 0.0, mx);
 }
 
 void NetServer::onMessage(uint32_t conn, const uint8_t* data, size_t size, std::vector<Inbound>& in) {
@@ -400,6 +422,7 @@ void NetServer::endSession(uint32_t conn, const std::string& reason, bool sendKi
   if (sendKick) sendTo(conn, cbmp::Kick{reason});
   SteamNetworkingSockets()->CloseConnection(conn, kEndKicked, reason.c_str(), sendKick);
   world_.removePlayer(s.id);
+  metrics_.removePlayer(s.id);
   spdlog::info("jogador {} saiu: {}", s.id, reason);
 }
 

@@ -89,25 +89,40 @@ TEST_CASE("world correction window ends after 1 s and counts a new incident") {
   h.world.onInput(a, input(1, {0, 0, 0}), 0.0625);
   h.world.onInput(a, input(2, {100'000, 0, 0}), 0.125);
   h.world.onInput(a, input(3, {100'000, 0, 0}), 1.0);    // ainda na janela: ignorado
-  h.world.onInput(a, input(4, {100'000, 0, 0}), 1.125);  // janela venceu: novo incidente
+  h.world.onInput(a, input(4, {100'000, 0, 0}), 1.125);  // janela venceu ainda longe: novo incidente + extra
   h.step();
   REQUIRE(h.msgs<Correction>(a).size() == 2);
-  REQUIRE(h.world.find(a)->correctionTimes.size() == 2);
+  REQUIRE(h.world.find(a)->correctionTimes.size() == 3);
 }
 
-TEST_CASE("world continuous cheater is kicked after 11 incidents in 10 s") {
+TEST_CASE("world correction window ending near the corrected position is a single incident") {
+  Harness h;
+  auto a = h.add("ana");
+  h.step(0);
+  h.world.onInput(a, input(1, {0, 0, 0}), 0.0625);
+  h.world.onInput(a, input(2, {100'000, 0, 0}), 0.125);  // incidente
+  h.world.onInput(a, input(3, {100, 0, 0}), 1.25);       // depois da janela, mas perto do corrigido: aceito
+  h.step();
+  REQUIRE(h.msgs<Correction>(a).size() == 1);
+  REQUIRE(h.world.find(a)->correctionTimes.size() == 1);
+  REQUIRE(h.world.find(a)->state.pos.x == 100);
+}
+
+TEST_CASE("world continuous cheater ignoring Correction is kicked after 11 incidents") {
   Harness h;
   auto a = h.add("ana");
   h.step(0);  // descarta a Correction do spawn
   h.world.onInput(a, input(1, {0, 0, 0}), 0.0);
-  // 16 inputs/s (passo exato em binário) sempre teleportados: um incidente por segundo
+  // 16 inputs/s (passo exato em binário) sempre teleportados: 1 incidente na 1ª Correction e 2 a cada janela
+  // ignorada (a cada 1 s) → 11 incidentes na 6ª Correction (~5 s). Sem o extra, janelas ≥ 1 s nunca passam de 10.
   uint32_t seq = 2;
   double t = 0.0625;
-  for (; t < 10.0; t += 0.0625) h.world.onInput(a, input(seq++, {100'000, 0, 0}), t);
+  for (; t < 5.0; t += 0.0625) h.world.onInput(a, input(seq++, {100'000, 0, 0}), t);
   h.step();
-  REQUIRE(h.msgs<Correction>(a).size() == 10);
+  REQUIRE(h.msgs<Correction>(a).size() == 5);
+  REQUIRE(h.world.find(a)->correctionTimes.size() == 9);
   REQUIRE(h.kicks.empty());
-  for (; t <= 10.0625; t += 0.0625) h.world.onInput(a, input(seq++, {100'000, 0, 0}), t);
+  for (; t <= 5.0625; t += 0.0625) h.world.onInput(a, input(seq++, {100'000, 0, 0}), t);
   h.step();
   REQUIRE(h.msgs<Correction>(a).size() == 1);
   REQUIRE(h.kicks.size() == 1);

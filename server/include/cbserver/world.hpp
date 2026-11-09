@@ -81,7 +81,8 @@ class World {
 
   // Ignora seq ≤ último. Com Correction pendente (janela de 1 s), ignora inputs longe da posição corrigida;
   // fecha a janela um input a ≤ slack + maxSpeed(estado) × (now − correctionSince) × (1+tol) dela (o cliente
-  // pode ter andado legalmente desde a correção). Cada Correction é um incidente; > 10 em 10 s → kick.
+  // pode ter andado legalmente desde a correção). Cada Correction é um incidente; se a janela inteira passa e o
+  // input continua longe (Correction ignorada), conta um incidente extra. > 10 em 10 s → kick.
   // Com SpawnMode::DevTrustFirstInput, o primeiro input define o spawn sem validação.
   void onInput(EntityId id, const cbmp::Input& in, double now);
   bool onEvent(EntityId id, const cbmp::Event& ev, double now);  // false = descartado

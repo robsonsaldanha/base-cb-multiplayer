@@ -101,6 +101,8 @@ class NetServer {
   // Encerra a sessão: Kick opcional, fecha e remove o jogador do mundo.
   void endSession(uint32_t conn, const std::string& reason, bool sendKick);
   void updateGauges();
+  // Banda "no fio" estimada pelo GNS (informativa), amostrada a cada 1 s no pump.
+  void sampleWire();
 
   const ServerConfig& cfg_;
   Authenticator& auth_;
@@ -110,6 +112,7 @@ class NetServer {
   uint32_t listen_ = 0, poll_ = 0;
   uint16_t boundPort_ = 0;
   double now_ = 0;
+  double lastWireSample_ = -1e9;
   std::unordered_map<uint32_t, Pending> pending_;
   std::unordered_map<std::string, int> pendingByIp_;
   std::unordered_map<uint32_t, Session> sessions_;

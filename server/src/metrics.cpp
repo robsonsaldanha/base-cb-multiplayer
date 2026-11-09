@@ -69,30 +69,40 @@ void Metrics::recordTick(std::chrono::microseconds d) {
 
 void Metrics::addBytesOut(uint16_t playerId, size_t bytes) {
   std::lock_guard lk(mu_);
-  auto now = std::chrono::steady_clock::now();
-  if (now - bytesStart_ > std::chrono::seconds(60)) {
-    bytes_.clear();
-    bytesStart_ = now;
-  }
-  bytes_[playerId] += bytes;
+  auto [it, fresh] = bytes_.try_emplace(playerId);
+  if (fresh) it->second.since = std::chrono::steady_clock::now();
+  it->second.bytes += bytes;
+}
+
+void Metrics::removePlayer(uint16_t playerId) {
+  std::lock_guard lk(mu_);
+  bytes_.erase(playerId);
+}
+
+void Metrics::setWireOut(double avgKbps, double maxKbps) {
+  std::lock_guard lk(mu_);
+  wireAvgKbps_ = avgKbps;
+  wireMaxKbps_ = maxKbps;
 }
 
 nlohmann::json Metrics::snapshot() const {
   std::vector<int64_t> sorted;
-  double avgKbps = 0, maxKbps = 0, cpu = 0;
+  double avgKbps = 0, maxKbps = 0, cpu = 0, wireAvg = 0, wireMax = 0;
   {
     std::lock_guard lk(mu_);
     sorted = ticks_;
     auto now = std::chrono::steady_clock::now();
-    double secs = std::max(1.0, std::chrono::duration<double>(now - bytesStart_).count());
     double sum = 0;
     for (auto& [id, b] : bytes_) {
       (void)id;
-      double kbps = static_cast<double>(b) * 8.0 / 1000.0 / secs;
+      const double secs = std::max(1.0, std::chrono::duration<double>(now - b.since).count());
+      double kbps = static_cast<double>(b.bytes) * 8.0 / 1000.0 / secs;
       sum += kbps;
       maxKbps = std::max(maxKbps, kbps);
     }
     if (!bytes_.empty()) avgKbps = sum / static_cast<double>(bytes_.size());
+    wireAvg = wireAvgKbps_;
+    wireMax = wireMaxKbps_;
 
     double cpuNow = processCpuSeconds();
     if (lastCpuSec_ >= 0) {
@@ -116,6 +126,8 @@ nlohmann::json Metrics::snapshot() const {
           {"sendFailures", sendFailures.load()},
           {"avgKbpsPerPlayer", avgKbps},
           {"maxKbpsPerPlayer", maxKbps},
+          {"wireAvgKbpsPerPlayer", wireAvg},
+          {"wireMaxKbpsPerPlayer", wireMax},
           {"rssBytes", static_cast<uint64_t>(rssBytes())},
           {"cpuPercent", cpu}};
 }

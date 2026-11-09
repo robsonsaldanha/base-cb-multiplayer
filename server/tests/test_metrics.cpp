@@ -49,3 +49,21 @@ TEST_CASE("metrics empty snapshot is zeros") {
   auto s = m.snapshot();
   REQUIRE(s["tickP99Ms"].get<double>() == 0);
 }
+
+TEST_CASE("metrics bandwidth is per connection and ends on removePlayer") {
+  Metrics m;
+  m.addBytesOut(1, 1000);  // < 1 s de conexão: divide por 1 s → 8 kbps
+  m.addBytesOut(2, 3000);  // 24 kbps
+  auto s = m.snapshot();
+  REQUIRE(s["avgKbpsPerPlayer"].get<double>() == Approx(16.0).margin(0.01));
+  REQUIRE(s["maxKbpsPerPlayer"].get<double>() == Approx(24.0).margin(0.01));
+  m.removePlayer(2);
+  s = m.snapshot();
+  REQUIRE(s["maxKbpsPerPlayer"].get<double>() == Approx(8.0).margin(0.01));
+  m.removePlayer(1);
+  m.setWireOut(30.0, 40.0);
+  s = m.snapshot();
+  REQUIRE(s["avgKbpsPerPlayer"].get<double>() == 0);
+  REQUIRE(s["wireAvgKbpsPerPlayer"].get<double>() == 30.0);
+  REQUIRE(s["wireMaxKbpsPerPlayer"].get<double>() == 40.0);
+}

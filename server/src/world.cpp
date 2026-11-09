@@ -140,16 +140,23 @@ void World::onInput(EntityId id, const cbmp::Input& in, double now) {
     grid_.upsert(id, in.s.pos);
     return;
   }
+  bool ignoredCorrection = false;
   if (p->correcting) {
     // Desde a Correction o cliente pode ter andado legalmente a partir da posição corrigida.
     const double elapsed = now - p->correctionSince;
     const double reach = limits_.slackCm + maxSpeedOf(p->state.state, in.s.state) * std::max(0.0, elapsed) *
                                                (1.0 + limits_.tolerance);
     const double d = std::sqrt(static_cast<double>(distSq(in.s.pos, p->state.pos)));
-    if (elapsed >= kCorrectionWindowSec || d <= reach)
-      p->correcting = false;  // cliente aplicou a correção (ou a janela venceu): valida normalmente
-    else
+    if (d <= reach) {
+      p->correcting = false;  // cliente aplicou a correção: valida normalmente
+    } else if (elapsed >= kCorrectionWindowSec) {
+      // A janela inteira passou e o cliente continua longe: ignorou a Correction (trapaceiro persistente).
+      // Conta um incidente extra; sem isso, um incidente por janela (≥ 1 s) nunca passaria de 10 em 10 s.
+      p->correcting = false;
+      ignoredCorrection = true;
+    } else {
       return;  // input ainda baseado na posição antiga (latência): ignorado, sem novo incidente
+    }
   }
   const double dt = std::clamp(now - p->lastInputTime, minDt_, kMaxMoveDtSec);
   if (validateMove(p->state, in.s, dt, limits_) == MoveVerdict::Ok) {
@@ -160,6 +167,7 @@ void World::onInput(EntityId id, const cbmp::Input& in, double now) {
   }
   sendCorrection(*p, in.seq, now);
   p->correctionTimes.push_back(now);
+  if (ignoredCorrection) p->correctionTimes.push_back(now);
   trimWindow(p->correctionTimes, now);
   if (p->correctionTimes.size() > kMaxCorrections) orderKick(*p, "movimento inválido");
 }

@@ -1,6 +1,5 @@
 find_package(spdlog CONFIG REQUIRED)
 find_package(httplib CONFIG REQUIRED)
-find_package(GameNetworkingSockets CONFIG REQUIRED)
 
 add_library(cbserver_core STATIC src/config.cpp src/metrics.cpp src/manifest.cpp src/http.cpp
   src/grid.cpp src/visibility.cpp src/movement.cpp src/world.cpp src/snapshots.cpp src/pool.cpp

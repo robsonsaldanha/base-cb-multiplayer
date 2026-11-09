@@ -14,6 +14,8 @@ endif()
 enable_testing()
 find_package(Catch2 3 CONFIG REQUIRED)
 include(Catch)
+# Aqui (e não em server/ e bots/): o config do GNS cria ALIAS globais e não pode ser carregado duas vezes.
+find_package(GameNetworkingSockets CONFIG REQUIRED)
 
 add_subdirectory(proto)
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/server/CMakeLists.txt)
