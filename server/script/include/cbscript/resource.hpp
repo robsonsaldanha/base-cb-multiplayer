@@ -49,8 +49,8 @@ class Resource {
   const ResourceManifest& manifest() const { return manifest_; }
 
   // Executa os serverScripts em ordem (cada um sob a vigia, como call()); o 1º valor retornado pelo último vira
-  // exports(). Em erro: false e `err` = "[<nome>] ..." com traceback.
-  bool runMain(std::string& err);
+  // exports(). Em erro: false e `err` = "[<nome>] ..." com traceback; `timedOut` (se dado) diz se foi aborto da vigia.
+  bool runMain(std::string& err, bool* timedOut = nullptr);
   sol::object exports() const { return exports_; }
 
   // Tempo de vida: `value` e `thread` são referências no registro deste estado Lua; precisam ser destruídos (ou

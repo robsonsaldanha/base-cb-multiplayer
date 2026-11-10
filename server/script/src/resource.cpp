@@ -549,7 +549,8 @@ int Resource::loadFile(lua_State* L, const std::string& rel, std::string& err) {
   return r;
 }
 
-bool Resource::runMain(std::string& err) {
+bool Resource::runMain(std::string& err, bool* timedOut) {
+  if (timedOut != nullptr) *timedOut = false;
   lua_State* L = lua_.lua_state();
   sol::object last;
   for (const auto& rel : manifest_.serverScripts) {
@@ -568,6 +569,7 @@ bool Resource::runMain(std::string& err) {
     CallResult r = call(fn);
     if (!r.ok) {
       err = r.error;
+      if (timedOut != nullptr) *timedOut = r.timedOut;
       return false;
     }
     if (r.yielded) {

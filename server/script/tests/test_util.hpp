@@ -17,6 +17,13 @@
 
 #include "cbscript/resource.hpp"
 
+// Funções C++ chamadas de quadros que o Lua atravessa com longjmp ficam fora de linha (ver resource.cpp).
+#if defined(_MSC_VER)
+#define CBSCRIPT_TEST_NOINLINE __declspec(noinline)
+#else
+#define CBSCRIPT_TEST_NOINLINE __attribute__((noinline))
+#endif
+
 namespace fs = std::filesystem;
 using cbscript::Limits;
 using cbscript::Resource;
