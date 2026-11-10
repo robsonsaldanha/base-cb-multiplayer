@@ -88,13 +88,6 @@ jobs:
           & "$env:GITHUB_WORKSPACE/vcpkg/bootstrap-vcpkg.bat" -disableMetrics
           "VCPKG_ROOT=$env:GITHUB_WORKSPACE/vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append
         shell: pwsh
-      # O download do lua.org pelo vcpkg estoura o tempo nos runners Windows; baixa antes com curl e
-      # retentativas (o vcpkg confere o SHA-512 do arquivo em downloads/ antes de usar).
-      - run: |
-          New-Item -ItemType Directory -Force "$env:VCPKG_ROOT/downloads" | Out-Null
-          curl.exe -fsSL --retry 6 --retry-all-errors --retry-delay 10 --connect-timeout 30 --max-time 300 `
-            -o "$env:VCPKG_ROOT/downloads/lua-5.4.7.tar.gz" https://www.lua.org/ftp/lua-5.4.7.tar.gz
-        shell: pwsh
       - run: cmake --preset windows-ci && cmake --build --preset windows-ci
         shell: pwsh
       - run: ctest --test-dir build-native/windows-ci -C Release --output-on-failure

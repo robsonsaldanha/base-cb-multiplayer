@@ -1,8 +1,10 @@
-vcpkg_download_distfile(ARCHIVE
-    URLS "https://www.lua.org/ftp/lua-${VERSION}.tar.gz"
-    FILENAME "lua-${VERSION}.tar.gz"
-    SHA512 98c5c8978dfdf867e37e9eb3b3ec83dee92d199243b5119505da83895e33f10d43c841be6a7d3b106daba8a0b2bd25fe099ebff8f87831dcc55c79c78b97d8b8
-)
+# cbmp: o tarball oficial (https://www.lua.org/ftp/lua-5.4.7.tar.gz, licença MIT) fica no repositório porque o
+# lua.org recusa/estoura conexões dos runners do CI. O SHA-512 é conferido igual ao download do vcpkg.
+set(ARCHIVE "${CMAKE_CURRENT_LIST_DIR}/lua-${VERSION}.tar.gz")
+file(SHA512 "${ARCHIVE}" _cbmp_lua_sha512)
+if(NOT _cbmp_lua_sha512 STREQUAL "98c5c8978dfdf867e37e9eb3b3ec83dee92d199243b5119505da83895e33f10d43c841be6a7d3b106daba8a0b2bd25fe099ebff8f87831dcc55c79c78b97d8b8")
+    message(FATAL_ERROR "lua-${VERSION}.tar.gz com SHA-512 inesperado: ${_cbmp_lua_sha512}")
+endif()
 vcpkg_extract_source_archive(
     SOURCE_PATH
     ARCHIVE "${ARCHIVE}"

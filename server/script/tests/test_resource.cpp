@@ -142,7 +142,9 @@ TEST_CASE("watchdog warns and then aborts an infinite loop") {
   auto dt = std::chrono::steady_clock::now() - t0;
   REQUIRE_FALSE(res.ok);
   REQUIRE(res.timedOut);
-  REQUIRE(dt >= 200ms);
+  // O prazo de aborto é 200 ms no relógio do vigia; a medida aqui pode sair até alguns ms menor (CI Linux mediu
+  // 199,7 ms: granularidade do relógio/agendamento entre o início do prazo e o t0 do teste).
+  REQUIRE(dt >= 190ms);
   REQUIRE(dt < 10s);  // folga para máquina carregada (ctest -j); o travamento real é pego pelo TIMEOUT do ctest
   REQUIRE(contains(res.error, "teste"));
   REQUIRE(contains(res.error, "stack traceback"));
