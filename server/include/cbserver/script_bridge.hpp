@@ -3,13 +3,21 @@
 // simulação e nunca espera a thread de scripts: só post/publishPlayers/drainCommands (filas não bloqueantes).
 //
 // - Ganchos do World → eventos do host: entrada (EvPlayerJoin), saída (EvPlayerLeave com o motivo), evento de
-//   cliente aceito pela cota (EvClientEvent). O evento de cliente `cb:command` (payload: texto JSON com a linha)
-//   vira EvCommand do jogador; qualquer outro nome `cb:*` vindo do cliente é descartado.
-// - applyCommands (antes de World::tick): CmdEmit → Event para o jogador (ou todos com -1), CmdKick → KickOrder,
-//   CmdSetPosition → setState (Correction com carência de carregamento). Kick/teleporte com `did` que não bate com o
-//   jogador atual daquele id (id reaproveitado) são ignorados.
-// - publishPlayers (depois de World::tick): foto imutável dos jogadores para cb.players.*.
+//   cliente aceito pela cota (EvClientEvent), todos com a sessão do jogador. O evento de cliente `cb:command`
+//   (payload: texto JSON com a linha) vira EvCommand do jogador; qualquer outro nome `cb:*` vindo do cliente é
+//   descartado.
+// - applyCommands (antes de World::tick): no máximo kMaxCommandsPerTick comandos e kMaxBytesPerTick bytes de payload
+//   por tick (o resto fica para os próximos ticks; só drena o host de novo quando o atraso acabar, então a fila do
+//   host — limitada em itens e bytes — segura a pressão). CmdEmit → Event (broadcast com uma cópia só do payload;
+//   nome > 64 ou payload > 4096 bytes → descartado e contado), CmdKick → KickOrder, CmdKickDid → KickOrder de todos
+//   com o did, CmdSetPosition → setState (Correction com carência). Comando com sessão diferente da do jogador atual
+//   daquele id (id reaproveitado) é ignorado.
+// - publishPlayers (depois de World::tick): foto imutável dos jogadores para cb.players.* (buffers reaproveitados
+//   quando a thread de scripts já soltou a foto antiga).
+#include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <memory>
 #include <vector>
 
 #include "cbscript/host.hpp"
@@ -19,6 +27,9 @@ namespace cbserver {
 
 class ScriptBridge {
  public:
+  static constexpr size_t kMaxCommandsPerTick = 2048;
+  static constexpr size_t kMaxBytesPerTick = size_t{2} << 20;
+
   ScriptBridge(World& world, cbscript::ScriptHost& host);
   ~ScriptBridge();  // remove os ganchos do World
   ScriptBridge(const ScriptBridge&) = delete;
@@ -27,13 +38,18 @@ class ScriptBridge {
   void applyCommands(double now);
   void publishPlayers();
 
-  uint64_t eventsDropped() const { return eventsDropped_; }  // recusados pela fila do host (cheia/parado)
+  uint64_t eventsDropped() const { return eventsDropped_; }        // eventos de cliente recusados pelo host
+  uint64_t joinLeaveDropped() const { return joinLeaveDropped_; }  // Join/Leave recusados (teto rígido/host parado)
+  uint64_t commandsRejected() const { return commandsRejected_; }  // CmdEmit inválidos (nome/payload grandes demais)
+  size_t backlog() const { return backlog_.size(); }               // comandos esperando o próximo tick
 
  private:
   World& world_;
   cbscript::ScriptHost& host_;
-  std::vector<cbscript::ScriptToSim> cmds_;  // reaproveitado
-  uint64_t eventsDropped_ = 0;
+  std::vector<cbscript::ScriptToSim> drained_;  // reaproveitado
+  std::deque<cbscript::ScriptToSim> backlog_;
+  std::vector<std::shared_ptr<std::vector<cbscript::PlayerView>>> snapPool_;
+  uint64_t eventsDropped_ = 0, joinLeaveDropped_ = 0, commandsRejected_ = 0;
 };
 
 }  // namespace cbserver

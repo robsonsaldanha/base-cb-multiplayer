@@ -41,6 +41,8 @@ struct ServerConfig {
   // scripting: limites por resource Lua (memória por estado, aviso e aborto da vigia) e arquivo de bans.
   int scriptMemoryLimitMB = 256, scriptWarnMs = 50, scriptAbortMs = 5000;
   std::string bansFile = "bans.json";
+  // Cota por jogador de eventos servidor → cliente vindos de scripts (bytes de nome + payload).
+  double scriptEventOutKBps = 64, scriptEventOutBurstKB = 128;
 
   // Lançam std::runtime_error (pt-BR: campo + motivo).
   static ServerConfig load(const std::filesystem::path& path);

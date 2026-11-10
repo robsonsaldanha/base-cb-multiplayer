@@ -144,6 +144,15 @@ TEST_CASE("config scripting section has defaults and validates its limits") {
   REQUIRE(c.scriptWarnMs == 20);
   REQUIRE(c.scriptAbortMs == 1000);
   REQUIRE(c.bansFile == "dados/bans.json");
+  REQUIRE(d.scriptEventOutKBps == 64);
+  REQUIRE(d.scriptEventOutBurstKB == 128);
+  auto out = base();
+  out["scripting"] = {{"eventOutKBps", 32}, {"eventOutBurstKB", 256}};
+  auto o = ServerConfig::fromJson(out);
+  REQUIRE(o.scriptEventOutKBps == 32);
+  REQUIRE(o.scriptEventOutBurstKB == 256);
+  out["scripting"] = {{"eventOutBurstKB", 1}};
+  requireRejects(out, "scripting.eventOutBurstKB");
 
   auto bad = base();
   bad["scripting"] = {{"memoryLimitMB", 0}};

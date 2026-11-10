@@ -1,11 +1,26 @@
 #include "cbscript/bans.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <fstream>
 #include <stdexcept>
 #include <system_error>
 
 #include <nlohmann/json.hpp>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <io.h>
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace cbscript {
 
@@ -13,6 +28,10 @@ namespace fs = std::filesystem;
 using nlohmann::json;
 
 namespace {
+
+constexpr int64_t kMaxUnix = int64_t{1} << 40;
+
+bool expired(const Ban& b, int64_t now) { return b.expiresAt != 0 && now >= b.expiresAt; }
 
 std::string u8(const fs::path& p) {
   auto s = p.generic_u8string();
@@ -34,9 +53,11 @@ Ban fromJson(const json& j, const std::string& where) {
     if (!j["by"].is_string()) throw fail("'by' deve ser texto");
     b.by = j["by"].get<std::string>();
   }
+  if (b.did.size() > 64) throw fail("'did' longo demais");
   for (const char* k : {"createdAt", "expiresAt"}) {
     if (!j.contains(k)) continue;
-    if (!j[k].is_number_integer()) throw fail("'createdAt'/'expiresAt' devem ser inteiros (Unix s)");
+    if (!j[k].is_number_integer() || j[k].get<int64_t>() < 0 || j[k].get<int64_t>() > kMaxUnix)
+      throw fail("'createdAt'/'expiresAt' devem ser inteiros entre 0 e 2^40 (Unix s)");
     (k[0] == 'c' ? b.createdAt : b.expiresAt) = j[k].get<int64_t>();
   }
   return b;
@@ -44,7 +65,14 @@ Ban fromJson(const json& j, const std::string& where) {
 
 }  // namespace
 
-BanStore::BanStore(fs::path file) : file_(std::move(file)) {
+int64_t BanStore::now() const {
+  if (now_) return now_();
+  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+BanStore::BanStore(fs::path file, std::function<int64_t()> nowUnix)
+    : file_(std::move(file)), now_(std::move(nowUnix)) {
   if (file_.empty()) return;
   std::error_code ec;
   if (!fs::exists(file_, ec)) return;
@@ -53,8 +81,10 @@ BanStore::BanStore(fs::path file) : file_(std::move(file)) {
   json j = json::parse(f, nullptr, false);
   if (j.is_discarded()) throw std::runtime_error("bans: JSON malformado em '" + u8(file_) + "'");
   if (!j.is_array()) throw std::runtime_error("bans: '" + u8(file_) + "' deve conter uma lista");
+  const int64_t t = now();
   for (const auto& e : j) {
     Ban b = fromJson(e, u8(file_));
+    if (expired(b, t)) continue;
     writer_[b.did] = b;
     live_[b.did] = std::move(b);
   }
@@ -64,7 +94,7 @@ std::optional<Ban> BanStore::check(const std::string& did, int64_t nowUnix) cons
   std::lock_guard<std::mutex> lk(mu_);
   auto it = live_.find(did);
   if (it == live_.end()) return std::nullopt;
-  if (it->second.expiresAt != 0 && nowUnix >= it->second.expiresAt) return std::nullopt;
+  if (expired(it->second, nowUnix)) return std::nullopt;
   return it->second;
 }
 
@@ -99,6 +129,8 @@ std::vector<Ban> BanStore::list() const {
 
 bool BanStore::persist(std::string& err) {
   if (file_.empty()) return true;
+  const int64_t t = now();
+  std::erase_if(writer_, [t](const auto& kv) { return expired(kv.second, t); });  // live_: check() já ignora
   std::vector<const Ban*> v;
   v.reserve(writer_.size());
   for (const auto& [d, b] : writer_) v.push_back(&b);
@@ -113,13 +145,25 @@ bool BanStore::persist(std::string& err) {
   std::error_code ec;
   if (file_.has_parent_path()) fs::create_directories(file_.parent_path(), ec);
   {
-    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    const std::string text = arr.dump(2, ' ', false, json::error_handler_t::replace) + "\n";
+#if defined(_WIN32)
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, tmp.c_str(), L"wb") != 0) f = nullptr;
+#else
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+#endif
     if (!f) {
       err = "não foi possível gravar '" + u8(tmp) + "'";
       return false;
     }
-    f << arr.dump(2, ' ', false, json::error_handler_t::replace) << '\n';
-    if (!f) {
+    bool ok = std::fwrite(text.data(), 1, text.size(), f) == text.size() && std::fflush(f) == 0;
+#if defined(_WIN32)
+    ok = ok && FlushFileBuffers(reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(f)))) != 0;
+#else
+    ok = ok && ::fsync(fileno(f)) == 0;
+#endif
+    ok = (std::fclose(f) == 0) && ok;
+    if (!ok) {
       err = "falha ao gravar '" + u8(tmp) + "'";
       return false;
     }

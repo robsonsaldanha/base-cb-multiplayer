@@ -107,6 +107,31 @@ struct Ref {
 
 struct Conn {
   std::string name, did, sub;
+  uint32_t session = 0;
+};
+
+// Limite de linhas por janela de 1 s (mesma regra do print: 200/s + linha de resumo).
+struct RateWindow {
+  std::chrono::steady_clock::time_point start{};
+  int lines = 0;
+  uint64_t dropped = 0;
+  // true = pode registrar. `summary` recebe o número descartado na janela anterior (0 = nada a resumir).
+  bool take(uint64_t& summary, int perSec = 200) {
+    const auto now = std::chrono::steady_clock::now();
+    summary = 0;
+    if (now - start >= std::chrono::seconds(1)) {
+      summary = dropped;
+      start = now;
+      lines = 0;
+      dropped = 0;
+    }
+    if (lines >= perSec) {
+      ++dropped;
+      return false;
+    }
+    ++lines;
+    return true;
+  }
 };
 
 struct Shared;
@@ -132,6 +157,8 @@ struct ApiRes {
   uint64_t nextTimer = 1;
   std::string scratch;    // JSON temporário dos bindings
   PlayersSnapshot snap;   // foto em uso por players.list/get
+  std::vector<const PlayerView*> view;  // entradas da foto cuja sessão bate com a dos conectados
+  RateWindow logRate;
 
   JsonOptions json(size_t maxBytes = kMaxPayload) const {
     JsonOptions o;
@@ -161,6 +188,7 @@ struct Shared {
   bool draining = false;
   double lastJsonWarn = -1e9;
   std::vector<uint64_t> dueScratch;
+  RateWindow auditRate;
 
   int64_t unixNow() const {
     if (o.unixNow) return o.unixNow();
@@ -188,9 +216,17 @@ const Conn* connOf(const Shared& sh, uint16_t id) {
 
 CBAPI_NOINLINE void auditLine(ApiRes& a, nlohmann::json line) {
   if (a.ctx->abandoned() || !a.sh->o.audit) return;
-  line["ts"] = a.sh->unixNow();
-  line["resource"] = a.h->name();
   try {
+    uint64_t summary = 0;
+    const bool ok = a.sh->auditRate.take(summary);
+    if (summary > 0)
+      a.sh->o.audit(nlohmann::json{{"type", "audit_dropped"}, {"ts", a.sh->unixNow()}, {"count", summary}}.dump());
+    if (!ok) {
+      if (a.sh->o.stats) a.sh->o.stats->auditDropped.fetch_add(1);
+      return;
+    }
+    line["ts"] = a.sh->unixNow();
+    line["resource"] = a.h->name();
     a.sh->o.audit(line.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
   } catch (...) {
   }
@@ -201,7 +237,8 @@ CBAPI_NOINLINE void auditLine(ApiRes& a, nlohmann::json line) {
 const char* checkName(lua_State* L, int idx, const char* fn, size_t* len) {
   if (lua_type(L, idx) != LUA_TSTRING) luaL_error(L, "%s: nome inválido (texto de 1 a 64 bytes)", fn);
   const char* s = lua_tolstring(L, idx, len);
-  if (*len == 0 || *len > kMaxEventName) luaL_error(L, "%s: nome inválido (texto de 1 a 64 bytes)", fn);
+  if (*len == 0 || *len > kMaxEventName || std::memchr(s, 0, *len) != nullptr)
+    luaL_error(L, "%s: nome inválido (texto de 1 a 64 bytes, sem NUL)", fn);
   if (*len >= 3 && std::memcmp(s, "cb:", 3) == 0) luaL_error(L, "%s: nomes 'cb:' são reservados ao motor", fn);
   return s;
 }
@@ -256,10 +293,12 @@ CBAPI_NOINLINE bool addNamed(std::map<std::string, std::vector<Ref>, std::less<>
 int l_on(lua_State* L) {
   ApiRes* a = self(L);
   if (lua_type(L, 1) != LUA_TSTRING) return luaL_error(L, "cb.on: nome do evento deve ser texto");
-  const char* name = lua_tostring(L, 1);
+  size_t nlen = 0;
+  const char* name = lua_tolstring(L, 1, &nlen);
   int kind = -1;
   for (int i = 0; i < OnCount; ++i)
-    if (std::strcmp(name, kOnNames[i]) == 0) kind = i;
+    if (nlen == std::strlen(kOnNames[i]) && std::memcmp(name, kOnNames[i], nlen) == 0) kind = i;
+  if (kind < 0 && std::memchr(name, 0, nlen) != nullptr) return luaL_error(L, "cb.on: nome do evento contém NUL");
   if (kind < 0)
     return luaL_error(L, "cb.on: evento desconhecido '%s' (use playerJoin, playerLeave, resourceStart ou resourceStop)",
                       name);
@@ -298,7 +337,13 @@ CBAPI_NOINLINE int doEmit(ApiRes* a, lua_State* L, lua_Integer target, const cha
       setErr(e, "cb.events.emit: payload inválido: " + err);
       return -1;
     }
-    return a->ctx->emit(CmdEmit{static_cast<int32_t>(target), std::string(name, len), a->scratch}) ? 1 : 0;
+    uint32_t session = 0;
+    if (target != -1) {
+      const Conn* c = connOf(*a->sh, static_cast<uint16_t>(target));
+      if (!c) return 0;  // jogador não conectado: ignorado (sem erro)
+      session = c->session;
+    }
+    return a->ctx->emit(CmdEmit{static_cast<int32_t>(target), std::string(name, len), a->scratch, session}) ? 1 : 0;
   } catch (...) {
     setErr(e, "cb.events.emit: sem memória");
     return -1;
@@ -352,7 +397,19 @@ int l_events_emitLocal(lua_State* L) {
 
 // --------------------------------------------------------------------------------------------- cb.players
 
-CBAPI_NOINLINE void grabSnap(ApiRes* a) { a->snap = a->ctx->players(); }
+// Foto atual, só com as entradas cuja sessão é a do jogador conectado (sem dados velhos de um id reaproveitado).
+CBAPI_NOINLINE void grabSnap(ApiRes* a) {
+  a->snap = a->ctx->players();
+  a->view.clear();
+  try {
+    for (const PlayerView& p : *a->snap) {
+      const Conn* c = connOf(*a->sh, p.id);
+      if (c && c->session == p.session) a->view.push_back(&p);
+    }
+  } catch (...) {
+    a->view.clear();
+  }
+}
 
 void pushPlayer(lua_State* L, const PlayerView& p) {
   lua_createtable(L, 0, 8);
@@ -377,10 +434,10 @@ void pushPlayer(lua_State* L, const PlayerView& p) {
 int l_players_list(lua_State* L) {
   ApiRes* a = self(L);
   grabSnap(a);
-  const std::vector<PlayerView>* v = a->snap.get();
+  const std::vector<const PlayerView*>* v = &a->view;
   lua_createtable(L, static_cast<int>(std::min<size_t>(v->size(), 65535)), 0);
   for (size_t i = 0; i < v->size(); ++i) {
-    pushPlayer(L, (*v)[i]);
+    pushPlayer(L, *(*v)[i]);
     lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
   }
   return 1;
@@ -390,10 +447,10 @@ int l_players_get(lua_State* L) {
   ApiRes* a = self(L);
   uint16_t id = checkId(L, 1, "cb.players.get");
   grabSnap(a);
-  const std::vector<PlayerView>* v = a->snap.get();
+  const std::vector<const PlayerView*>* v = &a->view;
   for (size_t i = 0; i < v->size(); ++i)
-    if ((*v)[i].id == id) {
-      pushPlayer(L, (*v)[i]);
+    if ((*v)[i]->id == id) {
+      pushPlayer(L, *(*v)[i]);
       return 1;
     }
   lua_pushnil(L);
@@ -407,7 +464,7 @@ CBAPI_NOINLINE int doKick(ApiRes* a, uint16_t id, const char* reason, size_t len
     const Conn* c = connOf(*a->sh, id);
     if (!c) return 0;
     std::string why = clampUtf8(std::string_view(reason, len), kMaxReason);
-    a->ctx->emit(CmdKick{id, why, c->did});
+    a->ctx->emit(CmdKick{id, why, c->session});
     auditLine(*a, {{"type", "kick"}, {"id", id}, {"did", c->did}, {"reason", why}});
     return 1;
   } catch (...) {
@@ -428,7 +485,8 @@ CBAPI_NOINLINE int doSetPosition(ApiRes* a, uint16_t id, lua_Integer x, lua_Inte
   try {
     const Conn* c = connOf(*a->sh, id);
     if (!c) return 0;
-    a->ctx->emit(CmdSetPosition{id, static_cast<int32_t>(x), static_cast<int32_t>(y), static_cast<int32_t>(z), c->did});
+    a->ctx->emit(
+        CmdSetPosition{id, static_cast<int32_t>(x), static_cast<int32_t>(y), static_cast<int32_t>(z), c->session});
     return 1;
   } catch (...) {
     return 0;
@@ -471,8 +529,8 @@ CBAPI_NOINLINE int doBan(ApiRes* a, const char* did, size_t didLen, const char* 
     if (!a->sh->o.bans->add(b, err))
       a->ctx->log(LogLevel::Error, "[" + a->h->name() + "] cb.players.ban: " + err + " (o ban vale até reiniciar)");
     const std::string why = clampUtf8("banido: " + b.reason, kMaxReason);
-    for (const auto& [id, c] : a->sh->players)
-      if (c.did == b.did) a->ctx->emit(CmdKick{id, why, c.did});
+    // Resolvido na simulação: pega também quem entrou e ainda não chegou aos scripts.
+    a->ctx->emit(CmdKickDid{b.did, why});
     auditLine(*a, {{"type", "ban"}, {"did", b.did}, {"reason", b.reason}, {"expiresAt", b.expiresAt}});
     return 1;
   } catch (...) {
@@ -660,12 +718,21 @@ int l_timers_cancel(lua_State* L) {
 
 CBAPI_NOINLINE void doLog(ApiRes* a, LogLevel lv, const char* s, size_t n) {
   try {
+    uint64_t summary = 0;
+    const bool ok = a->logRate.take(summary);
+    if (summary > 0)
+      a->ctx->log(LogLevel::Warn, "[" + a->h->name() + "] " + std::to_string(summary) +
+                                      " linhas de cb.log descartadas (limite de 200 por segundo)");
+    if (!ok) {
+      if (a->sh->o.stats) a->sh->o.stats->logDropped.fetch_add(1);
+      return;
+    }
     std::string line = "[" + a->h->name() + "] ";
     if (n > kMaxLogLine) {
-      line += clampUtf8(std::string_view(s, n), kMaxLogLine);
+      line += escapeLogText(clampUtf8(std::string_view(s, n), kMaxLogLine));
       line += "...(truncado, " + std::to_string(n) + " bytes)";
     } else {
-      line.append(s, n);
+      line += escapeLogText(std::string_view(s, n));
     }
     a->ctx->log(lv, line);
   } catch (...) {
@@ -933,6 +1000,7 @@ int l_resource(lua_State* L) {
   if (lua_type(L, 1) != LUA_TSTRING) return luaL_error(L, "cb.resource: nome deve ser texto");
   size_t len = 0;
   const char* name = lua_tolstring(L, 1, &len);
+  if (std::memchr(name, 0, len) != nullptr) return luaL_error(L, "cb.resource: nome contém NUL");
   Err e;
   if (checkTarget(a, name, len, e) < 0) return luaL_error(L, "%s", e.msg);
   lua_createtable(L, 0, 0);                 // proxy
@@ -962,16 +1030,19 @@ void pushOriginal(lua_State* L, int proxy) {
   lua_rawget(L, -2);
   lua_remove(L, -2);
 }
+// next(proxy, k) sobre a tabela original (upvalue 1): o script nunca recebe a original.
 int l_ro_next(lua_State* L) {
-  luaL_checktype(L, 1, LUA_TTABLE);
   lua_settop(L, 2);
-  if (lua_next(L, 1)) return 2;
+  lua_pushvalue(L, 2);
+  if (lua_next(L, lua_upvalueindex(1))) return 2;
   lua_pushnil(L);
   return 1;
 }
 int l_ro_pairs(lua_State* L) {
-  lua_pushcfunction(L, l_ro_next);
   pushOriginal(L, 1);
+  if (lua_type(L, -1) != LUA_TTABLE) return luaL_error(L, "pairs: tabela somente leitura inválida");
+  lua_pushcclosure(L, l_ro_next, 1);
+  lua_pushvalue(L, 1);
   lua_pushnil(L);
   return 3;
 }
@@ -1100,9 +1171,10 @@ PlayerView viewOf(const Shared& sh, ScriptContext& ctx, uint16_t id, const Conn*
     v.did = didFallback;
   }
   (void)sh;
+  v.session = c ? c->session : 0;
   PlayersSnapshot snap = ctx.players();
   for (const auto& p : *snap)
-    if (p.id == id) {
+    if (p.id == id && c && p.session == c->session) {  // posição só da mesma sessão (id pode ter sido reaproveitado)
       v.x = p.x;
       v.y = p.y;
       v.z = p.z;
@@ -1142,6 +1214,7 @@ void warnJson(Shared& sh, ScriptContext& ctx, const std::string& msg) {
 void onClientEvent(Shared& sh, ScriptContext& ctx, EvClientEvent& ev) {
   const Conn* c = connOf(sh, ev.id);
   if (!c) return;  // jogador já saiu (ou nunca entrou)
+  if (ev.session != 0 && ev.session != c->session) return;  // evento de uma sessão anterior com o mesmo id
   PlayerView pv;
   bool havePv = false;
   for (size_t i = 0; i < sh.live.size(); ++i) {
@@ -1155,7 +1228,8 @@ void onClientEvent(Shared& sh, ScriptContext& ctx, EvClientEvent& ev) {
     sol::object data;
     std::string err;
     if (!decodeFor(sh, a, ev.json, kMaxPayload, data, err)) {
-      warnJson(sh, ctx, "evento '" + ev.name + "' do jogador " + std::to_string(ev.id) + " descartado: " + err);
+      warnJson(sh, ctx,
+               "evento '" + escapeLogText(ev.name) + "' do jogador " + std::to_string(ev.id) + " descartado: " + err);
       return;
     }
     std::array<sol::object, 2> args{playerObj(a, pv), data};
@@ -1164,20 +1238,36 @@ void onClientEvent(Shared& sh, ScriptContext& ctx, EvClientEvent& ev) {
   }
 }
 
-void reply(ScriptContext& ctx, EvCommand& ev, const std::string& text) {
+// Texto JSON (string) de no máximo kMaxPayload bytes: corta o texto (sem quebrar UTF-8) e acrescenta "…".
+std::string replyJson(const std::string& text) {
+  auto dump = [](const std::string& t) {
+    return nlohmann::json(t).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+  };
+  std::string js = dump(text);
+  if (js.size() <= kMaxPayload) return js;
+  size_t cut = std::min(text.size(), kMaxPayload);
+  while (true) {
+    js = dump(clampUtf8(text, cut) + "\u2026");
+    if (js.size() <= kMaxPayload || cut == 0) return js;
+    cut = cut > js.size() - kMaxPayload + 8 ? cut - (js.size() - kMaxPayload + 8) : 0;  // escapes ocupam mais
+  }
+}
+
+void reply(ScriptContext& ctx, EvCommand& ev, uint32_t session, const std::string& text) {
   if (ev.reply) {
     ev.reply(text);
   } else if (ev.from) {
-    ctx.emit(CmdEmit{*ev.from, "cb:reply", nlohmann::json(text).dump(-1, ' ', false,
-                                                                        nlohmann::json::error_handler_t::replace)});
+    ctx.emit(CmdEmit{*ev.from, "cb:reply", replyJson(text), session});
   }
 }
 
 void onCommand(Shared& sh, ScriptContext& ctx, EvCommand& ev) {
   const Conn* c = nullptr;
+  uint32_t session = 0;
   if (ev.from) {
     c = connOf(sh, *ev.from);
     if (!c) return;  // jogador já saiu
+    session = c->session;
   }
   std::string_view line = ev.line;
   while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) line.remove_prefix(1);
@@ -1195,17 +1285,22 @@ void onCommand(Shared& sh, ScriptContext& ctx, EvCommand& ev) {
   if (tok.empty()) return;
   auto it = sh.commands.find(std::string_view(tok[0]));
   if (it == sh.commands.end()) {
-    reply(ctx, ev, "comando desconhecido: " + tok[0]);
+    // Eco curto: a linha veio do cliente (até 4 KiB) e a resposta tem de caber num evento.
+    std::string shown = clampUtf8(tok[0], 32);
+    if (shown.size() < tok[0].size()) shown += "\u2026";
+    reply(ctx, ev, session, "comando desconhecido: " + shown);
     return;
   }
   Command& cmd = it->second;
   if (ev.from && cmd.admin && !(sh.o.isAdmin && sh.o.isAdmin(c->did))) {
-    reply(ctx, ev, "sem permissão para '/" + tok[0] + "'");
+    reply(ctx, ev, session, "sem permissão para '/" + tok[0] + "'");
     return;
   }
   ApiRes& a = *cmd.owner;
   if (!ev.from)
     auditLine(a, {{"type", "command"}, {"by", ev.adminDid.empty() ? "console" : ev.adminDid}, {"line", std::string(line)}});
+  else if (cmd.admin)  // comando de admin digitado no chat
+    auditLine(a, {{"type", "command"}, {"by", c->did}, {"id", *ev.from}, {"line", std::string(line)}});
   lua_State* L = a.L;
   lua_createtable(L, static_cast<int>(tok.size() - 1), 0);
   for (size_t i = 1; i < tok.size(); ++i) {
@@ -1220,9 +1315,9 @@ void onCommand(Shared& sh, ScriptContext& ctx, EvCommand& ev) {
   const std::string name = tok[0];
   auto r = invokeOn(a, fn, args);
   if (!r.ok) {
-    reply(ctx, ev, "erro ao executar '" + name + "' (ver log)");
+    reply(ctx, ev, session, "erro ao executar '" + name + "' (ver log)");
   } else if (!r.yielded && r.value.valid() && r.value.get_type() == sol::type::string) {
-    reply(ctx, ev, r.value.as<std::string>());
+    reply(ctx, ev, session, r.value.as<std::string>());
   }
 }
 
@@ -1323,12 +1418,21 @@ void installApi(HostOptions& opt, ApiOptions api) {
         [&](auto& e) {
           using T = std::decay_t<decltype(e)>;
           if constexpr (std::is_same_v<T, EvPlayerJoin>) {
-            sh->players[e.p.id] = Conn{e.p.name, e.p.did, e.p.sub};
+            // Ban gravado depois da admissão deste jogador (o Join ainda estava na fila): expulsa já.
+            if (sh->o.bans) {
+              if (auto ban = sh->o.bans->check(e.p.did, sh->unixNow())) {
+                ctx.emit(CmdKick{e.p.id, clampUtf8("banido: " + ban->reason, kMaxReason), e.p.session});
+                sh->players.erase(e.p.id);
+                return;
+              }
+            }
+            sh->players[e.p.id] = Conn{e.p.name, e.p.did, e.p.sub, e.p.session};
             dispatchOn(*sh, OnJoin, &e.p, nullptr);
           } else if constexpr (std::is_same_v<T, EvPlayerLeave>) {
             auto it = sh->players.find(e.id);
-            PlayerView pv = viewOf(*sh, ctx, e.id, it == sh->players.end() ? nullptr : &it->second, e.did);
-            if (it != sh->players.end()) sh->players.erase(it);
+            if (it == sh->players.end() || (e.session != 0 && it->second.session != e.session)) return;
+            PlayerView pv = viewOf(*sh, ctx, e.id, &it->second, e.did);
+            sh->players.erase(it);
             dispatchOn(*sh, OnLeave, &pv, &e.reason);
           } else if constexpr (std::is_same_v<T, EvClientEvent>) {
             onClientEvent(*sh, ctx, e);

@@ -28,7 +28,14 @@ Itens levantados nas revisões que não bloquearam o merge, com o momento em que
   na Task 4 (`WorldHooks`, `queueEvent`/`broadcastEvent`, `ScriptBridge`).
 - `addPlayer` sempre na origem fora do modo dev: spawn deve vir do gamemode.
 - Lua deve rodar na thread da simulação ou por fila (`World`/`Authenticator` não são thread-safe).
-- Exceção dentro de `world.tick` derruba o servidor (sem try/catch no loop).
+- Exceção dentro de `world.tick` derruba o servidor (sem try/catch no loop). **Parcial (Task 4, fix 1):** mensagem
+  não codificável é descartada e contada em `NetServer::send` (`encodeErrors`); a ponte valida nome/payload dos
+  eventos de script; `applyCommands` tem try/catch. O `world.tick` em si continua sem try/catch.
+- Chamada `cb.resource` a um export que trava: o prazo da vigia do chamador também corre, então chamador e alvo levam
+  uma falta (os dois reiniciam com back-off). Documentar em `RESOURCES.md`; separar os prazos exigiria mudar o `Resource`.
+- Foto dos jogadores por tick: buffers reaproveitados quando a thread de scripts já soltou a foto antiga (até 4); ainda
+  copia as strings de cada jogador por tick (`assign`, sem nova alocação no caso comum).
+- Comando de chat que cede (consulta assíncrona da Task 5) não responde: só retorno síncrono vira `cb:reply`.
 - Política de teleporte (`setState` limpa `correctionTimes`; decidir se mantém o histórico).
 - Teto com kick para cliente que nunca alcança correção do servidor.
 - ~~Evento `echo` é de teste e fica ativo em produção: tornar só-dev.~~ Resolvido na Task 4: o eco C++ saiu; só existe

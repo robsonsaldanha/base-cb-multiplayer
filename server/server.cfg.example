@@ -12,7 +12,8 @@
   "movement": { "maxSpeedCmS": { "idle": 50, "walk": 400, "run": 900, "broom": 4000, "swim": 400, "fall": 6000, "apparate": 0 }, "tolerance": 0.2 },
   "events": { "perSecond": 20, "burst": 40 },
   "metrics": { "token": null },
-  "scripting": { "memoryLimitMB": 256, "warnMs": 50, "abortMs": 5000, "bansFile": "bans.json" },
+  "scripting": { "memoryLimitMB": 256, "warnMs": 50, "abortMs": 5000, "bansFile": "bans.json",
+                 "eventOutKBps": 64, "eventOutBurstKB": 128 },
   "resourcesDir": "resources",
   "logsDir": "logs"
 }

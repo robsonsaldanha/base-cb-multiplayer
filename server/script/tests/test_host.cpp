@@ -67,7 +67,7 @@ int luaOnce(lua_State* L) {
   lua_pushboolean(L, n->fetch_add(1) == 0);
   return 1;
 }
-CBSCRIPT_TEST_NOINLINE void doEmit(ScriptContext* ctx, const char* name) { ctx->emit(CmdEmit{-1, name, "{}"}); }
+CBSCRIPT_TEST_NOINLINE void doEmit(ScriptContext* ctx, const char* name) { ctx->emit(CmdEmit{-1, name, "{}", 0}); }
 int luaEmit(lua_State* L) {
   auto* ctx = static_cast<ScriptContext*>(lua_touserdata(L, lua_upvalueindex(1)));
   const char* s = luaL_checkstring(L, 1);
@@ -150,7 +150,7 @@ struct HostEnv {
             }
             if constexpr (std::is_same_v<T, EvClientEvent>) {
               if (e.name == "__players") {
-                ctx.emit(CmdEmit{-1, "players", std::to_string(ctx.players()->size())});
+                ctx.emit(CmdEmit{-1, "players", std::to_string(ctx.players()->size()), 0});
                 return;
               }
               for (HostedResource* h : ctx.running()) {
@@ -226,7 +226,7 @@ struct HostEnv {
     drain();
     return std::find(cmds.begin(), cmds.end(), n) != cmds.end();
   }
-  bool ev(const std::string& name) { return host->post(EvClientEvent{1, name, "{}"}); }
+  bool ev(const std::string& name) { return host->post(EvClientEvent{1, name, "{}", 0}); }
 };
 
 using Strs = std::vector<std::string>;
@@ -452,8 +452,8 @@ TEST_CASE("host: event queue is bounded, drops client events and never Join/Leav
     Out r{};
     for (int i = 0; i < 3; ++i) r.a[i] = env.ev("a" + std::to_string(i));
     r.fourth = env.ev("a3");
-    r.join = env.host->post(EvPlayerJoin{PlayerView{7, "p", "d", "s", 0, 0, 0, 0}});
-    r.leave = env.host->post(EvPlayerLeave{7, "d", "quit"});
+    r.join = env.host->post(EvPlayerJoin{PlayerView{7, "p", "d", "s", 0, 0, 0, 0, 0}});
+    r.leave = env.host->post(EvPlayerLeave{7, "d", "quit", 0});
     r.cmd = env.host->post(EvCommand{std::nullopt, "", "x", nullptr});
     return r;
   });
@@ -482,7 +482,7 @@ TEST_CASE("host: players snapshot, tasks, command replies and the command queue 
   REQUIRE(env.ev("__players"));
   REQUIRE(waitFor([&] { return env.gotCmd("players=3"); }));
 
-  env.host->runOnScriptThread([](ScriptContext& ctx) { ctx.emit(CmdKick{5, "x", ""}); });
+  env.host->runOnScriptThread([](ScriptContext& ctx) { ctx.emit(CmdKick{5, "x", 0}); });
   std::vector<ScriptToSim> out;
   REQUIRE(waitFor([&] {
     env.host->drainCommands(out);
@@ -497,7 +497,7 @@ TEST_CASE("host: players snapshot, tasks, command replies and the command queue 
 
   // fila scripts → simulação limitada
   env.host->runOnScriptThread([](ScriptContext& ctx) {
-    for (int i = 0; i < 5; ++i) ctx.emit(CmdKick{static_cast<uint16_t>(i), "", ""});
+    for (int i = 0; i < 5; ++i) ctx.emit(CmdKick{static_cast<uint16_t>(i), "", 0});
   });
   REQUIRE(waitFor([&] { return env.host->metrics().commandsDropped == 2; }));
   out.clear();
@@ -827,13 +827,13 @@ TEST_CASE("host: capacity and backstop count the batch being processed") {
   env.addRes("q", {}, "return { stuck = function() block() end }");
   env.boot();
   REQUIRE(env.ev("stuck"));
-  for (int i = 0; i < 15; ++i) REQUIRE(env.host->post(EvPlayerJoin{PlayerView{static_cast<uint16_t>(i), "p", "d", "s", 0, 0, 0, 0}}));
+  for (int i = 0; i < 15; ++i) REQUIRE(env.host->post(EvPlayerJoin{PlayerView{static_cast<uint16_t>(i), "p", "d", "s", 0, 0, 0, 0, 0}}));
   REQUIRE(waitFor([&] { return env.blocker.entered.load() == 1; }));
   // a thread de scripts já tirou os 16 da fila (lote em processamento), mas eles ainda contam
   int accepted = guarded("posts at the backstop", [&] {
     int acc = 0;
     for (int i = 0; i < 40; ++i)
-      if (env.host->post(EvPlayerJoin{PlayerView{static_cast<uint16_t>(100 + i), "p", "d", "s", 0, 0, 0, 0}})) ++acc;
+      if (env.host->post(EvPlayerJoin{PlayerView{static_cast<uint16_t>(100 + i), "p", "d", "s", 0, 0, 0, 0, 0}})) ++acc;
     if (env.ev("late")) ++acc;
     return acc;
   });
@@ -845,4 +845,30 @@ TEST_CASE("host: capacity and backstop count the batch being processed") {
   env.blocker.release();
   REQUIRE(waitFor([&] { return env.host->metrics().eventQueueDepth == 0; }));
   REQUIRE(env.ev("again"));  // abaixo da capacidade de novo
+}
+
+TEST_CASE("host: the script to simulation command queue is bounded in bytes") {
+  HostEnv env;
+  env.opt.commandQueueBytes = 20000;
+  env.addRes("a", {}, "return {}");
+  env.boot();
+  auto p = std::make_shared<std::promise<int>>();
+  auto fut = p->get_future();
+  env.host->runOnScriptThread([p](ScriptContext& ctx) {
+    int ok = 0;
+    for (int i = 0; i < 40; ++i) ok += ctx.emit(CmdEmit{-1, "e", std::string(1000, 'x'), 0}) ? 1 : 0;
+    p->set_value(ok);
+  });
+  const int accepted = guarded("emit", [&fut] { return fut.get(); });
+  REQUIRE(accepted >= 10);
+  REQUIRE(accepted < 20);
+  REQUIRE(env.host->metrics().commandsDropped == static_cast<uint64_t>(40 - accepted));
+  std::vector<ScriptToSim> out;
+  env.host->drainCommands(out);
+  REQUIRE(out.size() == static_cast<size_t>(accepted));
+  // Drenou: cabe de novo.
+  auto p2 = std::make_shared<std::promise<bool>>();
+  auto f2 = p2->get_future();
+  env.host->runOnScriptThread([p2](ScriptContext& ctx) { p2->set_value(ctx.emit(CmdEmit{-1, "e", std::string(1000, 'x'), 0})); });
+  REQUIRE(guarded("emit2", [&f2] { return f2.get(); }));
 }

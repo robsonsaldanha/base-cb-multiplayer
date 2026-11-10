@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <cbmp/messages.hpp>
@@ -36,6 +37,7 @@ struct SentRecord {
 
 struct PlayerSlot {
   EntityId id = 0;
+  uint32_t session = 0;  // único no processo (o id é reaproveitado; a sessão não)
   std::string sub, did, name;
   cbmp::PlayerState state;
   uint32_t lastInputSeq = 0;
@@ -58,12 +60,22 @@ struct PlayerSlot {
   double lastAckTime = 0;
   bool baselineFresh = false;  // calculado pelo World antes de montar snapshots (ack ≤ 1 s)
   bool kicked = false;         // KickOrder já emitida; ignora novos inputs/eventos
+  // Cota de eventos servidor → cliente (bytes de nome + payload): token bucket de scripting.eventOut*.
+  double outTokens = 0, outLast = -1;
   bool awaitingSpawn = false;  // SpawnMode::DevTrustFirstInput: fora da grade até o primeiro Input
 };
 
+// Mensagem para um jogador. `shared` (broadcast) aponta para uma mensagem imutável única para todos os
+// destinatários; use message() para ler.
 struct Outgoing {
   EntityId to = 0;
   cbmp::Message msg;
+  std::shared_ptr<const cbmp::Message> shared;
+
+  Outgoing() = default;
+  Outgoing(EntityId t, cbmp::Message m) : to(t), msg(std::move(m)) {}
+  Outgoing(EntityId t, std::shared_ptr<const cbmp::Message> m) : to(t), shared(std::move(m)) {}
+  const cbmp::Message& message() const { return shared ? *shared : msg; }
 };
 struct KickOrder {
   EntityId who = 0;
@@ -111,11 +123,16 @@ class World {
   void tick(double now, SnapshotBuilder& builder, std::vector<Outgoing>& out, std::vector<KickOrder>& kicks);
 
   void setHooks(WorldHooks hooks) { hooks_ = std::move(hooks); }
-  // Evento servidor → cliente, enviado no próximo tick (id inexistente ou já expulso: ignorado).
-  void queueEvent(EntityId to, cbmp::Event ev);
-  void broadcastEvent(const cbmp::Event& ev);  // para todos os jogadores ativos
-  // Expulsão pedida de fora (scripts): vira KickOrder no próximo tick (uma vez só).
-  void kick(EntityId id, std::string reason);
+  // Evento servidor → cliente, enviado no próximo tick. Ignorado se o id não existe, já foi expulso ou (session ≠ 0)
+  // tem outra sessão. Cada jogador tem cota de bytes (scripting.eventOutKBps/eventOutBurstKB): acima dela o evento
+  // é descartado e contado em eventsOutDropped(). false = não enfileirado.
+  bool queueEvent(EntityId to, uint32_t session, cbmp::Event ev, double now);
+  // Para todos os jogadores ativos (dentro da cota de cada um), com uma única cópia do payload.
+  void broadcastEvent(cbmp::Event ev, double now);
+  // Expulsão pedida de fora (scripts): vira KickOrder no próximo tick (uma vez só). session ≠ 0 tem de bater.
+  void kick(EntityId id, std::string reason, uint32_t session = 0);
+  void kickDid(const std::string& did, const std::string& reason);  // todos os jogadores com esse did
+  uint64_t eventsOutDropped() const { return eventsOutDropped_; }
 
   uint32_t currentTick() const { return tick_; }
   const std::vector<EntityId>& activeIds() const { return active_; }  // ordenados
@@ -143,8 +160,11 @@ class World {
   std::vector<Outgoing> pending_;
   std::vector<KickOrder> pendingKicks_;
   std::vector<EntityId> scratch_;
+  bool takeOut(PlayerSlot& p, size_t bytes, double now);
+
   uint32_t tick_ = 0;
   WorldHooks hooks_;
+  uint64_t eventsOutDropped_ = 0;
 };
 
 }  // namespace cbserver

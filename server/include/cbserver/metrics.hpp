@@ -26,6 +26,13 @@ class Metrics {
   nlohmann::json snapshot() const;
 
   std::atomic<int64_t> players{0}, pending{0}, corrections{0}, kicks{0}, droppedEvents{0}, decodeErrors{0}, sendFailures{0};
+  // Envio: mensagens descartadas por não caberem no protocolo (não derrubam o servidor).
+  std::atomic<int64_t> encodeErrors{0};
+  // Scripts (atualizados pelo loop principal): eventos não aceitos pela fila do host, comandos descartados pelo host
+  // (fila cheia) ou recusados pela simulação (inválidos), eventos servidor → cliente acima da cota do jogador,
+  // logs/auditoria descartados por limite de taxa, Join/Leave perdidos.
+  std::atomic<int64_t> scriptEventsDropped{0}, scriptCommandsDropped{0}, scriptCommandsRejected{0},
+      scriptEventsOutDropped{0}, scriptLogDropped{0}, scriptAuditDropped{0}, scriptJoinLeaveDropped{0};
 
  private:
   mutable std::mutex mu_;

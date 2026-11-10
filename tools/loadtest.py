@@ -243,6 +243,8 @@ def load_violations(r: dict, count: int) -> list[str]:
         v.append(f"{b['disconnected']} bot(s) caíram")
     if b["kicked"]:
         v.append(f"{b['kicked']} bot(s) expulsos: {b.get('kickReasons')}")
+    if b.get("echoReplies", 0) <= 0:
+        v.append("nenhuma resposta de eco (o resource Lua 'echo' não respondeu)")
     if b.get("botsWithoutSnapshots", 0):
         v.append(f"{b['botsWithoutSnapshots']} bot(s) sem nenhum snapshot")
     if r.get("serverExit") not in (0, None):
@@ -262,7 +264,7 @@ def print_load(r: dict) -> None:
         ("CPU máx do servidor (%)", f"{r['cpuPercentMax']:.0f}", "-"),
         ("bots conectados / falhas / caíram / expulsos", f"{b['connected']} / {b['failedToConnect']} / {b['disconnected']} / {b['kicked']}", "todos / 0 / 0 / 0"),
         ("intervalo entre snapshots máx / p99 (ms)", f"{b['maxSnapshotGapMs']:.0f} / {b['p99SnapshotGapMs']:.0f}", f"máx <= {LIMITS['maxSnapshotGapMs']:.0f}"),
-        ("RTT médio do eco (ms)", f"{b['avgRttMs']:.1f}", "-"),
+        ("RTT médio do eco (ms) / respostas", f"{b['avgRttMs']:.1f} / {b.get('echoReplies', 0)}", "respostas > 0"),
         ("banda recebida média por bot (kbps)", f"{b['avgKbpsInPerBot']:.1f}", "-"),
         ("correções / kicks no servidor", f"{r['serverCorrections']} / {r['serverKicks']}", "-"),
     ]

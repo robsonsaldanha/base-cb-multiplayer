@@ -491,3 +491,18 @@ TEST_CASE("net network-level closes of players are reported to the violation sin
   REQUIRE(got[1].sub == "u2");
   REQUIRE(got[1].reason == "mensagem não permitida");
 }
+
+TEST_CASE("net send drops messages that cannot be encoded, counts them and keeps running") {
+  Fixture f;
+  TestClient c(f.port);
+  f.login(c, "u1", "j1");
+  std::vector<cbserver::Outgoing> out;
+  out.emplace_back(cbserver::EntityId{1}, cbmp::Message{cbmp::Event{"big", std::vector<uint8_t>(5000, 'x')}});
+  out.emplace_back(cbserver::EntityId{1}, cbmp::Message{cbmp::Event{std::string(70, 'n'), {1}}});
+  out.emplace_back(cbserver::EntityId{1}, cbmp::Message{cbmp::Event{"ok", {1}}});
+  REQUIRE_NOTHROW(f.net.send(out));
+  REQUIRE(f.metrics.encodeErrors.load() == 2);
+  REQUIRE(f.metrics.snapshot()["encodeErrors"] == 2);
+  REQUIRE(f.until([&] { return c.first<cbmp::Event>() != nullptr; }, {&c}));
+  REQUIRE(c.first<cbmp::Event>()->name == "ok");
+}

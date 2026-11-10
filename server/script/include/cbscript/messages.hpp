@@ -17,6 +17,8 @@ struct PlayerView {
   std::string name, did, sub;
   int32_t x = 0, y = 0, z = 0;
   uint8_t state = 0;
+  // Sessão: número único no processo, dado na entrada. Um id pode ser reaproveitado por outro jogador; a sessão não.
+  uint32_t session = 0;
 };
 using PlayersSnapshot = std::shared_ptr<const std::vector<PlayerView>>;
 
@@ -28,11 +30,13 @@ struct EvPlayerLeave {
   uint16_t id = 0;
   std::string did;
   std::string reason;
+  uint32_t session = 0;
 };
 struct EvClientEvent {
   uint16_t id = 0;
   std::string name;
   std::string json;  // payload JSON (≤ 4096 bytes; validado na conversão para Lua)
+  uint32_t session = 0;
 };
 struct EvCommand {
   std::optional<uint16_t> from;  // jogador que digitou (chat) ou vazio (console/painel)
@@ -43,23 +47,31 @@ struct EvCommand {
 using SimToScript = std::variant<EvPlayerJoin, EvPlayerLeave, EvClientEvent, EvCommand>;
 
 // ---- Scripts → simulação ----
-// `did` (opcional): só aplica se o jogador com esse id ainda tiver esse did (o id pode ter sido reaproveitado).
+// `session` (0 = sem checagem): a simulação descarta o comando se o jogador daquele id tiver outra sessão (o id foi
+// reaproveitado por outro jogador entre o pedido e a aplicação).
 struct CmdKick {
   uint16_t id = 0;
   std::string reason;
-  std::string did;
+  uint32_t session = 0;
 };
 struct CmdEmit {
   int32_t target = -1;  // id do jogador ou -1 = todos
-  std::string name;
-  std::string json;
+  std::string name;     // ≤ 64 bytes
+  std::string json;     // ≤ 4096 bytes (a simulação descarta e conta o que passar)
+  uint32_t session = 0;
 };
 struct CmdSetPosition {
   uint16_t id = 0;
   int32_t x = 0, y = 0, z = 0;
-  std::string did;
+  uint32_t session = 0;
 };
-using ScriptToSim = std::variant<CmdKick, CmdEmit, CmdSetPosition>;
+// Expulsa todo jogador conectado com esse did (resolvido na simulação: pega também quem entrou e ainda não chegou
+// aos scripts).
+struct CmdKickDid {
+  std::string did;
+  std::string reason;
+};
+using ScriptToSim = std::variant<CmdKick, CmdEmit, CmdSetPosition, CmdKickDid>;
 
 struct ResourceStatus {
   std::string name;

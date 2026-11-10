@@ -42,7 +42,7 @@ struct Harness {
     std::vector<T> r;
     for (const auto& o : out)
       if (o.to == to)
-        if (const T* p = std::get_if<T>(&o.msg)) r.push_back(*p);
+        if (const T* p = std::get_if<T>(&o.message())) r.push_back(*p);
     return r;
   }
 

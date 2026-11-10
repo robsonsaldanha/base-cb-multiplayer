@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <random>
 #include <span>
@@ -374,10 +375,19 @@ void NetServer::send(const std::vector<Outgoing>& out) {
   for (const auto& o : out) {
     auto it = connOf_.find(o.to);
     if (it == connOf_.end()) continue;
-    const int n = sendTo(it->second, o.msg);
+    const cbmp::Message& m = o.message();
+    int n = 0;
+    try {
+      n = sendTo(it->second, m);
+    } catch (const std::exception& e) {
+      // Mensagem que não cabe no protocolo (ex.: payload > 4096): descarta só ela; o servidor segue.
+      if (metrics_.encodeErrors.fetch_add(1) % 1000 == 0)
+        spdlog::error("mensagem para o jogador {} descartada (não codificável): {}", o.to, e.what());
+      continue;
+    }
     if (n >= 0) {
       metrics_.addBytesOut(o.to, static_cast<size_t>(n));
-    } else if (n == -2 && cbmp::isReliable(cbmp::typeOf(o.msg)) &&
+    } else if (n == -2 && cbmp::isReliable(cbmp::typeOf(m)) &&
                std::find(slow_.begin(), slow_.end(), o.to) == slow_.end()) {
       slow_.push_back(o.to);  // fila confiável cheia: o cliente não acompanha
     }

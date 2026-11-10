@@ -6,6 +6,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -27,6 +28,10 @@ struct ResourceManifest {
 // [A-Za-z0-9._-] (ou "."/".."/longo demais); script de "server" que não seja caminho seguro "server/....lua";
 // dependência com nome inválido; "permissions" malformado.
 ResourceManifest loadManifest(const std::filesystem::path& dir);
+
+// Texto de script para uma linha de log: \n, \r e outros caracteres de controle (exceto tab) viram escapes
+// (\n, \r, \xHH), para um script não forjar linhas no log do servidor.
+std::string escapeLogText(std::string_view s);
 
 struct Limits {
   size_t memoryBytes = size_t{256} << 20;

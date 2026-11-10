@@ -1,6 +1,7 @@
 #include "cbserver/world.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <utility>
 
@@ -16,6 +17,8 @@ constexpr double kBaselineMaxAgeSec = 1.0;
 constexpr double kCorrectionWindowSec = 1.0;  // após uma Correction, não envia/conta outra por até 1 s
 constexpr double kServerGraceSec = 30.0;       // carência das janelas do servidor antes de reenviar a Correction
 constexpr int kMaxIgnoredWindows = 5;          // janelas de correção seguidas vencidas com o cliente longe → kick
+
+std::atomic<uint32_t> gNextSession{1};
 
 void trimWindow(std::deque<double>& q, double now) {
   while (!q.empty() && q.front() < now - kWindowSec) q.pop_front();
@@ -60,6 +63,8 @@ std::optional<EntityId> World::addPlayer(std::string sub, std::string did, std::
     if (slots_[i]) continue;
     auto p = std::make_unique<PlayerSlot>();
     p->id = static_cast<EntityId>(i);
+    p->session = gNextSession.fetch_add(1);
+    if (p->session == 0) p->session = gNextSession.fetch_add(1);  // 0 = "sem checagem"
     p->sub = std::move(sub);
     p->did = std::move(did);
     p->name = std::move(name);
@@ -210,19 +215,50 @@ bool World::onEvent(EntityId id, const cbmp::Event& ev, double now) {
   return true;
 }
 
-void World::queueEvent(EntityId to, cbmp::Event ev) {
-  const PlayerSlot* p = slot(to);
-  if (!p || p->kicked) return;
-  pending_.push_back(Outgoing{to, std::move(ev)});
+bool World::takeOut(PlayerSlot& p, size_t bytes, double now) {
+  const double rate = std::max(0.0, cfg_.scriptEventOutKBps) * 1024.0;
+  const double burst = std::max(0.0, cfg_.scriptEventOutBurstKB) * 1024.0;
+  if (p.outLast < 0)
+    p.outTokens = burst;
+  else
+    p.outTokens = std::min(burst, p.outTokens + std::max(0.0, now - p.outLast) * rate);
+  p.outLast = now;
+  const double need = static_cast<double>(bytes);
+  if (p.outTokens < need) {
+    ++eventsOutDropped_;
+    return false;
+  }
+  p.outTokens -= need;
+  return true;
 }
 
-void World::broadcastEvent(const cbmp::Event& ev) {
+bool World::queueEvent(EntityId to, uint32_t session, cbmp::Event ev, double now) {
+  PlayerSlot* p = slot(to);
+  if (!p || p->kicked || (session != 0 && p->session != session)) return false;
+  if (!takeOut(*p, ev.name.size() + ev.payload.size(), now)) return false;
+  pending_.push_back(Outgoing{to, cbmp::Message{std::move(ev)}});
+  return true;
+}
+
+void World::broadcastEvent(cbmp::Event ev, double now) {
+  const size_t bytes = ev.name.size() + ev.payload.size();
+  std::shared_ptr<const cbmp::Message> msg;
+  for (EntityId id : active_) {
+    PlayerSlot& p = *slots_[id];
+    if (p.kicked || !takeOut(p, bytes, now)) continue;
+    if (!msg) msg = std::make_shared<const cbmp::Message>(std::move(ev));
+    pending_.push_back(Outgoing{id, msg});
+  }
+}
+
+void World::kick(EntityId id, std::string reason, uint32_t session) {
+  PlayerSlot* p = slot(id);
+  if (p && (session == 0 || p->session == session)) orderKick(*p, std::move(reason));
+}
+
+void World::kickDid(const std::string& did, const std::string& reason) {
   for (EntityId id : active_)
-    if (!slots_[id]->kicked) pending_.push_back(Outgoing{id, ev});
-}
-
-void World::kick(EntityId id, std::string reason) {
-  if (PlayerSlot* p = slot(id)) orderKick(*p, std::move(reason));
+    if (slots_[id]->did == did) orderKick(*slots_[id], reason);
 }
 
 void World::onSnapshotAck(EntityId id, uint32_t tick, double now) {

@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <thread>
 #include <utility>
+#include <type_traits>
 #include <variant>
 
 // Decisões (ver também host.hpp e .superpowers/sdd/sub3/task-3-report.md):
@@ -101,6 +102,10 @@ struct Slot {
   bool stopping = false;
   std::chrono::steady_clock::duration busy{};
   double cpuMsPerSec = 0;
+  // Limite de logs de erro de callback (200 por janela de 1 s; o resto vira uma linha de resumo).
+  std::chrono::steady_clock::time_point errWindow{};
+  int errLines = 0;
+  uint64_t errDropped = 0;
 
   void setManifest(ResourceManifest m) { h.manifest_ = std::move(m); }
 };
@@ -131,6 +136,7 @@ struct HostImpl final : ScriptContext {
   // ---- fila Script→Sim (cmdMu) ----
   std::mutex cmdMu;
   std::vector<ScriptToSim> cmds;
+  size_t cmdBytes = 0;  // bytes aproximados em `cmds` (teto commandQueueBytes)
   std::atomic<uint64_t> cmdsDropped{0};
 
   // ---- foto dos jogadores (playersMu: só a troca do ponteiro) ----
@@ -176,12 +182,25 @@ struct HostImpl final : ScriptContext {
     std::lock_guard<std::mutex> lk(playersMu);
     return players_;
   }
+  static size_t bytesOf(const ScriptToSim& c) {
+    return sizeof(ScriptToSim) + std::visit(
+                                     [](const auto& x) -> size_t {
+                                       using T = std::decay_t<decltype(x)>;
+                                       if constexpr (std::is_same_v<T, CmdEmit>) return x.name.size() + x.json.size();
+                                       else if constexpr (std::is_same_v<T, CmdKickDid>) return x.did.size() + x.reason.size();
+                                       else if constexpr (std::is_same_v<T, CmdKick>) return x.reason.size();
+                                       else return 0;
+                                     },
+                                     c);
+  }
   bool emit(ScriptToSim cmd) override {
+    const size_t n = bytesOf(cmd);
     std::lock_guard<std::mutex> lk(cmdMu);
-    if (cmds.size() >= opt.commandQueueCapacity) {
+    if (cmds.size() >= opt.commandQueueCapacity || cmdBytes + n > opt.commandQueueBytes) {
       cmdsDropped.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
+    cmdBytes += n;
     cmds.push_back(std::move(cmd));
     return true;
   }
@@ -281,13 +300,32 @@ struct HostImpl final : ScriptContext {
     endCall();
     if (halted.load()) return res;
     if (!res.ok) {
-      log(LogLevel::Error, res.error);
+      logCallbackError(s, res.error);
       if (res.timedOut && !s.stopping && !s.timeoutPending) {
         s.timeoutPending = true;
         pendingTimeouts.push_back(&s);
       }
     }
     return res;
+  }
+
+  // Erro de callback: no máximo 200 linhas por segundo por resource (um script pode errar em todo evento).
+  void logCallbackError(Slot& s, const std::string& msg) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - s.errWindow >= std::chrono::seconds(1)) {
+      if (s.errDropped > 0)
+        log(LogLevel::Error, "[" + s.h.name() + "] " + std::to_string(s.errDropped) +
+                                 " erros de callback descartados (limite de 200 por segundo)");
+      s.errWindow = now;
+      s.errLines = 0;
+      s.errDropped = 0;
+    }
+    if (s.errLines >= 200) {
+      ++s.errDropped;
+      return;
+    }
+    ++s.errLines;
+    log(LogLevel::Error, msg);
   }
 
   // ================= status =================
@@ -1034,6 +1072,7 @@ void ScriptHost::drainCommands(std::vector<ScriptToSim>& out) {
   {
     std::lock_guard<std::mutex> lk(I.cmdMu);
     got.swap(I.cmds);
+    I.cmdBytes = 0;
   }
   if (out.empty()) {
     out.swap(got);

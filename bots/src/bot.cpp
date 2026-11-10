@@ -442,6 +442,7 @@ struct Swarm {
                      {"p99SnapshotGapMs", gaps.p99Ms()},
                      {"botsWithoutSnapshots", withoutSnapshots},
                      {"avgRttMs", rttN ? rttSum / static_cast<double>(rttN) * 1000.0 : 0.0},
+                     {"echoReplies", rttN},
                      {"bytesIn", bytesIn},
                      {"avgKbpsInPerBot", kbpsN ? kbpsSum / kbpsN : 0.0},
                      {"snapshotsReceived", snapshots},

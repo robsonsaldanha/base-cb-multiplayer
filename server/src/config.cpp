@@ -167,6 +167,8 @@ ServerConfig ServerConfig::fromJson(const json& j) {
     if (c.scriptAbortMs <= c.scriptWarnMs) fail("scripting.abortMs", "deve ser maior que 'scripting.warnMs'");
     getStr(*sc, "bansFile", "scripting.", c.bansFile);
     if (c.bansFile.empty()) fail("scripting.bansFile", "não pode ser vazio");
+    getNum(*sc, "eventOutKBps", "scripting.", 1, 1e6, c.scriptEventOutKBps);
+    getNum(*sc, "eventOutBurstKB", "scripting.", 8, 1e6, c.scriptEventOutBurstKB);
   }
   if (const json* m = sub(j, "metrics", "")) {
     if (const json* t = sub(*m, "token", "metrics.")) {

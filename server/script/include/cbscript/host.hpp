@@ -92,6 +92,7 @@ struct HostOptions {
   // teto rígido de 4× a capacidade: dali em diante tudo é descartado, com log CRÍTICO (1 por episódio) e métrica.
   size_t eventQueueCapacity = 65536;
   size_t commandQueueCapacity = 65536;  // scripts → simulação
+  size_t commandQueueBytes = size_t{16} << 20;  // teto de bytes (payloads) na fila scripts → simulação
   double supervisorGraceSec = 10.0;     // supervisor dispara em abortAfter + isto
   std::chrono::milliseconds supervisorPeriod{100};  // período real de checagem do supervisor
   std::chrono::milliseconds idleWait{10};  // espera máxima da thread de scripts sem trabalho (back-off, onTick)

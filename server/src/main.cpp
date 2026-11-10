@@ -162,12 +162,14 @@ int run(const std::string& cfgPath) {
   });
 
   // Scripts Lua: thread própria; a simulação só conversa com ela por filas (ScriptBridge).
-  auto bans = std::make_shared<cbscript::BanStore>(cfg.bansFile);
+  auto bans = std::make_shared<cbscript::BanStore>(cfg.bansFile, unixNow);
   auto auditLog = makeAuditLogger(cfg.logsDir);
   cbscript::ApiOptions api;
   api.bans = bans;
   api.audit = [auditLog](const std::string& line) { auditLog->info("{}", line); };
   api.unixNow = unixNow;
+  auto apiStats = std::make_shared<cbscript::ApiStats>();
+  api.stats = apiStats;
   cbscript::HostOptions hostOpt;
   cbscript::installApi(hostOpt, std::move(api));
   cbscript::Limits limits;
@@ -252,11 +254,15 @@ int run(const std::string& cfgPath) {
         if (!world.onEvent(m.from, *e, now)) ++metrics.droppedEvents;
       }
     }
-    bridge.applyCommands(now);
+    try {
+      bridge.applyCommands(now);
+    } catch (const std::exception& e) {  // comando de script nunca derruba a simulação
+      spdlog::error("scripts: falha ao aplicar comandos: {}", e.what());
+    }
     world.tick(now, builder, out, kicks);
     bridge.publishPlayers();
     for (const auto& o : out)
-      if (const auto* c = std::get_if<cbmp::Correction>(&o.msg); c && c->seq != 0) {
+      if (const auto* c = std::get_if<cbmp::Correction>(&o.message()); c && c->seq != 0) {
         ++metrics.corrections;
         anticheat(*acLog, world, o.to,
                   {{"type", "correction"}, {"seq", c->seq}, {"pos", {c->pos.x, c->pos.y, c->pos.z}}});
@@ -267,6 +273,16 @@ int run(const std::string& cfgPath) {
       net.kick(k.who, k.reason);  // também remove do mundo
     }
     metrics.recordTick(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start));
+    if (world.currentTick() % static_cast<uint32_t>(cfg.tickHz) == 0) {  // contadores dos scripts, 1×/s
+      const auto hm = scripts.metrics();
+      metrics.scriptEventsDropped = static_cast<int64_t>(hm.eventsDropped + bridge.eventsDropped());
+      metrics.scriptCommandsDropped = static_cast<int64_t>(hm.commandsDropped);
+      metrics.scriptCommandsRejected = static_cast<int64_t>(bridge.commandsRejected());
+      metrics.scriptEventsOutDropped = static_cast<int64_t>(world.eventsOutDropped());
+      metrics.scriptLogDropped = static_cast<int64_t>(apiStats->logDropped.load());
+      metrics.scriptAuditDropped = static_cast<int64_t>(apiStats->auditDropped.load());
+      metrics.scriptJoinLeaveDropped = static_cast<int64_t>(bridge.joinLeaveDropped());
+    }
 
     next += period;
     const auto after = Clock::now();

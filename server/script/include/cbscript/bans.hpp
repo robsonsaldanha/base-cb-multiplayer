@@ -2,6 +2,7 @@
 // BanStore: bans do servidor. Provisório (Task 4): só o arquivo bans.json; a Task 5 acrescenta o MySQL.
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -17,13 +18,17 @@ struct Ban {
 };
 
 // Threads: check() é chamado pela simulação (na entrada do jogador) e só segura o mutex por uma busca O(1).
-// add/remove são da thread de scripts (único escritor): atualizam o mapa sob o mutex (O(1)) e regravam o arquivo
-// fora dele, a partir da cópia do escritor.
+// add/remove têm UM escritor só (a thread de scripts; o painel da Task 7/8 também passa por ela): atualizam o mapa
+// sob o mutex (O(1)) e regravam o arquivo fora dele, a partir da cópia do escritor. Dois escritores ao mesmo tempo
+// não são suportados.
+// Arquivo: gravado num .tmp, com flush + fsync (FlushFileBuffers no Windows) antes do rename. Bans expirados são
+// descartados ao carregar e ao gravar.
 class BanStore {
  public:
   // Lê `file` se existir (lista JSON de {did, reason, by, createdAt, expiresAt}). Arquivo malformado → lança
   // std::runtime_error (pt-BR). Caminho vazio = só memória (testes).
-  explicit BanStore(std::filesystem::path file);
+  // `nowUnix`: relógio para descartar expirados (vazio = system_clock).
+  explicit BanStore(std::filesystem::path file, std::function<int64_t()> nowUnix = {});
 
   // Ban em vigor para `did` em `nowUnix` (expirados não contam).
   std::optional<Ban> check(const std::string& did, int64_t nowUnix) const;
@@ -38,8 +43,10 @@ class BanStore {
 
  private:
   bool persist(std::string& err);
+  int64_t now() const;
 
   std::filesystem::path file_;
+  std::function<int64_t()> now_;
   mutable std::mutex mu_;
   std::unordered_map<std::string, Ban> live_;    // sob mu_ (lido pela simulação)
   std::unordered_map<std::string, Ban> writer_;  // só a thread de scripts (fonte da gravação)

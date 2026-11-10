@@ -406,9 +406,9 @@ TEST_CASE("world queueEvent and broadcastEvent deliver server events in the next
   Harness h;
   auto a = h.add("ana");
   auto b = h.add("bia", {100, 0, 0});
-  h.world.queueEvent(a, Event{"so-a", {1}});
-  h.world.queueEvent(99, Event{"ninguem", {2}});  // id inexistente: ignorado
-  h.world.broadcastEvent(Event{"todos", {3}});
+  REQUIRE(h.world.queueEvent(a, 0, Event{"so-a", {1}}, 0.0));
+  REQUIRE_FALSE(h.world.queueEvent(99, 0, Event{"ninguem", {2}}, 0.0));  // id inexistente: ignorado
+  h.world.broadcastEvent(Event{"todos", {3}}, 0.0);
   h.step();
   auto ea = h.msgs<Event>(a);
   auto eb = h.msgs<Event>(b);
@@ -420,6 +420,73 @@ TEST_CASE("world queueEvent and broadcastEvent deliver server events in the next
   REQUIRE(eb[0].payload == std::vector<uint8_t>{3});
   h.step();
   REQUIRE(h.msgs<Event>(a).empty());
+}
+
+TEST_CASE("world sessions are unique, and events, kicks with another session are ignored") {
+  Harness h;
+  auto a = h.add("ana");
+  const uint32_t sa = h.world.find(a)->session;
+  REQUIRE(sa != 0);
+  h.world.removePlayer(a);
+  auto b = h.add("bia");
+  REQUIRE(b == a);  // id reaproveitado
+  const uint32_t sb = h.world.find(b)->session;
+  REQUIRE(sb != sa);
+  REQUIRE_FALSE(h.world.queueEvent(b, sa, Event{"velho", {1}}, 0.0));
+  REQUIRE(h.world.queueEvent(b, sb, Event{"novo", {2}}, 0.0));
+  h.world.kick(b, "kick velho", sa);
+  h.step();
+  REQUIRE(h.kicks.empty());
+  auto ev = h.msgs<Event>(b);
+  REQUIRE(ev.size() == 1);
+  REQUIRE(ev[0].name == "novo");
+  h.world.kick(b, "kick certo", sb);
+  h.step();
+  REQUIRE(h.kicks.size() == 1);
+}
+
+TEST_CASE("world kickDid kicks every player with that did") {
+  Harness h;
+  auto a = h.add("ana");
+  auto b = h.add("bia");
+  h.world.kickDid("did-bia", "banido: x");
+  h.world.kickDid("did-ninguem", "x");
+  h.step();
+  REQUIRE(h.kicks.size() == 1);
+  REQUIRE(h.kicks[0].who == b);
+  REQUIRE(h.kicks[0].reason == "banido: x");
+  REQUIRE_FALSE(h.world.find(a)->kicked);
+}
+
+TEST_CASE("world outbound event budget per player drops and counts the excess; broadcast shares one payload") {
+  ServerConfig cfg;
+  cfg.scriptEventOutKBps = 8;      // 8 KiB/s
+  cfg.scriptEventOutBurstKB = 16;  // 16 KiB
+  Harness h(cfg);
+  auto a = h.add("ana");
+  auto b = h.add("bia", {100, 0, 0});
+  const std::vector<uint8_t> kb(1023, 'x');  // 1 KiB com o nome "e"
+  int accepted = 0;
+  for (int i = 0; i < 40; ++i) accepted += h.world.queueEvent(a, 0, Event{"e", kb}, 0.0) ? 1 : 0;
+  REQUIRE(accepted == 16);
+  REQUIRE(h.world.eventsOutDropped() == 24);
+  REQUIRE(h.world.queueEvent(a, 0, Event{"e", kb}, 1.0));  // 1 s depois: 8 KiB de volta
+  for (int i = 0; i < 20; ++i) h.world.broadcastEvent(Event{"e", kb}, 1.0);
+  h.step();
+  const auto ea = h.msgs<Event>(a).size(), eb = h.msgs<Event>(b).size();
+  REQUIRE(ea == 17 + 7);  // a: 16 + 1 antes, depois 7 broadcasts (8 KiB − 1 KiB)
+  REQUIRE(eb == 16);      // b: só o burst
+  // Um broadcast = uma mensagem compartilhada entre os destinatários.
+  const cbmp::Message* first = nullptr;
+  for (const auto& o : h.out)
+    if (o.shared) {
+      if (!first) first = o.shared.get();
+      if (o.to == b) {
+        REQUIRE(o.shared.get() == first);
+        break;
+      }
+    }
+  REQUIRE(first != nullptr);
 }
 
 TEST_CASE("world kick orders a KickOrder once with the given reason") {

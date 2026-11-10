@@ -10,6 +10,7 @@
 //
 // Todo callback roda numa corrotina própria (ScriptContext::invoke). Eventos locais (cb.events.emitLocal) são
 // entregues na mesma thread logo depois do gancho/evento atual terminar (nunca reentrantes).
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -21,6 +22,12 @@
 namespace cbscript {
 
 class BanStore;
+
+// Contadores da API (lidos de qualquer thread, para /metrics).
+struct ApiStats {
+  std::atomic<uint64_t> logDropped{0};    // linhas de cb.log acima de 200/s por resource
+  std::atomic<uint64_t> auditDropped{0};  // linhas de cb.audit acima de 200/s (todas as fontes)
+};
 
 struct ApiOptions {
   // Uma linha JSONL de auditoria (sem '\n'), só da thread de scripts. Vazio = descartada.
@@ -35,6 +42,7 @@ struct ApiOptions {
   double minEveryMs = 10;
   size_t maxLocalQueue = 65536;  // eventos locais aguardando entrega (acima disso emitLocal dá erro)
   size_t maxLocalBytes = 65536;  // JSON de um evento local / argumento de cb.resource
+  std::shared_ptr<ApiStats> stats;  // opcional
 };
 
 void installApi(HostOptions& opt, ApiOptions api = {});

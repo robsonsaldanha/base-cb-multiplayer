@@ -47,8 +47,9 @@ struct ApiEnv {
   std::vector<std::string> audits;
   std::vector<ScriptToSim> cmds;
   std::vector<std::string> replies;
-  std::atomic<int64_t> unix{1'700'000'000};
+  std::atomic<int64_t> unixTime{1'700'000'000};
   HostOptions opt;
+  Limits lim = shortLimits();
   ApiOptions api;
   std::shared_ptr<BanStore> bans;
   std::unique_ptr<ScriptHost> host;
@@ -60,13 +61,13 @@ struct ApiEnv {
       std::lock_guard<std::mutex> lk(mu);
       logs.emplace_back(l, m);
     };
-    bans = std::make_shared<BanStore>(dir.p / "bans.json");
+    bans = std::make_shared<BanStore>(dir.p / "bans.json", [this] { return unixTime.load(); });
     api.bans = bans;
     api.audit = [this](const std::string& line) {
       std::lock_guard<std::mutex> lk(mu);
       audits.push_back(line);
     };
-    api.unixNow = [this] { return unix.load(); };
+    api.unixNow = [this] { return unixTime.load(); };
   }
   ~ApiEnv() {
     if (host)
@@ -84,7 +85,7 @@ struct ApiEnv {
   }
   void boot() {
     installApi(opt, api);
-    host = std::make_unique<ScriptHost>(dir.p / "res", shortLimits(), [c = clock] { return c->get(); }, opt);
+    host = std::make_unique<ScriptHost>(dir.p / "res", lim, [c = clock] { return c->get(); }, opt);
     guarded("start", [this] {
       host->start();
       return 0;
@@ -157,11 +158,15 @@ struct ApiEnv {
     });
     return found;
   }
+  static uint32_t sessionOf(uint16_t id) { return 1000u + id; }
+  void leave(uint16_t id, const std::string& why = "saiu") {
+    REQUIRE(host->post(EvPlayerLeave{id, "d" + std::to_string(id), why, sessionOf(id)}));
+  }
   void join(uint16_t id, const std::string& name, int32_t x = 0, int32_t y = 0, int32_t z = 0) {
-    REQUIRE(host->post(EvPlayerJoin{PlayerView{id, name, "d" + std::to_string(id), "s" + std::to_string(id), x, y, z, 1}}));
+    REQUIRE(host->post(EvPlayerJoin{PlayerView{id, name, "d" + std::to_string(id), "s" + std::to_string(id), x, y, z, 1, sessionOf(id)}}));
   }
   void event(uint16_t id, const std::string& name, const std::string& json = "{}") {
-    REQUIRE(host->post(EvClientEvent{id, name, json}));
+    REQUIRE(host->post(EvClientEvent{id, name, json, sessionOf(id)}));
   }
   void command(std::optional<uint16_t> from, const std::string& line, bool withReply = true) {
     EvCommand c;
@@ -211,7 +216,7 @@ TEST_CASE("api: cb.on receives playerJoin, playerLeave, resourceStart and resour
   REQUIRE(env.hasLog("bad fn cb.on: função esperada"));
   env.join(7, "ana", 1, 2, 3);
   REQUIRE(env.waitLog("join 7 ana d7 s7 1 2 3 1"));
-  REQUIRE(env.host->post(EvPlayerLeave{7, "d7", "saiu"}));
+  env.leave(7);
   REQUIRE(env.waitLog("leave 7 ana d7 saiu"));
   REQUIRE(env.call(env.host->stopResource("a")));
   REQUIRE(env.hasLog("[a] stop"));
@@ -275,11 +280,13 @@ TEST_CASE("api: client events are decoded, emitted back as JSON and limited to c
   REQUIRE(env.waitLog("emit999 ok"));
   env.sync();
   REQUIRE_FALSE(env.hasLog("ghost ran"));
-  REQUIRE(env.waitCmd<CmdEmit>([](const CmdEmit& c) { return c.target == 999; }));  // ignorado pela simulação
+  env.drain();
+  for (auto& c : env.cmds)  // id não conectado: emit devolve false e nada vai para a simulação
+    if (auto* em = std::get_if<CmdEmit>(&c)) REQUIRE(em->target != 999);
   REQUIRE(env.state("a") == State::Running);
 
   // Depois de sair, eventos atrasados do jogador não chegam mais aos handlers.
-  REQUIRE(env.host->post(EvPlayerLeave{3, "d3", "saiu"}));
+  env.leave(3);
   env.event(3, "to999");
   env.sync();
   REQUIRE(env.countLog("emit999 ok") == 1);
@@ -310,7 +317,7 @@ TEST_CASE("api: players come from the snapshot; kick and setPosition become comm
   env.join(1, "ana", 10, 20, 30);
   env.join(2, "bia");
   env.host->publishPlayers(std::make_shared<const std::vector<PlayerView>>(std::vector<PlayerView>{
-      PlayerView{1, "ana", "d1", "s1", 10, 20, 30, 2}, PlayerView{2, "bia", "d2", "s2", 0, 0, 0, 3}}));
+      PlayerView{1, "ana", "d1", "s1", 10, 20, 30, 2, 1001}, PlayerView{2, "bia", "d2", "s2", 0, 0, 0, 3, 1002}}));
   env.event(1, "go");
   REQUIRE(env.waitLog("n=2 first=ana x=10 z=30"));
   REQUIRE(env.hasLog("get2=bia state=3 did=d2"));
@@ -326,12 +333,12 @@ TEST_CASE("api: players come from the snapshot; kick and setPosition become comm
   REQUIRE(k);
   REQUIRE(k->id == 2);
   REQUIRE(k->reason == "tchau");
-  REQUIRE(k->did == "d2");
+  REQUIRE(k->session == 1002);
   auto* tp = env.waitCmd<CmdSetPosition>([](const CmdSetPosition&) { return true; });
   REQUIRE(tp);
   REQUIRE(tp->id == 1);
   REQUIRE((tp->x == 100 && tp->y == -200 && tp->z == 300));
-  REQUIRE(tp->did == "d1");
+  REQUIRE(tp->session == 1001);
 
   auto audits = env.auditLines();
   REQUIRE(audits.size() == 1);
@@ -370,13 +377,12 @@ TEST_CASE("api: ban persists to bans.json, kicks the connected player and unban 
   REQUIRE(env.hasLog("badban cb.players.ban: did inválido"));
   REQUIRE(env.hasLog("baddur cb.players.ban: duração inválida"));
 
-  auto* k = env.waitCmd<CmdKick>([](const CmdKick&) { return true; });
+  auto* k = env.waitCmd<CmdKickDid>([](const CmdKickDid&) { return true; });  // resolvido na simulação
   REQUIRE(k);
-  REQUIRE(k->id == 2);
   REQUIRE(k->did == "d2");
   REQUIRE(contains(k->reason, "cheat"));
 
-  const int64_t now = env.unix.load();
+  const int64_t now = env.unixTime.load();
   auto b = env.bans->check("d2", now);
   REQUIRE(b);
   REQUIRE(b->reason == "cheat");
@@ -385,7 +391,7 @@ TEST_CASE("api: ban persists to bans.json, kicks the connected player and unban 
   REQUIRE_FALSE(env.bans->check("d2", now + 61));
   REQUIRE_FALSE(env.bans->check("d9", now));
 
-  BanStore reloaded(env.dir.p / "bans.json");
+  BanStore reloaded(env.dir.p / "bans.json", [&env] { return env.unixTime.load(); });
   REQUIRE(reloaded.check("d2", now));
   REQUIRE_FALSE(reloaded.check("d9", now));
 
@@ -397,8 +403,9 @@ TEST_CASE("api: ban persists to bans.json, kicks the connected player and unban 
 
 TEST_CASE("bans: file round trip, expiry and malformed files") {
   TmpDir t;
+  auto clock = [] { return int64_t{150}; };
   {
-    BanStore s(t.p / "bans.json");
+    BanStore s(t.p / "bans.json", clock);
     std::string err;
     REQUIRE(s.add(Ban{"a", "r1", "admin:x", 100, 0}, err));
     REQUIRE(s.add(Ban{"b", "r2", "resource:y", 100, 200}, err));
@@ -411,7 +418,7 @@ TEST_CASE("bans: file round trip, expiry and malformed files") {
     REQUIRE(s.remove("a", removed, err));
     REQUIRE_FALSE(removed);
   }
-  BanStore again(t.p / "bans.json");
+  BanStore again(t.p / "bans.json", clock);
   REQUIRE_FALSE(again.check("a", 150));
   auto b = again.check("b", 150);
   REQUIRE(b);
@@ -701,4 +708,299 @@ TEST_CASE("api: handlers and commands registered by a restarted resource are not
   REQUIRE(waitUntil([&] { return env.hasReply("ok"); }));
   env.sync();
   REQUIRE(env.countLog("pong") == 1);
+}
+
+// ============================================== regressões dos ataques do revisor (Task 4, fix round 1)
+
+TEST_CASE("api: pairs over cb.config does not leak the original table") {
+  ApiEnv env;
+  env.addRes("a", R"(
+    local _, orig = pairs(cb.config)
+    local ok = pcall(function() orig.x = 'hacked' end)
+    cb.log.info('cfg ' .. tostring(ok) .. ' ' .. tostring(cb.config.x))
+  )", {}, {{"x", "orig"}});
+  env.boot();
+  INFO(env.allLogs());
+  REQUIRE(env.waitLog("cfg false orig"));
+}
+
+TEST_CASE("api: hostile arguments only raise Lua errors") {
+  ApiEnv env;
+  env.addRes("b", R"( return { v = 1 } )");
+  env.addRes("a", R"(
+    local mt = {__index=function() error('idx') end, __len=function() error('len') end,
+                __tostring=function() error('ts') end, __eq=function() return true end,
+                __pairs=function() error('pairs') end, __name='Hostil'}
+    local hostile = setmetatable({}, mt)
+    local function try(name, f, ...)
+      local ok, e = pcall(f, ...)
+      cb.log.info('T ' .. name .. ' ' .. tostring(ok) .. ' ' .. tostring(e))
+    end
+    try('emit-nan', cb.events.emit, 0/0, 'x', {})
+    try('emit-huge', cb.events.emit, 2^63, 'x', {})
+    try('emit-minint', cb.events.emit, math.mininteger, 'x', {})
+    try('emit-hostile', cb.events.emit, -1, 'x', hostile)
+    try('emit-hostile-name', cb.events.emit, -1, hostile, {})
+    try('emit-nul', cb.events.emit, -1, 'a\0b', {})
+    try('emit-nested-hostile', cb.events.emit, -1, 'x', {a = {b = hostile}})
+    try('kick-nan', cb.players.kick, 0/0)
+    try('kick-reason-tbl', cb.players.kick, 1, hostile)
+    try('setpos-inf', cb.players.setPosition, 1, math.huge, 0, 0)
+    try('setpos-big', cb.players.setPosition, 1, 2^31, 0, 0)
+    try('setpos-str', cb.players.setPosition, 1, '1', 0, 0)
+    try('after-inf', cb.timers.after, math.huge, function() end)
+    try('every-nan', cb.timers.every, 0/0, function() end)
+    try('every-neg0', cb.timers.every, -0.0, function() end)
+    try('cancel-huge', cb.timers.cancel, math.maxinteger)
+    try('cancel-neg', cb.timers.cancel, -1)
+    try('ban-hostile', cb.players.ban, hostile)
+    try('ban-dur-huge', cb.players.ban, 'd', 'r', math.maxinteger)
+    try('ban-dur-float', cb.players.ban, 'd', 'r', 1.5)
+    try('audit-hostile', cb.audit, 't', hostile)
+    try('audit-id-hostile', cb.audit, 't', setmetatable({id = 1}, mt))
+    try('log-hostile', cb.log.info, hostile)
+    try('log-tostring-nonstr', cb.log.info, setmetatable({}, {__tostring = function() return {} end}))
+    try('log-name', cb.log.info, setmetatable({}, {__name = 'zz'}))
+    try('register-hostile-opts', cb.commands.register, 'c1', function() end, hostile)
+    try('resource-hostile', cb.resource, hostile)
+    try('resource-nul', cb.resource, 'b\0x')
+    try('config-newindex', function() cb.config.x = 1 end)
+    try('get-nan', cb.players.get, 0/0)
+    try('on-nul', cb.on, 'playerJoin\0zzz', function() end)
+    try('null-index', function() return cb.null.x end)
+    local deep = {} local c = deep for i = 1, 100 do c[1] = {} c = c[1] end
+    try('emitLocal-deep', cb.events.emitLocal, 'x', deep)
+    local rec; rec = setmetatable({}, {__tostring = function() cb.log.info(rec) return 'x' end})
+    try('log-recursive', cb.log.info, rec)
+    local yielder = setmetatable({}, {__tostring = function() coroutine.yield() return 'y' end})
+    try('log-yield', cb.log.info, yielder)
+    cb.timers.after(0, function()
+      local p = cb.resource('b')
+      try('proxy-hostile-key', function() return p[hostile] end)
+      try('proxy-set', function() p.z = 1 end)
+      try('proxy-v', function() return p.v end)
+      cb.log.info('ALIVE')
+    end)
+  )", {"b"});
+  env.boot();
+  INFO(env.allLogs());
+  REQUIRE(env.waitLog("ALIVE"));
+  CHECK(env.state("a") == State::Running);
+}
+
+TEST_CASE("api: bindings at the memory cap only raise Lua errors") {
+  ApiEnv env;
+  env.addRes("a", R"(
+    cb.timers.after(0, function()
+      local hog = {}
+      pcall(function() while true do hog[#hog + 1] = string.rep('x', 65536) .. #hog end end)
+      local fails = 0
+      for i = 1, 150 do  -- 150: cb.log.info abaixo do limite de 200 linhas/s (o MEMOK tem de passar)
+        if not pcall(cb.players.list) then fails = fails + 1 end
+        if not pcall(cb.events.emit, -1, 'x', {1, 2, 3}) then fails = fails + 1 end
+        if not pcall(cb.log.info, 'x', i) then fails = fails + 1 end
+        if not pcall(cb.timers.after, 1000000, function() end) then fails = fails + 1 end
+        if not pcall(cb.events.on, 'n' .. i, function() end) then fails = fails + 1 end
+        if not pcall(cb.audit, 't', {a = i}) then fails = fails + 1 end
+        if not pcall(cb.events.emitLocal, 'l', {i}) then fails = fails + 1 end
+        if not pcall(cb.commands.register, 'c' .. i, function() end) then fails = fails + 1 end
+        if not pcall(function() return cb.config.k end) then fails = fails + 1 end
+      end
+      hog = nil
+      for i = 1, 50 do collectgarbage('step') end
+      cb.log.info('MEMOK ' .. fails)
+    end)
+  )", {}, {{"k", "v"}});
+  // Teto pequeno e prazo folgado: encher o teto com o GC de emergência leva mais que os 200 ms padrão dos testes.
+  env.lim = shortLimits(size_t{16} << 20);
+  env.lim.abortAfter = std::chrono::milliseconds(5000);
+  env.boot();
+  env.join(1, "ana");
+  const bool ok = env.waitLog("MEMOK", LogLevel::Info);
+  INFO(env.allLogs());
+  REQUIRE(ok);
+  REQUIRE(env.state("a") == State::Running);
+}
+
+// Comportamento atual (documentado para a Task 9): a chamada a cb.resource é síncrona, então o prazo da vigia do
+// chamador continua correndo enquanto o alvo roda. Um alvo preso é abortado, mas o chamador também passa do prazo e
+// leva uma falta (os dois reiniciam com back-off). O host não para e os dois voltam a rodar.
+TEST_CASE("api: a cb.resource target that spins forever is aborted; caller and target restart") {
+  ApiEnv env;
+  env.addRes("b", R"( return { spin = function() while true do end end } )");
+  env.addRes("a", R"(
+    cb.on('resourceStart', function()
+      cb.timers.after(0, function()
+        local ok, e = pcall(function() return cb.resource('b').spin() end)
+        cb.log.info('SPIN ' .. tostring(ok) .. ' ' .. tostring(e))
+      end)
+    end)
+  )", {"b"});
+  env.boot();
+  const bool both = waitUntil([&] {
+    return env.hasLog("[b] abortado por tempo", LogLevel::Warn) || env.countLog("abortado por tempo") >= 2;
+  });
+  INFO(env.allLogs());
+  REQUIRE(both);
+  REQUIRE(env.hasLog("[b] tempo esgotado", LogLevel::Error));
+  REQUIRE_FALSE(env.host->metrics().halted);
+  env.clock->advance(5.0);  // back-off
+  REQUIRE(waitUntil([&] { return env.state("a") == State::Running && env.state("b") == State::Running; }));
+}
+
+TEST_CASE("api: cb.log and print are rate limited and cannot forge log lines") {
+  ApiEnv env;
+  env.addRes("a", R"(
+    cb.log.info('line1\n[2026-11-10 00:00:00.000] [info] [admin] forged\r\0x')
+    print('p1\np2')
+    for i = 1, 20000 do cb.log.info('flood') end
+    for i = 1, 20000 do print('pflood') end
+    cb.timers.after(1100, function() cb.log.info('after window') end)
+  )");
+  env.boot();
+  INFO("cb.log lines = " << env.countLog("] flood"));
+  REQUIRE(env.countLog("] flood") <= 200);
+  REQUIRE(env.countLog("pflood") <= 200);
+  REQUIRE_FALSE(env.hasLog("\n[2026-11-10"));
+  REQUIRE(env.hasLog("line1\\n[2026-11-10 00:00:00.000] [info] [admin] forged\\r\\x00x"));
+  REQUIRE(env.countLog("p1\\np2") == 1);
+  // Janela seguinte: resumo do que foi descartado e a linha nova.
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+  env.clock->advance(1.2);
+  REQUIRE(env.waitLog("after window"));
+  REQUIRE(env.hasLog("linhas de cb.log descartadas", LogLevel::Warn));
+}
+
+TEST_CASE("api: callback error logs and audit lines are rate limited per second") {
+  ApiEnv env;
+  env.addRes("a", R"(
+    cb.events.on('boom', function() error('kaboom') end)
+    cb.events.on('audit', function() for i = 1, 1000 do cb.audit('flood', {i = i}) end cb.log.info('audited') end)
+  )");
+  env.api.stats = std::make_shared<ApiStats>();
+  env.boot();
+  env.join(3, "ana");
+  for (int i = 0; i < 500; ++i) env.event(3, "boom");
+  env.event(3, "audit");
+  REQUIRE(env.waitLog("audited"));
+  env.sync();
+  INFO("kaboom lines = " << env.countLog("kaboom"));
+  REQUIRE(env.countLog("kaboom") <= 200);
+  REQUIRE(env.auditLines().size() <= 200);
+  REQUIRE(env.api.stats->auditDropped.load() >= 800);
+}
+
+TEST_CASE("api: chat command replies always fit in an event and admin chat commands are audited") {
+  ApiEnv env;
+  env.api.isAdmin = [](const std::string& did) { return did == "d3"; };
+  env.addRes("a", R"(
+    cb.commands.register('big', function() return string.rep('x', 5000) end)
+    cb.commands.register('esc', function() return string.rep('"', 3000) end)
+    cb.commands.register('adm', function() return 'ok' end, {admin = true})
+  )");
+  env.boot();
+  env.join(3, "ana");
+  env.command(3, std::string(4094, 'z'), false);
+  env.command(3, "big", false);
+  env.command(3, "esc", false);
+  env.command(3, "adm", false);
+  auto* unknown = env.waitCmd<CmdEmit>([](const CmdEmit& c) { return contains(c.json, "desconhecido"); });
+  auto* big = env.waitCmd<CmdEmit>([](const CmdEmit& c) { return contains(c.json, "xxxx"); });
+  auto* esc = env.waitCmd<CmdEmit>([](const CmdEmit& c) { return contains(c.json, "\\\""); });
+  REQUIRE(unknown);
+  REQUIRE(big);
+  REQUIRE(esc);
+  REQUIRE(unknown->json.size() < 100);  // nome desconhecido ecoado com no máximo 32 bytes
+  REQUIRE(big->json.size() <= 4096);
+  REQUIRE(esc->json.size() <= 4096);
+  REQUIRE(contains(big->json, "\u2026"));
+  REQUIRE(nlohmann::json::parse(esc->json).is_string());
+  REQUIRE(unknown->session == ApiEnv::sessionOf(3));
+  REQUIRE(env.waitCmd<CmdEmit>([](const CmdEmit& c) { return c.json == R"("ok")"; }));
+  bool audited = false;
+  for (auto& a : env.auditLines()) {
+    auto j = nlohmann::json::parse(a);
+    audited = audited || (j["type"] == "command" && j["by"] == "d3" && j["line"] == "adm" && j["id"] == 3);
+  }
+  REQUIRE(audited);
+}
+
+TEST_CASE("api: events, leaves and players from another session of the same id are ignored") {
+  ApiEnv env;
+  env.addRes("a", R"(
+    cb.on('playerLeave', function(p, why) cb.log.info('leave ' .. p.id .. ' ' .. why) end)
+    cb.events.on('who', function(p)
+      local me = cb.players.get(p.id)
+      cb.log.info('who ' .. p.name .. ' x=' .. p.x .. ' get=' .. tostring(me and me.name) .. ' n=' .. #cb.players.list())
+    end)
+  )");
+  env.boot();
+  env.join(3, "ana");
+  // Foto ainda da sessão velha (id 3 era de outra pessoa, sessão 77).
+  env.host->publishPlayers(std::make_shared<const std::vector<PlayerView>>(
+      std::vector<PlayerView>{PlayerView{3, "velho", "dv", "sv", 500, 0, 0, 1, 77}}));
+  REQUIRE(env.host->post(EvClientEvent{3, "who", "{}", 77}));          // sessão velha: ignorado
+  REQUIRE(env.host->post(EvPlayerLeave{3, "dv", "velho saiu", 77}));   // idem
+  env.event(3, "who");
+  REQUIRE(env.waitLog("who ana x=0 get=nil n=0"));
+  REQUIRE_FALSE(env.hasLog("leave 3 velho saiu"));
+  env.host->publishPlayers(std::make_shared<const std::vector<PlayerView>>(
+      std::vector<PlayerView>{PlayerView{3, "ana", "d3", "s3", 40, 0, 0, 1, ApiEnv::sessionOf(3)}}));
+  env.event(3, "who");
+  REQUIRE(env.waitLog("who ana x=40 get=ana n=1"));
+}
+
+TEST_CASE("api: a join that reaches the scripts after a ban is kicked and not dispatched") {
+  ApiEnv env;
+  env.addRes("a", "cb.on('playerJoin', function(p) cb.log.info('join ' .. p.id) end)");
+  env.boot();
+  std::string err;
+  REQUIRE(env.bans->add(Ban{"d5", "trapaça", "admin:x", env.unixTime.load(), 0}, err));
+  env.join(5, "eva");
+  env.join(6, "ivo");
+  REQUIRE(env.waitLog("join 6"));
+  REQUIRE_FALSE(env.hasLog("join 5"));
+  auto* k = env.waitCmd<CmdKick>([](const CmdKick& c) { return c.id == 5; });
+  REQUIRE(k);
+  REQUIRE(k->session == ApiEnv::sessionOf(5));
+  REQUIRE(contains(k->reason, "trapaça"));
+}
+
+TEST_CASE("api: NUL is rejected in event, command, cb.on and resource names") {
+  ApiEnv env;
+  env.addRes("a", R"(
+    local function e(f, ...) local ok, m = pcall(f, ...) return tostring(ok) end
+    cb.log.info('nul ' .. e(cb.events.on, 'a\0b', print) .. e(cb.events.emit, -1, 'a\0b', {}) ..
+      e(cb.events.onLocal, 'a\0b', print) .. e(cb.commands.register, 'a\0b', print) ..
+      e(cb.on, 'playerJoin\0x', print) .. e(cb.resource, 'a\0b'))
+  )");
+  env.boot();
+  INFO(env.allLogs());
+  REQUIRE(env.hasLog("nul falsefalsefalsefalsefalsefalse"));
+}
+
+TEST_CASE("bans: expired bans are purged on load and save; out-of-range values are rejected") {
+  TmpDir t;
+  int64_t now = 1000;
+  auto clk = [&now] { return now; };
+  {
+    BanStore s(t.p / "b.json", clk);
+    std::string err;
+    REQUIRE(s.add(Ban{"x", "r", "by", 900, 1500}, err));
+    REQUIRE(s.add(Ban{"y", "r", "by", 900, 0}, err));
+  }
+  now = 2000;
+  BanStore again(t.p / "b.json", clk);
+  REQUIRE(again.list().size() == 1);
+  std::string err;
+  REQUIRE(again.add(Ban{"z", "r", "by", 2000, 0}, err));
+  std::ifstream f(t.p / "b.json");
+  std::stringstream ss;
+  ss << f.rdbuf();
+  REQUIRE_FALSE(contains(ss.str(), "\"x\""));
+  REQUIRE(contains(ss.str(), "\"z\""));
+  put(t.p / "neg.json", R"([{"did": "a", "expiresAt": -1}])");
+  REQUIRE_THROWS(BanStore(t.p / "neg.json", clk));
+  put(t.p / "huge.json", R"([{"did": "a", "createdAt": 1000000000000000}])");
+  REQUIRE_THROWS(BanStore(t.p / "huge.json", clk));
 }
