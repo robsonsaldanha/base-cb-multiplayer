@@ -17,6 +17,17 @@ struct HubConfig {
 // fica pendente até o primeiro Input, cuja posição vira o spawn sem validação de movimento.
 enum class SpawnMode { Origin, DevTrustFirstInput };
 
+// db: MySQL/MariaDB dos scripts (cb.db) e dos bans. Ausente/null = sem banco (bans em scripting.bansFile).
+// Erros de validação nunca repetem a senha.
+struct DbSettings {
+  std::string host = "127.0.0.1";
+  int port = 3306;
+  std::string user, password, database;
+  int pool = 4;           // conexões (1..64)
+  int timeoutMs = 5000;   // por consulta (100..600000)
+  std::string tls = "auto";  // auto | off | required | verify
+};
+
 struct ServerConfig {
   std::string name = "Meu servidor";
   std::string description;
@@ -44,6 +55,7 @@ struct ServerConfig {
   // Cota por jogador de eventos servidor → cliente vindos de scripts (bytes de nome + payload).
   // Padrão 8 KiB/s = 64 kbps (alvo de banda por jogador da spec), rajada de 32 KiB.
   double scriptEventOutKBps = 8, scriptEventOutBurstKB = 32;
+  std::optional<DbSettings> db;
 
   // Lançam std::runtime_error (pt-BR: campo + motivo).
   static ServerConfig load(const std::filesystem::path& path);

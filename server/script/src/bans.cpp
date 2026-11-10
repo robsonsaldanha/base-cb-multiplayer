@@ -1,13 +1,21 @@
 #include "cbscript/bans.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <deque>
 #include <fstream>
+#include <future>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
+
+#include "cbscript/db.hpp"
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -27,6 +35,7 @@ namespace cbscript {
 
 namespace fs = std::filesystem;
 using nlohmann::json;
+using std::chrono::milliseconds;
 
 namespace {
 
@@ -64,89 +73,13 @@ Ban fromJson(const json& j, const std::string& where) {
   return b;
 }
 
-}  // namespace
-
-int64_t BanStore::now() const {
-  if (now_) return now_();
-  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
-      .count();
-}
-
-BanStore::BanStore(fs::path file, std::function<int64_t()> nowUnix)
-    : file_(std::move(file)), now_(std::move(nowUnix)) {
-  if (file_.empty()) return;
-  std::error_code ec;
-  if (!fs::exists(file_, ec)) return;
-  std::ifstream f(file_, std::ios::binary);
-  if (!f) throw std::runtime_error("bans: não foi possível ler '" + u8(file_) + "'");
-  json j = json::parse(f, nullptr, false);
-  if (j.is_discarded()) throw std::runtime_error("bans: JSON malformado em '" + u8(file_) + "'");
-  if (!j.is_array()) throw std::runtime_error("bans: '" + u8(file_) + "' deve conter uma lista");
-  const int64_t t = now();
-  for (const auto& e : j) {
-    Ban b = fromJson(e, u8(file_));
-    if (expired(b, t)) continue;
-    writer_[b.did] = b;
-    live_[b.did] = std::move(b);
-  }
-}
-
-std::optional<Ban> BanStore::check(const std::string& did, int64_t nowUnix) const {
-  std::lock_guard<std::mutex> lk(mu_);
-  auto it = live_.find(did);
-  if (it == live_.end()) return std::nullopt;
-  if (expired(it->second, nowUnix)) return std::nullopt;
-  return it->second;
-}
-
-bool BanStore::add(Ban b, std::string& err) {
-  writer_[b.did] = b;
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    live_[b.did] = std::move(b);
-  }
-  return persist(err);
-}
-
-bool BanStore::remove(const std::string& did, bool& removed, std::string& err) {
-  removed = writer_.erase(did) > 0;
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    live_.erase(did);
-  }
-  return removed ? persist(err) : true;
-}
-
-std::vector<Ban> BanStore::list() const {
-  std::vector<Ban> v;
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    v.reserve(live_.size());
-    for (const auto& [d, b] : live_) v.push_back(b);
-  }
-  std::sort(v.begin(), v.end(), [](const Ban& a, const Ban& b) { return a.did < b.did; });
-  return v;
-}
-
-bool BanStore::persist(std::string& err) {
-  if (file_.empty()) return true;
-  const int64_t t = now();
-  std::erase_if(writer_, [t](const auto& kv) { return expired(kv.second, t); });  // live_: check() já ignora
-  std::vector<const Ban*> v;
-  v.reserve(writer_.size());
-  for (const auto& [d, b] : writer_) v.push_back(&b);
-  std::sort(v.begin(), v.end(), [](const Ban* a, const Ban* b) { return a->did < b->did; });
-  json arr = json::array();
-  for (const Ban* b : v)
-    arr.push_back({{"did", b->did}, {"reason", b->reason}, {"by", b->by}, {"createdAt", b->createdAt},
-                   {"expiresAt", b->expiresAt}});
-  // Grava num temporário e troca (o arquivo nunca fica pela metade).
-  fs::path tmp = file_;
+// Grava `text` em `file` de forma atômica: temporário + flush + fsync, rename, fsync da pasta (POSIX).
+bool writeAtomic(const fs::path& file, const std::string& text, std::string& err) {
+  fs::path tmp = file;
   tmp += ".tmp";
   std::error_code ec;
-  if (file_.has_parent_path()) fs::create_directories(file_.parent_path(), ec);
+  if (file.has_parent_path()) fs::create_directories(file.parent_path(), ec);
   {
-    const std::string text = arr.dump(2, ' ', false, json::error_handler_t::replace) + "\n";
 #if defined(_WIN32)
     FILE* f = nullptr;
     if (_wfopen_s(&f, tmp.c_str(), L"wb") != 0) f = nullptr;
@@ -169,14 +102,14 @@ bool BanStore::persist(std::string& err) {
       return false;
     }
   }
-  fs::rename(tmp, file_, ec);
+  fs::rename(tmp, file, ec);
   if (ec) {
-    err = "não foi possível substituir '" + u8(file_) + "': " + ec.message();
+    err = "não foi possível substituir '" + u8(file) + "': " + ec.message();
     return false;
   }
 #if !defined(_WIN32)
   // POSIX: o rename só é durável depois do fsync da pasta.
-  const fs::path dir = file_.has_parent_path() ? file_.parent_path() : fs::path(".");
+  const fs::path dir = file.has_parent_path() ? file.parent_path() : fs::path(".");
   const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
   if (dfd >= 0) {
     (void)::fsync(dfd);
@@ -185,5 +118,404 @@ bool BanStore::persist(std::string& err) {
 #endif
   return true;
 }
+
+int64_t asInt(const DbValue& v) {
+  if (v.type == DbValue::Type::Int) return v.i;
+  if (v.type == DbValue::Type::Double) return static_cast<int64_t>(v.d);
+  if (v.type == DbValue::Type::Text) {
+    try {
+      return std::stoll(v.s);
+    } catch (...) {
+    }
+  }
+  return 0;
+}
+
+}  // namespace
+
+// ------------------------------------------------------------------------------------------------ backends
+
+struct BanStore::Backend {
+  virtual ~Backend() = default;
+  virtual const char* name() const = 0;
+  // Depois de o cache mudar (thread de scripts). `existed`: havia ban no cache.
+  virtual bool put(const Ban& b, std::string& err) = 0;
+  virtual bool erase(const std::string& did, bool existed, std::string& err) = 0;
+  virtual size_t pending() const { return 0; }
+  virtual bool flush(milliseconds) { return true; }
+};
+
+namespace {
+
+// bans.json (ou só memória com caminho vazio). Cópia própria do escritor (thread de scripts): o arquivo é regravado
+// inteiro a cada mudança.
+class JsonBackend final : public BanStore::Backend {
+ public:
+  JsonBackend(fs::path file, std::function<int64_t()> now) : file_(std::move(file)), now_(std::move(now)) {}
+  const char* name() const override { return file_.empty() ? "memória" : "json"; }
+  void seed(const Ban& b) { writer_[b.did] = b; }
+  bool put(const Ban& b, std::string& err) override {
+    writer_[b.did] = b;
+    return persist(err);
+  }
+  bool erase(const std::string& did, bool, std::string& err) override {
+    return writer_.erase(did) > 0 ? persist(err) : true;
+  }
+
+ private:
+  bool persist(std::string& err) {
+    if (file_.empty()) return true;
+    const int64_t t = now_();
+    std::erase_if(writer_, [t](const auto& kv) { return expired(kv.second, t); });
+    std::vector<const Ban*> v;
+    v.reserve(writer_.size());
+    for (const auto& [d, b] : writer_) v.push_back(&b);
+    std::sort(v.begin(), v.end(), [](const Ban* a, const Ban* b) { return a->did < b->did; });
+    json arr = json::array();
+    for (const Ban* b : v)
+      arr.push_back({{"did", b->did}, {"reason", b->reason}, {"by", b->by}, {"createdAt", b->createdAt},
+                     {"expiresAt", b->expiresAt}});
+    return writeAtomic(file_, arr.dump(2, ' ', false, json::error_handler_t::replace) + "\n", err);
+  }
+
+  fs::path file_;
+  std::function<int64_t()> now_;
+  std::unordered_map<std::string, Ban> writer_;
+};
+
+constexpr const char* kCreate =
+    "CREATE TABLE IF NOT EXISTS cb_bans ("
+    "did VARCHAR(64) NOT NULL PRIMARY KEY, "
+    "reason VARCHAR(255) NOT NULL DEFAULT '', "
+    "created_at BIGINT NOT NULL, "
+    "expires_at BIGINT NULL, "
+    "created_by VARCHAR(128) NOT NULL DEFAULT '', "
+    "KEY cb_bans_expires (expires_at)"
+    ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+constexpr const char* kPurge = "DELETE FROM cb_bans WHERE expires_at IS NOT NULL AND expires_at <= ?";
+constexpr const char* kSelect =
+    "SELECT did, reason, created_at, expires_at, created_by FROM cb_bans WHERE expires_at IS NULL OR expires_at > ?";
+constexpr const char* kReplace =
+    "REPLACE INTO cb_bans (did, reason, created_at, expires_at, created_by) VALUES (?, ?, ?, ?, ?)";
+constexpr const char* kDelete = "DELETE FROM cb_bans WHERE did = ?";
+
+}  // namespace
+
+// MySQL: thread própria que faz a carga inicial e depois grava, em ordem, as mudanças enfileiradas.
+class BanMysqlBackend final : public BanStore::Backend {
+ public:
+  BanMysqlBackend(std::shared_ptr<DbPool> db, std::function<int64_t()> now, BanStoreDbOptions opt,
+                  std::function<void(std::vector<Ban>)> merge)
+      : db_(std::move(db)), now_(std::move(now)), opt_(std::move(opt)), merge_(std::move(merge)) {
+    th_ = std::thread([this] { run(); });
+  }
+  ~BanMysqlBackend() override {
+    size_t left = 0;
+    {
+      // Dá até 2 s para as gravações pendentes (só se o banco está respondendo: carga inicial feita).
+      std::unique_lock<std::mutex> lk(mu_);
+      if (loaded_) cv_.wait_for(lk, milliseconds(2000), [&] { return q_.empty(); });
+      stop_ = true;
+      left = q_.size();
+      cv_.notify_all();
+    }
+    if (th_.joinable()) th_.join();
+    if (left > 0)
+      log(true, "bans: " + std::to_string(left) + " gravação(ões) não gravada(s) no banco (cb_bans) no encerramento");
+  }
+  const char* name() const override { return "mysql"; }
+  bool put(const Ban& b, std::string&) override {
+    push(Op{true, b});
+    return true;
+  }
+  bool erase(const std::string& did, bool, std::string&) override {
+    Ban b;
+    b.did = did;
+    push(Op{false, std::move(b)});  // mesmo sem ban no cache: o banco pode ter (carga ainda não terminou)
+    return true;
+  }
+  size_t pending() const override {
+    std::lock_guard<std::mutex> lk(mu_);
+    return q_.size();
+  }
+  bool flush(milliseconds limit) override {
+    std::unique_lock<std::mutex> lk(mu_);
+    return cv_.wait_for(lk, limit, [&] { return stop_ || (loaded_ && q_.empty()); }) && loaded_ && q_.empty();
+  }
+
+ private:
+  struct Op {
+    bool put = true;
+    Ban b;
+  };
+
+  void log(bool error, const std::string& m) const {
+    try {
+      if (opt_.log)
+        opt_.log(error, m);
+      else if (error)
+        spdlog::error("{}", m);
+      else
+        spdlog::warn("{}", m);
+    } catch (...) {
+    }
+  }
+
+  void push(Op op) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (q_.size() >= opt_.maxPendingWrites && !q_.empty()) {
+      // A da frente pode estar em andamento: descarta a seguinte (a mais antiga ainda não iniciada).
+      const size_t at = q_.size() > 1 ? 1 : 0;
+      log(true, "bans: fila de gravações cheia; descartada a gravação de '" + q_[at].b.did + "'");
+      q_.erase(q_.begin() + static_cast<std::ptrdiff_t>(at));
+    }
+    q_.push_back(std::move(op));
+    cv_.notify_all();
+  }
+
+  // Pedido síncrono (só nesta thread), com prazo; volta cedo se o backend for encerrado.
+  DbResult call(DbRequest r) {
+    auto p = std::make_shared<std::promise<DbResult>>();
+    auto f = p->get_future();
+    std::string err;
+    if (db_->submit(std::move(r), [p](DbResult x) { p->set_value(std::move(x)); }, err) == 0)
+      return DbResult::fail(err);
+    const auto limit = std::chrono::steady_clock::now() + milliseconds(db_->config().timeoutMs) + std::chrono::seconds(2);
+    while (f.wait_for(milliseconds(50)) != std::future_status::ready) {
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (stop_) return DbResult::fail("encerrado");
+      }
+      if (std::chrono::steady_clock::now() > limit) return DbResult::fail("sem resposta do banco");
+    }
+    return f.get();
+  }
+
+  static DbRequest req(DbOp op, const char* sql, std::vector<DbValue> params = {}) {
+    DbRequest r;
+    r.op = op;
+    r.sql = sql;
+    r.params = std::move(params);
+    return r;
+  }
+
+  bool load(std::string& err) {
+    DbResult r = call(req(DbOp::Exec, kCreate));
+    if (!r.ok) {
+      err = r.error;
+      return false;
+    }
+    const int64_t now = now_();
+    r = call(req(DbOp::Exec, kPurge, {DbValue::integer(now)}));
+    if (!r.ok) {
+      err = r.error;
+      return false;
+    }
+    r = call(req(DbOp::Query, kSelect, {DbValue::integer(now)}));
+    if (!r.ok) {
+      err = r.error;
+      return false;
+    }
+    std::vector<Ban> v;
+    v.reserve(r.rows.size());
+    for (const auto& row : r.rows) {
+      if (row.size() < 5 || row[0].type != DbValue::Type::Text || row[0].s.empty()) continue;
+      Ban b;
+      b.did = row[0].s;
+      b.reason = row[1].s;
+      b.createdAt = asInt(row[2]);
+      b.expiresAt = row[3].type == DbValue::Type::Null ? 0 : asInt(row[3]);
+      b.by = row[4].s;
+      v.push_back(std::move(b));
+    }
+    merge_(std::move(v));
+    return true;
+  }
+
+  bool apply(const Op& op, std::string& err) {
+    DbResult r;
+    if (op.put) {
+      const Ban& b = op.b;
+      r = call(req(DbOp::Exec, kReplace,
+                   {DbValue::text(b.did), DbValue::text(b.reason), DbValue::integer(b.createdAt),
+                    b.expiresAt != 0 ? DbValue::integer(b.expiresAt) : DbValue::null(), DbValue::text(b.by)}));
+    } else {
+      r = call(req(DbOp::Exec, kDelete, {DbValue::text(op.b.did)}));
+    }
+    if (!r.ok) err = r.error;
+    return r.ok;
+  }
+
+  // Espera crescente entre tentativas; false se o backend foi encerrado.
+  bool backoff(milliseconds& b) {
+    b = b.count() == 0 ? opt_.retryMin : std::min(opt_.retryMax, b * 2);
+    std::unique_lock<std::mutex> lk(mu_);
+    return !cv_.wait_for(lk, b, [&] { return stop_; });
+  }
+
+  void run() {
+    milliseconds wait{0};
+    for (;;) {
+      bool isLoaded;
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (stop_) return;
+        isLoaded = loaded_;
+      }
+      std::string err;
+      if (!isLoaded) {
+        if (load(err)) {
+          std::lock_guard<std::mutex> lk(mu_);
+          loaded_ = true;
+          wait = milliseconds(0);
+          cv_.notify_all();
+          continue;
+        }
+        log(true, "bans: carga de cb_bans falhou (nova tentativa em " +
+                      std::to_string((wait.count() == 0 ? opt_.retryMin : std::min(opt_.retryMax, wait * 2)).count()) +
+                      " ms): " + err);
+        if (!backoff(wait)) return;
+        continue;
+      }
+      Op op;
+      {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [&] { return stop_ || !q_.empty(); });
+        if (stop_) return;
+        op = q_.front();
+      }
+      if (apply(op, err)) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!q_.empty()) q_.pop_front();
+        wait = milliseconds(0);
+        cv_.notify_all();
+        continue;
+      }
+      log(true, "bans: gravação de '" + op.b.did + "' em cb_bans falhou (nova tentativa): " + err);
+      if (!backoff(wait)) return;
+    }
+  }
+
+  std::shared_ptr<DbPool> db_;
+  std::function<int64_t()> now_;
+  BanStoreDbOptions opt_;
+  std::function<void(std::vector<Ban>)> merge_;
+  mutable std::mutex mu_;
+  std::condition_variable cv_;
+  std::deque<Op> q_;  // a da frente está em andamento (sai só depois de gravada)
+  bool loaded_ = false;
+  bool stop_ = false;
+  std::thread th_;
+};
+
+// --------------------------------------------------------------------------------------------------- BanStore
+
+int64_t BanStore::now() const {
+  if (now_) return now_();
+  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+BanStore::BanStore(fs::path file, std::function<int64_t()> nowUnix) : now_(std::move(nowUnix)) {
+  auto be = std::make_unique<JsonBackend>(file, [this] { return now(); });
+  if (!file.empty()) {
+    std::error_code ec;
+    if (fs::exists(file, ec)) {
+      std::ifstream f(file, std::ios::binary);
+      if (!f) throw std::runtime_error("bans: não foi possível ler '" + u8(file) + "'");
+      json j = json::parse(f, nullptr, false);
+      if (j.is_discarded()) throw std::runtime_error("bans: JSON malformado em '" + u8(file) + "'");
+      if (!j.is_array()) throw std::runtime_error("bans: '" + u8(file) + "' deve conter uma lista");
+      const int64_t t = now();
+      for (const auto& e : j) {
+        Ban b = fromJson(e, u8(file));
+        if (expired(b, t)) continue;
+        be->seed(b);
+        live_[b.did] = std::move(b);
+      }
+    }
+  }
+  be_ = std::move(be);
+}
+
+BanStore::BanStore(std::shared_ptr<DbPool> db, std::function<int64_t()> nowUnix, BanStoreDbOptions opt)
+    : now_(std::move(nowUnix)) {
+  if (!db) throw std::invalid_argument("bans: pool de banco nulo");
+  loaded_ = false;
+  be_ = std::make_unique<BanMysqlBackend>(std::move(db), [this] { return now(); }, std::move(opt),
+                                          [this](std::vector<Ban> v) { merge(std::move(v)); });
+}
+
+BanStore::~BanStore() { be_.reset(); }  // antes dos membros que a thread do backend usa (mu_, live_)
+
+void BanStore::merge(std::vector<Ban> loaded) {
+  // O mapa novo é montado fora do mutex (a simulação lê o cache na entrada de cada jogador); sob o mutex só entram
+  // as mudanças locais feitas antes da carga (poucas) e a troca.
+  std::unordered_map<std::string, Ban> m;
+  m.reserve(loaded.size() + 16);
+  for (auto& b : loaded) {
+    std::string d = b.did;
+    m[std::move(d)] = std::move(b);
+  }
+  std::lock_guard<std::mutex> lk(mu_);
+  for (const auto& d : touched_) {
+    auto it = live_.find(d);
+    if (it != live_.end())
+      m[d] = it->second;
+    else
+      m.erase(d);
+  }
+  live_.swap(m);
+  touched_.clear();
+  loaded_ = true;
+}
+
+std::optional<Ban> BanStore::check(const std::string& did, int64_t nowUnix) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  auto it = live_.find(did);
+  if (it == live_.end()) return std::nullopt;
+  if (expired(it->second, nowUnix)) return std::nullopt;
+  return it->second;
+}
+
+bool BanStore::add(Ban b, std::string& err) {
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!loaded_) touched_.insert(b.did);
+    live_[b.did] = b;
+  }
+  return be_->put(b, err);
+}
+
+bool BanStore::remove(const std::string& did, bool& removed, std::string& err) {
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!loaded_) touched_.insert(did);
+    removed = live_.erase(did) > 0;
+  }
+  return be_->erase(did, removed, err);
+}
+
+std::vector<Ban> BanStore::list() const {
+  std::vector<Ban> v;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    v.reserve(live_.size());
+    for (const auto& [d, b] : live_) v.push_back(b);
+  }
+  std::sort(v.begin(), v.end(), [](const Ban& a, const Ban& b) { return a.did < b.did; });
+  return v;
+}
+
+const char* BanStore::backend() const { return be_->name(); }
+
+bool BanStore::loaded() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return loaded_;
+}
+
+size_t BanStore::pendingWrites() const { return be_->pending(); }
+
+bool BanStore::flush(milliseconds limit) { return be_->flush(limit); }
 
 }  // namespace cbscript

@@ -18,7 +18,9 @@
 #include <cstring>
 #include <deque>
 #include <initializer_list>
+#include <functional>
 #include <map>
+#include <mutex>
 #include <set>
 #include <span>
 #include <stdexcept>
@@ -34,6 +36,7 @@
 #include <sol/sol.hpp>
 
 #include "cbscript/bans.hpp"
+#include "cbscript/db.hpp"
 #include "cbscript/json_lua.hpp"
 
 #if defined(_MSC_VER)
@@ -136,6 +139,28 @@ struct RateWindow {
 
 struct Shared;
 
+// Resultado de banco sendo entregue a uma corrotina (vive no quadro do host durante o resume; lido por k_db).
+struct DbDelivery {
+  DbOp op = DbOp::Query;
+  const char* fn = "cb.db";
+  DbResult res;
+  uint64_t txId = 0;
+};
+
+// Corrotina esperando o banco. `done`: continuação do despachante (resposta de comando), chamada quando a corrotina
+// terminar de vez.
+struct DbWaiting {
+  uint64_t req = 0;
+  Ref thread;
+  std::function<void(Resource::CallResult&)> done;
+};
+
+struct DbTx {
+  lua_State* co = nullptr;  // corrotina dona (mantida viva por `thread`)
+  Ref thread;
+  bool inflight = false;  // comando em andamento
+};
+
 struct Timer {
   double due = 0;
   double interval = 0;  // 0 = uma vez
@@ -161,6 +186,14 @@ struct ApiRes {
   std::vector<const PlayerView*> view;  // entradas da foto cuja sessão bate com a dos conectados
   RateWindow logRate;
   RateWindow auditRate;  // só cb.audit
+  // cb.db
+  int proxyDepth = 0;     // dentro de uma chamada cb.resource (alvo): cb.db recusado
+  size_t dbPending = 0;   // pedidos em andamento
+  std::unordered_map<lua_State*, DbWaiting> waiting;  // corrotina → pedido que ela espera
+  std::unordered_map<uint64_t, DbTx> txs;             // transação (id do pool) → dona
+  std::unordered_map<lua_State*, uint64_t> txOf;      // corrotina → transação aberta
+  uint64_t dbToken = 0;                // pedido sendo entregue agora (k_db confere)
+  const DbDelivery* dbResult = nullptr;
 
   JsonOptions json(size_t maxBytes = kMaxPayload) const {
     JsonOptions o;
@@ -181,6 +214,33 @@ struct LocalEvent {
   std::string name, json, from;
 };
 
+// Respostas do pool (threads do pool → thread de scripts, lidas no onTick). Só mutex + vetor: o pool nunca toca no
+// host (que pode ter sido abandonado).
+struct DbInbox {
+  std::mutex mu;
+  std::vector<std::pair<uint64_t, DbResult>> items;
+  void push(uint64_t id, DbResult r) {
+    std::lock_guard<std::mutex> lk(mu);
+    items.emplace_back(id, std::move(r));
+  }
+  std::vector<std::pair<uint64_t, DbResult>> take() {
+    std::lock_guard<std::mutex> lk(mu);
+    std::vector<std::pair<uint64_t, DbResult>> v;
+    v.swap(items);
+    return v;
+  }
+};
+
+struct DbPending {
+  ApiRes* a = nullptr;
+  lua_State* co = nullptr;
+  DbOp op = DbOp::Query;
+  uint64_t tx = 0;      // transação do pedido (0 = avulso)
+  uint64_t poolId = 0;  // id no pool (Begin: id da transação)
+  double deadline = 0;  // relógio do host
+  const char* fn = "cb.db";
+};
+
 struct Shared {
   ApiOptions o;
   std::unordered_map<uint16_t, Conn> players;  // conectados (Join/Leave, na ordem da fila)
@@ -191,6 +251,11 @@ struct Shared {
   double lastJsonWarn = -1e9;
   std::vector<uint64_t> dueScratch;
   uint32_t nextSource = 1;
+  // cb.db
+  std::shared_ptr<DbInbox> inbox = std::make_shared<DbInbox>();
+  std::unordered_map<uint64_t, DbPending> reqs;  // id da API → pedido
+  std::set<std::pair<double, uint64_t>> deadlines;
+  uint64_t nextReq = 1;
 
   int64_t unixNow() const {
     if (o.unixNow) return o.unixNow();
@@ -201,6 +266,22 @@ struct Shared {
 
 ApiRes::~ApiRes() {
   if (!sh) return;
+  // cb.db: pedidos em andamento são cancelados (resultado descartado) e transações abertas sofrem rollback.
+  const bool usePool = sh->o.db && !(ctx && ctx->abandoned());
+  for (auto it = sh->reqs.begin(); it != sh->reqs.end();) {
+    if (it->second.a != this) {
+      ++it;
+      continue;
+    }
+    if (usePool) {
+      sh->o.db->cancel(it->second.poolId);
+      if (it->second.op == DbOp::Begin) sh->o.db->abortTx(it->second.poolId);
+    }
+    sh->deadlines.erase({it->second.deadline, it->first});
+    it = sh->reqs.erase(it);
+  }
+  if (usePool)
+    for (auto& [id, tx] : txs) sh->o.db->abortTx(id);
   std::erase(sh->live, this);
   for (auto it = sh->commands.begin(); it != sh->commands.end();)
     it = it->second.owner == this ? sh->commands.erase(it) : std::next(it);
@@ -833,6 +914,347 @@ int l_audit(lua_State* L) {
   return 0;
 }
 
+// ------------------------------------------------------------------------------------------------- cb.db
+//
+// Fluxo: o binding valida (quadro puro + ajudante), registra a corrotina (ref no registro), enfileira no pool e cede
+// com lua_yieldk(..., k_db). A resposta chega pela DbInbox; no onTick o host procura o pedido, guarda o resultado
+// em ApiRes::dbResult e retoma a corrotina (ctx.resume). k_db confere o token (retomada por fora → erro), empilha o
+// resultado (linhas, contagem, id) ou lança o erro.
+
+const char* dbFnName(DbOp op, bool tx) {
+  switch (op) {
+    case DbOp::Query:
+      return tx ? "tx.query" : "cb.db.query";
+    case DbOp::Exec:
+      return tx ? "tx.exec" : "cb.db.exec";
+    case DbOp::Insert:
+      return tx ? "tx.insert" : "cb.db.insert";
+    default:
+      return "cb.db.transaction";
+  }
+}
+
+// Empilha as linhas (lista de {coluna = valor}; NULL = cb.null). Quadro puro: só referências e inteiros.
+int pushRows(lua_State* L, const DbResult& res) {
+  if (!lua_checkstack(L, 8)) return luaL_error(L, "cb.db.query: pilha do Lua esgotada");
+  const size_t nr = res.rows.size(), nc = res.columns.size();
+  lua_createtable(L, static_cast<int>(std::min<size_t>(nr, size_t{1} << 20)), 0);
+  for (size_t i = 0; i < nr; ++i) {
+    const std::vector<DbValue>& row = res.rows[i];
+    lua_createtable(L, 0, static_cast<int>(std::min<size_t>(nc, size_t{1} << 12)));
+    for (size_t c = 0; c < nc && c < row.size(); ++c) {
+      const std::string& col = res.columns[c];
+      const DbValue& v = row[c];
+      lua_pushlstring(L, col.data(), col.size());
+      switch (v.type) {
+        case DbValue::Type::Null:
+          lua_pushlightuserdata(L, &gNullTag);
+          break;
+        case DbValue::Type::Int:
+          lua_pushinteger(L, static_cast<lua_Integer>(v.i));
+          break;
+        case DbValue::Type::Double:
+          lua_pushnumber(L, static_cast<lua_Number>(v.d));
+          break;
+        case DbValue::Type::Text:
+          lua_pushlstring(L, v.s.data(), v.s.size());
+          break;
+      }
+      lua_rawset(L, -3);
+    }
+    lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+  }
+  return 1;
+}
+
+// Continuação de toda espera do banco. Quadro puro.
+int k_db(lua_State* L, int status, lua_KContext kctx) {
+  (void)status;
+  ApiRes* a = self(L);
+  const uint64_t rid = static_cast<uint64_t>(kctx);
+  if (a->dbToken != rid || a->dbResult == nullptr)
+    return luaL_error(L, "cb.db: a corrotina foi retomada por fora (coroutine.resume) enquanto esperava o banco");
+  const DbDelivery* d = a->dbResult;
+  a->dbResult = nullptr;
+  a->dbToken = 0;
+  lua_settop(L, 0);
+  if (!d->res.ok) {
+    if (d->op == DbOp::Rollback) return 0;  // rollback que falhou: a conexão já desfaz a transação
+    return luaL_error(L, "%s: %s", d->fn, d->res.error.c_str());
+  }
+  switch (d->op) {
+    case DbOp::Query:
+      return pushRows(L, d->res);
+    case DbOp::Exec:
+      lua_pushinteger(L, static_cast<lua_Integer>(d->res.affected));
+      return 1;
+    case DbOp::Insert:
+      lua_pushinteger(L, static_cast<lua_Integer>(d->res.insertId));
+      return 1;
+    case DbOp::Begin:
+      lua_pushinteger(L, static_cast<lua_Integer>(d->txId));
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+// Condições para esperar o banco. 0 = ok; -1 = erro em e.
+CBAPI_NOINLINE int dbCheck(ApiRes* a, lua_State* L, DbOp op, uint64_t tx, Err& e) {
+  try {
+    const std::string fn = dbFnName(op, tx != 0);
+    if (a->ctx->abandoned()) {
+      setErr(e, fn + ": host de scripts encerrado");
+      return -1;
+    }
+    if (!a->h->manifest().db) {
+      setErr(e, fn + ": o resource não tem permissão de banco (permissions.db = true no resource.json)");
+      return -1;
+    }
+    if (!a->sh->o.db) {
+      setErr(e, fn + ": banco não configurado neste servidor (seção \"db\" do server.cfg)");
+      return -1;
+    }
+    if (!a->live) {
+      setErr(e, fn + ": só pode ser usado depois que o resource subiu (no nível de cima do script use "
+                     "cb.on('resourceStart', function() ... end))");
+      return -1;
+    }
+    if (a->proxyDepth > 0) {
+      setErr(e, fn + ": não pode ser usado dentro de uma chamada cb.resource (a chamada entre resources não espera)");
+      return -1;
+    }
+    if (!lua_isyieldable(L)) {
+      setErr(e, fn + ": não dá para esperar o banco aqui (metamétodo ou função chamada pelo C, como table.sort); "
+                     "chame direto do callback");
+      return -1;
+    }
+    if (op == DbOp::Begin) {
+      if (a->txOf.count(L)) {
+        setErr(e, "cb.db.transaction: transação aninhada não é permitida");
+        return -1;
+      }
+    } else if (tx == 0) {
+      if (a->txOf.count(L)) {
+        setErr(e, fn + ": dentro de cb.db.transaction use tx.query/tx.exec/tx.insert");
+        return -1;
+      }
+    } else {
+      auto it = a->txs.find(tx);
+      if (it == a->txs.end()) {
+        setErr(e, fn + ": transação já encerrada");
+        return -1;
+      }
+      if (it->second.co != L) {
+        setErr(e, fn + ": a transação pertence a outra corrotina");
+        return -1;
+      }
+      if (it->second.inflight) {
+        setErr(e, fn + ": já há um comando em andamento nesta transação");
+        return -1;
+      }
+    }
+    if (a->dbPending >= a->sh->o.maxDbPending) {
+      setErr(e, fn + ": consultas pendentes demais neste resource (máximo " + std::to_string(a->sh->o.maxDbPending) +
+                    ")");
+      return -1;
+    }
+    return 0;
+  } catch (...) {
+    setErr(e, "cb.db: sem memória");
+    return -1;
+  }
+}
+
+// Monta e enfileira o pedido (parâmetros depois de sqlIdx, se op for consulta). Fica com `tref` (ref da corrotina)
+// se der certo. Devolve o id do pedido (> 0) ou 0 + erro.
+CBAPI_NOINLINE uint64_t dbSubmit(ApiRes* a, lua_State* L, DbOp op, uint64_t tx, int sqlIdx, int tref, Err& e) {
+  const char* fn = dbFnName(op, tx != 0);
+  uint64_t poolId = 0;
+  try {
+    DbRequest r;
+    r.op = op;
+    r.tx = tx;
+    if (op == DbOp::Query || op == DbOp::Exec || op == DbOp::Insert) {
+      size_t len = 0;
+      const char* s = lua_tolstring(L, sqlIdx, &len);  // já conferido: é texto (sem conversão)
+      r.sql.assign(s, len);
+      const int top = lua_gettop(L);
+      r.params.reserve(static_cast<size_t>(std::max(0, top - sqlIdx)));
+      for (int i = sqlIdx + 1; i <= top; ++i) {
+        const int t = lua_type(L, i);
+        if (t == LUA_TNIL || (t == LUA_TLIGHTUSERDATA && lua_touserdata(L, i) == &gNullTag)) {
+          r.params.push_back(DbValue::null());
+        } else if (t == LUA_TBOOLEAN) {
+          r.params.push_back(DbValue::integer(lua_toboolean(L, i) ? 1 : 0));
+        } else if (t == LUA_TNUMBER) {
+          if (lua_isinteger(L, i))
+            r.params.push_back(DbValue::integer(static_cast<int64_t>(lua_tointeger(L, i))));
+          else
+            r.params.push_back(DbValue::number(static_cast<double>(lua_tonumber(L, i))));
+        } else if (t == LUA_TSTRING) {
+          size_t n = 0;
+          const char* p = lua_tolstring(L, i, &n);
+          r.params.push_back(DbValue::text(std::string(p, n)));
+        } else {
+          setErr(e, std::string(fn) + ": parâmetro " + std::to_string(i - sqlIdx) + ": tipo não suportado (" +
+                        lua_typename(L, t) + "); use nil/cb.null, boolean, número ou texto");
+          return 0;
+        }
+      }
+    }
+    Shared& sh = *a->sh;
+    const uint64_t rid = sh.nextReq++;
+    std::string err;
+    poolId = sh.o.db->submit(
+        std::move(r), [inbox = sh.inbox, rid](DbResult res) { inbox->push(rid, std::move(res)); }, err);
+    if (poolId == 0) {
+      setErr(e, std::string(fn) + ": " + err);
+      return 0;
+    }
+    DbPending p;
+    p.a = a;
+    p.co = L;
+    p.op = op;
+    p.tx = tx;
+    p.poolId = poolId;
+    p.deadline = a->ctx->now() + sh.o.db->config().timeoutMs / 1000.0 + sh.o.dbGraceSec;
+    p.fn = fn;
+    auto& w = a->waiting[L];
+    w.thread.release(L);
+    w.thread = Ref(a->L, tref);
+    w.req = rid;
+    sh.reqs[rid] = p;
+    sh.deadlines.emplace(p.deadline, rid);
+    ++a->dbPending;
+    if (tx != 0) a->txs[tx].inflight = true;
+    return rid;
+  } catch (...) {
+    if (poolId != 0) a->sh->o.db->cancel(poolId);
+    setErr(e, std::string(fn) + ": sem memória");
+    return 0;
+  }
+}
+
+// Espera do banco para o binding (quadro puro): valida, registra, cede.
+int dbWait(lua_State* L, DbOp op, uint64_t tx, int sqlIdx) {
+  ApiRes* a = self(L);
+  Err e;
+  if (dbCheck(a, L, op, tx, e) < 0) return luaL_error(L, "%s", e.msg);
+  lua_pushthread(L);
+  const int tref = luaL_ref(L, LUA_REGISTRYINDEX);
+  const uint64_t rid = dbSubmit(a, L, op, tx, sqlIdx, tref, e);
+  if (rid == 0) {
+    luaL_unref(L, LUA_REGISTRYINDEX, tref);
+    return luaL_error(L, "%s", e.msg);
+  }
+  lua_settop(L, 0);
+  return lua_yieldk(L, 0, static_cast<lua_KContext>(rid), k_db);
+}
+
+int dbQueryLike(lua_State* L, DbOp op, uint64_t tx, int sqlIdx) {
+  if (lua_type(L, sqlIdx) != LUA_TSTRING) return luaL_error(L, "%s: o SQL deve ser texto", dbFnName(op, tx != 0));
+  return dbWait(L, op, tx, sqlIdx);
+}
+
+int l_db_query(lua_State* L) { return dbQueryLike(L, DbOp::Query, 0, 1); }
+int l_db_exec(lua_State* L) { return dbQueryLike(L, DbOp::Exec, 0, 1); }
+int l_db_insert(lua_State* L) { return dbQueryLike(L, DbOp::Insert, 0, 1); }
+
+uint64_t checkTxId(lua_State* L, int idx) {
+  int isnum = 0;
+  const lua_Integer v = lua_type(L, idx) == LUA_TNUMBER ? lua_tointegerx(L, idx, &isnum) : 0;
+  if (!isnum || v <= 0) luaL_error(L, "cb.db.transaction: transação inválida");
+  return static_cast<uint64_t>(v);
+}
+
+// Primitivas do embrulho Lua de cb.db.transaction (não ficam visíveis aos scripts).
+// run_(id, tipo 1..3, sql, ...)
+int l_db_txrun(lua_State* L) {
+  const uint64_t tx = checkTxId(L, 1);
+  int isnum = 0;
+  const lua_Integer kind = lua_tointegerx(L, 2, &isnum);
+  if (!isnum || kind < 1 || kind > 3) return luaL_error(L, "cb.db.transaction: comando inválido");
+  const DbOp op = kind == 1 ? DbOp::Query : kind == 2 ? DbOp::Exec : DbOp::Insert;
+  return dbQueryLike(L, op, tx, 3);
+}
+
+// begin_() → id da transação
+int l_db_begin(lua_State* L) {
+  lua_settop(L, 0);
+  return dbWait(L, DbOp::Begin, 0, 0);
+}
+
+// Antes do commit/rollback. 1 = pode pedir; 0 = transação desconhecida (rollback: nada a fazer); -1 = erro.
+CBAPI_NOINLINE int dbFinishCheck(ApiRes* a, lua_State* L, uint64_t tx, bool commit, Err& e) {
+  auto it = a->txs.find(tx);
+  if (it == a->txs.end() || it->second.co != L) {
+    if (commit) {
+      setErr(e, "cb.db.transaction: transação já encerrada (commit não feito)");
+      return -1;
+    }
+    return 0;
+  }
+  return 1;
+}
+
+// Esquece uma transação que o pool já encerrou (prazo, conexão perdida...).
+CBAPI_NOINLINE void dbForget(ApiRes* a, lua_State* L, uint64_t tx) {
+  auto it = a->txs.find(tx);
+  if (it == a->txs.end()) return;
+  it->second.thread.release(L);
+  a->txOf.erase(it->second.co);
+  a->txs.erase(it);
+}
+
+// finish_(id, commit)
+int l_db_finish(lua_State* L) {
+  ApiRes* a = self(L);
+  const uint64_t tx = checkTxId(L, 1);
+  const bool commit = lua_toboolean(L, 2) != 0;
+  const DbOp op = commit ? DbOp::Commit : DbOp::Rollback;
+  Err e;
+  const int rc = dbFinishCheck(a, L, tx, commit, e);
+  if (rc < 0) return luaL_error(L, "%s", e.msg);
+  if (rc == 0) return 0;
+  if (dbCheck(a, L, op, tx, e) < 0) {
+    dbForget(a, L, tx);
+    if (commit) return luaL_error(L, "%s", e.msg);
+    return 0;
+  }
+  lua_pushthread(L);
+  const int tref = luaL_ref(L, LUA_REGISTRYINDEX);
+  const uint64_t rid = dbSubmit(a, L, op, tx, 0, tref, e);
+  if (rid == 0) {  // o pool já soltou a transação
+    luaL_unref(L, LUA_REGISTRYINDEX, tref);
+    dbForget(a, L, tx);
+    if (commit) return luaL_error(L, "%s", e.msg);
+    return 0;
+  }
+  lua_settop(L, 0);
+  return lua_yieldk(L, 0, static_cast<lua_KContext>(rid), k_db);
+}
+
+// cb.db.transaction em Lua (confiável, compilado no onSetup). pcall/error/type são os originais.
+constexpr const char* kTxWrapper = R"lua(
+local begin_, run_, finish_, pcall, error, type = ...
+local function wrap(id, kind)
+  return function(sql, ...) return run_(id, kind, sql, ...) end
+end
+return function(fn)
+  if type(fn) ~= 'function' then error('cb.db.transaction: função esperada', 2) end
+  local id = begin_()
+  local tx = { query = wrap(id, 1), exec = wrap(id, 2), insert = wrap(id, 3) }
+  local ok, r = pcall(fn, tx)
+  if ok then
+    finish_(id, true)
+    return r
+  end
+  finish_(id, false)
+  error(r, 0)
+end
+)lua";
+
 // ---------------------------------------------------------------------------------------------- cb.resource
 
 // Chamada da API num resource, contando reentrância.
@@ -948,7 +1370,9 @@ CBAPI_NOINLINE int proxyCall(ApiRes* a, lua_State* L, int nargs, const char* res
       args.emplace_back(bL, -1);
       lua_pop(bL, 1);
     }
+    ++b->proxyDepth;  // cb.db recusado dentro da chamada (ela não pode esperar)
     auto r = invokeOn(*b, fn, args);
+    --b->proxyDepth;
     if (!r.ok) {
       setErr(e, "cb.resource: erro em '" + what + "' (ver log)");
       return -1;
@@ -1141,6 +1565,41 @@ void pushModule(lua_State* L, ApiRes* a, const char* modName, std::initializer_l
   lua_pop(L, 1);
 }
 
+// Empilha a tabela cb.db: query/exec/insert em C; transaction em Lua confiável sobre as primitivas begin_/run_/
+// finish_ (que não ficam visíveis aos scripts).
+void buildDb(lua_State* L, ApiRes* a) {
+  if (!lua_checkstack(L, 12)) throw std::runtime_error("cbscript: pilha do Lua esgotada ao montar cb.db");
+  pushModule(L, a, "cb.db", {{"query", l_db_query}, {"exec", l_db_exec}, {"insert", l_db_insert}});  // [db]
+  if (luaL_loadbufferx(L, kTxWrapper, std::strlen(kTxWrapper), "=cb.db.transaction", "t") != LUA_OK) {
+    const std::string m = lua_tostring(L, -1) ? lua_tostring(L, -1) : "?";
+    lua_pop(L, 2);
+    throw std::runtime_error("cbscript: cb.db.transaction: " + m);
+  }
+  for (lua_CFunction f : {l_db_begin, l_db_txrun, l_db_finish}) {
+    lua_pushlightuserdata(L, a);
+    lua_pushcclosure(L, f, 1);
+  }
+  lua_pushglobaltable(L);  // ainda sem código do script: são as funções originais
+  const int g = lua_gettop(L);
+  for (const char* n : {"pcall", "error", "type"}) {
+    lua_pushstring(L, n);
+    lua_rawget(L, g);
+  }
+  lua_remove(L, g);  // [db, chunk, begin, run, finish, pcall, error, type]
+  if (lua_pcall(L, 6, 1, 0) != LUA_OK) {
+    const std::string m = lua_tostring(L, -1) ? lua_tostring(L, -1) : "?";
+    lua_pop(L, 2);
+    throw std::runtime_error("cbscript: cb.db.transaction: " + m);
+  }
+  lua_pushvalue(L, -1);
+  lua_setfield(L, -3, "transaction");  // [db, fn]
+  luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_LOADED_TABLE);
+  lua_getfield(L, -1, "cb.db");
+  lua_pushvalue(L, -3);
+  lua_setfield(L, -2, "transaction");  // snapshot para os tracebacks
+  lua_pop(L, 3);                       // [db]
+}
+
 void buildApi(ApiRes* a) {
   lua_State* L = a->L;
   if (!lua_checkstack(L, 16)) throw std::runtime_error("cbscript: pilha do Lua esgotada ao montar cb.*");
@@ -1166,6 +1625,8 @@ void buildApi(ApiRes* a) {
   lua_setfield(L, -2, "log");
   lua_pushlightuserdata(L, &gNullTag);
   lua_setfield(L, -2, "null");
+  buildDb(L, a);
+  lua_setfield(L, -2, "db");
 
   // cb.config: cópia somente leitura do "config" do manifest.
   std::string err;
@@ -1357,6 +1818,23 @@ void onCommand(Shared& sh, ScriptContext& ctx, EvCommand& ev) {
   sol::reference fn = cmd.fn.get();
   const std::string name = tok[0];
   auto r = invokeOn(a, fn, args);
+  if (r.ok && r.yielded && r.thread.valid()) {
+    // Esperando o banco: responde quando a corrotina terminar (ver deliverDb).
+    auto w = a.waiting.find(r.thread.thread_state());
+    if (w != a.waiting.end()) {
+      ScriptContext* sc = &ctx;
+      w->second.done = [sc, rep = ev.reply, from = ev.from, session, name](Resource::CallResult& rr) {
+        EvCommand tmp;
+        tmp.reply = rep;
+        tmp.from = from;
+        if (!rr.ok)
+          reply(*sc, tmp, session, "erro ao executar '" + name + "' (ver log)");
+        else if (!rr.yielded && rr.value.valid() && rr.value.get_type() == sol::type::string)
+          reply(*sc, tmp, session, rr.value.as<std::string>());
+      };
+    }
+    return;
+  }
   if (!r.ok) {
     reply(ctx, ev, session, "erro ao executar '" + name + "' (ver log)");
   } else if (!r.yielded && r.value.valid() && r.value.get_type() == sol::type::string) {
@@ -1385,6 +1863,104 @@ void drainLocal(Shared& sh) {
     }
   }
   sh.draining = false;
+}
+
+// ------------------------------------------------------------------------------------- cb.db: entrega (host)
+
+// Entrega o resultado do pedido `rid` à corrotina que o espera (fora de qualquer chamada ao Lua).
+void deliverOne(Shared& sh, ScriptContext& ctx, uint64_t rid, DbResult res) {
+  auto it = sh.reqs.find(rid);
+  if (it == sh.reqs.end()) return;  // cancelado (resource parado) ou já respondido (prazo)
+  const DbPending p = it->second;
+  sh.reqs.erase(it);
+  sh.deadlines.erase({p.deadline, rid});
+  ApiRes& a = *p.a;
+  if (a.dbPending > 0) --a.dbPending;
+  auto w = a.waiting.find(p.co);
+  if (w == a.waiting.end() || w->second.req != rid) return;
+  DbWaiting wait = std::move(w->second);
+  a.waiting.erase(w);
+
+  uint64_t txId = 0;
+  if (p.op == DbOp::Begin) {
+    if (res.ok) {
+      lua_rawgeti(a.L, LUA_REGISTRYINDEX, wait.thread.ref);
+      DbTx t;
+      t.co = p.co;
+      t.thread = Ref(a.L, luaL_ref(a.L, LUA_REGISTRYINDEX));
+      a.txs[p.poolId] = std::move(t);
+      a.txOf[p.co] = p.poolId;
+      txId = p.poolId;
+    }
+  } else if (p.tx != 0) {
+    auto t = a.txs.find(p.tx);
+    if (t != a.txs.end()) {
+      t->second.inflight = false;
+      if (p.op == DbOp::Commit || p.op == DbOp::Rollback) {
+        a.txOf.erase(t->second.co);
+        a.txs.erase(t);
+      }
+    }
+  }
+  if (lua_status(p.co) != LUA_YIELD) return;  // a corrotina morreu (coroutine.close, retomada por fora...)
+
+  DbDelivery d;
+  d.op = p.op;
+  d.fn = p.fn;
+  d.res = std::move(res);
+  d.txId = txId;
+  lua_rawgeti(a.L, LUA_REGISTRYINDEX, wait.thread.ref);
+  sol::thread th(a.L, -1);
+  lua_pop(a.L, 1);
+  a.dbResult = &d;
+  a.dbToken = rid;
+  ++a.depth;
+  auto r = ctx.resume(*a.h, th, {});
+  --a.depth;
+  a.dbResult = nullptr;
+  a.dbToken = 0;
+  auto again = a.waiting.find(p.co);
+  if (r.ok && r.yielded && again != a.waiting.end()) {
+    again->second.done = std::move(wait.done);  // esperando o banco de novo
+  } else if (wait.done) {
+    wait.done(r);
+  }
+}
+
+// onTick: respostas do pool, prazos vencidos do lado do script e transações abandonadas.
+void deliverDb(Shared& sh, ScriptContext& ctx) {
+  if (!sh.o.db) return;
+  for (auto& [rid, res] : sh.inbox->take()) {
+    deliverOne(sh, ctx, rid, std::move(res));
+    drainLocal(sh);
+  }
+  const double now = ctx.now();
+  while (!sh.deadlines.empty() && sh.deadlines.begin()->first <= now) {
+    const uint64_t rid = sh.deadlines.begin()->second;
+    auto it = sh.reqs.find(rid);
+    if (it == sh.reqs.end()) {
+      sh.deadlines.erase(sh.deadlines.begin());
+      continue;
+    }
+    sh.o.db->cancel(it->second.poolId);
+    if (it->second.op == DbOp::Begin) sh.o.db->abortTx(it->second.poolId);
+    deliverOne(sh, ctx, rid,
+               DbResult::fail("tempo esgotado (" + std::to_string(sh.o.db->config().timeoutMs) + " ms + folga)", true));
+    drainLocal(sh);
+  }
+  // Fora de qualquer chamada ao Lua, toda transação viva tem um comando em andamento; sem comando = a corrotina
+  // dona morreu ou cedeu para outro lugar → rollback.
+  for (ApiRes* a : sh.live) {
+    for (auto t = a->txs.begin(); t != a->txs.end();) {
+      if (t->second.inflight) {
+        ++t;
+        continue;
+      }
+      sh.o.db->abortTx(t->first);
+      a->txOf.erase(t->second.co);
+      t = a->txs.erase(t);
+    }
+  }
 }
 
 void fireTimers(Shared& sh, ScriptContext& ctx) {
@@ -1490,6 +2066,7 @@ void installApi(HostOptions& opt, ApiOptions api) {
     if (prevEvent) prevEvent(ctx, ev);
   };
   opt.onTick = [sh, prevTick](ScriptContext& ctx) {
+    deliverDb(*sh, ctx);
     fireTimers(*sh, ctx);
     drainLocal(*sh);
     if (prevTick) prevTick(ctx);

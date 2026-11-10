@@ -164,3 +164,58 @@ TEST_CASE("config scripting section has defaults and validates its limits") {
   bad["scripting"] = 5;
   requireRejects(bad, "scripting");
 }
+
+TEST_CASE("config db section is optional, has defaults and never echoes the password in errors") {
+  REQUIRE_FALSE(ServerConfig::fromJson(json::object()).db.has_value());
+  REQUIRE_FALSE(ServerConfig::load(CBSERVER_CFG_EXAMPLE).db.has_value());  // exemplo: "db": null
+  auto j = base();
+  j["db"] = {{"host", "db.local"}, {"user", "cb"}, {"password", "s3cr3t-xyz"}, {"database", "castelo"}};
+  auto c = ServerConfig::fromJson(j);
+  REQUIRE(c.db.has_value());
+  REQUIRE(c.db->host == "db.local");
+  REQUIRE(c.db->port == 3306);
+  REQUIRE(c.db->user == "cb");
+  REQUIRE(c.db->password == "s3cr3t-xyz");
+  REQUIRE(c.db->database == "castelo");
+  REQUIRE(c.db->pool == 4);
+  REQUIRE(c.db->timeoutMs == 5000);
+  REQUIRE(c.db->tls == "auto");
+  j["db"]["port"] = 3307;
+  j["db"]["pool"] = 8;
+  j["db"]["timeoutMs"] = 2500;
+  j["db"]["tls"] = "verify";
+  c = ServerConfig::fromJson(j);
+  REQUIRE(c.db->port == 3307);
+  REQUIRE(c.db->pool == 8);
+  REQUIRE(c.db->timeoutMs == 2500);
+  REQUIRE(c.db->tls == "verify");
+
+  auto rejects = [&](const char* key, json value, const char* field) {
+    auto b = j;
+    if (value.is_null())
+      b["db"].erase(key);
+    else
+      b["db"][key] = value;
+    try {
+      (void)ServerConfig::fromJson(b);
+      FAIL("deveria recusar " << field);
+    } catch (const std::runtime_error& e) {
+      const std::string m = e.what();
+      REQUIRE_THAT(m, ContainsSubstring(field));
+      REQUIRE(m.find("s3cr3t-xyz") == std::string::npos);
+    }
+  };
+  rejects("host", nullptr, "db.host");
+  rejects("host", "", "db.host");
+  rejects("user", nullptr, "db.user");
+  rejects("database", nullptr, "db.database");
+  rejects("pool", 0, "db.pool");
+  rejects("pool", 65, "db.pool");
+  rejects("timeoutMs", 50, "db.timeoutMs");
+  rejects("port", 0, "db.port");
+  rejects("tls", "talvez", "db.tls");
+  rejects("password", 5, "db.password");
+  auto bad = base();
+  bad["db"] = "mysql://x";
+  requireRejects(bad, "db");
+}

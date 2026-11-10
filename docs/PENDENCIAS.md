@@ -35,7 +35,16 @@ Itens levantados nas revisões que não bloquearam o merge, com o momento em que
   uma falta (os dois reiniciam com back-off). Documentar em `RESOURCES.md`; separar os prazos exigiria mudar o `Resource`.
 - Foto dos jogadores por tick: buffers reaproveitados quando a thread de scripts já soltou a foto antiga (até 4); ainda
   copia as strings de cada jogador por tick (`assign`, sem nova alocação no caso comum).
-- Comando de chat que cede (consulta assíncrona da Task 5) não responde: só retorno síncrono vira `cb:reply`.
+- ~~Comando de chat que cede (consulta assíncrona da Task 5) não responde: só retorno síncrono vira `cb:reply`.~~
+  Resolvido na Task 5: o comando que espera o banco responde com o texto que devolver no fim.
+- Banco (Task 5): bans com MySQL só são lidos do banco na subida (carga com novas tentativas); bans gravados por
+  outro servidor no mesmo banco só valem depois de reiniciar. Gravações de ban com o banco fora ficam em fila na
+  memória (teto 100 000) e se perdem se o processo cair antes de o banco voltar.
+- Banco (Task 5): `cb.db` dentro de corrotinas do próprio script (`coroutine.wrap`) cede para o `resume` do script;
+  quando o resultado chega, o host retoma a corrotina (o "resume" do script recebe só a cessão). Documentar em
+  `RESOURCES.md`; resultado ≤ 10 000 linhas / 8 MiB; CALL com conjuntos de resultado não é suportado.
+- Distribuição Linux do `cb-server` precisa levar `libmariadb.so*` (LGPL, ligada dinamicamente pelo triplet
+  `vcpkg-triplets/x64-linux.cmake`).
 - Eventos servidor → cliente de scripts: cota por jogador de `scripting.eventOutKBps` (padrão 8 KiB/s = 64 kbps) com
   rajada `eventOutBurstKB` (32 KiB) e 48 B de overhead por mensagem; teto de 8192 eventos de saída por tick. Um
   gamemode que precise de mais banda por jogador tem de subir a cota (e conferir o orçamento de 64 kbps da spec).

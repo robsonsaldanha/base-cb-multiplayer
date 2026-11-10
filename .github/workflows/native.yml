@@ -1,9 +1,9 @@
 name: native
 on:
   push:
-    paths: ['proto/**', 'server/**', 'bots/**', 'CMakeLists.txt', 'CMakePresets.json', 'vcpkg.json', 'packages/contracts/test-vectors/**', '.github/workflows/native.yml']
+    paths: ['proto/**', 'server/**', 'bots/**', 'CMakeLists.txt', 'CMakePresets.json', 'vcpkg.json', 'vcpkg-overlays/**', 'vcpkg-triplets/**', 'packages/contracts/test-vectors/**', '.github/workflows/native.yml']
   pull_request:
-    paths: ['proto/**', 'server/**', 'bots/**', 'CMakeLists.txt', 'CMakePresets.json', 'vcpkg.json', 'packages/contracts/test-vectors/**', '.github/workflows/native.yml']
+    paths: ['proto/**', 'server/**', 'bots/**', 'CMakeLists.txt', 'CMakePresets.json', 'vcpkg.json', 'vcpkg-overlays/**', 'vcpkg-triplets/**', 'packages/contracts/test-vectors/**', '.github/workflows/native.yml']
 concurrency:
   group: native-${{ github.ref }}
   cancel-in-progress: true
@@ -45,6 +45,8 @@ jobs:
           "$GITHUB_WORKSPACE/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
           echo "VCPKG_ROOT=$GITHUB_WORKSPACE/vcpkg" >> $GITHUB_ENV
       - run: cmake --preset linux-asan && cmake --build --preset linux-asan -- -k 0
+      - name: libmariadb ligada dinamicamente (LGPL)
+        run: ldd build-native/linux-asan/server/cb-server | tee /dev/stderr | grep -q 'libmariadb\.so'
       - run: ctest --test-dir build-native/linux-asan --output-on-failure
       - uses: actions/cache/save@v4
         if: always()

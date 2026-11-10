@@ -57,7 +57,7 @@ ServerConfig ServerConfig::fromJson(const json& j) {
   ServerConfig c;
   static const char* kKnown[] = {"name",   "description", "tags",     "locale",       "maxPlayers", "port",
                                  "hub",    "auth",        "net",      "sim",          "movement",   "events",
-                                 "metrics", "resourcesDir", "logsDir", "scripting"};
+                                 "metrics", "resourcesDir", "logsDir", "scripting", "db"};
   for (auto it = j.begin(); it != j.end(); ++it) {
     bool known = false;
     for (auto* k : kKnown) known = known || it.key() == k;
@@ -169,6 +169,31 @@ ServerConfig ServerConfig::fromJson(const json& j) {
     if (c.bansFile.empty()) fail("scripting.bansFile", "não pode ser vazio");
     getNum(*sc, "eventOutKBps", "scripting.", 1, 1e6, c.scriptEventOutKBps);
     getNum(*sc, "eventOutBurstKB", "scripting.", 8, 1e6, c.scriptEventOutBurstKB);
+  }
+  if (const json* d = sub(j, "db", "")) {
+    if (!d->is_object()) fail("db", "deve ser um objeto {host, port, user, password, database, pool, timeoutMs, tls} ou null");
+    static const char* kDbKeys[] = {"host", "port", "user", "password", "database", "pool", "timeoutMs", "tls"};
+    for (auto it = d->begin(); it != d->end(); ++it) {
+      bool known = false;
+      for (auto* k : kDbKeys) known = known || it.key() == k;
+      if (!known) spdlog::warn("Configuração: chave desconhecida 'db.{}' ignorada", it.key());
+    }
+    DbSettings db;
+    getStr(*d, "host", "db.", db.host);
+    getInt(*d, "port", "db.", 1, 65535, db.port);
+    getStr(*d, "user", "db.", db.user);
+    getStr(*d, "password", "db.", db.password);  // erros de tipo citam só o campo, nunca o valor
+    getStr(*d, "database", "db.", db.database);
+    getInt(*d, "pool", "db.", 1, 64, db.pool);
+    getInt(*d, "timeoutMs", "db.", 100, 600000, db.timeoutMs);
+    getStr(*d, "tls", "db.", db.tls);
+    if (!d->contains("host") || db.host.empty() || db.host.size() > 255) fail("db.host", "é obrigatório (1 a 255 caracteres)");
+    if (!d->contains("user") || db.user.empty() || db.user.size() > 80) fail("db.user", "é obrigatório (1 a 80 caracteres)");
+    if (!d->contains("database") || db.database.empty() || db.database.size() > 64)
+      fail("db.database", "é obrigatório (1 a 64 caracteres)");
+    if (db.tls != "auto" && db.tls != "off" && db.tls != "required" && db.tls != "verify")
+      fail("db.tls", "deve ser 'auto', 'off', 'required' ou 'verify'");
+    c.db = std::move(db);
   }
   if (const json* m = sub(j, "metrics", "")) {
     if (const json* t = sub(*m, "token", "metrics.")) {

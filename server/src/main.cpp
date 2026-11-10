@@ -29,6 +29,7 @@
 
 #include "cbscript/api.hpp"
 #include "cbscript/bans.hpp"
+#include "cbscript/db.hpp"
 #include "cbscript/host.hpp"
 #include "cbserver/auth.hpp"
 #include "cbserver/config.hpp"
@@ -162,10 +163,31 @@ int run(const std::string& cfgPath) {
   });
 
   // Scripts Lua: thread própria; a simulação só conversa com ela por filas (ScriptBridge).
-  auto bans = std::make_shared<cbscript::BanStore>(cfg.bansFile, unixNow);
+  // Banco (opcional): pool em threads próprias; ninguém espera por ele (sobe mesmo com o banco fora do ar).
+  std::shared_ptr<cbscript::DbPool> db;
+  if (cfg.db) {
+    cbscript::DbConfig dc;
+    dc.host = cfg.db->host;
+    dc.port = cfg.db->port;
+    dc.user = cfg.db->user;
+    dc.password = cfg.db->password;
+    dc.database = cfg.db->database;
+    dc.pool = cfg.db->pool;
+    dc.timeoutMs = cfg.db->timeoutMs;
+    dc.tls = cfg.db->tls == "off"        ? cbscript::DbConfig::Tls::Off
+             : cfg.db->tls == "required" ? cbscript::DbConfig::Tls::Required
+             : cfg.db->tls == "verify"   ? cbscript::DbConfig::Tls::Verify
+                                         : cbscript::DbConfig::Tls::Auto;
+    spdlog::info("banco: {} (pool {}, timeout {} ms, tls {})", dc.describe(), dc.pool, dc.timeoutMs, cfg.db->tls);
+    db = std::make_shared<cbscript::DbPool>(dc, cbscript::mysqlConnectionFactory(dc));
+  }
+  auto bans = db ? std::make_shared<cbscript::BanStore>(db, unixNow)
+                 : std::make_shared<cbscript::BanStore>(cfg.bansFile, unixNow);
+  spdlog::info("bans: backend {}", bans->backend());
   auto auditLog = makeAuditLogger(cfg.logsDir);
   cbscript::ApiOptions api;
   api.bans = bans;
+  api.db = db;
   api.audit = [auditLog](const std::string& line) { auditLog->info("{}", line); };
   api.unixNow = unixNow;
   auto apiStats = std::make_shared<cbscript::ApiStats>();
@@ -282,6 +304,13 @@ int run(const std::string& cfgPath) {
       metrics.scriptLogDropped = static_cast<int64_t>(apiStats->logDropped.load());
       metrics.scriptAuditDropped = static_cast<int64_t>(apiStats->auditDropped.load());
       metrics.scriptJoinLeaveDropped = static_cast<int64_t>(bridge.joinLeaveDropped());
+      if (db) {
+        const auto dm = db->metrics();
+        metrics.setDb({{"queries", dm.queries}, {"errors", dm.errors}, {"timeouts", dm.timeouts}, {"qps", dm.qps},
+                       {"p50Ms", dm.p50Ms}, {"p99Ms", dm.p99Ms}, {"busy", dm.busy}, {"connected", dm.connected},
+                       {"size", dm.size}, {"queued", dm.queued}, {"activeTx", dm.activeTx},
+                       {"bansLoaded", bans->loaded()}, {"bansPendingWrites", bans->pendingWrites()}});
+      }
     }
 
     next += period;

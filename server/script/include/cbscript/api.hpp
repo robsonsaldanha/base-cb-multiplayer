@@ -16,6 +16,19 @@
 //
 // Todo callback roda numa corrotina própria (ScriptContext::invoke). Eventos locais (cb.events.emitLocal) são
 // entregues na mesma thread logo depois do gancho/evento atual terminar (nunca reentrantes).
+//
+// cb.db (permissions.db = true; ApiOptions::db):
+// - cb.db.query(sql, ...) → lista de linhas {coluna = valor}; cb.db.exec → linhas afetadas; cb.db.insert → último
+//   id inserido. Só '?' (um parâmetro por '?': nil/cb.null, boolean, integer, number, string). A corrotina do
+//   callback cede e é retomada na thread de scripts quando o pool responder (onTick); erro (SQL, banco fora, tempo
+//   esgotado) → erro Lua no callback.
+// - cb.db.transaction(fn(tx)) → tx.query/exec/insert numa conexão dedicada; commit se fn terminar (devolve o 1º
+//   valor de fn), rollback e o mesmo erro se fn falhar. Aninhar, ou usar cb.db.* direto dentro de fn, é erro.
+//   Aborto pela vigia/stop do resource → rollback (abortTx); transação abandonada → rollback.
+// - Recusado: no nível de cima do script principal (use resourceStart), dentro de cb.resource e onde não dá para
+//   ceder (metamétodo/iterador chamado por C). Corrotina retomada por fora (coroutine.resume) enquanto espera o banco
+//   → erro nela. Resource parado → pedidos cancelados e resultados descartados.
+// - Comando (cb.commands) que espera o banco ainda responde com o texto que devolver no fim.
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -28,6 +41,7 @@
 namespace cbscript {
 
 class BanStore;
+class DbPool;
 
 // Contadores da API (lidos de qualquer thread, para /metrics).
 struct ApiStats {
@@ -40,8 +54,12 @@ struct ApiOptions {
   std::function<void(const std::string&)> audit;
   // Relógio Unix em segundos (auditoria e bans). Vazio = system_clock.
   std::function<int64_t()> unixNow;
-  // Bans (bans.json até a Task 5). Nulo → cb.players.ban/unban dão erro.
+  // Bans (bans.json ou MySQL). Nulo → cb.players.ban/unban dão erro.
   std::shared_ptr<BanStore> bans;
+  // Banco (cb.db.*). Nulo → cb.db.* dão erro "banco não configurado". Resources precisam de permissions.db = true.
+  std::shared_ptr<DbPool> db;
+  size_t maxDbPending = 1024;  // pedidos cb.db em andamento por resource (acima disso: erro)
+  double dbGraceSec = 1.0;     // prazo do lado do script = timeoutMs do pool + isto (relógio do host)
   // Jogador (por did) pode usar comandos admin=true pelo chat. Vazio = ninguém (só console/painel).
   std::function<bool(const std::string& did)> isAdmin;
   size_t maxTimersPerResource = 10000;
