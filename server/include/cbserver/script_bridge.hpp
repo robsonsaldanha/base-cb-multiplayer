@@ -27,7 +27,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include "cbscript/api.hpp"
 #include "cbscript/host.hpp"
+#include "cbserver/config.hpp"
 #include "cbserver/world.hpp"
 
 namespace cbserver {
@@ -82,5 +84,10 @@ class ScriptBridge {
   std::vector<cbscript::ScriptToSim> adminInbox_, adminTaken_;
   uint64_t eventsDropped_ = 0, joinLeaveDropped_ = 0, commandsRejected_ = 0, commandsDropped_ = 0;
 };
+
+// Opções da API cb.* que vêm do server.cfg; o main.cpp parte delas e acrescenta os objetos de execução (bans, banco,
+// HTTP de saída, auditoria, relógio, estatísticas). Hoje: comandos {admin = true} pelo chat só para os dids de
+// admin.admins (isAdmin; o console do painel tem as regras dele). Testada em test_script_world.cpp.
+cbscript::ApiOptions scriptApiOptions(const ServerConfig& cfg);
 
 }  // namespace cbserver

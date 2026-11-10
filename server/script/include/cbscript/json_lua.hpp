@@ -18,7 +18,7 @@ struct JsonOptions {
 
 // Decodifica `json` e empilha 1 valor em L. Em erro devolve false, não empilha nada e preenche `err`.
 // Pode ser chamada pelo host ou de dentro de uma função C chamada pelo script: a montagem da tabela roda sob
-// lua_pcall, então erro de memória (teto do estado) vira `false`, nunca longjmp por quadros C++.
+// lua_pcall, então erro de memória (teto do estado) vira `false`, nunca um erro do Lua atravessando quadros C++.
 // Mapeamento: objeto → tabela com chaves texto; array → sequência 1..n; inteiro → integer; número com ponto/expoente
 // → float; inteiro acima de int64 → float; número que não cabe em double (1E400) → erro; texto → string (UTF-8 já validado); true/false → boolean.
 bool jsonToLua(lua_State* L, std::string_view json, std::string& err, const JsonOptions& opt = {});

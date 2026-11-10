@@ -9,7 +9,7 @@
     "nlohmann-json",
     "spdlog",
     "catch2",
-    "lua",
+    { "name": "lua", "features": ["cpp"] },
     "sol2",
     "libmariadb"
   ],

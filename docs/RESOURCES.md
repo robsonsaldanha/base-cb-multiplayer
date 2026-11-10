@@ -617,8 +617,8 @@ end, { admin = true })
   outra conexão e pode esperar pelos bloqueios da própria transação.
 - Aborto pela vigia, resource parado ou corrotina abandonada → ROLLBACK automático. Transação sem comando por 10 s →
   ROLLBACK pelo pool.
-- No máximo `pool − 1` transações abertas ao mesmo tempo (sobra conexão para consultas avulsas). Com `db.pool: 1` uma
-  transação segura a única conexão (o servidor avisa no log): use `pool ≥ 2`.
+- No máximo `max(1, pool − 1)` transações abertas ao mesmo tempo (com `pool ≥ 2` sobra conexão para consultas
+  avulsas). Com `db.pool: 1` cabe uma transação, que segura a única conexão (o servidor avisa no log): use `pool ≥ 2`.
 
 ### Limites e prazos
 

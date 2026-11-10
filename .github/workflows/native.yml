@@ -99,6 +99,12 @@ jobs:
         shell: pwsh
       - run: ctest --test-dir build-native/windows-ci -C Release --output-on-failure
         shell: pwsh
+      # Debug só do cbscript (vigia/sandbox do Lua): /Od + /RTC aumentam os quadros e mudam o desenrolar de erros do Lua;
+      # foi só em Debug que apareceu a pilha estourada pelos 200 níveis C do Lua (revisão final do sub3, I2). Os testes de
+      # tempo (p99) do cbserver ficam de fora: não fazem sentido sem otimização.
+      - run: |
+          cmake --build --preset windows-ci --config Debug --target cbscript_tests && ctest --test-dir build-native/windows-ci/server/script -C Debug --output-on-failure
+        shell: pwsh
       - uses: actions/cache/save@v4
         if: always()
         with:

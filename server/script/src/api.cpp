@@ -1,9 +1,12 @@
 // API cb.* (ver api.hpp).
 //
-// Regra dos bindings (ver resource.cpp, Task 2): erros do Lua (luaL_error e erro de memória no teto do estado)
-// fazem longjmp. Por isso as funções lua_CFunction abaixo ("quadros puros") só têm variáveis triviais (inteiros,
-// ponteiros, buffers de char); todo trabalho com objetos C++ fica em ajudantes CBAPI_NOINLINE que não chamam
-// nenhuma função do Lua capaz de lançar erro e devolvem um código + mensagem num buffer de char do chamador.
+// Regra dos bindings (ver resource.cpp, Task 2): o Lua é compilado como C++ (vcpkg-overlays/lua, feature cpp), então
+// erros do Lua (luaL_error, erro de memória no teto do estado, aborto da vigia) e yields são exceções C++ que
+// desenrolam os quadros chamando destrutores. Mesmo assim as funções lua_CFunction abaixo ("quadros puros") só têm
+// variáveis triviais e o trabalho com objetos C++ fica em ajudantes CBAPI_NOINLINE que não chamam funções do Lua
+// capazes de lançar erro e devolvem um código + mensagem num buffer de char do chamador: assim nenhum erro do Lua
+// passa por um `try` nosso. Nesses ajudantes, `catch` só pega std::exception (nunca `catch (...)`, que engoliria a
+// exceção interna do Lua e deixaria o estado inconsistente).
 //
 // Referências: os bindings guardam funções com luaL_ref (inteiro, no registro compartilhado por todas as threads do
 // estado). O host só monta sol::reference a partir delas fora de qualquer chamada ao Lua (despacho de eventos,
@@ -547,7 +550,7 @@ CBAPI_NOINLINE int doEmit(ApiRes* a, lua_State* L, lua_Integer target, const cha
     return a->ctx->emit(CmdEmit{static_cast<int32_t>(target), std::string(name, len), a->scratch, session, a->source})
                ? 1
                : 0;
-  } catch (...) {
+  } catch (const std::exception&) {
     setErr(e, "cb.events.emit: sem memória");
     return -1;
   }
@@ -583,7 +586,7 @@ CBAPI_NOINLINE int doEmitLocal(ApiRes* a, lua_State* L, const char* name, size_t
     }
     a->sh->localQ.push_back(LocalEvent{std::string(name, len), std::move(out), a->h->name()});
     return 0;
-  } catch (...) {
+  } catch (const std::exception&) {
     setErr(e, "cb.events.emitLocal: sem memória");
     return -1;
   }
@@ -992,7 +995,7 @@ CBAPI_NOINLINE int doAudit(ApiRes* a, lua_State* L, const char* type, size_t len
       }
     auditLine(*a, std::move(line), true);
     return 0;
-  } catch (...) {
+  } catch (const std::exception&) {
     setErr(e, "cb.audit: falha ao montar a linha");
     return -1;
   }
@@ -1252,7 +1255,7 @@ CBAPI_NOINLINE uint64_t dbSubmit(ApiRes* a, lua_State* L, DbOp op, uint64_t tx, 
     a->dbPendingBytes += bytes;
     if (tx != 0) a->txs[tx].inflight = true;
     return rid;
-  } catch (...) {
+  } catch (const std::exception&) {
     if (poolId != 0) a->sh->o.db->cancel(poolId);
     setErr(e, std::string(fn) + ": sem memória");
     return 0;
@@ -1548,7 +1551,7 @@ CBAPI_NOINLINE uint64_t httpSubmit(ApiRes* a, lua_State* L, HttpMethod m, const 
     sh.httpDeadlines.emplace(p.deadline, rid);
     ++a->httpPending;
     return rid;
-  } catch (...) {
+  } catch (const std::exception&) {
     if (poolId != 0) a->sh->o.http->cancel(poolId);
     setErr(e, std::string(fn) + ": sem memória");
     return 0;
@@ -1669,7 +1672,7 @@ CBAPI_NOINLINE int proxyIndex(ApiRes* a, lua_State* L, const char* res, size_t r
       return -1;
     }
     return 1;
-  } catch (...) {
+  } catch (const std::exception&) {
     setErr(e, "cb.resource: sem memória");
     return -1;
   }
@@ -1740,7 +1743,7 @@ CBAPI_NOINLINE int proxyCall(ApiRes* a, lua_State* L, int nargs, const char* res
       return -1;
     }
     return 1;
-  } catch (...) {
+  } catch (const std::exception&) {
     setErr(e, "cb.resource: sem memória");
     return -1;
   }

@@ -280,4 +280,10 @@ void ScriptBridge::publishPlayers() {
   host_.publishPlayers(std::move(buf));
 }
 
+cbscript::ApiOptions scriptApiOptions(const ServerConfig& cfg) {
+  cbscript::ApiOptions api;
+  api.isAdmin = chatAdminCheck(cfg.admin);
+  return api;
+}
+
 }  // namespace cbserver

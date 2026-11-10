@@ -281,15 +281,22 @@ TEST_CASE("bridge: chat admin commands follow admin.admins from server.cfg; empt
   {
     const auto cfg = cbserver::ServerConfig::fromJson(nlohmann::json::parse(
         R"({"admin": {"admins": [")" + adminDid + R"("]}})"));
-    Env env(probe, std::chrono::milliseconds(300), nullptr, cbserver::chatAdminCheck(cfg.admin));
+    // Mesmo caminho do main.cpp: ApiOptions montadas a partir do server.cfg.
+    Env env(probe, std::chrono::milliseconds(300), nullptr, cbserver::scriptApiOptions(cfg).isAdmin);
     INFO(env.allLogs());
     auto adm = join(env, adminDid, "adm");
     auto bob = join(env, otherDid, "bob");
+    // Falsificação: nome e sub iguais ao did do admin, did diferente. Só o did (do ticket) conta.
+    auto fake = env.h.world.addPlayer(adminDid, "555555555555555555", adminDid, env.h.now, cbmp::PlayerState{});
+    REQUIRE(fake);
+    REQUIRE(env.ticksUntil([&] { return env.hasLog("join " + std::to_string(*fake)); }));
     REQUIRE(env.h.world.onEvent(adm, Event{"cb:command", bytes(R"("/segredo")")}, env.h.now));
     REQUIRE(env.h.world.onEvent(bob, Event{"cb:command", bytes(R"("/segredo")")}, env.h.now));
-    auto r = replies(env, {adm, bob});
+    REQUIRE(env.h.world.onEvent(*fake, Event{"cb:command", bytes(R"("/segredo")")}, env.h.now));
+    auto r = replies(env, {adm, bob, *fake});
     CHECK(r[adm] == "\"segredo " + std::to_string(adm) + "\"");
     CHECK(r[bob].find("sem permiss") != std::string::npos);
+    CHECK(r[*fake].find("sem permiss") != std::string::npos);
     // Comando de admin pelo chat continua auditado com o did de quem digitou.
     std::lock_guard<std::mutex> lk(env.mu);
     int audited = 0;
@@ -306,7 +313,7 @@ TEST_CASE("bridge: chat admin commands follow admin.admins from server.cfg; empt
     // Lista vazia (padrão): ninguém usa comandos de admin pelo chat.
     const auto cfg = cbserver::ServerConfig::fromJson(nlohmann::json::object());
     REQUIRE(cfg.admin.admins.empty());
-    Env env(probe, std::chrono::milliseconds(300), nullptr, cbserver::chatAdminCheck(cfg.admin));
+    Env env(probe, std::chrono::milliseconds(300), nullptr, cbserver::scriptApiOptions(cfg).isAdmin);
     INFO(env.allLogs());
     auto adm = join(env, adminDid, "adm");
     REQUIRE(env.h.world.onEvent(adm, Event{"cb:command", bytes(R"("/segredo")")}, env.h.now));

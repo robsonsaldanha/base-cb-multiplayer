@@ -14,7 +14,24 @@ baseline `ec48c11e…`) com três patches pequenos usados pela vigia dos scripts
 | `cbmp-c2-vm-interrupt.patch` | `lstate.h`, `lstate.c`, `lapi.c`, `lua.h`, `lvm.c`, `ldebug.c` | Pedido de interrupção vindo de outra thread do SO: `global_State.cbmp_interrupt` (`volatile sig_atomic_t`), gravado só por `lua_cbmp_setinterrupt(L, on)`. A VM junta a flag ao `trap` (`updatetrap` e entrada de função), então qualquer laço Lua a vê no próximo salto; em `luaG_traceexec` chama o callback do host guardado no extra space da thread (`luaE_cbmpinterrupt`), que lança o erro de tempo ou desliga a flag. `lua_cbmp_poll(L)` deixa bibliotecas C conferirem a flag. Zera o extra space da thread principal em `lua_newstate`. |
 | `cbmp-i1-lib-interrupt.patch` | `lstrlib.c`, `ltablib.c`, `loslib.c` | `lua_cbmp_poll` nos laços C longos: casamento de padrões (passos de `match`, `singlematch` pesado pelo tamanho da classe, `%b`, busca simples `lmemfind` pesada pelo tamanho da agulha) a cada 4096 unidades; `string.rep` de pedaços vazios devolve `""` na hora e monta o resultado dobrando o trecho já copiado (O(log n) `memcpy` em vez de um por pedaço, com `lua_cbmp_poll` entre as cópias: um `memcpy` por byte deixava `('a'):rep(1 << 25)` em ~0,2 s ininterruptos sob ASan); `table.insert/remove/move/concat` por iteração; cada comparação do `table.sort`; `os.date` por conversão. Ao atualizar o Lua, refaça a varredura de laços (tabela no report da Task 2 do sub3). |
 
-`port-version` 100 só marca que é o port local.
+`port-version` 100+ só marca que é o port local (101: `lua-cpp` com PIC e `libm`, como o alvo C).
+
+### Lua compilado como C++ (feature `cpp`)
+
+O `vcpkg.json` da raiz pede `lua[cpp]`, e o `CMakeLists.txt` da raiz liga só com o alvo `lua-cpp` (`liblua-c++.a` /
+`lua-c++.dll`; o port continua gerando também a biblioteca C `lua`, que não é usada). Compilado como C++, o Lua
+implementa erros e yields com `throw` (`LUAI_THROW` em `ldo.c`) em vez de `longjmp`, então um erro (inclusive o
+aborto da vigia) que atravessa quadros C++ chama os destrutores. Consequências para quem usa:
+
+- Os cabeçalhos são incluídos **sem** `extern "C"` (`lua.h`, `lauxlib.h`, `lualib.h`; o `lua.hpp` não é instalado com
+  a feature) e o sol2 é compilado com `SOL_USING_CXX_LUA=1` (definido em `server/script/CMakeLists.txt`). Misturar com
+  o alvo C daria erro de link (nomes C++ × C), nunca uma mistura silenciosa.
+- Nunca use `catch (...)` em volta de chamadas à API do Lua que possam lançar erro: pegaria a exceção interna do Lua
+  (erro ou yield). Pegue `std::exception`. O sol2 com `SOL_USING_CXX_LUA` já desliga o `catch (...)` dos trampolins.
+- Exceções C++ que escapam de uma função C para dentro do Lua são pegas pelo `catch (...)` do Lua e viram erro com
+  status -1; os bindings do projeto não deixam exceções escaparem.
+- No Linux o CMake compila os `.c` como C++ (`LANGUAGE CXX` → `-x c++` no GCC/Clang); no MSVC, `/TP` com `/EHsc` (flags
+  padrão do vcpkg). Os patches `cbmp-*` são C que também é C++ válido (sem conversão implícita de `void *`).
 
 ### Ao atualizar o Lua
 

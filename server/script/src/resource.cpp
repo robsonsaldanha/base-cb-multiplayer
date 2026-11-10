@@ -44,9 +44,10 @@
 //   enormes, GC de emergência perto do teto) só é interrompida quando termina. O teto de memória limita o tamanho;
 //   o ScriptHost precisa de supervisor (ver report).
 
-// Funções chamadas a partir de quadros que o Lua atravessa com longjmp (callback de interrupção, funções C do
-// sandbox) ficam fora de linha: assim o quadro atravessado não tem objetos C++ com destrutor. No MSVC, um longjmp do
-// lua.dll (C) atravessando um quadro C++ com estado de EH derrubou o processo (0xC0000409/0xC0000374).
+// O Lua é compilado como C++ (vcpkg-overlays/lua, feature cpp): erros e yields são exceções C++ (LUAI_THROW), não
+// longjmp. Antes (Lua em C) um longjmp do lua.dll atravessando um quadro C++ com estado de EH derrubou o processo no
+// MSVC (0xC0000409/0xC0000374). As funções chamadas a partir de quadros que o Lua atravessa (callback de interrupção,
+// funções C do sandbox) continuam fora de linha e sem objetos C++ vivos no ponto do erro, por clareza.
 #if defined(_MSC_VER)
 #define CBSCRIPT_NOINLINE __declspec(noinline)
 #else
@@ -193,7 +194,7 @@ Shared* sharedOf(lua_State* L) {
 }
 
 // Chamado pelo Lua com patch, na thread do Lua, quando a flag de interrupção está ligada. Enquanto a chamada estiver
-// vencida, lança o erro (longjmp; quadro sem objetos C++). Flag velha (fora de chamada vencida): desliga.
+// vencida, lança o erro (exceção do Lua; quadro sem objetos C++). Flag velha (fora de chamada vencida): desliga.
 void interruptCheck(lua_State* L) {
   Shared* s = sharedOf(L);
   if (s->depth > 0 && (s->aborting || s->abortDue.load(std::memory_order_acquire))) {
@@ -366,7 +367,7 @@ bool isUnder(const fs::path& base, const fs::path& p) {
 }  // namespace
 
 // Parte C++ do require, isolada num quadro próprio: aqui só há operações protegidas (luaL_loadbufferx) ou sem
-// limite de memória, então nenhum longjmp do Lua atravessa objetos C++ vivos. Empilha o chunk ou a mensagem de erro.
+// limite de memória, então nenhum erro do Lua atravessa objetos C++ vivos. Empilha o chunk ou a mensagem de erro.
 CBSCRIPT_NOINLINE int prepareModule(Resource* self, lua_State* L) {
   EnforceOff off(*self->sh_);
   size_t n = 0;

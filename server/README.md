@@ -81,7 +81,7 @@ JSON; todos os campos são opcionais. Valores abaixo são os padrões.
 | `db.pool` | `4` | 1 a 64 conexões |
 | `db.timeoutMs` | `5000` | 100 a 600000; prazo de cada consulta (fila + execução) |
 | `db.tls` | `"auto"` | `auto`, `off`, `required` ou `verify` (abaixo) |
-| `admin.admins` | `[]` | ids Discord (texto, 17 a 20 dígitos), até 100; repetidos são ignorados. Vazio e sem `devToken` = painel desligado. Também são quem pode usar pelo chat os comandos de script com `admin = true` (lido na subida) |
+| `admin.admins` | `[]` | ids Discord (texto, 17 a 20 dígitos), até 100; repetidos são ignorados. Vazio e sem `devToken` = painel desligado. Também são quem pode usar pelo chat os comandos de script com `admin = true` (lido na subida; em modo dev, quem tem a chave privada dev entra com qualquer did, inclusive o de um admin) |
 | `admin.port` | `30510` | 1 a 65535, diferente de `port` |
 | `admin.bind` | `"127.0.0.1"` | IP literal sem porta (`127.0.0.1`, `::1`, `0.0.0.0`, `::`, IP da máquina) |
 | `admin.publicUrl` | `null` | origem `https://host[:porta]` (http só em loopback), sem caminho; anunciada ao Hub (`adminUrl`). Sem ela não há login via Hub |
@@ -97,7 +97,8 @@ JSON; todos os campos são opcionais. Valores abaixo são os padrões.
   - Em produção use sempre `https://`.
 - **Dev**: informe `auth.devPublicKey` e `hub: null`; o servidor aceita tickets assinados pela chave privada correspondente
   (usado por `cb-bots` e `tools/loadtest.py`, serverId `srv_dev`). **Nunca coloque `devPublicKey` em produção**: quem tiver a
-  chave privada entra como qualquer jogador.
+  chave privada entra como qualquer jogador, inclusive com o did de um admin de `admin.admins` (e então usa pelo chat
+  os comandos de script com `admin = true`).
 - `sim.spawn.mode = "devTrustFirstInput"` (o jogador aparece onde mandar o primeiro Input, sem validação) só vale em modo
   dev; fora dele a config é recusada. Em produção use `origin`.
 - As velocidades de `movement.maxSpeedCmS` são provisórias até o subprojeto 5.
@@ -150,7 +151,7 @@ Opcional. Com a seção `db`, `cb.db` fica disponível aos resources com `permis
   CA interna use `required`. Erro de conexão em `verify` que pareça de TLS sugere `required` no log.
 - O servidor sobe mesmo com o banco fora do ar: as consultas falham na hora enquanto ele reconecta (espera crescente).
   Os bans do banco só valem depois da primeira carga (log CRÍTICO após 5 falhas seguidas; `/metrics.db.bansLoaded`).
-- `pool: 1` gera aviso: uma transação aberta segura a única conexão. No máximo `pool − 1` transações ao mesmo tempo.
+- `pool: 1` gera aviso: uma transação aberta segura a única conexão. No máximo `max(1, pool − 1)` transações ao mesmo tempo (com `pool: 1`, uma).
 - Na subida o log mostra `banco: user@host:porta/banco (pool, timeout, tls)` (sem a senha), a pasta dos plugins de
   autenticação e `bans: backend mysql|json`.
 

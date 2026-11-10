@@ -14,8 +14,6 @@ das tasks).
   forma. Dono: sub4.
 - **Resource de exemplo com arquivos de cliente** para o launcher testar download: `resources.example/echo` só tem
   `server/`. Acrescentar um exemplo com `client/`/`ui/`/`files/`. Dono: sub4.
-- **Comandos `admin = true` pelo chat** usam `admin.admins` (lida na subida). Falta testar com o chat do cliente real e
-  decidir se admins de jogo devem ter uma lista separada da do painel. Dono: sub5 (quando houver chat no cliente).
 - **`nonce` no ticket de admin**: o `state` do painel só prova que *algum* navegador começou o fluxo; um ticket
   roubado pode ser pareado com o state do próprio atacante. O Hub deve amarrar o hash do state no ticket (claim
   `nonce`) e o painel conferir. Mudança no Hub e no contrato. Dono: Hub.
@@ -37,6 +35,8 @@ das tasks).
 - **Teto com kick para cliente que nunca alcança uma correção do servidor** (spawn/teleporte): hoje a Correction é
   reenviada uma vez e os inputs seguem ignorados. Decidir junto com o cliente real.
 - **Política de teleporte**: `setState` limpa `correctionTimes`; decidir se mantém o histórico.
+- **Comandos `admin = true` pelo chat** usam `admin.admins` (lida na subida). Falta testar com o chat do cliente real e
+  decidir se admins de jogo devem ter uma lista separada da do painel. Dono: sub5.
 
 ## Servidor: resíduos do subprojeto 3 (Lua / MySQL / admin)
 
@@ -104,6 +104,10 @@ Decisões registradas e limites aceitos; o comportamento atual está documentado
   o aviso de licença, a pasta `plugins/libmariadb/` ao lado do executável (sem ela, MySQL 8 com
   `caching_sha2_password` e contas `ed25519` não conectam) e, no Linux, depender de `ca-certificates`. Conferir o
   caminho de carga da `.so` (RPATH/`LD_LIBRARY_PATH`) no pacote.
+  Levar também `THIRD-PARTY-NOTICES.md` (raiz do repositório) com as licenças de todas as dependências vcpkg ligadas
+  ao `cb-server` (OpenSSL Apache-2.0 com LICENSE/NOTICE, Lua, sol2, spdlog/fmt, nlohmann-json, cpp-httplib, libsodium,
+  GameNetworkingSockets/protobuf/abseil, brotli/zlib) e os arquivos `copyright` de `<vcpkg_installed>/<triplet>/share/*/`
+  do build que gerou o pacote; conferir a lista contra `vcpkg list` a cada atualização da baseline.
 - Limite de taxa de **novas conexões por IP** (hoje só há limite de pendentes).
 - Teto de saída por cliente (`net.maxOutKbpsPerClient` é lido mas não aplicado).
 - Limites explícitos do HTTP do jogo (`/info`, `/cb/*`, `/metrics`: `set_payload_max_length`, timeouts, pool). O

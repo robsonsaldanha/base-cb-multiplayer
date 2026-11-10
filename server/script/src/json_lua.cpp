@@ -12,15 +12,18 @@
 #include <unordered_set>
 #include <vector>
 
-#include <lua.hpp>
+// Lua compilado como C++ (vcpkg-overlays/lua, feature cpp): cabeçalhos sem extern "C".
+#include <lauxlib.h>
+#include <lua.h>
+#include <lualib.h>
 #include <nlohmann/json.hpp>
 
 // Decisões (ver também json_lua.hpp):
 // - JSON → Lua: o nlohmann valida a sintaxe e o UTF-8; o resultado é achatado numa "fita" de nós simples e só então
 //   a tabela é montada, dentro de lua_pcall, por uma função C cujo quadro só tem tipos triviais. Um erro de memória
-//   (teto do estado durante uma chamada do script) vira um retorno false, sem longjmp por quadros C++ com destrutor.
+//   (teto do estado durante uma chamada do script) vira um retorno false, sem erro do Lua atravessando quadros C++ com destrutor.
 // - Lua → JSON: só leitura crua (lua_next/lua_rawgeti), nada é alocado no estado e nenhuma API usada aqui lança erro
-//   Lua, então nenhum longjmp sai desta função; exceções C++ (bad_alloc) são capturadas.
+//   Lua, então nenhum erro do Lua sai desta função; exceções C++ (bad_alloc) são capturadas.
 // - O tamanho é conferido durante a escrita (para cedo), e tabelas com mais entradas que bytes permitidos são
 //   recusadas sem varrer o resto.
 
@@ -119,7 +122,7 @@ struct PushCtx {
   int nullRef;
 };
 
-// Quadros só com tipos triviais: o Lua pode sair daqui por longjmp (memória).
+// Quadros só com tipos triviais: o Lua pode sair daqui com erro de memória (exceção do Lua).
 void pushNode(lua_State* L, PushCtx* c) {
   const Node& n = c->tape[c->pos++];
   luaL_checkstack(L, 3, "json");

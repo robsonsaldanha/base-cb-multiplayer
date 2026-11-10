@@ -21,11 +21,13 @@ add_subdirectory(admin)
 add_executable(cb-server src/main.cpp)
 target_link_libraries(cb-server PRIVATE cbserver_core cbserver_script cbadmin)
 cbmp_copy_mariadb_plugins(cb-server)
+cbmp_lua_stack(cb-server)
 
 add_executable(cbserver_tests tests/test_config.cpp tests/test_metrics.cpp tests/test_manifest.cpp tests/test_http.cpp
   tests/test_grid.cpp tests/test_visibility.cpp tests/test_rate.cpp tests/test_movement.cpp tests/test_world.cpp
   tests/test_snapshots.cpp tests/test_auth.cpp tests/test_net.cpp tests/test_hub.cpp tests/test_script_world.cpp)
 target_link_libraries(cbserver_tests PRIVATE cbserver_core cbserver_script Catch2::Catch2WithMain)
+cbmp_lua_stack(cbserver_tests)
 target_compile_definitions(cbserver_tests PRIVATE CBSERVER_CFG_EXAMPLE="${CMAKE_CURRENT_SOURCE_DIR}/server.cfg.example"
   CBMP_EXAMPLE_RESOURCES="${CMAKE_SOURCE_DIR}/resources.example"
   CBMP_ADMIN_ORIGIN_VECTORS="${CMAKE_SOURCE_DIR}/packages/contracts/test-vectors/admin-origin.json")

@@ -16,7 +16,7 @@ Fora do escopo: Lua no cliente (subprojeto 5), UI HTML dentro do jogo, voz, NPCs
 
 | Tema | Decisão |
 |---|---|
-| Linguagem | **Lua 5.4.7** (override de versão no vcpkg; o baseline traz 5.5) + **sol2 3.5** |
+| Linguagem | **Lua 5.4.7** compilado como C++ (overlay port `vcpkg-overlays/lua` com patches; o baseline traz 5.5) + **sol2 3.5** (dono do estado, bibliotecas, referências e objetos; a API `cb.*` é registrada como `lua_CFunction` direto) |
 | Isolamento | um `lua_State` por resource |
 | Threads | **uma thread de script** separada da simulação; filas nos dois sentidos |
 | API | própria, por módulos: `cb.on`, `cb.events`, `cb.players`, `cb.commands`, `cb.timers`, `cb.log`, `cb.audit`, `cb.db`, `cb.http`, `cb.config`, `cb.resource` |
@@ -43,15 +43,19 @@ Fora do escopo: Lua no cliente (subprojeto 5), UI HTML dentro do jogo, voz, NPCs
   (ambiente `nil` → ambiente sandbox do resource); `string` sem `dump`, `table` (`move` reimplementado sob o vigia),
   `math`, `utf8`, `coroutine`; `os` reduzido a `time`, `clock`, `date`. Sem `io`, `debug` (exceto `traceback` interno),
   `package` nativo. `print` limitado (64 KiB por linha, 200 linhas/s por resource).
-- Lua 5.4.7 **com patches mínimos** (overlay no vcpkg): hooks reabilitados ao fechar/resetar corrotinas (`__close`
-  não escapa do vigia) e orçamento de passos nas funções de padrão (`find`/`match`/`gmatch`/`gsub`) que respeita o
-  prazo do vigia. Vigia checado a cada chamada (inclusive C) via flag atômico, além da contagem de instruções.
+- Lua 5.4.7 **com patches mínimos** (overlay port `vcpkg-overlays/lua`, feature `cpp`): **flag de interrupção** no
+  `global_State` (`lua_cbmp_setinterrupt`, gravada só pela thread do relógio) lida pela VM em chamadas, retornos e
+  saltos e, via `lua_cbmp_poll`, nos laços C longos das bibliotecas (padrões de `find`/`match`/`gmatch`/`gsub`
+  ponderados, `string.rep`, `table.*`, `os.date`); sem hooks do Lua. A flag fica ligada até a chamada externa
+  terminar, então `pcall`/`xpcall`/corrotinas/`__close` não engolem o aborto. O Lua é compilado como **C++**: erros e
+  yields são exceções C++ (não `longjmp`), seguros ao atravessar quadros C++ com destrutor; o sol2 é usado com
+  `SOL_USING_CXX_LUA`. Pilha das threads que rodam Lua: 8 MiB (o Lua limita o aninhamento C por contagem, 200 níveis).
 - Supervisor no host: callback que passar do prazo de aborto + 10 s sem retornar → log CRÍTICO, todos os resources
   `Failed`, Lua deixa de receber eventos (a simulação continua).
 - `require(nome)`: carrega `<resource>/server/<nome com / >.lua` (mesma regra de caminho seguro do manifest), cache por
   resource; nada fora da pasta.
 - Memória: alocador por estado com teto (`scripting.memoryLimitMB`, padrão 256) → erro de memória no callback.
-- Vigia: hook de instruções; callback > 50 ms → aviso com nome do resource; > 5 s → o callback é abortado com erro e o
+- Vigia: flag de interrupção (acima); callback > 50 ms → aviso com nome do resource; > 5 s → o callback é abortado com erro e o
   resource é reiniciado (com back-off se repetir 3× em 1 min: fica parado e o painel mostra o motivo).
 
 ### Threads e filas
@@ -151,7 +155,8 @@ desenvolvedor de resources (`docs/RESOURCES.md`) escritas.
 
 ## Riscos
 
-- sol2 + Lua 5.4 por override de versão: se o override falhar no vcpkg, usar overlay port fixo.
+- Lua 5.4.7 com patches num overlay port: atualizar o Lua exige reaplicar os patches e refazer a varredura de laços C
+  (`vcpkg-overlays/README.md`).
 - Thread única de script pode virar gargalo com gamemodes pesados → métricas por resource (tempo de CPU) para guiar
   uma futura divisão em várias threads.
 - Login via Hub depende de `publicUrl` acessível pelo navegador do admin (proxy com TLS documentado).

@@ -199,11 +199,14 @@ TEST_CASE("api: ban persists to bans.json, kicks the connected player and unban 
     end)
   )");
   env.boot();
-  INFO(env.allLogs());
   env.join(1, "ana");
   env.join(2, "bia");
   env.event(1, "ban");
-  REQUIRE(env.waitLog("unban2=false"));
+  // Espera a ÚLTIMA linha do handler: as anteriores já estão no log quando ela aparece (a thread de scripts escreve
+  // em ordem). Esperar por uma linha do meio deixava as seguintes correrem contra o REQUIRE (falhou sob ASan no CI).
+  REQUIRE(env.waitLog("baddur cb.players.ban: duração inválida"));
+  INFO(env.allLogs());
+  REQUIRE(env.hasLog("unban2=false"));
   REQUIRE(env.hasLog("ban=true"));
   REQUIRE(env.hasLog("perm=true"));
   REQUIRE(env.hasLog("unban=true"));

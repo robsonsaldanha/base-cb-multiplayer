@@ -197,7 +197,8 @@ int run(const std::string& cfgPath) {
     bans = std::make_shared<cbscript::BanStore>(cfg.bansFile, unixNow);
   }
   spdlog::info("bans: backend {}", bans->backend());
-  cbscript::ApiOptions api;
+  // Partes vindas do server.cfg (inclui isAdmin: comandos {admin = true} pelo chat só para dids de admin.admins).
+  cbscript::ApiOptions api = cbserver::scriptApiOptions(cfg);
   api.bans = bans;
   api.db = db;
   // HTTP de saída dos scripts (cb.http): 4 threads próprias; https com verificação de certificado pelas CAs do
@@ -205,8 +206,6 @@ int run(const std::string& cfgPath) {
   api.http = std::make_shared<cbscript::HttpOutPool>();
   api.audit = [auditLog](const std::string& line) { auditLog->info("{}", line); };
   api.unixNow = unixNow;
-  // Comandos {admin = true} pelo chat: só dids de admin.admins (o console do painel tem as regras dele).
-  api.isAdmin = cbserver::chatAdminCheck(cfg.admin);
   auto apiStats = std::make_shared<cbscript::ApiStats>();
   api.stats = apiStats;
   cbscript::HostOptions hostOpt;

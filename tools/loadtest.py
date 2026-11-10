@@ -485,6 +485,7 @@ def run_slow_script(server_bin: Path, bots_bin: Path, out_dir: Path, count: int,
     live = [s for s in srv.samples if s.get("players", 0) > 0]
     r = {
         "name": "slow-script",
+        "durationSec": duration,
         "serverExit": rc,
         "bots": bots,
         "samples": srv.samples,
@@ -512,12 +513,16 @@ def slow_violations(r: dict, count: int) -> list[str]:
                  f"expulsos {b['kicked']}")
     if b["maxSnapshotGapMs"] > LIMITS["maxSnapshotGapMs"]:
         v.append(f"bot sem snapshot por {b['maxSnapshotGapMs']:.0f} ms > {LIMITS['maxSnapshotGapMs']:.0f}")
-    if r["watchdogWarnings"] < 1:
-        v.append(f"nenhum aviso da vigia ('{SLOW_WARN}') no log")
+    # Um laço a cada 10 s a partir do 1º eco (logo após a conexão): espera-se um aviso por janela de 10 s.
+    want_warn = max(1, int(r.get("durationSec", 10) // 10))
+    if r["watchdogWarnings"] < want_warn:
+        v.append(f"avisos da vigia ('{SLOW_WARN}') {r['watchdogWarnings']} < {want_warn} (um por 10 s de cenário)")
     if r["watchdogAborts"]:
         v.append(f"a vigia abortou o laço {r['watchdogAborts']}x (esperado só aviso: 2–3 s < 5 s)")
-    if b.get("echoReplies", 0) <= 0:
-        v.append("nenhuma resposta de eco (a thread de scripts não voltou a atender)")
+    # O laço só atrasa o eco (os eventos esperam na fila); queda forte = a thread de scripts não voltou a atender.
+    sent, got = b.get("echoSent", 0), b.get("echoReplies", 0)
+    if got <= 0 or got < 0.8 * sent:
+        v.append(f"respostas de eco {got}/{sent} (< 80%: a thread de scripts não voltou a atender)")
     if r.get("serverExit") not in (0, None):
         v.append(f"cb-server saiu com código {r['serverExit']}")
     return v

@@ -30,7 +30,22 @@ find_package(Lua REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(sol2 CONFIG REQUIRED)
 find_package(unofficial-libmariadb CONFIG REQUIRED)
-set(CBMP_LUA_TARGET ${LUA_LIBRARIES})
+# Lua compilado como C++ (feature `cpp` do overlay vcpkg-overlays/lua): erros e yields do Lua viram exceções C++ em
+# vez de longjmp, então atravessam quadros C++ (sol2, std::string...) chamando destrutores. Os cabeçalhos do Lua são
+# incluídos sem extern "C" (SOL_USING_CXX_LUA em server/script/CMakeLists.txt); nunca ligar com o alvo C `lua`.
+if(NOT TARGET lua-cpp)
+  message(FATAL_ERROR "Lua: alvo lua-cpp ausente (vcpkg.json precisa de lua[cpp] com o overlay vcpkg-overlays/lua)")
+endif()
+set(CBMP_LUA_TARGET lua-cpp)
+# Pilha das threads que rodam Lua. O Lua limita o aninhamento de chamadas C por contagem (LUAI_MAXCCALLS = 200), não
+# por bytes: xpcall com tratador que erra, coroutine.wrap aninhado etc. chegam a ~200 níveis de luaV_execute +
+# lua_resume/luaD_throw. Em Debug no MSVC isso passa de 1 MiB (padrão do Windows para o executável e para cada
+# std::thread) e estoura a pilha. 8 MiB = padrão do Linux; só reserva endereço, a memória é usada sob demanda.
+function(cbmp_lua_stack tgt)
+  if(MSVC)
+    target_link_options(${tgt} PRIVATE /STACK:8388608)
+  endif()
+endfunction()
 set(CBMP_MARIADB_TARGET unofficial::libmariadb)
 # Plugins de autenticação da libmariadb (caching_sha2_password do MySQL 8, client_ed25519, sha256_password...): são
 # módulos dinâmicos carregados de <pasta do executável>/plugins/libmariadb (MYSQL_PLUGIN_DIR em db_mysql.cpp).

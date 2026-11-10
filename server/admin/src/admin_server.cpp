@@ -1149,7 +1149,10 @@ struct AdminServer::Impl {
     svr.Get("/api/players", [this](const httplib::Request& req, httplib::Response& res) {
       if (!auth(req, res)) return;
       json out = json::array();
-      for (const auto& p : *players())
+      // Foto em variável nomeada: num for sobre *players() o shared_ptr temporário morre antes do laço (sem P2718
+      // no GCC 13) e o vetor é lido depois de liberado (ASan no CI).
+      const auto snap = players();
+      for (const auto& p : *snap)
         out.push_back({{"id", p.id}, {"name", p.name}, {"did", p.did}, {"x", p.x}, {"y", p.y}, {"z", p.z},
                        {"state", p.state}, {"session", p.session}});
       sendJson(res, out);
