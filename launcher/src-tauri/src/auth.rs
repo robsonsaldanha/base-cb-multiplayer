@@ -15,8 +15,13 @@ use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use url::Url;
 
-/// Serviço do Credential Manager.
-pub const VAULT_SERVICE: &str = "CBMultiplayer";
+/// Serviço do Credential Manager. O build de teste local usa outro, para o login no Hub local não trocar o do
+/// launcher oficial.
+pub const VAULT_SERVICE: &str = if crate::profile::LOCAL_TEST {
+    "CBMultiplayer (Teste local)"
+} else {
+    "CBMultiplayer"
+};
 /// Conta (usuário) da credencial que guarda o refresh token.
 pub const VAULT_USER: &str = "refresh_token";
 /// Validade do login pendente (state + verifier).
@@ -498,14 +503,14 @@ impl Auth {
 
 // ----- navegador do sistema -----
 
-/// Só `https://` (ou `http://` de loopback em debug) vai para o navegador.
+/// Só `https://` (ou `http://` de loopback em debug/teste local) vai para o navegador.
 pub fn browser_url_allowed(url: &Url, dev: bool) -> bool {
     crate::hub::allowed_url(url, dev)
 }
 
 /// Abre `url` no navegador padrão (ShellExecuteW). Não exposto à UI como URL livre: só o Rust chama.
 pub fn open_in_browser(url: &Url) -> AppResult<()> {
-    if !browser_url_allowed(url, cfg!(debug_assertions)) {
+    if !browser_url_allowed(url, crate::profile::RELAXED_NETWORK) {
         return Err(AppError::new(
             "invalid_url",
             "Endereço não permitido para abrir no navegador.",

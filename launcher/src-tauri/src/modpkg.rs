@@ -895,7 +895,7 @@ fn validate_offer(info: &ModInfo, protocol: u32, hub_base: &Url) -> AppResult<Ur
         && url.port_or_known_default() == hub_base.port_or_known_default()
         && url.username().is_empty()
         && url.password().is_none();
-    if !same_origin || !hub::allowed_url(&url, cfg!(debug_assertions)) {
+    if !same_origin || !hub::allowed_url(&url, crate::profile::RELAXED_NETWORK) {
         return Err(bad_offer());
     }
     Ok(url)

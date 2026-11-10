@@ -332,7 +332,7 @@ pub fn validate_manifest(
 /// O endereço vem do Hub (não confiável): IP literal passa por [`ip_allowed`] (regra do build atual); nome de domínio é
 /// conferido na resolução por [`ServerResolver`], que os clientes de conteúdo e de ping usam.
 pub fn server_base_url(host: &str, http_port: u16) -> AppResult<Url> {
-    server_base_url_with(host, http_port, cfg!(debug_assertions))
+    server_base_url_with(host, http_port, crate::profile::RELAXED_NETWORK)
 }
 
 /// [`server_base_url`] com a regra explícita: `dev` libera loopback e redes privadas.
@@ -378,7 +378,7 @@ pub fn server_base_url_with(host: &str, http_port: u16, dev: bool) -> AppResult<
 /// Endereços que um servidor de jogo anunciado pelo Hub pode ter.
 /// - Sempre recusados: não especificado (`0.0.0.0/8`, `::`), multicast, broadcast/reservado (`240.0.0.0/4`) e
 ///   link-local (`169.254.0.0/16`, `fe80::/10`) — inclusive na forma IPv4 mapeada em IPv6.
-/// - Só em `dev` (build de debug): loopback, redes privadas (RFC 1918), CGNAT (`100.64.0.0/10`) e ULA/site-local
+/// - Só em `dev` (build de debug ou de teste local): loopback, redes privadas (RFC 1918), CGNAT (`100.64.0.0/10`) e ULA/site-local
 ///   (`fc00::/7`, `fec0::/10`). Em produção o Hub já recusa servidores com esses endereços; aqui fica igual.
 pub fn ip_allowed(ip: IpAddr, dev: bool) -> bool {
     let ip = match ip {
@@ -414,7 +414,7 @@ pub struct ServerResolver {
 impl Default for ServerResolver {
     fn default() -> Self {
         Self {
-            dev: cfg!(debug_assertions),
+            dev: crate::profile::RELAXED_NETWORK,
         }
     }
 }

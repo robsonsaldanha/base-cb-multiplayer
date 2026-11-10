@@ -4,7 +4,11 @@
 //!   emitir eventos, alternar devtools);
 //! - aparecer capability remota, em formato não verificado, ou o `assetProtocol` for ligado;
 //! - a CSP mudar ou tiver `unsafe-`;
-//! - um plugin fora da lista (deep-link, single-instance, updater, dialog) for registrado ou virar dependência direta.
+//! - um plugin fora da lista (deep-link, single-instance, updater, dialog) for registrado ou virar dependência direta;
+//! - o updater ganhar opções `dangerous*` no build oficial;
+//! - o overlay do build de teste local (`tauri.localtest.conf.json`) mexer em algo além de nome, identificador,
+//!   janela e endpoint do updater no Hub local, ou a configuração mesclada falhar em qualquer regra acima;
+//! - a feature `local-test` entrar no padrão do Cargo.
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -43,6 +47,94 @@ fn read(p: &Path) -> String {
 
 fn conf() -> Value {
     serde_json::from_str(&read(&root().join("tauri.conf.json"))).expect("tauri.conf.json inválido")
+}
+
+fn localtest_overlay() -> Value {
+    serde_json::from_str(&read(&root().join("tauri.localtest.conf.json")))
+        .expect("tauri.localtest.conf.json inválido")
+}
+
+/// JSON Merge Patch (RFC 7396), como a CLI do Tauri aplica `--config`: objetos mesclados, o resto substituído.
+fn merge_patch(base: &mut Value, patch: &Value) {
+    match (base, patch) {
+        (Value::Object(b), Value::Object(p)) => {
+            for (k, v) in p {
+                if v.is_null() {
+                    b.remove(k);
+                } else {
+                    merge_patch(b.entry(k.clone()).or_insert(Value::Null), v);
+                }
+            }
+        }
+        (b, p) => *b = p.clone(),
+    }
+}
+
+/// Caminhos (folhas ou subárvores inteiras) que o overlay de teste local pode definir.
+const LOCALTEST_ALLOWED: [&str; 8] = [
+    "$schema",
+    "productName",
+    "mainBinaryName",
+    "identifier",
+    "app.windows",
+    "bundle.shortDescription",
+    "plugins.updater.endpoints",
+    "plugins.updater.dangerousInsecureTransportProtocol",
+];
+
+/// Caminhos definidos pelo overlay que não estão na lista.
+fn overlay_violations(overlay: &Value) -> Vec<String> {
+    fn walk(v: &Value, path: String, out: &mut Vec<String>) {
+        if LOCALTEST_ALLOWED.contains(&path.as_str()) {
+            return;
+        }
+        match v {
+            Value::Object(o) if !o.is_empty() => {
+                for (k, child) in o {
+                    let p = if path.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{path}.{k}")
+                    };
+                    walk(child, p, out);
+                }
+            }
+            _ => out.push(format!("overlay de teste local define {path}")),
+        }
+    }
+    let mut out = Vec::new();
+    walk(overlay, String::new(), &mut out);
+    out
+}
+
+/// Regras do updater: no build oficial nenhuma opção `dangerous*`; no de teste local só
+/// `dangerousInsecureTransportProtocol`, com todos os endpoints em `http://` de loopback.
+fn updater_violations(conf: &Value, local_test: bool) -> Vec<String> {
+    let mut v = Vec::new();
+    let up = &conf["plugins"]["updater"];
+    for key in [
+        "dangerousAcceptInvalidCerts",
+        "dangerousAcceptInvalidHostnames",
+        "allowDowngrades",
+    ] {
+        if !up[key].is_null() && up[key] != Value::Bool(false) {
+            v.push(format!("updater.{key} ligado"));
+        }
+    }
+    let insecure = up["dangerousInsecureTransportProtocol"] == Value::Bool(true);
+    if insecure && !local_test {
+        v.push("updater.dangerousInsecureTransportProtocol no build oficial".into());
+    }
+    for ep in up["endpoints"].as_array().into_iter().flatten() {
+        let ep = ep.as_str().unwrap_or("");
+        let ok = ep.starts_with("https://")
+            || (local_test
+                && (ep.starts_with("http://127.0.0.1:") || ep.starts_with("http://[::1]:")));
+        if !ok {
+            v.push(format!("endpoint do updater recusado: {ep}"));
+        }
+    }
+    v
 }
 
 // ----- leitura das capabilities (mesmo alcance do tauri-build: `capabilities/**/*`) -----
@@ -392,6 +484,50 @@ fn fixture_plugin_fora_da_lista_no_codigo_e_no_cargo() {
     assert!(v[0].contains("tauri-plugin-opener"));
 }
 
+#[test]
+fn verificador_do_overlay_e_do_updater() {
+    assert!(overlay_violations(&serde_json::json!({
+        "productName": "x", "identifier": "y", "app": { "windows": [{}] },
+        "plugins": { "updater": { "endpoints": [] } }
+    }))
+    .is_empty());
+    for bad in [
+        serde_json::json!({ "app": { "security": { "csp": "default-src *" } } }),
+        serde_json::json!({ "app": { "withGlobalTauri": true } }),
+        serde_json::json!({ "plugins": { "updater": { "pubkey": "outra" } } }),
+        serde_json::json!({ "plugins": { "shell": {} } }),
+        serde_json::json!({ "bundle": { "createUpdaterArtifacts": true } }),
+        serde_json::json!({ "build": { "devUrl": "http://evil" } }),
+        serde_json::json!({ "version": "9.9.9" }),
+    ] {
+        assert_eq!(overlay_violations(&bad).len(), 1, "{bad}");
+    }
+
+    let mut c = good_conf();
+    c["plugins"]["updater"] = serde_json::json!({
+        "endpoints": ["https://hub/v1/x"], "dangerousInsecureTransportProtocol": true
+    });
+    assert_eq!(updater_violations(&c, false).len(), 1);
+    assert!(updater_violations(&c, true).is_empty());
+    c["plugins"]["updater"]["endpoints"] = serde_json::json!(["http://hub.exemplo:8787/x"]);
+    assert_eq!(updater_violations(&c, true).len(), 1);
+    c["plugins"]["updater"]["endpoints"] = serde_json::json!(["http://127.0.0.1:8787/x"]);
+    assert!(updater_violations(&c, true).is_empty());
+    assert_eq!(updater_violations(&c, false).len(), 2);
+    c["plugins"]["updater"]["dangerousAcceptInvalidCerts"] = Value::Bool(true);
+    assert_eq!(updater_violations(&c, true).len(), 1);
+
+    let mut base = serde_json::json!({ "a": { "b": 1, "c": [1, 2] }, "d": 1 });
+    merge_patch(
+        &mut base,
+        &serde_json::json!({ "a": { "c": [3] }, "d": null, "e": "x" }),
+    );
+    assert_eq!(
+        base,
+        serde_json::json!({ "a": { "b": 1, "c": [3] }, "e": "x" })
+    );
+}
+
 // ----- os arquivos reais -----
 
 fn real_capabilities() -> Vec<(String, Value)> {
@@ -525,5 +661,97 @@ fn comandos_do_build_rs_batem_com_a_capability() {
         );
         let perm = format!("allow-{}", cmd.replace('_', "-"));
         assert!(perms.contains(&perm), "{perm} fora da capability");
+    }
+}
+
+#[test]
+fn updater_oficial_sem_opcoes_perigosas() {
+    assert_eq!(updater_violations(&conf(), false), Vec::<String>::new());
+}
+
+#[test]
+fn overlay_de_teste_local_so_muda_o_permitido_e_passa_no_guarda() {
+    let overlay = localtest_overlay();
+    assert_eq!(overlay_violations(&overlay), Vec::<String>::new());
+    let base = conf();
+    let mut merged = base.clone();
+    merge_patch(&mut merged, &overlay);
+    // Mesma CSP, capabilities, plugins e chave pública do oficial.
+    assert_eq!(
+        violations(&merged, &real_capabilities()),
+        Vec::<String>::new()
+    );
+    assert_eq!(updater_violations(&merged, true), Vec::<String>::new());
+    assert_eq!(merged["app"]["security"], base["app"]["security"]);
+    assert_eq!(
+        merged["plugins"]["updater"]["pubkey"],
+        base["plugins"]["updater"]["pubkey"]
+    );
+    assert_eq!(
+        merged["plugins"]["updater"]["requireSignedVersion"],
+        serde_json::json!(true)
+    );
+    assert_eq!(merged["plugins"]["deep-link"], base["plugins"]["deep-link"]);
+    assert_eq!(merged["bundle"]["createUpdaterArtifacts"], false);
+
+    assert_eq!(merged["productName"], "CB Multiplayer (Teste local)");
+    assert_eq!(merged["identifier"], "br.com.castelobruxo.cbmp.localtest");
+    assert_ne!(merged["mainBinaryName"], base["mainBinaryName"]);
+    // A janela continua a mesma (label e tamanhos que o resto do app espera); só o título muda.
+    let (w, base_w) = (&merged["app"]["windows"][0], &base["app"]["windows"][0]);
+    assert_eq!(merged["app"]["windows"].as_array().unwrap().len(), 1);
+    for k in [
+        "label",
+        "width",
+        "height",
+        "minWidth",
+        "minHeight",
+        "center",
+    ] {
+        assert_eq!(w[k], base_w[k], "{k}");
+    }
+    assert_eq!(w["title"], "CB Multiplayer (Teste local)");
+
+    // O endpoint é o que o Rust monta para o Hub local do build de teste.
+    assert_eq!(
+        cbmp_launcher_lib::profile::LOCAL_TEST_HUB_URL,
+        "http://127.0.0.1:8787"
+    );
+    let eps = merged["plugins"]["updater"]["endpoints"]
+        .as_array()
+        .unwrap();
+    assert_eq!(eps.len(), 1);
+    let built = cbmp_launcher_lib::update::endpoint(cbmp_launcher_lib::profile::LOCAL_TEST_HUB_URL)
+        .unwrap();
+    assert_eq!(
+        eps[0].as_str().unwrap(),
+        built.as_str().replace("%7B", "{").replace("%7D", "}")
+    );
+}
+
+#[test]
+fn feature_local_test_so_por_flag_explicita() {
+    let manifest: toml::Table = toml::from_str(&read(&root().join("Cargo.toml"))).unwrap();
+    let features = manifest["features"].as_table().expect("[features]");
+    assert_eq!(features["local-test"], toml::Value::Array(vec![]));
+    assert!(
+        !features.contains_key("default"),
+        "nenhuma feature no padrão (local-test só por flag explícita)"
+    );
+    assert_eq!(
+        features.len(),
+        1,
+        "feature nova precisa ser revisada aqui: {features:?}"
+    );
+    if !cfg!(feature = "local-test") {
+        assert_eq!(
+            cbmp_launcher_lib::settings::default_hub_url(),
+            cbmp_launcher_lib::settings::DEFAULT_HUB_URL
+        );
+    } else {
+        assert_eq!(
+            cbmp_launcher_lib::settings::default_hub_url(),
+            cbmp_launcher_lib::profile::LOCAL_TEST_HUB_URL
+        );
     }
 }

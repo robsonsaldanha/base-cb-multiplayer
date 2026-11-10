@@ -69,9 +69,9 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// Valida com a regra do build atual: `http://` de loopback só é aceito em debug.
+    /// Valida com a regra do build atual: `http://` de loopback só é aceito em debug/teste local.
     pub fn validate(&self) -> AppResult<()> {
-        self.validate_with(cfg!(debug_assertions))
+        self.validate_with(crate::profile::RELAXED_NETWORK)
     }
 
     /// `dev` libera `http://` para loopback (Hub local durante o desenvolvimento).
@@ -219,10 +219,19 @@ fn salvage(map: &Map<String, Value>) -> (Settings, bool) {
     (s, lossy)
 }
 
-/// Endereço do Hub deste build: o padrão, ou `CBMP_HUB_URL` em builds de debug (se válido).
+/// Hub padrão deste build: o oficial, ou o local no build de teste local.
+pub fn default_hub_url() -> &'static str {
+    if crate::profile::LOCAL_TEST {
+        crate::profile::LOCAL_TEST_HUB_URL
+    } else {
+        DEFAULT_HUB_URL
+    }
+}
+
+/// Endereço do Hub deste build: o padrão ([`default_hub_url`]), ou `CBMP_HUB_URL` em builds de debug (se válido).
 pub fn build_hub_url() -> String {
     resolve_hub_url(
-        DEFAULT_HUB_URL,
+        default_hub_url(),
         std::env::var("CBMP_HUB_URL").ok(),
         cfg!(debug_assertions),
     )
@@ -315,6 +324,10 @@ mod tests {
         }
     }
 
+    /// Regra de rede do build release deste sabor: o oficial é estrito; o de teste local aceita o Hub em
+    /// `http://127.0.0.1` (o padrão dele).
+    const RELEASE_RULES: bool = crate::profile::LOCAL_TEST;
+
     fn bad_path(p: &Path) -> PathBuf {
         sibling(p, ".bad")
     }
@@ -326,13 +339,13 @@ mod tests {
     #[test]
     fn padroes() {
         let s = Settings::default();
-        assert_eq!(s.hub_url, DEFAULT_HUB_URL);
+        assert_eq!(s.hub_url, default_hub_url());
         assert!(s.favorites.is_empty() && s.recent.is_empty());
         assert_eq!(s.game_dir, None);
         assert_eq!(s.cache_limit_mb, 10_240);
         assert_eq!(s.max_server_content_mb, 2_048);
         assert!(s.simulate_launch);
-        s.validate_with(false).unwrap();
+        s.validate_with(RELEASE_RULES).unwrap();
     }
 
     #[test]
@@ -497,7 +510,7 @@ mod tests {
         let s = load(&path);
         assert_eq!(s.favorites, vec!["x".to_string()]);
         assert_eq!(s.cache_limit_mb, DEFAULT_CACHE_LIMIT_MB);
-        assert_eq!(s.hub_url, DEFAULT_HUB_URL);
+        assert_eq!(s.hub_url, default_hub_url());
         assert!(!bad_path(&path).exists());
     }
 
@@ -609,12 +622,12 @@ mod tests {
             max_server_content_mb: m,
             ..Settings::default()
         };
-        s(256, 1).validate_with(false).unwrap();
-        s(1_048_576, 65_536).validate_with(false).unwrap();
-        assert!(s(255, 2048).validate_with(false).is_err());
-        assert!(s(1_048_577, 2048).validate_with(false).is_err());
-        assert!(s(10_240, 0).validate_with(false).is_err());
-        assert!(s(10_240, 65_537).validate_with(false).is_err());
+        s(256, 1).validate_with(RELEASE_RULES).unwrap();
+        s(1_048_576, 65_536).validate_with(RELEASE_RULES).unwrap();
+        assert!(s(255, 2048).validate_with(RELEASE_RULES).is_err());
+        assert!(s(1_048_577, 2048).validate_with(RELEASE_RULES).is_err());
+        assert!(s(10_240, 0).validate_with(RELEASE_RULES).is_err());
+        assert!(s(10_240, 65_537).validate_with(RELEASE_RULES).is_err());
     }
 
     #[test]
@@ -625,19 +638,21 @@ mod tests {
             ..Settings::default()
         };
         s(vec!["a".into(), "x".repeat(64)])
-            .validate_with(false)
+            .validate_with(RELEASE_RULES)
             .unwrap();
-        assert!(s(vec!["".into()]).validate_with(false).is_err());
-        assert!(s(vec!["x".repeat(65)]).validate_with(false).is_err());
-        assert!(s(vec!["a\nb".into()]).validate_with(false).is_err());
+        assert!(s(vec!["".into()]).validate_with(RELEASE_RULES).is_err());
+        assert!(s(vec!["x".repeat(65)])
+            .validate_with(RELEASE_RULES)
+            .is_err());
+        assert!(s(vec!["a\nb".into()]).validate_with(RELEASE_RULES).is_err());
         assert!(s((0..501).map(|i| i.to_string()).collect())
-            .validate_with(false)
+            .validate_with(RELEASE_RULES)
             .is_err());
         let only_recent = Settings {
             recent: vec!["".into()],
             ..Settings::default()
         };
-        assert!(only_recent.validate_with(false).is_err());
+        assert!(only_recent.validate_with(RELEASE_RULES).is_err());
     }
 
     #[test]
@@ -647,14 +662,14 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(
-            rel.validate_with(false).unwrap_err().code,
+            rel.validate_with(RELEASE_RULES).unwrap_err().code,
             "invalid_settings"
         );
         let abs = Settings {
             game_dir: Some(std::env::temp_dir()),
             ..Settings::default()
         };
-        abs.validate_with(false).unwrap();
+        abs.validate_with(RELEASE_RULES).unwrap();
     }
 
     #[test]

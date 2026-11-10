@@ -9,6 +9,12 @@ publish = false
 [lib]
 name = "cbmp_launcher_lib"
 
+[features]
+# Build de teste local (Hub em http://127.0.0.1:8787, servidores em loopback/LAN, updater no Hub local). Só por flag
+# explícita, junto com `tauri.localtest.conf.json`: `--features local-test --config tauri.localtest.conf.json`.
+# Nunca entra no padrão nem em release publicado.
+local-test = []
+
 [build-dependencies]
 tauri-build = { version = "=2.7.4", features = [] }
 

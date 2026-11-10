@@ -8,10 +8,12 @@ pub mod error;
 pub mod game;
 pub mod hub;
 pub mod launch;
+pub mod logging;
 pub mod modpkg;
 pub mod paths;
 pub mod ping;
 pub mod play;
+pub mod profile;
 pub mod server_cache;
 pub mod settings;
 pub mod update;
@@ -22,6 +24,8 @@ use tauri::Manager;
 use tauri_plugin_deep_link::DeepLinkExt;
 
 pub fn run() {
+    // Antes de tudo: `%LOCALAPPDATA%\CBMultiplayer\logs\launcher.log` (rotação, sem tokens/tickets/códigos).
+    logging::init(&paths::logs_dir());
     let state = AppState::load(paths::settings_file());
     let hub =
         hub::HubClient::new(&state.get_settings().hub_url).expect("hub_url validado em settings");
@@ -65,6 +69,7 @@ pub fn run() {
         // Um play por vez (também trava "limpar cache", a faxina da abertura e a instalação de update).
         .manage(play::PlayGate::default())
         .setup(move |app| {
+            log::info!("versão {}", app.package_info().version);
             // Ticket de uma execução anterior que o mod não leu.
             launch::remove_stale(&paths::run_dir());
             let handle = app.handle().clone();

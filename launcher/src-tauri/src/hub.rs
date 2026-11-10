@@ -264,11 +264,11 @@ async fn read_limited(mut resp: reqwest::Response, max: usize) -> AppResult<Vec<
 }
 
 impl HubClient {
-    /// Valida o endereço (https; http de loopback só em debug).
+    /// Valida o endereço (https; http de loopback só em debug/teste local).
     pub fn new(base: &str) -> AppResult<Self> {
         let invalid = || AppError::invalid_settings("Endereço do Hub inválido.");
         let base = Url::parse(base).map_err(|_| invalid())?;
-        if !allowed_url(&base, cfg!(debug_assertions))
+        if !allowed_url(&base, crate::profile::RELAXED_NETWORK)
             || base.query().is_some()
             || base.fragment().is_some()
         {

@@ -1,0 +1,28 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "CB Multiplayer (Teste local)",
+  "mainBinaryName": "CBMultiplayerTesteLocal",
+  "identifier": "br.com.castelobruxo.cbmp.localtest",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "CB Multiplayer (Teste local)",
+        "width": 1100,
+        "height": 700,
+        "minWidth": 900,
+        "minHeight": 600,
+        "center": true
+      }
+    ]
+  },
+  "bundle": {
+    "shortDescription": "CB Multiplayer (Teste local)"
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": ["http://127.0.0.1:8787/v1/launcher/update/{{target}}/{{arch}}/{{current_version}}"],
+      "dangerousInsecureTransportProtocol": true
+    }
+  }
+}

@@ -4,7 +4,7 @@
 //! O endereço vem do Hub (não confiável), então o ping não pode virar um gerador de pedidos controlado por ele:
 //! - a UI pede por id ([`Pinger::ping_ids`]); host e porta vêm da lista do Hub guardada no [`ServerDirectory`];
 //! - endereços passam pela regra de `content::server_base_url`/[`ServerResolver`] (sem link-local, multicast etc.;
-//!   loopback e rede privada só em debug);
+//!   loopback e rede privada só em debug/teste local);
 //! - ids que apontam para o mesmo `host:porta` geram um pedido só;
 //! - no máximo [`MAX_CONCURRENT`] pedidos em voo no launcher inteiro (semáforo único do [`Pinger`]);
 //! - o mesmo endereço é pingado no máximo uma vez a cada [`MIN_INTERVAL`] (chamadas próximas reaproveitam o resultado).
