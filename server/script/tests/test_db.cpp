@@ -682,3 +682,201 @@ TEST_CASE("api: results over the limits and too many pending queries raise error
   INFO(env.allLogs());
   REQUIRE(env.countLog("pend ") == 2);
 }
+
+// ------------------------------------------------------------------------------------------------- fix round 1
+
+TEST_CASE("db: permanent and transient errors are told apart") {
+  auto err = [](int code, bool timeout = false) {
+    DbResult r = DbResult::fail("x", timeout);
+    r.code = code;
+    return r;
+  };
+  REQUIRE(dbPermanentError(err(1366)));        // Incorrect string value
+  REQUIRE(dbPermanentError(err(1142)));        // comando negado
+  REQUIRE(dbPermanentError(err(1146)));        // tabela não existe
+  REQUIRE_FALSE(dbPermanentError(err(0)));     // pool (sem conexão, fila)
+  REQUIRE_FALSE(dbPermanentError(err(2013)));  // conexão perdida
+  REQUIRE_FALSE(dbPermanentError(err(1205)));  // espera de bloqueio
+  REQUIRE_FALSE(dbPermanentError(err(1213)));  // deadlock
+  REQUIRE_FALSE(dbPermanentError(err(1040)));  // conexões demais
+  REQUIRE_FALSE(dbPermanentError(err(1969, true)));
+  DbResult ok;
+  ok.ok = true;
+  REQUIRE_FALSE(dbPermanentError(ok));
+}
+
+TEST_CASE("db pool: requests over the byte limit (SQL + parameters) are refused at submit") {
+  auto db = rowsDb();
+  DbPool pool(fakeCfg(1), fakeFactory(db), fastPoolOpt());
+  std::string err;
+  REQUIRE(pool.submit(req(DbOp::Exec, "INSERT INTO t VALUES (?)", 0, {DbValue::text(std::string((1 << 20) + 1, 'x'))}),
+                      [](DbResult) {}, err) == 0);
+  REQUIRE(contains(err, "grande demais"));
+  REQUIRE(pool.submit(req(DbOp::Exec, "INSERT INTO t VALUES (?, ?)", 0,
+                          {DbValue::text(std::string(600000, 'x')), DbValue::text(std::string(600000, 'y'))}),
+                      [](DbResult) {}, err) == 0);
+  REQUIRE(sync(pool, req(DbOp::Exec, "INSERT INTO t VALUES (?)", 0, {DbValue::text(std::string(1000, 'x'))})).ok);
+}
+
+TEST_CASE("db pool: abortTx wins over statements already queued in the transaction") {
+  auto db = rowsDb();
+  db->blockOn = "SLEEP";
+  DbPool pool(fakeCfg(2), fakeFactory(db), fastPoolOpt());
+  std::string err;
+  Waiter b;
+  const uint64_t t = pool.submit(req(DbOp::Begin), b.done(), err);
+  REQUIRE(b.get().ok);
+  Waiter s1, s2;
+  REQUIRE(pool.submit(req(DbOp::Query, "SELECT SLEEP(1)", t), s1.done(), err) > 0);
+  REQUIRE(waitUntil([&] { return db->blockedNow() == 1; }));
+  REQUIRE(pool.submit(req(DbOp::Exec, "UPDATE depois", t), s2.done(), err) > 0);
+  pool.abortTx(t);
+  db->release();
+  REQUIRE(s1.get().ok);
+  DbResult r2 = s2.get();
+  REQUIRE_FALSE(r2.ok);
+  REQUIRE(contains(r2.error, "transação encerrada"));
+  REQUIRE(db->count("UPDATE depois") == 0);
+  REQUIRE(waitUntil([&] { return db->count("ROLLBACK") == 1 && pool.metrics().activeTx == 0; }));
+}
+
+TEST_CASE("db: the libmariadb plugin folder sits next to the executable") {
+  const std::string dir = mysqlPluginDir();
+  INFO(dir);
+  REQUIRE(contains(dir, "plugins"));
+  REQUIRE(contains(dir, "libmariadb"));
+#if defined(_WIN32)
+  REQUIRE(fs::exists(fs::path(dir) / "caching_sha2_password.dll"));
+#else
+  REQUIRE(fs::exists(fs::path(dir) / "caching_sha2_password.so"));
+#endif
+}
+
+TEST_CASE("api: a transaction whose rollback is refused locally is released at once") {
+  DbEnv env;  // txIdle padrão (10 s): só o abortTx explica um ROLLBACK rápido
+  env.fdb->handler = typedRows;
+  env.fdb->blockOn = "SLEEP";
+  env.addRes("a", R"(
+    local waiting
+    cb.on('resourceStart', function()
+      local ok, e = pcall(cb.db.transaction, function(tx)
+        waiting = coroutine.running()
+        tx.query('SELECT SLEEP(1)')
+      end)
+      cb.log.info('fim ' .. tostring(ok) .. ' ' .. tostring(e))
+    end)
+    cb.commands.register('cutuca', function() coroutine.resume(waiting) return 'ok' end)
+  )", {}, nlohmann::json::object(), kDbPerm);
+  env.boot();
+  REQUIRE(waitUntil([&] { return env.fdb->blockedNow() == 1; }));
+  env.command(std::nullopt, "cutuca");  // erro "por fora" dentro de fn; o rollback esbarra no comando em andamento
+  REQUIRE(env.waitLog("[a] fim false"));
+  env.fdb->release();
+  REQUIRE(waitUntil([&] { return env.fdb->count("ROLLBACK") == 1; }, std::chrono::milliseconds(3000)));
+  REQUIRE(waitUntil([&] { return env.pool->metrics().activeTx == 0; }, std::chrono::milliseconds(3000)));
+}
+
+TEST_CASE("api: COMMIT and ROLLBACK are not blocked by the pending-query cap") {
+  DbEnv env;
+  env.api.maxDbPending = 1;
+  env.fdb->handler = typedRows;
+  env.fdb->blockOn = "SLEEP";
+  env.addRes("a", R"(
+    cb.on('resourceStart', function()
+      local ok, e = pcall(cb.db.transaction, function(tx)
+        -- corrotina filha: o pedido dela ocupa a única vaga enquanto fn termina
+        coroutine.wrap(function() cb.db.query('SELECT SLEEP(1)') end)()
+        return 'feito'
+      end)
+      cb.log.info('commit ' .. tostring(ok) .. ' ' .. tostring(e))
+    end)
+  )", {}, nlohmann::json::object(), kDbPerm);
+  env.boot();
+  REQUIRE(env.waitLog("[a] commit true feito"));
+  REQUIRE(env.fdb->count("COMMIT") == 1);
+}
+
+TEST_CASE("api: parameter bytes in flight are capped per resource") {
+  DbEnv env;
+  env.api.maxDbPendingBytes = 1000;
+  env.fdb->handler = typedRows;
+  env.fdb->blockOn = "SLEEP";
+  env.addRes("a", R"(
+    cb.on('resourceStart', function()
+      cb.timers.after(0, function() cb.db.query('SELECT SLEEP(?)', string.rep('x', 600)) end)
+      cb.timers.after(0, function()
+        local ok, e = pcall(cb.db.query, 'SELECT SLEEP(?)', string.rep('y', 600))
+        cb.log.info('bytes ' .. tostring(ok) .. ' ' .. tostring(e))
+      end)
+    end)
+  )", {}, nlohmann::json::object(), kDbPerm);
+  env.boot();
+  REQUIRE(env.waitLog("[a] bytes false"));
+  REQUIRE(env.hasLog("bytes"));
+  REQUIRE(waitUntil([&] { return env.fdb->blockedNow() == 1; }));  // o 1º chegou ao banco (assíncrono)
+  REQUIRE(env.fdb->count("SLEEP") == 1);                           // o 2º nunca foi enviado
+}
+
+TEST_CASE("api: a transaction abandoned by a plain coroutine.yield is rolled back") {
+  DbEnv env;
+  env.fdb->handler = typedRows;
+  env.addRes("a", R"(
+    cb.on('resourceStart', function()
+      cb.db.transaction(function(tx)
+        tx.exec('UPDATE a SET x = 1')
+        coroutine.yield()  -- volta ao host sem esperar o banco: ninguém retoma
+      end)
+    end)
+  )", {}, nlohmann::json::object(), kDbPerm);
+  env.boot();
+  REQUIRE(waitUntil([&] { return env.fdb->count("ROLLBACK") == 1; }, std::chrono::milliseconds(3000)));
+  REQUIRE(env.fdb->count("COMMIT") == 0);
+}
+
+TEST_CASE("api: a coroutine resumed from outside that yields again is not resumed by the late result") {
+  DbEnv env;
+  env.fdb->handler = typedRows;
+  env.fdb->blockOn = "SLEEP";
+  env.addRes("a", R"(
+    local waiting
+    cb.on('resourceStart', function()
+      local co = coroutine.create(function()
+        local ok = pcall(cb.db.query, 'SELECT SLEEP(1)')
+        cb.log.info('erro por fora ' .. tostring(ok))
+        local v = coroutine.yield()
+        cb.log.info('sequestrada ' .. tostring(v))
+      end)
+      waiting = co
+      coroutine.resume(co)
+    end)
+    cb.commands.register('cutuca', function() coroutine.resume(waiting) return 'ok' end)
+  )", {}, nlohmann::json::object(), kDbPerm);
+  env.boot();
+  REQUIRE(waitUntil([&] { return env.fdb->blockedNow() == 1; }));
+  env.command(std::nullopt, "cutuca");
+  REQUIRE(env.waitLog("[a] erro por fora false"));
+  env.fdb->release();
+  REQUIRE(waitUntil([&] { return env.fdb->blockedNow() == 0; }));
+  env.sync();
+  env.sync();
+  REQUIRE_FALSE(env.hasLog("sequestrada"));
+}
+
+TEST_CASE("api: cb.players.ban refuses a did that is not UTF-8 and cleans the reason") {
+  ApiEnv env;
+  env.addRes("a", R"(
+    cb.on('resourceStart', function()
+      local ok, e = pcall(cb.players.ban, 'd\255x', 'r')
+      cb.log.info('did ' .. tostring(ok) .. ' ' .. tostring(e))
+      cb.players.ban('d7', 'mot\255ivo')
+      cb.log.info('feito')
+    end)
+  )");
+  env.boot();
+  REQUIRE(env.waitLog("[a] feito"));
+  REQUIRE(env.hasLog("[a] did false"));
+  REQUIRE(env.hasLog("UTF-8"));
+  auto b = env.bans->check("d7", env.unixTime.load());
+  REQUIRE(b);
+  REQUIRE(b->reason == "mot\xEF\xBF\xBD" "ivo");  // U+FFFD no lugar do byte inválido
+}

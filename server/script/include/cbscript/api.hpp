@@ -59,6 +59,7 @@ struct ApiOptions {
   // Banco (cb.db.*). Nulo → cb.db.* dão erro "banco não configurado". Resources precisam de permissions.db = true.
   std::shared_ptr<DbPool> db;
   size_t maxDbPending = 1024;  // pedidos cb.db em andamento por resource (acima disso: erro)
+  size_t maxDbPendingBytes = size_t{16} << 20;  // bytes de SQL + parâmetros em andamento por resource
   double dbGraceSec = 1.0;     // prazo do lado do script = timeoutMs do pool + isto (relógio do host)
   // Jogador (por did) pode usar comandos admin=true pelo chat. Vazio = ninguém (só console/painel).
   std::function<bool(const std::string& did)> isAdmin;

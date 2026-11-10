@@ -179,12 +179,22 @@ int run(const std::string& cfgPath) {
              : cfg.db->tls == "verify"   ? cbscript::DbConfig::Tls::Verify
                                          : cbscript::DbConfig::Tls::Auto;
     spdlog::info("banco: {} (pool {}, timeout {} ms, tls {})", dc.describe(), dc.pool, dc.timeoutMs, cfg.db->tls);
+    if (dc.pool == 1)
+      spdlog::warn("banco: pool 1 — uma transação aberta (cb.db.transaction) segura a única conexão e atrasa as "
+                   "demais consultas e as gravações de ban; use pool >= 2");
+    spdlog::info("banco: plugins de autenticação em {}", cbscript::mysqlPluginDir());
     db = std::make_shared<cbscript::DbPool>(dc, cbscript::mysqlConnectionFactory(dc));
   }
-  auto bans = db ? std::make_shared<cbscript::BanStore>(db, unixNow)
-                 : std::make_shared<cbscript::BanStore>(cfg.bansFile, unixNow);
-  spdlog::info("bans: backend {}", bans->backend());
   auto auditLog = makeAuditLogger(cfg.logsDir);
+  std::shared_ptr<cbscript::BanStore> bans;
+  if (db) {
+    cbscript::BanStoreDbOptions bo;
+    bo.audit = [auditLog](const std::string& line) { auditLog->info("{}", line); };
+    bans = std::make_shared<cbscript::BanStore>(db, unixNow, bo);
+  } else {
+    bans = std::make_shared<cbscript::BanStore>(cfg.bansFile, unixNow);
+  }
+  spdlog::info("bans: backend {}", bans->backend());
   cbscript::ApiOptions api;
   api.bans = bans;
   api.db = db;

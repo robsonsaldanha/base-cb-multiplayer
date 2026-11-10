@@ -43,8 +43,19 @@ Itens levantados nas revisões que não bloquearam o merge, com o momento em que
 - Banco (Task 5): `cb.db` dentro de corrotinas do próprio script (`coroutine.wrap`) cede para o `resume` do script;
   quando o resultado chega, o host retoma a corrotina (o "resume" do script recebe só a cessão). Documentar em
   `RESOURCES.md`; resultado ≤ 10 000 linhas / 8 MiB; CALL com conjuntos de resultado não é suportado.
-- Distribuição Linux do `cb-server` precisa levar `libmariadb.so*` (LGPL, ligada dinamicamente pelo triplet
-  `vcpkg-triplets/x64-linux.cmake`).
+- Distribuição do `cb-server` precisa levar `libmariadb.so*`/`libmariadb.dll` (LGPL, ligada dinamicamente; no Linux
+  pelo triplet `vcpkg-triplets/x64-linux.cmake`) **e a pasta `plugins/libmariadb/` ao lado do executável** (o build
+  já a copia; sem ela, MySQL 8 com `caching_sha2_password` e contas `ed25519` não conectam).
+- Banco (Task 5, fix 1), documentar em `RESOURCES.md`/config:
+  - tempo esgotado em `exec`/`insert`/COMMIT diz "resultado incerto" (o comando pode ter sido aplicado);
+  - corrotina filha (`coroutine.wrap`) dentro de `cb.db.transaction` usa outra conexão (fora da transação) e não é
+    barrada pela regra de não aninhar;
+  - colunas com o mesmo nome se sobrescrevem na linha (use alias);
+  - `db.pool: 1` + transação segura a única conexão (aviso no log); fila do pool é FIFO única, sem justiça entre
+    resources (cada resource limitado a 1024 pedidos e 16 MiB pendentes);
+  - `db.tls: "off"` só desliga a verificação; não impede o servidor de negociar TLS se exigir;
+  - MySQL (não MariaDB): `max_execution_time` só vale para SELECT; o resto depende do timeout de leitura do cliente;
+  - subida com o banco fora: bans do banco não valem até a carga (log CRÍTICO após 5 falhas; `/metrics.db.bansLoaded`).
 - Eventos servidor → cliente de scripts: cota por jogador de `scripting.eventOutKBps` (padrão 8 KiB/s = 64 kbps) com
   rajada `eventOutBurstKB` (32 KiB) e 48 B de overhead por mensagem; teto de 8192 eventos de saída por tick. Um
   gamemode que precise de mais banda por jogador tem de subir a cota (e conferir o orçamento de 64 kbps da spec).

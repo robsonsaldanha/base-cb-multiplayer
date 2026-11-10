@@ -30,6 +30,8 @@ struct BanStoreDbOptions {
   size_t maxPendingWrites = 100000;  // acima disso a gravação mais antiga é descartada (log de erro)
   // Avisos/erros (thread própria do backend). Vazio = spdlog.
   std::function<void(bool error, const std::string&)> log;
+  // Linha JSONL de auditoria quando uma gravação é descartada por erro permanente ({"type":"ban_write_dropped"...}).
+  std::function<void(const std::string&)> audit;
 };
 
 // Threads: check() é chamado pela simulação (na entrada do jogador) e só segura o mutex por uma busca O(1) no cache;

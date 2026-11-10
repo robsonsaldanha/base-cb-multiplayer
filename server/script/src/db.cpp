@@ -9,9 +9,20 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <filesystem>
 #include <utility>
 
 #include <spdlog/spdlog.h>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 namespace cbscript {
 
@@ -27,6 +38,42 @@ std::string DbConfig::describe() const {
 std::string dbTooBig(const DbLimits& lim) {
   return "resultado grande demais (máximo " + std::to_string(lim.maxRows) + " linhas e " +
          std::to_string(lim.maxBytes >> 20) + " MiB); use LIMIT ou filtre mais";
+}
+
+bool dbPermanentError(const DbResult& r) {
+  if (r.ok || r.timedOut || r.code == 0) return false;
+  if (r.code >= 2000 && r.code < 3000) return false;  // cliente: conexão, rede, TLS
+  switch (r.code) {
+    case 1040:  // conexões demais
+    case 1053:  // servidor desligando
+    case 1205:  // espera de bloqueio
+    case 1213:  // deadlock
+    case 1317:  // consulta interrompida
+    case 1969:  // max_statement_time (MariaDB)
+    case 3024:  // max_execution_time (MySQL)
+    case 1927:  // conexão morta (MariaDB)
+      return false;
+    default:
+      return true;
+  }
+}
+
+std::string mysqlPluginDir() {
+  static const std::string dir = [] {
+    std::filesystem::path exe;
+#if defined(_WIN32)
+    std::wstring buf(32768, L'x');
+    const DWORD n = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
+    if (n > 0 && n < buf.size()) exe = std::filesystem::path(buf.substr(0, n));
+#else
+    std::error_code ec;
+    exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+#endif
+    const std::filesystem::path base = exe.empty() ? std::filesystem::current_path() : exe.parent_path();
+    const auto u8 = (base / "plugins" / "libmariadb").u8string();
+    return std::string(u8.begin(), u8.end());
+  }();
+  return dir;
 }
 
 namespace {
@@ -272,7 +319,10 @@ struct DbPoolState {
   mutable uint64_t lastQueries = 0;
   mutable Clock::time_point lastAt = Clock::now();
 
+  std::atomic<bool> quiet{false};  // encerrado: threads desanexadas não registram mais nada
+
   void log(bool error, const std::string& m) const {
+    if (quiet.load()) return;
     try {
       if (opt.log)
         opt.log(error, m);
@@ -397,13 +447,17 @@ struct DbPoolState {
         for (;;) {
           if (stop) break;
           if (w.tx != 0) {
+            if (w.txAbort) {  // abortTx vence os comandos já enfileirados da transação
+              rollbackNow = true;
+              break;
+            }
             if (!w.txq.empty()) {
               job = std::move(w.txq.front());
               w.txq.pop_front();
               have = true;
               break;
             }
-            if (w.txAbort || Clock::now() >= w.txIdleUntil) {
+            if (Clock::now() >= w.txIdleUntil) {
               rollbackNow = true;
               break;
             }
@@ -554,6 +608,8 @@ DbPool::~DbPool() {
       w->th.detach();
     }
   }
+  // Threads desanexadas podem voltar depois do fim do main (spdlog já destruído): não registram mais nada.
+  s.quiet.store(true);
 }
 
 uint64_t DbPool::submit(DbRequest r, Done done, std::string& err) {
@@ -582,6 +638,13 @@ uint64_t DbPool::submit(DbRequest r, Done done, std::string& err) {
     const int n = countPlaceholders(r.sql);
     if (n < 0) {
       err = "SQL malformado (texto entre aspas, identificador ou comentário sem fim)";
+      return 0;
+    }
+    size_t bytes = r.sql.size();
+    for (const auto& p : r.params) bytes += 16 + p.s.size();
+    if (bytes > s.opt.limits.maxRequestBytes) {
+      err = "pedido grande demais (SQL + parâmetros: " + std::to_string(bytes) + " bytes; máximo " +
+            std::to_string(s.opt.limits.maxRequestBytes) + ")";
       return 0;
     }
     if (r.params.size() > s.opt.limits.maxParams) {

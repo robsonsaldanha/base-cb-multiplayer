@@ -82,6 +82,7 @@ struct DbResult {
   bool ok = false;
   bool timedOut = false;
   std::string error;  // mensagem (pt-BR, ou a do servidor); nunca a senha
+  int code = 0;       // código de erro do MySQL (servidor 1xxx/3xxx, cliente 2xxx); 0 = erro local do pool
   std::vector<std::string> columns;
   std::vector<std::vector<DbValue>> rows;
   int64_t affected = 0;
@@ -100,7 +101,12 @@ struct DbLimits {
   size_t maxBytes = size_t{8} << 20;  // texto + 16 bytes por valor
   size_t maxSql = 64 * 1024;
   size_t maxParams = 1000;
+  size_t maxRequestBytes = size_t{1} << 20;  // SQL + parâmetros de um pedido (memória fora do teto do Lua)
 };
+
+// Erro que não adianta repetir (erro do servidor 1xxx/3xxx, exceto bloqueio, deadlock, interrupção e excesso de
+// conexões). Erros do cliente (2xxx), do pool (0) e tempo esgotado são transitórios.
+bool dbPermanentError(const DbResult& r);
 
 // Mensagem do erro de resultado grande demais (o backend e o pool usam a mesma).
 std::string dbTooBig(const DbLimits& lim);
@@ -181,6 +187,10 @@ int countPlaceholders(std::string_view sql);
 // Data/hora do MySQL em texto ISO: DATE "AAAA-MM-DD", TIME "[-]HH:MM:SS[.ffffff]", DATETIME/TIMESTAMP
 // "AAAA-MM-DDTHH:MM:SS[.ffffff]". `decimals` = casas de fração da coluna (0..6).
 enum class DbTimeKind { Date, Time, DateTime };
+// Pasta dos plugins de autenticação da libmariadb (caching_sha2_password, client_ed25519...):
+// <pasta do executável>/plugins/libmariadb. O build copia a pasta para lá (server/script/CMakeLists.txt).
+std::string mysqlPluginDir();
+
 std::string formatDbTime(DbTimeKind kind, bool negative, unsigned year, unsigned month, unsigned day, unsigned hour,
                          unsigned minute, unsigned second, unsigned long micro, unsigned decimals);
 

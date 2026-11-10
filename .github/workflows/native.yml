@@ -27,6 +27,17 @@ jobs:
         options: >-
           --health-cmd="healthcheck.sh --connect --innodb_initialized"
           --health-interval=5s --health-timeout=5s --health-retries=20
+      # MySQL 8: autenticação caching_sha2_password (plugin dinâmico da libmariadb) e max_execution_time.
+      mysql8:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_DATABASE: cbtest
+        ports:
+          - 3307:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -ptest --silent"
+          --health-interval=5s --health-timeout=5s --health-retries=30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4
@@ -48,6 +59,10 @@ jobs:
       - name: libmariadb ligada dinamicamente (LGPL)
         run: ldd build-native/linux-asan/server/cb-server | tee /dev/stderr | grep -q 'libmariadb\.so'
       - run: ctest --test-dir build-native/linux-asan --output-on-failure
+      - name: integração MySQL 8 (caching_sha2_password; TLS sem verificação, certificado autoassinado)
+        run: 'ctest --test-dir build-native/linux-asan --output-on-failure -R "^mysql: "'
+        env:
+          CBMP_TEST_MYSQL: mysql://root:test@127.0.0.1:3307/cbtest?tls=required
       - uses: actions/cache/save@v4
         if: always()
         with:

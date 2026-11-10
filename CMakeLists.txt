@@ -32,6 +32,21 @@ find_package(sol2 CONFIG REQUIRED)
 find_package(unofficial-libmariadb CONFIG REQUIRED)
 set(CBMP_LUA_TARGET ${LUA_LIBRARIES})
 set(CBMP_MARIADB_TARGET unofficial::libmariadb)
+# Plugins de autenticação da libmariadb (caching_sha2_password do MySQL 8, client_ed25519, sha256_password...): são
+# módulos dinâmicos carregados de <pasta do executável>/plugins/libmariadb (MYSQL_PLUGIN_DIR em db_mysql.cpp).
+# Copiados depois de cada build dos executáveis que usam o banco; a distribuição precisa levar a pasta junto.
+set(CBMP_MARIADB_PLUGIN_ROOT "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
+function(cbmp_copy_mariadb_plugins tgt)
+  if(EXISTS "${CBMP_MARIADB_PLUGIN_ROOT}/plugins/libmariadb")
+    add_custom_command(TARGET ${tgt} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CBMP_MARIADB_PLUGIN_ROOT}/$<$<CONFIG:Debug>:debug/>plugins/libmariadb"
+        "$<TARGET_FILE_DIR:${tgt}>/plugins/libmariadb"
+      VERBATIM)
+  else()
+    message(WARNING "plugins da libmariadb não encontrados em ${CBMP_MARIADB_PLUGIN_ROOT}/plugins/libmariadb")
+  endif()
+endfunction()
 
 add_subdirectory(proto)
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/server/script/CMakeLists.txt)

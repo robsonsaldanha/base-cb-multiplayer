@@ -17,6 +17,9 @@ struct FakeBanTable {
   std::mutex mu;
   std::map<std::string, Ban> rows;
   bool created = false;
+  int selectFailCode = 0;               // != 0: o SELECT falha com esse código (permissão negada...)
+  std::map<std::string, int> failDid;   // REPLACE deste did falha com o código
+  int selects = 0;
 
   DbResult handle(const DbRequest& r) {
     std::lock_guard<std::mutex> lk(mu);
@@ -32,14 +35,28 @@ struct FakeBanTable {
       const int64_t now = r.params.at(0).i;
       std::erase_if(rows, [now](const auto& kv) { return kv.second.expiresAt != 0 && kv.second.expiresAt <= now; });
     } else if (has("SELECT did, reason, created_at, expires_at, created_by FROM cb_bans")) {
+      ++selects;
+      if (selectFailCode != 0) {
+        DbResult f = DbResult::fail("SELECT command denied to user");
+        f.code = selectFailCode;
+        return f;
+      }
       const int64_t now = r.params.at(0).i;
+      const std::string after = r.params.at(1).s;  // paginação por did
+      const size_t lim = static_cast<size_t>(std::stoul(s.substr(s.rfind("LIMIT ") + 6)));
       res.columns = {"did", "reason", "created_at", "expires_at", "created_by"};
-      for (auto& [d, b] : rows) {
+      for (auto it = rows.upper_bound(after); it != rows.end() && res.rows.size() < lim; ++it) {
+        const Ban& b = it->second;
         if (b.expiresAt != 0 && b.expiresAt <= now) continue;
         res.rows.push_back({DbValue::text(b.did), DbValue::text(b.reason), DbValue::integer(b.createdAt),
                             b.expiresAt ? DbValue::integer(b.expiresAt) : DbValue::null(), DbValue::text(b.by)});
       }
     } else if (has("REPLACE INTO cb_bans")) {
+      if (auto f = failDid.find(r.params.at(0).s); f != failDid.end()) {
+        DbResult e = DbResult::fail("Incorrect string value");
+        e.code = f->second;
+        return e;
+      }
       Ban b;
       b.did = r.params.at(0).s;
       b.reason = r.params.at(1).s;
@@ -215,4 +232,67 @@ TEST_CASE("api: cb.players.ban with the mysql store kicks, persists and survives
   REQUIRE(b);
   REQUIRE(b->by == "resource:a");
   REQUIRE(b->expiresAt == env.unixTime.load() + 60);
+}
+
+TEST_CASE("bans mysql: more bans than the query row limit are loaded in pages") {
+  BanDb db;
+  {
+    std::lock_guard<std::mutex> lk(db.table->mu);
+    db.table->created = true;
+    for (int i = 0; i < 12000; ++i) {
+      char d[16];
+      std::snprintf(d, sizeof d, "d%05d", i);
+      db.table->rows[d] = Ban{d, "r", "admin:1", 10, 0};
+    }
+  }
+  auto s = db.store();  // pool com o limite padrão de 10 000 linhas por consulta
+  REQUIRE(s->flush(std::chrono::milliseconds(10000)));
+  REQUIRE(s->loaded());
+  REQUIRE(s->list().size() == 12000);
+  REQUIRE(s->check("d00000", db.now));
+  REQUIRE(s->check("d11999", db.now));
+  REQUIRE(db.table->selects >= 3);
+}
+
+TEST_CASE("bans mysql: a write that fails permanently is dropped, logged and audited; the queue moves on") {
+  BanDb db;
+  std::vector<std::string> audits;
+  std::mutex amu;
+  db.opt.audit = [&](const std::string& line) {
+    std::lock_guard<std::mutex> lk(amu);
+    audits.push_back(line);
+  };
+  {
+    std::lock_guard<std::mutex> lk(db.table->mu);
+    db.table->failDid["ruim"] = 1366;  // Incorrect string value: repetir não adianta
+  }
+  auto s = db.store();
+  REQUIRE(s->flush(std::chrono::milliseconds(5000)));
+  std::string err;
+  REQUIRE(s->add(Ban{"ruim", "x", "resource:r", db.now, 0}, err));
+  REQUIRE(s->add(Ban{"bom", "y", "resource:r", db.now, 0}, err));
+  REQUIRE(s->flush(std::chrono::milliseconds(5000)));
+  REQUIRE(db.table->hasRow("bom"));
+  REQUIRE_FALSE(db.table->hasRow("ruim"));
+  REQUIRE(s->check("ruim", db.now));  // continua valendo em memória até reiniciar
+  REQUIRE(db.logged("ruim"));
+  std::lock_guard<std::mutex> lk(amu);
+  REQUIRE(audits.size() == 1);
+  REQUIRE(contains(audits[0], "ban_write_dropped"));
+  REQUIRE(contains(audits[0], "ruim"));
+}
+
+TEST_CASE("bans mysql: writes still reach the database while the initial load keeps failing") {
+  BanDb db;
+  {
+    std::lock_guard<std::mutex> lk(db.table->mu);
+    db.table->created = true;
+    db.table->selectFailCode = 1142;  // sem permissão de SELECT
+  }
+  auto s = db.store();
+  std::string err;
+  REQUIRE(s->add(Ban{"w", "z", "resource:r", db.now, 0}, err));
+  REQUIRE(waitUntil([&] { return db.table->hasRow("w"); }));
+  REQUIRE_FALSE(s->loaded());
+  REQUIRE(waitUntil([&] { return db.logged("NÃO"); }));  // aviso crítico depois de várias falhas
 }

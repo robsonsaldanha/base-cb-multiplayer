@@ -76,6 +76,55 @@ std::string clampUtf8(std::string_view s, size_t max) {
   return std::string(s.substr(0, n));
 }
 
+// Tamanho da sequência UTF-8 válida em p (0 = inválida). Sem sobrelongas, sem surrogates, até U+10FFFF.
+size_t utf8Seq(const unsigned char* p, size_t n) {
+  const unsigned c = p[0];
+  if (c < 0x80) return 1;
+  auto cont = [&](size_t i) { return i < n && (p[i] & 0xC0) == 0x80; };
+  if (c >= 0xC2 && c <= 0xDF) return cont(1) ? 2 : 0;
+  if (c >= 0xE0 && c <= 0xEF) {
+    if (n < 3 || !cont(1) || !cont(2)) return 0;
+    if (c == 0xE0 && p[1] < 0xA0) return 0;
+    if (c == 0xED && p[1] > 0x9F) return 0;
+    return 3;
+  }
+  if (c >= 0xF0 && c <= 0xF4) {
+    if (n < 4 || !cont(1) || !cont(2) || !cont(3)) return 0;
+    if (c == 0xF0 && p[1] < 0x90) return 0;
+    if (c == 0xF4 && p[1] > 0x8F) return 0;
+    return 4;
+  }
+  return 0;
+}
+
+bool validUtf8(const char* s, size_t n) {
+  const auto* p = reinterpret_cast<const unsigned char*>(s);
+  for (size_t i = 0; i < n;) {
+    const size_t k = utf8Seq(p + i, n - i);
+    if (k == 0) return false;
+    i += k;
+  }
+  return true;
+}
+
+// Troca cada byte inválido por U+FFFD (o banco recusa texto que não é UTF-8).
+std::string sanitizeUtf8(std::string_view s) {
+  std::string out;
+  out.reserve(s.size());
+  const auto* p = reinterpret_cast<const unsigned char*>(s.data());
+  for (size_t i = 0; i < s.size();) {
+    const size_t k = utf8Seq(p + i, s.size() - i);
+    if (k == 0) {
+      out += "\xEF\xBF\xBD";  // U+FFFD
+      ++i;
+    } else {
+      out.append(s.data() + i, k);
+      i += k;
+    }
+  }
+  return out;
+}
+
 // Referência no registro (do estado principal). Destruída pelo host (fora de chamadas ao Lua); dentro de um
 // binding, solte com release(L) antes.
 struct Ref {
@@ -189,6 +238,7 @@ struct ApiRes {
   // cb.db
   int proxyDepth = 0;     // dentro de uma chamada cb.resource (alvo): cb.db recusado
   size_t dbPending = 0;   // pedidos em andamento
+  size_t dbPendingBytes = 0;  // SQL + parâmetros dos pedidos em andamento
   std::unordered_map<lua_State*, DbWaiting> waiting;  // corrotina → pedido que ela espera
   std::unordered_map<uint64_t, DbTx> txs;             // transação (id do pool) → dona
   std::unordered_map<lua_State*, uint64_t> txOf;      // corrotina → transação aberta
@@ -238,6 +288,7 @@ struct DbPending {
   uint64_t tx = 0;      // transação do pedido (0 = avulso)
   uint64_t poolId = 0;  // id no pool (Begin: id da transação)
   double deadline = 0;  // relógio do host
+  size_t bytes = 0;     // SQL + parâmetros (conta em ApiRes::dbPendingBytes)
   const char* fn = "cb.db";
 };
 
@@ -634,7 +685,7 @@ CBAPI_NOINLINE int doBan(ApiRes* a, const char* did, size_t didLen, const char* 
   try {
     Ban b;
     b.did.assign(did, didLen);
-    b.reason = clampUtf8(std::string_view(reason, reasonLen), kMaxReason);
+    b.reason = clampUtf8(sanitizeUtf8(std::string_view(reason, reasonLen)), kMaxReason);
     b.by = "resource:" + a->h->name();
     b.createdAt = a->sh->unixNow();
     b.expiresAt = dur > 0 ? b.createdAt + dur : 0;
@@ -657,6 +708,8 @@ const char* checkDid(lua_State* L, int idx, const char* fn, size_t* len) {
   if (lua_type(L, idx) != LUA_TSTRING) luaL_error(L, "%s: did inválido", fn);
   const char* s = lua_tolstring(L, idx, len);
   if (*len == 0 || *len > 64) luaL_error(L, "%s: did inválido", fn);
+  if (std::memchr(s, 0, *len) != nullptr || !validUtf8(s, *len))
+    luaL_error(L, "%s: did inválido (precisa ser texto UTF-8, sem NUL)", fn);
   return s;
 }
 
@@ -967,13 +1020,23 @@ int pushRows(lua_State* L, const DbResult& res) {
   return 1;
 }
 
+// Retomada por fora: a corrotina deixa de esperar o pedido `rid`.
+CBAPI_NOINLINE void dbDropWaiting(ApiRes* a, lua_State* L, uint64_t rid) {
+  auto w = a->waiting.find(L);
+  if (w == a->waiting.end() || w->second.req != rid) return;
+  w->second.thread.release(L);
+  a->waiting.erase(w);
+}
+
 // Continuação de toda espera do banco. Quadro puro.
 int k_db(lua_State* L, int status, lua_KContext kctx) {
   (void)status;
   ApiRes* a = self(L);
   const uint64_t rid = static_cast<uint64_t>(kctx);
-  if (a->dbToken != rid || a->dbResult == nullptr)
+  if (a->dbToken != rid || a->dbResult == nullptr) {
+    dbDropWaiting(a, L, rid);  // o resultado verdadeiro, quando vier, não retoma mais esta corrotina
     return luaL_error(L, "cb.db: a corrotina foi retomada por fora (coroutine.resume) enquanto esperava o banco");
+  }
   const DbDelivery* d = a->dbResult;
   a->dbResult = nullptr;
   a->dbToken = 0;
@@ -1054,7 +1117,8 @@ CBAPI_NOINLINE int dbCheck(ApiRes* a, lua_State* L, DbOp op, uint64_t tx, Err& e
         return -1;
       }
     }
-    if (a->dbPending >= a->sh->o.maxDbPending) {
+    // COMMIT/ROLLBACK passam do teto: eles soltam conexão e bloqueios.
+    if (op != DbOp::Commit && op != DbOp::Rollback && a->dbPending >= a->sh->o.maxDbPending) {
       setErr(e, fn + ": consultas pendentes demais neste resource (máximo " + std::to_string(a->sh->o.maxDbPending) +
                     ")");
       return -1;
@@ -1104,6 +1168,13 @@ CBAPI_NOINLINE uint64_t dbSubmit(ApiRes* a, lua_State* L, DbOp op, uint64_t tx, 
       }
     }
     Shared& sh = *a->sh;
+    size_t bytes = r.sql.size();
+    for (const auto& v : r.params) bytes += 16 + v.s.size();
+    if (op != DbOp::Commit && op != DbOp::Rollback && a->dbPendingBytes + bytes > sh.o.maxDbPendingBytes) {
+      setErr(e, std::string(fn) + ": bytes demais em consultas pendentes neste resource (máximo " +
+                    std::to_string(sh.o.maxDbPendingBytes) + " bytes de SQL + parâmetros)");
+      return 0;
+    }
     const uint64_t rid = sh.nextReq++;
     std::string err;
     poolId = sh.o.db->submit(
@@ -1120,6 +1191,7 @@ CBAPI_NOINLINE uint64_t dbSubmit(ApiRes* a, lua_State* L, DbOp op, uint64_t tx, 
     p.poolId = poolId;
     p.deadline = a->ctx->now() + sh.o.db->config().timeoutMs / 1000.0 + sh.o.dbGraceSec;
     p.fn = fn;
+    p.bytes = bytes;
     auto& w = a->waiting[L];
     w.thread.release(L);
     w.thread = Ref(a->L, tref);
@@ -1127,6 +1199,7 @@ CBAPI_NOINLINE uint64_t dbSubmit(ApiRes* a, lua_State* L, DbOp op, uint64_t tx, 
     sh.reqs[rid] = p;
     sh.deadlines.emplace(p.deadline, rid);
     ++a->dbPending;
+    a->dbPendingBytes += bytes;
     if (tx != 0) a->txs[tx].inflight = true;
     return rid;
   } catch (...) {
@@ -1202,6 +1275,8 @@ CBAPI_NOINLINE int dbFinishCheck(ApiRes* a, lua_State* L, uint64_t tx, bool comm
 CBAPI_NOINLINE void dbForget(ApiRes* a, lua_State* L, uint64_t tx) {
   auto it = a->txs.find(tx);
   if (it == a->txs.end()) return;
+  // Rollback no pool já (solta a conexão e os bloqueios), sem esperar o txIdle.
+  if (a->sh->o.db && !a->ctx->abandoned()) a->sh->o.db->abortTx(tx);
   it->second.thread.release(L);
   a->txOf.erase(it->second.co);
   a->txs.erase(it);
@@ -1370,9 +1445,14 @@ CBAPI_NOINLINE int proxyCall(ApiRes* a, lua_State* L, int nargs, const char* res
       args.emplace_back(bL, -1);
       lua_pop(bL, 1);
     }
-    ++b->proxyDepth;  // cb.db recusado dentro da chamada (ela não pode esperar)
+    struct Depth {
+      int& d;
+      explicit Depth(int& x) : d(x) { ++d; }
+      ~Depth() { --d; }
+      Depth(const Depth&) = delete;
+      Depth& operator=(const Depth&) = delete;
+    } depth(b->proxyDepth);  // cb.db recusado dentro da chamada (ela não pode esperar)
     auto r = invokeOn(*b, fn, args);
-    --b->proxyDepth;
     if (!r.ok) {
       setErr(e, "cb.resource: erro em '" + what + "' (ver log)");
       return -1;
@@ -1876,8 +1956,17 @@ void deliverOne(Shared& sh, ScriptContext& ctx, uint64_t rid, DbResult res) {
   sh.deadlines.erase({p.deadline, rid});
   ApiRes& a = *p.a;
   if (a.dbPending > 0) --a.dbPending;
+  a.dbPendingBytes -= std::min(a.dbPendingBytes, p.bytes);
+  if (!res.ok && res.timedOut && (p.op == DbOp::Exec || p.op == DbOp::Insert || p.op == DbOp::Commit))
+    res.error += " (resultado incerto: o comando pode ter sido aplicado no banco)";
   auto w = a.waiting.find(p.co);
-  if (w == a.waiting.end() || w->second.req != rid) return;
+  if (w == a.waiting.end() || w->second.req != rid) {
+    // Ninguém mais espera (corrotina retomada por fora): só a contabilidade da transação.
+    if (p.op == DbOp::Begin && res.ok && sh.o.db) sh.o.db->abortTx(p.poolId);
+    if (p.tx != 0)
+      if (auto t = a.txs.find(p.tx); t != a.txs.end()) t->second.inflight = false;
+    return;
+  }
   DbWaiting wait = std::move(w->second);
   a.waiting.erase(w);
 

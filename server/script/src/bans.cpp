@@ -185,7 +185,7 @@ class JsonBackend final : public BanStore::Backend {
 
 constexpr const char* kCreate =
     "CREATE TABLE IF NOT EXISTS cb_bans ("
-    "did VARCHAR(64) NOT NULL PRIMARY KEY, "
+    "did VARCHAR(64) COLLATE utf8mb4_bin NOT NULL PRIMARY KEY, "
     "reason VARCHAR(255) NOT NULL DEFAULT '', "
     "created_at BIGINT NOT NULL, "
     "expires_at BIGINT NULL, "
@@ -193,8 +193,11 @@ constexpr const char* kCreate =
     "KEY cb_bans_expires (expires_at)"
     ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
 constexpr const char* kPurge = "DELETE FROM cb_bans WHERE expires_at IS NOT NULL AND expires_at <= ?";
+// Carga em páginas por did (o pool limita cada resultado a 10 000 linhas / 8 MiB).
+constexpr size_t kPage = 5000;
 constexpr const char* kSelect =
-    "SELECT did, reason, created_at, expires_at, created_by FROM cb_bans WHERE expires_at IS NULL OR expires_at > ?";
+    "SELECT did, reason, created_at, expires_at, created_by FROM cb_bans "
+    "WHERE (expires_at IS NULL OR expires_at > ?) AND did > ? ORDER BY did LIMIT 5000";
 constexpr const char* kReplace =
     "REPLACE INTO cb_bans (did, reason, created_at, expires_at, created_by) VALUES (?, ?, ?, ?, ?)";
 constexpr const char* kDelete = "DELETE FROM cb_bans WHERE did = ?";
@@ -311,39 +314,76 @@ class BanMysqlBackend final : public BanStore::Backend {
       err = r.error;
       return false;
     }
-    r = call(req(DbOp::Query, kSelect, {DbValue::integer(now)}));
-    if (!r.ok) {
-      err = r.error;
-      return false;
-    }
     std::vector<Ban> v;
-    v.reserve(r.rows.size());
-    for (const auto& row : r.rows) {
-      if (row.size() < 5 || row[0].type != DbValue::Type::Text || row[0].s.empty()) continue;
-      Ban b;
-      b.did = row[0].s;
-      b.reason = row[1].s;
-      b.createdAt = asInt(row[2]);
-      b.expiresAt = row[3].type == DbValue::Type::Null ? 0 : asInt(row[3]);
-      b.by = row[4].s;
-      v.push_back(std::move(b));
+    std::string after;
+    for (;;) {
+      r = call(req(DbOp::Query, kSelect, {DbValue::integer(now), DbValue::text(after)}));
+      if (!r.ok) {
+        err = r.error;
+        return false;
+      }
+      for (const auto& row : r.rows) {
+        if (row.size() < 5 || row[0].type != DbValue::Type::Text || row[0].s.empty()) continue;
+        Ban b;
+        b.did = row[0].s;
+        b.reason = row[1].s;
+        b.createdAt = asInt(row[2]);
+        b.expiresAt = row[3].type == DbValue::Type::Null ? 0 : asInt(row[3]);
+        b.by = row[4].s;
+        v.push_back(std::move(b));
+      }
+      if (r.rows.size() < kPage || r.rows.back().empty()) break;
+      after = r.rows.back()[0].s;
     }
     merge_(std::move(v));
     return true;
   }
 
-  bool apply(const Op& op, std::string& err) {
-    DbResult r;
+  DbResult apply(const Op& op) {
     if (op.put) {
       const Ban& b = op.b;
-      r = call(req(DbOp::Exec, kReplace,
-                   {DbValue::text(b.did), DbValue::text(b.reason), DbValue::integer(b.createdAt),
-                    b.expiresAt != 0 ? DbValue::integer(b.expiresAt) : DbValue::null(), DbValue::text(b.by)}));
-    } else {
-      r = call(req(DbOp::Exec, kDelete, {DbValue::text(op.b.did)}));
+      return call(req(DbOp::Exec, kReplace,
+                      {DbValue::text(b.did), DbValue::text(b.reason), DbValue::integer(b.createdAt),
+                       b.expiresAt != 0 ? DbValue::integer(b.expiresAt) : DbValue::null(), DbValue::text(b.by)}));
     }
-    if (!r.ok) err = r.error;
-    return r.ok;
+    return call(req(DbOp::Exec, kDelete, {DbValue::text(op.b.did)}));
+  }
+
+  // Grava a fila em ordem até esvaziar (true) ou até uma falha transitória (false: tentar de novo depois). Erro
+  // permanente (dbPermanentError): a gravação é descartada com log e auditoria, e a fila segue.
+  bool drainWrites() {
+    for (;;) {
+      Op op;
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (stop_ || q_.empty()) return true;
+        op = q_.front();
+      }
+      DbResult r = apply(op);
+      if (!r.ok && !dbPermanentError(r)) {
+        log(true, "bans: gravação de '" + op.b.did + "' em cb_bans falhou (nova tentativa): " + r.error);
+        return false;
+      }
+      if (!r.ok) {
+        log(true, "bans: gravação de '" + op.b.did + "' em cb_bans DESCARTADA (erro permanente " +
+                      std::to_string(r.code) + "): " + r.error + " (o ban vale só até reiniciar)");
+        if (opt_.audit) {
+          try {
+            opt_.audit(json{{"type", "ban_write_dropped"},
+                            {"did", op.b.did},
+                            {"op", op.put ? "ban" : "unban"},
+                            {"error", r.error},
+                            {"code", r.code},
+                            {"ts", now_()}}
+                           .dump(-1, ' ', false, json::error_handler_t::replace));
+          } catch (...) {
+          }
+        }
+      }
+      std::lock_guard<std::mutex> lk(mu_);
+      if (!q_.empty()) q_.pop_front();
+      cv_.notify_all();
+    }
   }
 
   // Espera crescente entre tentativas; false se o backend foi encerrado.
@@ -355,6 +395,7 @@ class BanMysqlBackend final : public BanStore::Backend {
 
   void run() {
     milliseconds wait{0};
+    int loadFails = 0;
     for (;;) {
       bool isLoaded;
       {
@@ -371,28 +412,28 @@ class BanMysqlBackend final : public BanStore::Backend {
           cv_.notify_all();
           continue;
         }
+        ++loadFails;
         log(true, "bans: carga de cb_bans falhou (nova tentativa em " +
                       std::to_string((wait.count() == 0 ? opt_.retryMin : std::min(opt_.retryMax, wait * 2)).count()) +
                       " ms): " + err);
+        if (loadFails == 5)
+          log(true, "CRÍTICO: bans: a carga de cb_bans falhou 5 vezes seguidas; os bans gravados no banco NÃO estão "
+                    "sendo aplicados (só valem os desta execução) até a carga funcionar. Último erro: " + err);
+        // As gravações não esperam a carga (mudanças locais vencem a carga quando ela vier).
+        (void)drainWrites();
         if (!backoff(wait)) return;
         continue;
       }
-      Op op;
       {
         std::unique_lock<std::mutex> lk(mu_);
         cv_.wait(lk, [&] { return stop_ || !q_.empty(); });
         if (stop_) return;
-        op = q_.front();
       }
-      if (apply(op, err)) {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (!q_.empty()) q_.pop_front();
+      if (drainWrites()) {
         wait = milliseconds(0);
-        cv_.notify_all();
-        continue;
+      } else if (!backoff(wait)) {
+        return;
       }
-      log(true, "bans: gravação de '" + op.b.did + "' em cb_bans falhou (nova tentativa): " + err);
-      if (!backoff(wait)) return;
     }
   }
 

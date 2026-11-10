@@ -60,6 +60,16 @@ class MysqlConn final : public DbConnection {
     mysql_options(my_, MYSQL_OPT_READ_TIMEOUT, &ioTimeout);
     mysql_options(my_, MYSQL_OPT_WRITE_TIMEOUT, &ioTimeout);
     mysql_options(my_, MYSQL_SET_CHARSET_NAME, "utf8mb4");
+    // Sempre TCP: "localhost" no Linux iria para o socket Unix no caminho padrão da libmariadb (/tmp/mysql.sock).
+    unsigned proto = MYSQL_PROTOCOL_TCP;
+    mysql_options(my_, MYSQL_OPT_PROTOCOL, &proto);
+    unsigned noLocalInfile = 0;  // defesa contra servidor malicioso pedindo arquivos locais (LOAD DATA LOCAL)
+    mysql_options(my_, MYSQL_OPT_LOCAL_INFILE, &noLocalInfile);
+    unsigned long maxPacket = 32ul << 20;  // linha/pacote máximo lido do servidor
+    mysql_options(my_, MYSQL_OPT_MAX_ALLOWED_PACKET, &maxPacket);
+    // Plugins de autenticação (caching_sha2_password do MySQL 8, client_ed25519...) ficam ao lado do executável.
+    static const std::string pluginDir = mysqlPluginDir();
+    if (!pluginDir.empty()) mysql_options(my_, MYSQL_PLUGIN_DIR, pluginDir.c_str());
     my_bool on = 1, off = 0;
     mysql_options(my_, MYSQL_REPORT_DATA_TRUNCATION, &on);
     DbConfig::Tls tls = cfg_.tls;
@@ -80,7 +90,12 @@ class MysqlConn final : public DbConnection {
     const char* db = cfg_.database.empty() ? nullptr : cfg_.database.c_str();
     if (mysql_real_connect(my_, cfg_.host.c_str(), cfg_.user.c_str(), cfg_.password.c_str(), db,
                            static_cast<unsigned>(cfg_.port), nullptr, 0) == nullptr) {
-      err = std::string(mysql_error(my_)) + " (" + std::to_string(mysql_errno(my_)) + ")";
+      const unsigned code = mysql_errno(my_);
+      err = std::string(mysql_error(my_)) + " (" + std::to_string(code) + ")";
+      if (tls == DbConfig::Tls::Verify &&
+          (code == kCrSslConnection || err.find("TLS") != std::string::npos || err.find("SSL") != std::string::npos ||
+           err.find("certificate") != std::string::npos))
+        err += " [TLS com verificação do certificado: para certificado autoassinado use db.tls = \"required\"]";
       mysql_close(my_);
       my_ = nullptr;
       return false;
@@ -117,7 +132,14 @@ class MysqlConn final : public DbConnection {
       case DbOp::Rollback:
         return simple("ROLLBACK");
       default:
-        return prepared(r, lim);
+      {
+        DbResult out = prepared(r, lim);
+        // MySQL: max_execution_time interrompe SLEEP() sem erro (devolve 1). Consulta que passou do prazo vira
+        // tempo esgotado (SELECT não tem efeito colateral para se perder).
+        if (out.ok && !mariadb_ && r.op == DbOp::Query && late())
+          return DbResult::fail("tempo esgotado (" + std::to_string(cfg_.timeoutMs) + " ms)", true);
+        return out;
+      }
     }
   }
 
@@ -134,8 +156,10 @@ class MysqlConn final : public DbConnection {
     const bool timeout = code == kErStatementTimeout || code == kErQueryTimeout ||
                          ((code == kErQueryInterrupted || code == kCrServerLost || code == kCrServerLostExtended) && late());
     if (connectionLost(code)) close();
-    if (timeout) return DbResult::fail("tempo esgotado (" + std::to_string(cfg_.timeoutMs) + " ms): " + m, true);
-    return DbResult::fail(m);
+    DbResult r = timeout ? DbResult::fail("tempo esgotado (" + std::to_string(cfg_.timeoutMs) + " ms): " + m, true)
+                         : DbResult::fail(m);
+    r.code = static_cast<int>(code);
+    return r;
   }
 
   DbResult simple(const char* sql) {

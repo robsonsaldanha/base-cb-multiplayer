@@ -18,6 +18,7 @@ target_link_libraries(cbserver_script PUBLIC cbserver_core cbscript)
 
 add_executable(cb-server src/main.cpp)
 target_link_libraries(cb-server PRIVATE cbserver_core cbserver_script)
+cbmp_copy_mariadb_plugins(cb-server)
 
 add_executable(cbserver_tests tests/test_config.cpp tests/test_metrics.cpp tests/test_manifest.cpp tests/test_http.cpp
   tests/test_grid.cpp tests/test_visibility.cpp tests/test_rate.cpp tests/test_movement.cpp tests/test_world.cpp
