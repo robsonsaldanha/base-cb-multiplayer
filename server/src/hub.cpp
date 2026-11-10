@@ -214,6 +214,14 @@ bool Heartbeat::sendOnce() {
         lastListed_ = listed;
         lastReason_ = reason;
       }
+      const std::string adminIgnored =
+          j.contains("adminUrlIgnored") && j["adminUrlIgnored"].is_string() ? j["adminUrlIgnored"].get<std::string>() : "";
+      if (adminIgnored != lastAdminIgnored_) {
+        if (!adminIgnored.empty())
+          spdlog::warn("hub: admin.publicUrl ignorada pelo Hub ({}); login de admin via Hub indisponível",
+                       adminIgnored.substr(0, 40));
+        lastAdminIgnored_ = adminIgnored;
+      }
     }
     return true;
   } catch (const std::exception& e) {

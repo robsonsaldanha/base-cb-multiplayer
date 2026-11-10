@@ -38,6 +38,10 @@ const MIGRATIONS: string[] = [
   `
   ALTER TABLE server_status ADD COLUMN admin_url TEXT;
   `,
+  `
+  ALTER TABLE oauth_states ADD COLUMN return_server_id TEXT;
+  ALTER TABLE oauth_states ADD COLUMN return_state TEXT;
+  `,
 ];
 
 export function openDb(file: string): DB {

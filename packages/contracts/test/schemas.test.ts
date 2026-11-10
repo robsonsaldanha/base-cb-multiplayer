@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { ExchangeRequest, HeartbeatBody, RefreshRequest, ResourceManifest, ServerDetail, TokenResponse } from '../src/index';
+import { readFileSync } from 'node:fs';
+import { ExchangeRequest, HeartbeatBody, normalizeAdminOrigin, RefreshRequest, ResourceManifest, ServerDetail, TokenResponse } from '../src/index';
 
 const hb = { name: 'Castelo Bruxo', players: 10, maxPlayers: 512, gamePort: 30500, httpPort: 30500, version: '0.1.0', protocol: 1 };
 
@@ -95,5 +96,18 @@ describe('HeartbeatBody.adminUrl', () => {
     ]) {
       expect(parse(u).success, JSON.stringify(u)).toBe(false);
     }
+  });
+});
+
+describe('normalizeAdminOrigin: vetores compartilhados com o C++', () => {
+  const v = JSON.parse(readFileSync(new URL('../test-vectors/admin-origin.json', import.meta.url), 'utf8')) as { accept: [string, string][]; reject: string[] };
+  it('aceita e normaliza igual ao C++', () => {
+    for (const [input, out] of v.accept) expect(normalizeAdminOrigin(input), input).toBe(out);
+  });
+  it('recusa igual ao C++', () => {
+    for (const input of v.reject) expect(normalizeAdminOrigin(input), JSON.stringify(input)).toBeNull();
+  });
+  it('a saída é sempre a origem WHATWG (o que o navegador usa)', () => {
+    for (const [, out] of v.accept) expect(new URL(out).origin).toBe(out);
   });
 });

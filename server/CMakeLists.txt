@@ -25,6 +25,7 @@ add_executable(cbserver_tests tests/test_config.cpp tests/test_metrics.cpp tests
   tests/test_snapshots.cpp tests/test_auth.cpp tests/test_net.cpp tests/test_hub.cpp tests/test_script_world.cpp)
 target_link_libraries(cbserver_tests PRIVATE cbserver_core cbserver_script Catch2::Catch2WithMain)
 target_compile_definitions(cbserver_tests PRIVATE CBSERVER_CFG_EXAMPLE="${CMAKE_CURRENT_SOURCE_DIR}/server.cfg.example"
-  CBMP_EXAMPLE_RESOURCES="${CMAKE_SOURCE_DIR}/resources.example")
+  CBMP_EXAMPLE_RESOURCES="${CMAKE_SOURCE_DIR}/resources.example"
+  CBMP_ADMIN_ORIGIN_VECTORS="${CMAKE_SOURCE_DIR}/packages/contracts/test-vectors/admin-origin.json")
 # Prazo por teste: os de integração com a thread de scripts não podem pendurar o CI.
 catch_discover_tests(cbserver_tests PROPERTIES TIMEOUT 60)

@@ -1,6 +1,8 @@
 #include "cbserver/config.hpp"
 
+#include <cstdio>
 #include <fstream>
+#include <vector>
 #include <regex>
 #include <stdexcept>
 
@@ -50,18 +52,108 @@ void getStr(const json& obj, const char* key, const std::string& path, std::stri
   out = v->get<std::string>();
 }
 
+bool allOf(const std::string& s, const char* set) { return !s.empty() && s.find_first_not_of(set) == std::string::npos; }
+
+
+std::vector<std::string> split(const std::string& s, char sep) {
+  std::vector<std::string> out;
+  size_t b = 0;
+  for (;;) {
+    const auto e = s.find(sep, b);
+    out.push_back(s.substr(b, e == std::string::npos ? std::string::npos : e - b));
+    if (e == std::string::npos) break;
+    b = e + 1;
+  }
+  return out;
+}
+
+// IPv4 decimal estrito: 4 octetos, sem zero à esquerda, <= 255.
+bool strictIpv4(const std::string& host) {
+  const auto parts = split(host, '.');
+  if (parts.size() != 4) return false;
+  for (const auto& p : parts) {
+    if (p.empty() || p.size() > 3 || !allOf(p, "0123456789") || (p.size() > 1 && p[0] == '0')) return false;
+    if (std::stoi(p) > 255) return false;
+  }
+  return true;
+}
+
 bool isLoopbackHost(const std::string& host) {
-  if (host == "localhost" || host == "[::1]") return true;
-  static const std::regex v4(R"(^127\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$)");
-  std::smatch m;
-  if (!std::regex_match(host, m, v4)) return false;
-  for (size_t i = 1; i <= 3; ++i)
-    if (std::stoi(m[i].str()) > 255) return false;
+  return host == "localhost" || host == "[::1]" || (strictIpv4(host) && host.rfind("127.", 0) == 0);
+}
+
+// Conteúdo entre colchetes -> IPv6 canônico (RFC 5952 / WHATWG); vazio se inválido.
+std::string canonicalIpv6(const std::string& inner) {
+  if (!allOf(inner, "0123456789abcdef:")) return {};
+  const auto first = inner.find("::");
+  if (first != std::string::npos && first != inner.rfind("::")) return {};
+  auto groupsOf = [](const std::string& s) { return s.empty() ? std::vector<std::string>{} : split(s, ':'); };
+  std::vector<std::string> groups;
+  if (first != std::string::npos) {
+    auto head = groupsOf(inner.substr(0, first));
+    auto tail = groupsOf(inner.substr(first + 2));
+    if (head.size() + tail.size() > 7) return {};
+    groups = head;
+    groups.resize(8 - tail.size(), "0");
+    groups.insert(groups.end(), tail.begin(), tail.end());
+  } else {
+    groups = split(inner, ':');
+    if (groups.size() != 8) return {};
+  }
+  int n[8];
+  for (size_t i = 0; i < 8; ++i) {
+    if (groups[i].empty() || groups[i].size() > 4 || !allOf(groups[i], "0123456789abcdef")) return {};
+    n[i] = std::stoi(groups[i], nullptr, 16);
+  }
+  int bestAt = -1, bestLen = 0;
+  for (int i = 0; i < 8;) {
+    if (n[i] != 0) {
+      ++i;
+      continue;
+    }
+    int j = i;
+    while (j < 8 && n[j] == 0) ++j;
+    if (j - i > bestLen) {
+      bestAt = i;
+      bestLen = j - i;
+    }
+    i = j;
+  }
+  auto hex = [&](int from, int to) {
+    std::string out;
+    char buf[8];
+    for (int i = from; i < to; ++i) {
+      std::snprintf(buf, sizeof buf, "%x", static_cast<unsigned>(n[i]));
+      if (i > from) out += ':';
+      out += buf;
+    }
+    return out;
+  };
+  if (bestLen < 2) return hex(0, 8);
+  return hex(0, bestAt) + "::" + hex(bestAt + bestLen, 8);
+}
+
+// Nome DNS ASCII estrito: rótulos 1..63 de [a-z0-9-] sem hífen nas pontas, sem "xn--" (sem IDN), <= 253.
+// Último rótulo numérico (ou 0x...) = IPv4 para o parser de URL: só a forma decimal estrita.
+bool strictHostName(const std::string& host) {
+  if (host.empty() || host.size() > 253) return false;
+  const auto labels = split(host, '.');
+  const std::string& last = labels.back();
+  const bool numericLast = allOf(last, "0123456789") ||
+                           (last.rfind("0x", 0) == 0 && (last.size() == 2 || allOf(last.substr(2), "0123456789abcdef")));
+  if (numericLast) return strictIpv4(host);
+  for (const auto& l : labels) {
+    if (l.empty() || l.size() > 63 || !allOf(l, "abcdefghijklmnopqrstuvwxyz0123456789-") || l.front() == '-' ||
+        l.back() == '-' || l.rfind("xn--", 0) == 0)
+      return false;
+  }
   return true;
 }
 
 }  // namespace
 
+// MESMO algoritmo de normalizeAdminOrigin em packages/contracts/src/schemas.ts (vetores compartilhados em
+// packages/contracts/test-vectors/admin-origin.json).
 std::optional<std::string> normalizeAdminOrigin(std::string_view rawView) {
   if (rawView.empty() || rawView.size() > 256) return std::nullopt;
   std::string raw(rawView);
@@ -70,47 +162,40 @@ std::optional<std::string> normalizeAdminOrigin(std::string_view rawView) {
     if (u <= 0x20 || u >= 0x7f) return std::nullopt;  // espaços, controles, não-ASCII
     if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
   }
-  // Mesmo formato do schema TS: sem @, barra invertida, ? e #, e no máximo uma "/" final.
+  // Sem @, barra invertida, %, ? e #, e no máximo uma "/" final.
   static const std::regex re(R"(^(https?)://([a-z0-9.\-\[\]:]+)/?$)");
   std::smatch m;
   if (!std::regex_match(raw, m, re)) return std::nullopt;
   const std::string scheme = m[1].str();
   const std::string authority = m[2].str();
-  std::string host, port;
+  std::string host;
+  std::optional<std::string> port;
   if (authority.front() == '[') {
     const auto close = authority.find(']');
     if (close == std::string::npos) return std::nullopt;
-    host = authority.substr(0, close + 1);
-    const std::string inner = host.substr(1, host.size() - 2);
-    if (inner.empty() || inner.find_first_not_of("0123456789abcdef:") != std::string::npos ||
-        inner.find(':') == std::string::npos)
-      return std::nullopt;
+    const std::string v6 = canonicalIpv6(authority.substr(1, close - 1));
+    if (v6.empty()) return std::nullopt;
+    host = "[" + v6 + "]";
     const std::string rest = authority.substr(close + 1);
     if (!rest.empty()) {
       if (rest[0] != ':') return std::nullopt;
       port = rest.substr(1);
-      if (port.empty()) return std::nullopt;
     }
   } else {
     const auto colon = authority.find(':');
     host = authority.substr(0, colon);
-    if (colon != std::string::npos) {
-      port = authority.substr(colon + 1);
-      if (port.empty()) return std::nullopt;
-    }
-    if (host.empty() || host.find_first_of("[]:") != std::string::npos || host.front() == '.' || host.back() == '.' ||
-        host.find("..") != std::string::npos)
-      return std::nullopt;
+    if (!strictHostName(host)) return std::nullopt;
+    if (colon != std::string::npos) port = authority.substr(colon + 1);
   }
-  if (!port.empty()) {
-    if (port.size() > 5 || port.find_first_not_of("0123456789") != std::string::npos) return std::nullopt;
-    const int p = std::stoi(port);
+  std::string portOut;
+  if (port) {
+    if (port->empty() || port->size() > 5 || !allOf(*port, "0123456789")) return std::nullopt;
+    const int p = std::stoi(*port);
     if (p < 1 || p > 65535) return std::nullopt;
-    port = std::to_string(p);
-    if ((scheme == "https" && p == 443) || (scheme == "http" && p == 80)) port.clear();
+    if (!((scheme == "https" && p == 443) || (scheme == "http" && p == 80))) portOut = ":" + std::to_string(p);
   }
   if (scheme == "http" && !isLoopbackHost(host)) return std::nullopt;
-  return scheme + "://" + host + (port.empty() ? "" : ":" + port);
+  return scheme + "://" + host + portOut;
 }
 
 ServerConfig ServerConfig::fromJson(const json& j) {

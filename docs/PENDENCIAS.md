@@ -83,22 +83,28 @@ Itens levantados nas revisões que não bloquearam o merge, com o momento em que
   - CAs: Linux usa os caminhos padrão do OpenSSL → a distribuição Linux precisa de `ca-certificates`.
     `HttpOutOptions::caFile` existe, mas não há chave no `server.cfg`. O caminho das CAs do sistema só é exercitado
     pelo teste de AIA (recusa); não há teste de sucesso contra uma CA do sistema (sem rede externa nos testes).
-- Login de admin via Hub (Task 7), resíduos e decisões:
-  - `GET /v1/auth/server-admin` emite o ticket direto (GET → 303), sem tela de confirmação: um link para essa rota
-    leva o `did`/nome do usuário logado no Hub ao painel de quem controla aquele `adminUrl`, sem o usuário confirmar.
-    O ticket só vale para `<serverId>#admin` (inútil em outro servidor), mas a identificação vaza com um clique.
-    Avaliar uma página de confirmação (POST com checagem de Origin) antes de produção.
+- Login de admin via Hub (Task 7 + fix 1), resíduos e decisões:
+  - GET `server-admin` só confirma; o ticket sai no POST com Origin = Hub e token CSRF (HMAC com chave do processo:
+    reiniciar o Hub invalida confirmações abertas; o usuário recarrega). Um clique a mais no fluxo legítimo.
   - Ticket de admin é emitido para qualquer usuário logado (inclusive quem não é dono): quem decide é o servidor
-    (`admin.admins`, Task 8). Ban global não bloqueia o login de admin.
-  - `adminUrl` em loopback é aceita pelo schema mas só é gravada com `HUB_ALLOW_PRIVATE_SERVERS=1` (dev); em
-    produção é ignorada (servidor segue listado, sem login de admin) com aviso no log do Hub.
-  - Limites (10/min por usuário, 30/min por IP) ficam em memória do processo do Hub (janela fixa de 60 s; zeram ao
-    reiniciar; não valem entre várias instâncias).
-  - `adminUrl` é a origem anunciada pelo próprio servidor (chave `sk_`): quem tem a chave pode apontá-la para
-    qualquer origem https. O Hub não sonda o painel (não confere que responde em `/auth/callback`).
-  - C++: só `admin.publicUrl` existe no `ServerConfig` (normalizada com as mesmas regras do schema TS); porta, bind e
-    `admin.admins` chegam com o painel (Task 8) e hoje são ignoradas sem aviso dentro de `admin`.
-  - Hosts não-ASCII precisam vir em punycode (`xn--…`) nos dois lados.
+    (`admin.admins`). Ban global não bloqueia o login de admin.
+  - `adminUrl` inválida, ou loopback/IP privado/`localhost`/`*.localhost` sem `HUB_ALLOW_PRIVATE_SERVERS=1`, é
+    ignorada (o servidor segue listado; `adminUrlIgnored` na resposta; aviso no log do Hub e do cb-server). Nomes DNS
+    não são resolvidos: um nome público que aponte para 127.0.0.1 passa (só o fragmento vai ao destino que o dono
+    escolheu). IPv4 mapeado em IPv6 é sempre tratado como não público.
+  - Sem IDN: rótulos `xn--` são recusados nos dois lados (evita homógrafos na confirmação e divergência de
+    validação de punycode entre C++ e o parser WHATWG). IPv4 só decimal estrito (`127.1`, `0x7f…`, `0177…`
+    recusados).
+  - Limites (10 tickets/min por usuário, 30 req/min por IP com IPv6 por /64) em memória do processo: janela
+    deslizante aproximada, até 50 000 chaves por janela (acima disso chaves novas levam 429); zeram ao reiniciar e não
+    valem entre várias instâncias.
+  - Auditoria em logger filho com nível `info` fixo: aparece mesmo com `HUB_LOG_LEVEL=warn/error`; some só com
+    `silent`.
+  - O Hub não sonda o painel admin (não confere que responde em `/auth/callback`).
+  - **Para a Task 8 (painel no cb-server):** gerar `state` (`[A-Za-z0-9_-]{16,64}`) em cookie `SameSite=Strict`,
+    mandar em `server-admin?…&state=`, conferir `#…&state=` no `/auth/callback` antes de enviar o ticket (evita login
+    CSRF no painel); `admin.port`/`bind`/`admins` no `ServerConfig` (hoje só `publicUrl`; outras chaves de `admin`
+    ignoradas sem aviso); jti de admin com cache próprio; logar `adminUrlIgnored` já é feito pelo heartbeat.
   - Sem `/metrics` para o HTTP (`HttpOutPool::metrics()` existe; falta expor).
   - Redirecionamento para outro host/porta descarta os cabeçalhos do script e recusa 307/308 com corpo; 301/302 de
     POST e 303 viram GET sem corpo. `Expect: 100-continue` automático do httplib para corpos ≥ 1 KiB.

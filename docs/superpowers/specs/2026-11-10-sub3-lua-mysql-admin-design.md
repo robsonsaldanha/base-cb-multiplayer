@@ -114,13 +114,17 @@ Fora do escopo: Lua no cliente (subprojeto 5), UI HTML dentro do jogo, voz, NPCs
 
 ### Login via Hub (rota nova no Hub)
 
-1. Painel → `{hub}/v1/auth/server-admin?serverId=<id>`.
-2. Hub exige sessão de painel (se não houver, faz login Discord e volta).
-3. Hub confere que o servidor existe e tem `adminUrl` anunciado; emite ticket com `aud = "<serverId>#admin"`
-   (mesmo formato/assinatura dos tickets de jogo, TTL 300 s).
-4. Hub redireciona **somente** para `<adminUrl>/auth/callback#ticket=<ticket>` (fragmento, não query).
-5. JS do painel envia o ticket em `POST /auth/login`; servidor valida offline (`verifyTicket` com audiência
-   `<serverId>#admin`, jti não repetido), confere `did` em `admin.admins`, cria a sessão.
+1. Painel → `{hub}/v1/auth/server-admin?serverId=<id>&state=<state>` (o painel gera `state` aleatório
+   `[A-Za-z0-9_-]{16,64}` e o guarda em cookie `SameSite=Strict`).
+2. Hub exige sessão de painel (se não houver, faz login Discord com o retorno guardado no state OAuth e volta).
+3. Hub confere que o servidor existe, está online e tem `adminUrl` anunciado, e mostra uma **página de confirmação**
+   (servidor, `serverId`, origem de destino, identidade Discord que será compartilhada) com o botão "Entrar como
+   admin". O GET nunca emite ticket.
+4. O botão faz POST same-origin (Origin = Hub, token CSRF amarrado à sessão/servidor/state/origem). Só então o Hub
+   emite ticket com `aud = "<serverId>#admin"` (mesmo formato/assinatura dos tickets de jogo, TTL 300 s) e
+   redireciona (303) **somente** para `<adminUrl>/auth/callback#ticket=<ticket>&state=<state>` (fragmento, não query).
+5. JS do painel confere o `state` contra o cookie, envia o ticket em `POST /auth/login`; servidor valida offline
+   (`verifyTicket` com audiência `<serverId>#admin`, jti não repetido), confere `did` em `admin.admins`, cria a sessão.
 
 Heartbeat ganha campo opcional `adminUrl` (https obrigatório, exceto loopback em dev); `HeartbeatBody` e a API do Hub
 são atualizados em `@cbmp/contracts`.

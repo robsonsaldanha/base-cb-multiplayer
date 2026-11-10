@@ -91,6 +91,7 @@ class Heartbeat {
   std::atomic<int64_t> lastDelayMs_{0};
   int lastListed_ = -1;  // -1 desconhecido
   std::string lastReason_;
+  std::string lastAdminIgnored_;  // motivo do Hub para ignorar o adminUrl (vazio = aceito/ausente)
   std::thread th_;
 };
 

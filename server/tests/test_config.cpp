@@ -255,3 +255,20 @@ TEST_CASE("config admin publicUrl rejects anything but a safe origin") {
   requireRejects(json{{"admin", {{"publicUrl", 42}}}}, "admin.publicUrl");
   requireRejects(json{{"admin", "https://painel.example.com"}}, "admin");
 }
+
+TEST_CASE("config admin origin matches the shared TS vectors") {
+  std::ifstream f(CBMP_ADMIN_ORIGIN_VECTORS);
+  REQUIRE(f);
+  const auto v = json::parse(f);
+  for (const auto& pair : v.at("accept")) {
+    const auto in = pair.at(0).get<std::string>();
+    INFO(in);
+    const auto out = cbserver::normalizeAdminOrigin(in);
+    REQUIRE(out.has_value());
+    REQUIRE(*out == pair.at(1).get<std::string>());
+  }
+  for (const auto& in : v.at("reject")) {
+    INFO(in.dump());
+    REQUIRE_FALSE(cbserver::normalizeAdminOrigin(in.get<std::string>()).has_value());
+  }
+}

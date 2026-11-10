@@ -3,6 +3,7 @@ import type { HeartbeatBody } from '@cbmp/contracts';
 import type { DB } from './db';
 
 export type ClientKind = 'launcher' | 'panel';
+export interface ReturnTo { serverId: string; state: string | null }
 export interface UserRow { id: string; discordId: string; name: string; avatar: string | null }
 export interface ServerRow {
   id: string; ownerId: string; name: string; description: string; tags: string[]; locale: string;
@@ -106,16 +107,22 @@ export class Store {
   }
 
   // ---- OAuth state e códigos de login (uso único)
-  createOauthState(client: ClientKind, now: number, codeChallenge?: string): string {
+  /** `returnTo` (só painel): volta para a confirmação de login de admin daquele servidor; morre com o state. */
+  createOauthState(client: ClientKind, now: number, codeChallenge?: string, returnTo?: ReturnTo): string {
     const state = randomBytes(24).toString('base64url');
-    this.db.prepare('INSERT INTO oauth_states (state, client, created_at, code_challenge) VALUES (?, ?, ?, ?)').run(state, client, now, codeChallenge ?? null);
+    this.db.prepare('INSERT INTO oauth_states (state, client, created_at, code_challenge, return_server_id, return_state) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(state, client, now, codeChallenge ?? null, returnTo?.serverId ?? null, returnTo?.state ?? null);
     return state;
   }
 
-  consumeOauthState(state: string, now: number): { client: ClientKind; codeChallenge: string | null } | null {
-    const r = this.db.prepare('DELETE FROM oauth_states WHERE state = ? RETURNING client, created_at, code_challenge').get(state) as Raw | undefined;
+  consumeOauthState(state: string, now: number): { client: ClientKind; codeChallenge: string | null; returnTo: ReturnTo | null } | null {
+    const r = this.db.prepare('DELETE FROM oauth_states WHERE state = ? RETURNING client, created_at, code_challenge, return_server_id, return_state').get(state) as Raw | undefined;
     if (!r || now - (r.created_at as number) > OAUTH_STATE_TTL) return null;
-    return { client: r.client as ClientKind, codeChallenge: (r.code_challenge as string | null) ?? null };
+    const sid = (r.return_server_id as string | null) ?? null;
+    return {
+      client: r.client as ClientKind, codeChallenge: (r.code_challenge as string | null) ?? null,
+      returnTo: sid ? { serverId: sid, state: (r.return_state as string | null) ?? null } : null,
+    };
   }
 
   createLoginCode(userId: string, now: number, codeChallenge: string): string {

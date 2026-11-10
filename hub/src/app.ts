@@ -35,7 +35,7 @@ declare module 'fastify' {
 
 export async function buildApp(deps: HubDeps): Promise<FastifyInstance> {
   const app = Fastify({
-    logger: deps.logStream ? { level: 'info', stream: deps.logStream }
+    logger: deps.logStream ? { level: deps.config.logLevel === 'silent' ? 'info' : deps.config.logLevel, stream: deps.logStream }
       : deps.config.logLevel === 'silent' ? false : { level: deps.config.logLevel },
     trustProxy: deps.config.trustProxy,
     bodyLimit: 64 * 1024,
