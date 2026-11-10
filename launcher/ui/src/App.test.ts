@@ -102,6 +102,24 @@ describe("App (layout A)", () => {
     expect(within(top).getByText("R")).toBeInTheDocument();
   });
 
+  it("Hub fora com sessão guardada: mostra o motivo e Tentar de novo, sem ir para o login", async () => {
+    let down = true;
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "me") {
+        if (down) throw { code: "hub_unreachable", message: "Não foi possível falar com o Hub." };
+        return profile;
+      }
+      if (cmd === "app_version") return "0.1.0";
+      return settings;
+    });
+    render(App);
+    expect(await screen.findByText("Não foi possível falar com o Hub.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Entrar com Discord" })).toBeNull();
+    down = false;
+    await fireEvent.click(screen.getByRole("button", { name: "Tentar de novo" }));
+    expect(await screen.findByRole("navigation", { name: "Menu principal" })).toBeInTheDocument();
+  });
+
   it("sem sessão mostra o login; auth://changed com sucesso abre o launcher", async () => {
     loggedIn = false;
     render(App);

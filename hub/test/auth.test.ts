@@ -160,6 +160,18 @@ describe('auth', () => {
     for (const bad of ['curto', `${mine}x`, mine.slice(0, 42) + '+']) expect((await go({ state: bad })).status).toBe(400);
   });
 
+  it('painel: state próprio é ignorado (não muda o redirecionamento)', async () => {
+    const { app, discord } = await makeTestApp();
+    discord.users.set('c1', { id: '8', username: 'p', global_name: null, avatar: null });
+    const mine = randomBytes(32).toString('base64url');
+    const res = await app.inject({ method: 'GET', url: `/v1/auth/discord/login?client=panel&state=${mine}` });
+    expect(res.statusCode).toBe(302);
+    const st = new URL(res.headers.location as string).searchParams.get('state')!;
+    expect(st).not.toBe(mine);
+    const cb = await callback(app, 'c1', st, res.cookies.find((c) => c.name === 'cbmp_oauth')!.value);
+    expect(cb.headers.location).toBe('/panel');
+  });
+
   it('dev-login do launcher também devolve o state próprio', async () => {
     const on = await makeTestApp({ config: { devLogin: true } });
     const mine = randomBytes(32).toString('base64url');

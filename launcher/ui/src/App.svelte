@@ -9,7 +9,7 @@
   import Settings from "./routes/Settings.svelte";
   import Login from "./routes/Login.svelte";
   import { appVersion } from "./lib/api";
-  import { auth, initAuth, signOut } from "./lib/stores";
+  import { auth, initAuth, refreshProfile, signOut } from "./lib/stores";
   import { VIEWS, type View } from "./lib/views";
 
   let view = $state<View>("servers");
@@ -54,6 +54,11 @@
   </div>
 {:else if $auth.status === "checking"}
   <p class="checking" role="status">Carregando…</p>
+{:else if $auth.status === "unavailable"}
+  <div class="checking">
+    <p role="alert">{$auth.error.message}</p>
+    <button type="button" onclick={refreshProfile}>Tentar de novo</button>
+  </div>
 {:else}
   <Login />
 {/if}
@@ -86,9 +91,23 @@
   }
   .checking {
     display: grid;
-    place-items: center;
+    place-content: center;
+    justify-items: center;
+    gap: 12px;
     height: 100vh;
     margin: 0;
     color: var(--muted);
+  }
+  .checking p {
+    margin: 0;
+  }
+  .checking button {
+    padding: 8px 16px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    cursor: pointer;
   }
 </style>

@@ -8,7 +8,7 @@
 //! - Logs: só códigos de erro; nunca tokens, códigos OAuth, verifier ou state.
 
 use crate::error::{AppError, AppResult};
-use crate::hub::{HubClient, Me};
+use crate::hub::{HubClient, Me, Tokens};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
@@ -220,16 +220,22 @@ pub fn parse_deep_link(raw: &str) -> AppResult<DeepLink> {
 
 // ----- sessão -----
 
-/// Relógio em unix seconds (injetável nos testes).
+/// Relógio monotônico em segundos (injetável nos testes). Mede o TTL do login pendente e a validade do access
+/// token; nunca é comparado com horas absolutas do Hub.
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
-pub fn system_clock() -> Clock {
-    Arc::new(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
-    })
+/// Segundos desde a criação, por `Instant` (não muda se o usuário acertar o relógio do Windows).
+pub fn monotonic_clock() -> Clock {
+    let base = std::time::Instant::now();
+    Arc::new(move || base.elapsed().as_secs() as i64)
+}
+
+/// Hora do sistema em unix seconds: só para o caso raro de o Hub não mandar `Date`.
+fn wall_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 struct Pending {
@@ -240,6 +246,7 @@ struct Pending {
 
 struct Session {
     access: String,
+    /// Em segundos do [`Clock`] monotônico: recebimento + validade informada pelo Hub.
     expires_at: i64,
 }
 
@@ -260,9 +267,14 @@ fn session_expired() -> AppError {
     AppError::new("session_expired", "Sua sessão expirou. Entre de novo.")
 }
 
+/// Refresh recusado pelo Hub (token inválido/revogado): só nesse caso a sessão é apagada.
+fn refresh_refused(e: &AppError) -> bool {
+    matches!(e.code, "session_expired" | "hub_rejected")
+}
+
 impl Auth {
     pub fn new(hub: HubClient, vault: Arc<dyn TokenVault>) -> Self {
-        Self::with_clock(hub, vault, system_clock())
+        Self::with_clock(hub, vault, monotonic_clock())
     }
 
     pub fn with_clock(hub: HubClient, vault: Arc<dyn TokenVault>, clock: Clock) -> Self {
@@ -286,6 +298,13 @@ impl Auth {
     /// Há refresh token guardado (sessão de uma abertura anterior).
     pub fn has_stored_session(&self) -> bool {
         matches!(self.vault.get(), Ok(Some(_)))
+    }
+
+    fn session_from(&self, t: &Tokens) -> Session {
+        Session {
+            access: t.access_token.clone(),
+            expires_at: (self.clock)() + t.access_lifetime(wall_now()),
+        }
     }
 
     /// Novo login: substitui o pendente anterior e devolve a URL do Hub para o navegador.
@@ -344,17 +363,27 @@ impl Auth {
         };
         let mut session = self.session.lock().await;
         let t = self.hub.exchange(&code, &verifier).await?;
-        let rt = t.refresh_token.ok_or_else(login_failed)?;
+        let rt = t.refresh_token.clone().ok_or_else(login_failed)?;
+        let old_rt = self.vault.get().ok().flatten();
+        let old_access = session.as_ref().map(|s| s.access.clone());
         self.vault.set(&rt)?;
-        *session = Some(Session {
-            access: t.access_token,
-            expires_at: t.access_expires_at,
-        });
+        *session = Some(self.session_from(&t));
+        // Login por cima de uma sessão viva: encerra a antiga no Hub (melhor esforço).
+        if old_rt.is_some() || old_access.is_some() {
+            if let Err(e) = self
+                .hub
+                .logout(old_access.as_deref(), old_rt.as_deref())
+                .await
+            {
+                log::warn!("logout da sessão anterior falhou: {}", e.code);
+            }
+        }
         Ok(())
     }
 
-    /// Access token válido por pelo menos mais 60 s, renovando pelo cofre se preciso. Refresh recusado → cofre
-    /// limpo e `session_expired`; sem refresh token → `not_logged_in`; Hub fora → `hub_unreachable` (cofre fica).
+    /// Access token válido por pelo menos mais 60 s, renovando pelo cofre se preciso.
+    /// - Refresh recusado → cofre limpo e `session_expired`; sem refresh token → `not_logged_in`.
+    /// - Hub fora/erro → cofre e sessão ficam; se o token atual ainda não venceu, ele é devolvido.
     pub async fn access_token(&self) -> AppResult<String> {
         let mut session = self.session.lock().await;
         if let Some(s) = session.as_ref() {
@@ -362,52 +391,80 @@ impl Auth {
                 return Ok(s.access.clone());
             }
         }
-        *session = None;
+        match self.refresh_locked(&mut session).await {
+            Ok(at) => Ok(at),
+            Err(e) => match session.as_ref() {
+                Some(s) if !refresh_refused(&e) && s.expires_at > (self.clock)() => {
+                    Ok(s.access.clone())
+                }
+                _ => Err(e),
+            },
+        }
+    }
+
+    /// Refresh com o lock da sessão na mão. Só apaga sessão e cofre se o Hub recusar o refresh.
+    async fn refresh_locked(&self, session: &mut Option<Session>) -> AppResult<String> {
         let Some(rt) = self.vault.get()? else {
+            *session = None;
             return Err(not_logged_in());
         };
         match self.hub.refresh(&rt).await {
             Ok(t) => {
-                let Some(new_rt) = t.refresh_token else {
+                let Some(new_rt) = t.refresh_token.as_deref() else {
+                    *session = None;
                     let _ = self.vault.clear();
                     log::warn!("refresh sem refresh token novo; sessão encerrada");
                     return Err(session_expired());
                 };
-                self.vault.set(&new_rt)?;
-                *session = Some(Session {
-                    access: t.access_token.clone(),
-                    expires_at: t.access_expires_at,
-                });
-                log::info!("sessão renovada");
+                // O Hub já girou: mesmo se o cofre falhar, a sessão nova vale nesta execução.
+                let saved = self.vault.set(new_rt);
+                *session = Some(self.session_from(&t));
+                match saved {
+                    Ok(()) => log::info!("sessão renovada"),
+                    Err(e) => log::warn!("sessão renovada, mas o cofre falhou: {}", e.code),
+                }
                 Ok(t.access_token)
             }
-            Err(e) if matches!(e.code, "session_expired" | "hub_rejected") => {
+            Err(e) if refresh_refused(&e) => {
+                *session = None;
                 let _ = self.vault.clear();
                 log::warn!("refresh recusado pelo Hub; sessão encerrada");
                 Err(session_expired())
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                log::warn!("refresh falhou: {}", e.code);
+                Err(e)
+            }
         }
     }
 
-    /// Hub recusou o access token: esquece a sessão local inteira.
-    async fn drop_session(&self) {
-        *self.session.lock().await = None;
-        let _ = self.vault.clear();
-        log::warn!("Hub recusou a sessão; sessão encerrada");
+    /// O Hub recusou `used` (401). Se outro chamador já girou o token, devolve o atual; senão faz um refresh
+    /// (serializado pelo lock: quem chegar depois vê o token novo e não renova de novo).
+    async fn after_unauthorized(&self, used: &str) -> AppResult<String> {
+        let mut session = self.session.lock().await;
+        if let Some(s) = session.as_ref() {
+            if !ct_eq(&s.access, used) {
+                return Ok(s.access.clone());
+            }
+        }
+        self.refresh_locked(&mut session).await
     }
 
+    /// Chama o Hub com a sessão; num 401, tenta uma vez de novo com o token atual (ou renovado). A sessão só cai
+    /// se o refresh for recusado; erro de rede nunca a apaga.
     async fn with_session<T, F, Fut>(&self, f: F) -> AppResult<T>
     where
-        F: FnOnce(String) -> Fut,
+        F: Fn(String) -> Fut,
         Fut: std::future::Future<Output = AppResult<T>>,
     {
         let access = self.access_token().await?;
-        let r = f(access).await;
-        if matches!(&r, Err(e) if e.code == "session_expired") {
-            self.drop_session().await;
+        match f(access.clone()).await {
+            Err(e) if e.code == "session_expired" => {
+                let fresh = self.after_unauthorized(&access).await?;
+                f(fresh).await
+            }
+            r => r,
         }
-        r
     }
 
     /// `GET /v1/me` com a sessão atual.

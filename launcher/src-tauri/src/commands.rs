@@ -119,10 +119,9 @@ pub fn auth_event_for(result: &AppResult<()>) -> Option<AuthChanged> {
 pub fn handle_deep_link(app: AppHandle, auth: Arc<Auth>, url: String) {
     tauri::async_runtime::spawn(async move {
         let r = auth.on_deep_link(&url).await;
+        // Link do nosso login (sucesso ou erro): traz a janela para a frente do navegador. Link alheio não.
         if let Some(ev) = auth_event_for(&r) {
             let _ = app.emit(AUTH_CHANGED, ev);
-        }
-        if r.is_ok() {
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.unminimize();
                 let _ = w.set_focus();

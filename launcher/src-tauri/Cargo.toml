@@ -29,6 +29,7 @@ sha2 = "=0.10.9"
 base64 = "=0.23.1"
 getrandom = "=0.3.4"
 log = "=0.4.35"
+httpdate = "=1.0.3"
 # Cofre: Windows Credential Manager (serviço `CBMultiplayer`).
 keyring = { version = "=3.6.3", features = ["windows-native"] }
 
@@ -41,7 +42,7 @@ tempfile = "=3.27.0"
 toml = "=1.2.1"
 # Hub falso dos testes.
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
-tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "net", "sync"] }
+tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
 
 [profile.release]
 codegen-units = 1

@@ -6,12 +6,16 @@ export type AuthState =
   | { status: "checking" }
   | { status: "anonymous"; error: ApiError | null }
   | { status: "waiting" }
+  /** Sessão pode existir, mas o Hub/cofre falhou agora: não é motivo para pedir login de novo. */
+  | { status: "unavailable"; error: ApiError }
   | { status: "logged_in"; profile: Profile };
 
 export const auth = writable<AuthState>({ status: "checking" });
 
 /** Códigos que só significam "precisa entrar" (sem mensagem de erro na tela). */
 const SILENT = new Set(["not_logged_in"]);
+/** Códigos que mandam para a tela de login; qualquer outro erro do `me` é falha passageira. */
+const NEEDS_LOGIN = new Set(["not_logged_in", "session_expired"]);
 
 const anonymous = (error: ApiError | null = null): AuthState => ({ status: "anonymous", error });
 
@@ -21,7 +25,8 @@ export async function refreshProfile(): Promise<void> {
     auth.set({ status: "logged_in", profile: await me() });
   } catch (e) {
     const err = toApiError(e);
-    auth.set(anonymous(SILENT.has(err.code) ? null : err));
+    if (!NEEDS_LOGIN.has(err.code)) auth.set({ status: "unavailable", error: err });
+    else auth.set(anonymous(SILENT.has(err.code) ? null : err));
   }
 }
 

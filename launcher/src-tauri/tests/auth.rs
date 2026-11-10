@@ -65,8 +65,13 @@ struct Fake {
     refreshes: u32,
     logouts: Vec<(Option<String>, Option<String>)>,
     banned: bool,
-    /// Relógio do teste (os tokens vencem em relação a ele).
+    /// Relógio do Hub falso (`accessExpiresAt` e cabeçalho `Date`); independente do relógio do launcher.
     now: Arc<AtomicI64>,
+    /// `/v1/auth/refresh` responde 503 (Hub com problema, refresh não recusado).
+    refresh_down: bool,
+    /// Atraso (ms) só da próxima chamada a `/v1/me`, que confere o token **depois** de esperar.
+    me_delay_ms: u64,
+    me_calls: u32,
 }
 
 type Shared = Arc<Mutex<Fake>>;
@@ -75,15 +80,25 @@ fn err(status: StatusCode, code: &str) -> Response {
     (status, Json(json!({ "error": code, "message": "x" }))).into_response()
 }
 
-fn issue(f: &mut Fake) -> Value {
+/// Emite a geração seguinte de tokens, com `Date` do relógio do Hub falso (como o Hub real, que manda `Date`).
+fn issue(f: &mut Fake) -> Response {
     f.generation += 1;
     let g = f.generation;
     let at = format!("at_{SECRET}_{g}");
     let rt = format!("rt_{SECRET}_{g}");
-    let exp = f.now.load(Ordering::SeqCst) + ACCESS_TTL;
+    let now = f.now.load(Ordering::SeqCst);
+    let exp = now + ACCESS_TTL;
     f.access.insert(at.clone(), exp);
     f.refresh.insert(rt.clone(), g);
-    json!({ "accessToken": at, "accessExpiresAt": exp, "refreshToken": rt, "refreshExpiresAt": T0 + 86400 })
+    let date =
+        httpdate::fmt_http_date(std::time::UNIX_EPOCH + std::time::Duration::from_secs(now as u64));
+    (
+        [("date", date)],
+        Json(
+            json!({ "accessToken": at, "accessExpiresAt": exp, "refreshToken": rt, "refreshExpiresAt": now + 86400 }),
+        ),
+    )
+        .into_response()
 }
 
 fn bearer(h: &HeaderMap) -> Option<String> {
@@ -105,17 +120,22 @@ async fn exchange(State(s): State<Shared>, Json(b): Json<Value>) -> Response {
     if URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())) != ch {
         return err(StatusCode::BAD_REQUEST, "bad_code");
     }
-    Json(issue(&mut f)).into_response()
+    issue(&mut f)
 }
 
 async fn refresh(State(s): State<Shared>, Json(b): Json<Value>) -> Response {
     let mut f = s.lock().unwrap();
     f.refreshes += 1;
-    let rt = b["refreshToken"].as_str().unwrap_or_default();
-    if f.refresh.remove(rt).is_none() {
-        return err(StatusCode::UNAUTHORIZED, "bad_refresh");
+    if f.refresh_down {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "busy");
     }
-    Json(issue(&mut f)).into_response()
+    let rt = b["refreshToken"].as_str().unwrap_or_default();
+    let Some(g) = f.refresh.remove(rt) else {
+        return err(StatusCode::UNAUTHORIZED, "bad_refresh");
+    };
+    // Como o Hub real: o refresh apaga a sessão inteira, então o access antigo deixa de valer na hora.
+    f.access.remove(&format!("at_{SECRET}_{g}"));
+    issue(&mut f)
 }
 
 async fn logout(State(s): State<Shared>, h: HeaderMap, body: Option<Json<Value>>) -> Response {
@@ -133,6 +153,14 @@ async fn logout(State(s): State<Shared>, h: HeaderMap, body: Option<Json<Value>>
 }
 
 async fn me(State(s): State<Shared>, h: HeaderMap) -> Response {
+    let delay = {
+        let mut f = s.lock().unwrap();
+        f.me_calls += 1;
+        std::mem::take(&mut f.me_delay_ms)
+    };
+    if delay > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+    }
     let f = s.lock().unwrap();
     match bearer(&h) {
         Some(a) if f.access.contains_key(&a) => Json(json!({
@@ -196,15 +224,19 @@ struct Env {
     base: Url,
     fake: Shared,
     vault: Arc<MemoryVault>,
+    /// Relógio (monotônico) do launcher.
     clock: Arc<AtomicI64>,
+    /// Relógio do Hub falso.
+    hub_clock: Arc<AtomicI64>,
     auth: Auth,
 }
 
 async fn env() -> Env {
     logs();
     let clock = Arc::new(AtomicI64::new(T0));
+    let hub_clock = Arc::new(AtomicI64::new(T0));
     let fake: Shared = Arc::new(Mutex::new(Fake {
-        now: clock.clone(),
+        now: hub_clock.clone(),
         ..Fake::default()
     }));
     let app = Router::new()
@@ -230,6 +262,7 @@ async fn env() -> Env {
         fake,
         vault,
         clock,
+        hub_clock,
         auth,
     }
 }
@@ -598,6 +631,137 @@ async fn hub_fora_no_refresh_mantem_o_cofre() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn chamada_em_voo_durante_rotacao_nao_derruba_a_sessao() {
+    let e = Arc::new(env().await);
+    e.login().await;
+    // `me` sai com at_1 e o Hub só confere depois de 300 ms; nesse meio-tempo outro chamador gira os tokens.
+    e.fake.lock().unwrap().me_delay_ms = 300;
+    let e2 = e.clone();
+    let inflight = tokio::spawn(async move { e2.auth.me().await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    e.clock.store(T0 + ACCESS_TTL - 60, Ordering::SeqCst);
+    assert_eq!(
+        e.auth.access_token().await.unwrap(),
+        format!("at_{SECRET}_2")
+    );
+
+    let me = inflight.await.unwrap().unwrap();
+    assert_eq!(me.discord_id, "123");
+    let f = e.fake.lock().unwrap();
+    assert_eq!(
+        f.me_calls, 2,
+        "401 com o token velho → repete uma vez com o atual"
+    );
+    assert_eq!(
+        f.refreshes, 1,
+        "o token já girado não provoca outro refresh"
+    );
+    drop(f);
+    assert_eq!(
+        e.vault.get().unwrap().as_deref(),
+        Some(format!("rt_{SECRET}_2").as_str())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chamadas_concorrentes_com_401_fazem_um_refresh_so() {
+    let e = Arc::new(env().await);
+    e.login().await;
+    // Hub esqueceu o access (ex.: relógio do launcher atrasado), mas o refresh vale.
+    e.fake.lock().unwrap().access.clear();
+    let mut hs = Vec::new();
+    for _ in 0..6 {
+        let e = e.clone();
+        hs.push(tokio::spawn(async move { e.auth.me().await }));
+    }
+    for h in hs {
+        assert_eq!(h.await.unwrap().unwrap().name, "Robson <b>");
+    }
+    assert_eq!(e.fake.lock().unwrap().refreshes, 1);
+    assert_eq!(
+        e.vault.get().unwrap().as_deref(),
+        Some(format!("rt_{SECRET}_2").as_str())
+    );
+    assert_eq!(
+        e.auth.access_token().await.unwrap(),
+        format!("at_{SECRET}_2")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refresh_com_hub_em_erro_mantem_cofre_e_token_ainda_valido() {
+    let e = env().await;
+    e.login().await;
+    e.fake.lock().unwrap().refresh_down = true;
+    // Dentro da margem de 60 s mas ainda válido: refresh falha, o token atual continua servindo.
+    e.clock.store(T0 + ACCESS_TTL - 30, Ordering::SeqCst);
+    assert_eq!(
+        e.auth.access_token().await.unwrap(),
+        format!("at_{SECRET}_1")
+    );
+    // Vencido: erro do Hub, mas nada é apagado.
+    e.clock.store(T0 + ACCESS_TTL + 1, Ordering::SeqCst);
+    assert_eq!(e.auth.access_token().await.unwrap_err().code, "hub_busy");
+    assert_eq!(
+        e.vault.get().unwrap().as_deref(),
+        Some(format!("rt_{SECRET}_1").as_str())
+    );
+    // 401 numa chamada + refresh com erro do Hub: também não apaga.
+    e.clock.store(T0, Ordering::SeqCst);
+    e.fake.lock().unwrap().access.clear();
+    assert_eq!(e.auth.me().await.unwrap_err().code, "hub_busy");
+    assert!(e.auth.has_stored_session());
+    // Hub volta: a mesma sessão renova.
+    e.fake.lock().unwrap().refresh_down = false;
+    assert_eq!(e.auth.me().await.unwrap().discord_id, "123");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn relogio_local_errado_nao_desloga_nem_renova_a_toa() {
+    for skew in [7200, -7200] {
+        let e = env().await;
+        e.hub_clock.store(T0 + skew, Ordering::SeqCst);
+        e.login().await;
+        // Validade conta a partir do recebimento (900 s pelo `Date` do Hub), não da hora absoluta.
+        e.clock.store(T0 + ACCESS_TTL - 61, Ordering::SeqCst);
+        assert_eq!(
+            e.auth.access_token().await.unwrap(),
+            format!("at_{SECRET}_1")
+        );
+        assert_eq!(e.auth.me().await.unwrap().discord_id, "123");
+        assert_eq!(e.fake.lock().unwrap().refreshes, 0, "skew {skew}");
+        e.clock.store(T0 + ACCESS_TTL - 60, Ordering::SeqCst);
+        assert_eq!(
+            e.auth.access_token().await.unwrap(),
+            format!("at_{SECRET}_2")
+        );
+        assert!(e.auth.has_stored_session());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn login_por_cima_de_sessao_viva_encerra_a_antiga() {
+    let e = env().await;
+    e.login().await;
+    e.login().await;
+    assert_eq!(
+        e.vault.get().unwrap().as_deref(),
+        Some(format!("rt_{SECRET}_2").as_str())
+    );
+    assert_eq!(
+        e.fake.lock().unwrap().logouts,
+        vec![(
+            Some(format!("at_{SECRET}_1")),
+            Some(format!("rt_{SECRET}_1"))
+        )]
+    );
+    assert_eq!(
+        e.auth.access_token().await.unwrap(),
+        format!("at_{SECRET}_2")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn me_com_401_derruba_a_sessao() {
     let e = env().await;
     e.login().await;
@@ -723,9 +887,10 @@ fn hub_client_recusa_http_fora_do_loopback() {
     assert!(HubClient::new("http://hub.example.com/").is_err());
     assert!(HubClient::new("ftp://127.0.0.1/").is_err());
     assert!(HubClient::new("https://hub.example.com").is_ok());
-    assert!(
+    // Loopback http só vale em build de debug.
+    assert_eq!(
         HubClient::new("http://localhost:8787").is_ok(),
-        "debug: loopback"
+        cfg!(debug_assertions)
     );
 }
 
@@ -787,4 +952,55 @@ fn cofre_real_do_windows() {
     v.clear().unwrap();
     v.clear().unwrap();
     assert_eq!(v.get().unwrap(), None);
+}
+
+/// Cofre cujo `set` pode falhar sob comando (Credential Manager indisponível).
+#[derive(Default)]
+struct FlakyVault {
+    inner: MemoryVault,
+    fail_set: std::sync::atomic::AtomicBool,
+}
+
+impl TokenVault for FlakyVault {
+    fn get(&self) -> cbmp_launcher_lib::error::AppResult<Option<String>> {
+        self.inner.get()
+    }
+    fn set(&self, rt: &str) -> cbmp_launcher_lib::error::AppResult<()> {
+        if self.fail_set.load(Ordering::SeqCst) {
+            return Err(cbmp_launcher_lib::error::AppError::new("vault_error", "x"));
+        }
+        self.inner.set(rt)
+    }
+    fn clear(&self) -> cbmp_launcher_lib::error::AppResult<()> {
+        self.inner.clear()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cofre_falhando_depois_da_rotacao_mantem_a_sessao_desta_execucao() {
+    let e = env().await;
+    let vault = Arc::new(FlakyVault::default());
+    let c = e.clock.clone();
+    let auth = Auth::with_clock(
+        HubClient::new(e.base.as_str()).unwrap(),
+        vault.clone(),
+        Arc::new(move || c.load(Ordering::SeqCst)),
+    );
+    let url = auth.begin_login();
+    e.fake
+        .lock()
+        .unwrap()
+        .codes
+        .insert("lc_cofre".into(), param(&url, "code_challenge"));
+    auth.on_deep_link(&format!(
+        "cbmp://auth?code=lc_cofre&state={}",
+        param(&url, "state")
+    ))
+    .await
+    .unwrap();
+    vault.fail_set.store(true, Ordering::SeqCst);
+    e.clock.store(T0 + ACCESS_TTL, Ordering::SeqCst);
+    // O Hub já girou: o access novo vale nesta execução mesmo sem conseguir gravar o refresh novo.
+    assert_eq!(auth.access_token().await.unwrap(), format!("at_{SECRET}_2"));
+    assert_eq!(auth.me().await.unwrap().discord_id, "123");
 }

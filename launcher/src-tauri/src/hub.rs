@@ -86,6 +86,17 @@ pub struct Tokens {
     pub access_expires_at: i64,
     pub refresh_token: Option<String>,
     pub refresh_expires_at: Option<i64>,
+    /// Hora do Hub (cabeçalho `Date`, unix seconds) quando respondeu. Com ela a validade vira relativa
+    /// (`accessExpiresAt - server_time`), imune a relógio local errado.
+    #[serde(skip)]
+    pub server_time: Option<i64>,
+}
+
+impl Tokens {
+    /// Segundos de validade do access token a partir do recebimento. Sem `Date`, usa o relógio local (`wall_now`).
+    pub fn access_lifetime(&self, wall_now: i64) -> i64 {
+        (self.access_expires_at - self.server_time.unwrap_or(wall_now)).max(0)
+    }
 }
 
 impl fmt::Debug for Tokens {
@@ -98,6 +109,7 @@ impl fmt::Debug for Tokens {
                 &self.refresh_token.as_ref().map(|_| "<oculto>"),
             )
             .field("refresh_expires_at", &self.refresh_expires_at)
+            .field("server_time", &self.server_time)
             .finish()
     }
 }
@@ -251,7 +263,20 @@ impl HubClient {
     }
 
     async fn send<T: DeserializeOwned>(&self, req: reqwest::RequestBuilder) -> AppResult<T> {
+        Ok(self.send_dated(req).await?.0)
+    }
+
+    /// Como `send`, devolvendo também o cabeçalho `Date` da resposta (unix seconds), se válido.
+    async fn send_dated<T: DeserializeOwned>(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> AppResult<(T, Option<i64>)> {
         let resp = req.send().await.map_err(|_| unreachable_err())?;
+        let date = resp
+            .headers()
+            .get(reqwest::header::DATE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_http_date);
         let status = resp.status();
         let body = read_limited(resp, MAX_BODY).await?;
         if !status.is_success() {
@@ -260,7 +285,14 @@ impl HubClient {
                 .map(|b| b.error);
             return Err(map_hub_error(status.as_u16(), code.as_deref()));
         }
-        serde_json::from_slice(&body).map_err(|_| bad_response())
+        let v = serde_json::from_slice(&body).map_err(|_| bad_response())?;
+        Ok((v, date))
+    }
+
+    async fn send_tokens(&self, req: reqwest::RequestBuilder) -> AppResult<Tokens> {
+        let (mut t, date): (Tokens, _) = self.send_dated(req).await?;
+        t.server_time = date;
+        Ok(t)
     }
 
     pub async fn servers(&self) -> AppResult<Vec<ServerListing>> {
@@ -292,7 +324,7 @@ impl HubClient {
     }
 
     pub async fn exchange(&self, code: &str, verifier: &str) -> AppResult<Tokens> {
-        self.send(
+        self.send_tokens(
             self.http
                 .post(self.url("v1/auth/exchange"))
                 .json(&serde_json::json!({ "code": code, "codeVerifier": verifier })),
@@ -301,7 +333,7 @@ impl HubClient {
     }
 
     pub async fn refresh(&self, refresh_token: &str) -> AppResult<Tokens> {
-        self.send(
+        self.send_tokens(
             self.http
                 .post(self.url("v1/auth/refresh"))
                 .json(&serde_json::json!({ "refreshToken": refresh_token })),
@@ -328,6 +360,13 @@ impl HubClient {
         let url = avatar_url(&me.discord_id, me.avatar.as_deref()?)?;
         fetch_image_data_url(&self.http, &url, AVATAR_PREFIX).await
     }
+}
+
+/// Cabeçalho HTTP `Date` → unix seconds.
+pub fn parse_http_date(v: &str) -> Option<i64> {
+    let t = httpdate::parse_http_date(v).ok()?;
+    let secs = t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    i64::try_from(secs).ok()
 }
 
 /// URL do avatar no CDN do Discord, só com id numérico e hash no formato do Discord.
@@ -465,12 +504,35 @@ mod tests {
     }
 
     #[test]
+    fn validade_relativa_usa_a_hora_do_hub() {
+        let mut t = Tokens {
+            access_token: "a".into(),
+            access_expires_at: 10_900,
+            refresh_token: None,
+            refresh_expires_at: None,
+            server_time: Some(10_000),
+        };
+        // Relógio local 2 h adiantado ou atrasado não muda a validade.
+        assert_eq!(t.access_lifetime(10_000 + 7200), 900);
+        assert_eq!(t.access_lifetime(10_000 - 7200), 900);
+        t.server_time = None;
+        assert_eq!(t.access_lifetime(10_100), 800);
+        assert_eq!(t.access_lifetime(20_000), 0);
+        assert_eq!(
+            parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784_111_777)
+        );
+        assert_eq!(parse_http_date("ontem"), None);
+    }
+
+    #[test]
     fn tokens_nao_aparecem_no_debug() {
         let t = Tokens {
             access_token: "at_SEGREDO".into(),
             access_expires_at: 1,
             refresh_token: Some("rt_SEGREDO".into()),
             refresh_expires_at: Some(2),
+            server_time: None,
         };
         assert!(!format!("{t:?}").contains("SEGREDO"));
     }

@@ -35,6 +35,14 @@ describe("stores de login", () => {
     expect(get(auth)).toMatchObject({ status: "anonymous", error: { code: "session_expired" } });
   });
 
+  it("Hub fora ou cofre com erro não manda para o login: fica indisponível (sessão preservada)", async () => {
+    for (const code of ["hub_unreachable", "vault_error", "hub_busy"]) {
+      invoke.mockRejectedValueOnce({ code, message: "m" });
+      await refreshProfile();
+      expect(get(auth)).toMatchObject({ status: "unavailable", error: { code } });
+    }
+  });
+
   it("login: aguarda o navegador; falha ao abrir volta com erro; cancelar volta ao início", async () => {
     invoke.mockResolvedValueOnce(undefined);
     await startLogin();
