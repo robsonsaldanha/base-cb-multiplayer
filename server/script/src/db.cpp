@@ -401,7 +401,9 @@ struct DbPoolState {
     if (!ensure(w, err)) return DbResult::fail(err);
     busy.fetch_add(1);
     const auto t0 = Clock::now();
-    const auto left = std::max(milliseconds(1), std::chrono::duration_cast<milliseconds>(j.deadline - t0));
+    // ceil, não duration_cast (que trunca): o backend recebe o prazo inteiro que resta e, se o honrar à risca, só
+    // devolve "tempo esgotado" depois do deadline do pedido, nunca até 1 ms antes.
+    const auto left = std::max(milliseconds(1), std::chrono::ceil<milliseconds>(j.deadline - t0));
     DbResult r;
     try {
       r = w.conn->run(j.req, opt.limits, left);

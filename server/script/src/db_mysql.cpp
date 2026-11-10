@@ -201,8 +201,16 @@ class MysqlConn final : public DbConnection {
 
   // Erro num statement em cache: tira do cache (pode ter ficado inválido) e devolve a falha.
   DbResult stmtFail(const std::string& sql, MYSQL_STMT* st) {
-    const unsigned code = mysql_stmt_errno(st);
-    const std::string msg = mysql_stmt_error(st);
+    unsigned code = mysql_stmt_errno(st);
+    std::string msg = mysql_stmt_error(st);
+    // Erro que chega durante mysql_stmt_fetch (leitura sem buffer: o servidor manda as colunas e só depois o erro,
+    // como o 1969 do max_statement_time do MariaDB num SELECT SLEEP) fica só no MYSQL da conexão: a libmariadb não o
+    // copia para o statement, que fica com errno 0 e mensagem vazia.
+    if (code == 0 && my_ != nullptr) {
+      code = mysql_errno(my_);
+      msg = mysql_error(my_);
+    }
+    if (msg.empty()) msg = "erro desconhecido do banco";
     if (my_ != nullptr) {
       auto it = cache_.find(sql);
       if (it != cache_.end() && it->second.st == st) {

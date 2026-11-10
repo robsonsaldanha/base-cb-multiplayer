@@ -156,8 +156,16 @@ TEST_CASE("db pool: requests run on the pool threads, results come back and metr
 }
 
 TEST_CASE("db pool: a request that outlived its deadline in the queue fails without running") {
+  // O pedido A ocupa a única conexão por 300 ms e então falha por tempo (servidor que estoura o prazo, como o MariaDB
+  // com max_statement_time por sessão). Antes o falso esperava exatamente o prazo de A, mas B, enviado depois, tem
+  // deadline um pouco maior (o intervalo entre os dois submit): no Linux, com espera precisa, B ainda tinha tempo
+  // quando saía da fila e rodava. Com A estourando bem além dos 150 ms, B certamente venceu na fila.
   auto db = rowsDb();
-  db->blockOn = "SLEEP";
+  db->handler = [h = db->handler](const DbRequest& r) {
+    if (r.sql.find("SLEEP") == std::string::npos) return h(r);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    return DbResult::fail("tempo esgotado (servidor)", true);
+  };
   DbPool pool(fakeCfg(1, 150), fakeFactory(db), fastPoolOpt());
   Waiter a, b;
   std::string err;

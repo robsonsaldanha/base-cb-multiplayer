@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <deque>
 #include <fstream>
 #include <mutex>
 #include <optional>
@@ -47,7 +48,10 @@ struct ApiEnv {
   mutable std::mutex mu;
   std::vector<std::pair<LogLevel, std::string>> logs;
   std::vector<std::string> audits;
-  std::vector<ScriptToSim> cmds;
+  // deque, não vector: waitCmd devolve ponteiros para dentro de `cmds` e cada drain() seguinte acrescenta; num
+  // vector a realocação invalidaria esses ponteiros (heap-use-after-free pego pelo ASan no CI Linux). push_back em
+  // deque preserva referências aos elementos já guardados.
+  std::deque<ScriptToSim> cmds;
   std::vector<std::string> replies;
   std::atomic<int64_t> unixTime{1'700'000'000};
   HostOptions opt;
@@ -147,6 +151,7 @@ struct ApiEnv {
     host->drainCommands(out);
     for (auto& c : out) cmds.push_back(std::move(c));
   }
+  // O ponteiro devolvido continua válido enquanto o ApiEnv existir (cmds só cresce, e é um deque).
   template <class T, class P>
   const T* waitCmd(P pred) {
     const T* found = nullptr;

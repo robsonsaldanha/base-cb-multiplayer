@@ -1,14 +1,15 @@
 cbmp: libraries poll the interrupt request in long C loops (Lua 5.4.7).
 lstrlib: match() steps, singlematch and %f (weighted by class length), back-references
 (weighted by capture length), %b scan and lmemfind (weighted by needle length) poll every
-4096 work units; string.rep of empty pieces returns "" at once. ltablib: insert/remove/
+4096 work units; string.rep of empty pieces returns "" at once and string.rep builds its
+result by doubling (O(log n) copies, polling between them). ltablib: insert/remove/
 move/concat per iteration and every sort comparison. loslib: os.date per conversion.
 Re-check on upgrade: MatchState, match, singlematch, match_capture, matchbalance, lmemfind,
 prepstate, str_rep; tinsert/tremove/tmove/tconcat/sort_comp; os_date.
 
 --- a/src/lstrlib.c
 +++ b/src/lstrlib.c
-@@ -152,8 +152,8 @@
+@@ -152,22 +152,31 @@
    const char *s = luaL_checklstring(L, 1, &l);
    lua_Integer n = luaL_checkinteger(L, 2);
    const char *sep = luaL_optlstring(L, 3, "", &lsep);
@@ -19,7 +20,36 @@ prepstate, str_rep; tinsert/tremove/tmove/tconcat/sort_comp; os_date.
    else if (l_unlikely(l + lsep < l || l + lsep > MAXSIZE / n))
      return luaL_error(L, "resulting string too large");
    else {
-@@ -361,6 +361,7 @@
+     size_t totallen = (size_t)n * l + (size_t)(n - 1) * lsep;
+     luaL_Buffer b;
+     char *p = luaL_buffinitsize(L, &b, totallen);
+-    while (n-- > 1) {  /* first n-1 copies (followed by separator) */
+-      memcpy(p, s, l * sizeof(char)); p += l;
+-      if (lsep > 0) {  /* empty 'memcpy' is not that cheap */
+-        memcpy(p, sep, lsep * sizeof(char));
+-        p += lsep;
++    /* cbmp patch: the result is a prefix of ('s' .. 'sep') repeated 'n'
++    ** times, so write one period and keep doubling the filled prefix:
++    ** O(log n) 'memcpy' calls instead of 'n' (one call per byte made
++    ** rep('a', 1 << 25) take ~0.2 s under ASan, with no interrupt poll).
++    ** 'done' stays a multiple of the period until the last partial copy. */
++    size_t done = l;
++    memcpy(p, s, l * sizeof(char));
++    if (n > 1) {
++      memcpy(p + l, sep, lsep * sizeof(char));
++      done += lsep;
++      while (done < totallen) {
++        size_t chunk = (done < totallen - done) ? done : totallen - done;
++        memcpy(p + done, p, chunk * sizeof(char));  /* no overlap: chunk <= done */
++        done += chunk;
++        lua_cbmp_poll(L);
+       }
+     }
+-    memcpy(p, s, l * sizeof(char));  /* last copy (not followed by separator) */
+     luaL_pushresultsize(&b, totallen);
+   }
+   return 1;
+@@ -361,6 +370,7 @@
    const char *p_end;  /* end ('\0') of pattern */
    lua_State *L;
    int matchdepth;  /* control for recursive depth (to avoid C stack overflow) */
@@ -27,7 +57,7 @@ prepstate, str_rep; tinsert/tremove/tmove/tconcat/sort_comp; os_date.
    unsigned char level;  /* total number of captures (finished or unfinished) */
    struct {
      const char *init;
-@@ -373,6 +374,25 @@
+@@ -373,6 +383,25 @@
  static const char *match (MatchState *ms, const char *s, const char *p);
  
  
@@ -53,7 +83,7 @@ prepstate, str_rep; tinsert/tremove/tmove/tconcat/sort_comp; os_date.
  /* maximum recursion depth for 'match' */
  #if !defined(MAXCCALLS)
  #define MAXCCALLS	200
-@@ -469,6 +489,7 @@
+@@ -469,6 +498,7 @@
  
  static int singlematch (MatchState *ms, const char *s, const char *p,
                          const char *ep) {
@@ -61,7 +91,7 @@ prepstate, str_rep; tinsert/tremove/tmove/tconcat/sort_comp; os_date.
    if (s >= ms->src_end)
      return 0;
    else {
-@@ -493,6 +514,7 @@
+@@ -493,6 +523,7 @@
      int e = *(p+1);
      int cont = 1;
      while (++s < ms->src_end) {
@@ -69,7 +99,7 @@ prepstate, str_rep; tinsert/tremove/tmove/tconcat/sort_comp; os_date.
        if (*s == e) {
          if (--cont == 0) return s+1;
        }
-@@ -560,6 +582,7 @@
+@@ -560,6 +591,7 @@
    size_t len;
    l = check_capture(ms, l);
    len = ms->capture[l].len;
@@ -77,7 +107,7 @@ prepstate, str_rep; tinsert/tremove/tmove/tconcat/sort_comp; os_date.
    if ((size_t)(ms->src_end-s) >= len &&
        memcmp(ms->capture[l].init, s, len) == 0)
      return s+len;
-@@ -571,6 +594,7 @@
+@@ -571,6 +603,7 @@
    if (l_unlikely(ms->matchdepth-- == 0))
      luaL_error(ms->L, "pattern too complex");
    init: /* using goto to optimize tail recursion */
@@ -85,7 +115,7 @@ prepstate, str_rep; tinsert/tremove/tmove/tconcat/sort_comp; os_date.
    if (p != ms->p_end) {  /* end of pattern? */
      switch (*p) {
        case '(': {  /* start capture */
-@@ -605,6 +629,7 @@
+@@ -605,6 +638,7 @@
              if (l_unlikely(*p != '['))
                luaL_error(ms->L, "missing '[' after '%%f' in pattern");
              ep = classend(ms, p);  /* points to what is next */
@@ -93,7 +123,7 @@ prepstate, str_rep; tinsert/tremove/tmove/tconcat/sort_comp; os_date.
              previous = (s == ms->src_init) ? '\0' : *(s - 1);
              if (!matchbracketclass(uchar(previous), p, ep - 1) &&
                 matchbracketclass(uchar(*s), p, ep - 1)) {
-@@ -670,12 +695,13 @@
+@@ -670,12 +704,13 @@
  
  
  
@@ -108,7 +138,7 @@ prepstate, str_rep; tinsert/tremove/tmove/tconcat/sort_comp; os_date.
      l2--;  /* 1st char will be checked by 'memchr' */
      l1 = l1-l2;  /* 's2' cannot be found after that */
      while (l1 > 0 && (init = (const char *)memchr(s1, *s2, l1)) != NULL) {
-@@ -686,6 +712,7 @@
+@@ -686,6 +721,7 @@
          l1 -= init-s1;
          s1 = init;
        }
@@ -116,7 +146,7 @@ prepstate, str_rep; tinsert/tremove/tmove/tconcat/sort_comp; os_date.
      }
      return NULL;  /* not found */
    }
-@@ -758,6 +785,7 @@
+@@ -758,6 +794,7 @@
                         const char *s, size_t ls, const char *p, size_t lp) {
    ms->L = L;
    ms->matchdepth = MAXCCALLS;
@@ -124,7 +154,7 @@ prepstate, str_rep; tinsert/tremove/tmove/tconcat/sort_comp; os_date.
    ms->src_init = s;
    ms->src_end = s + ls;
    ms->p_end = p + lp;
-@@ -782,7 +810,7 @@
+@@ -782,7 +819,7 @@
    /* explicit request or no special characters? */
    if (find && (lua_toboolean(L, 4) || nospecials(p, lp))) {
      /* do a plain search */

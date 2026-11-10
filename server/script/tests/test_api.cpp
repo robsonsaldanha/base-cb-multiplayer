@@ -755,6 +755,39 @@ TEST_CASE("api: chat command replies always fit in an event and admin chat comma
   REQUIRE(audited);
 }
 
+// Regressão do CI Linux/ASan: o teste acima guardava ponteiros de waitCmd e, nas esperas seguintes, drain() acrescentava
+// comandos; com `cmds` num vector a realocação liberava a memória apontada (heap-use-after-free). Aqui a realocação é
+// forçada (centenas de comandos depois do primeiro ponteiro), e o endereço e o conteúdo precisam continuar os mesmos.
+TEST_CASE("api test env: commands returned by waitCmd stay valid while more commands arrive") {
+  ApiEnv env;
+  env.addRes("a", R"(
+    cb.events.on('burst', function(p, data)
+      for i = 1, data.n do cb.events.emit(p.id, data.tag .. i, {i = i}) end
+      cb.log.info('burst ' .. data.tag)
+    end)
+  )");
+  env.boot();
+  env.join(3, "ana");
+  env.event(3, "burst", R"({"n":1,"tag":"first"})");
+  const CmdEmit* first = env.waitCmd<CmdEmit>([](const CmdEmit& c) { return c.name == "first1"; });
+  REQUIRE(first);
+  size_t idx = env.cmds.size();
+  for (size_t i = 0; i < env.cmds.size(); ++i)
+    if (std::get_if<CmdEmit>(&env.cmds[i]) == first) idx = i;
+  REQUIRE(idx < env.cmds.size());
+  const std::string firstJson = first->json;
+  for (int k = 0; k < 4; ++k) {  // cada rodada: 200 comandos novos, drenados aos poucos pelas esperas
+    const std::string tag = "r" + std::to_string(k) + "_";
+    env.event(3, "burst", R"({"n":200,"tag":")" + tag + R"("})");
+    REQUIRE(env.waitCmd<CmdEmit>([&](const CmdEmit& c) { return c.name == tag + "200"; }));
+  }
+  REQUIRE(env.cmds.size() >= idx + 801);
+  REQUIRE(std::get_if<CmdEmit>(&env.cmds[idx]) == first);  // num vector, a realocação mudaria o endereço
+  REQUIRE(first->name == "first1");
+  REQUIRE(first->json == firstJson);
+  REQUIRE(first->target == 3);
+}
+
 TEST_CASE("api: events, leaves and players from another session of the same id are ignored") {
   ApiEnv env;
   env.addRes("a", R"(

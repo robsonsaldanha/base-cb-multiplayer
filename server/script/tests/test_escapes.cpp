@@ -118,6 +118,26 @@ TEST_CASE("table.move keeps standard semantics") {
   REQUIRE(f.isTrue("return not pcall(table.move, {}, -1, math.maxinteger, 1)"));
 }
 
+// string.rep monta o resultado dobrando o trecho já copiado (patch cbmp-i1): mesmo resultado do laço original.
+TEST_CASE("string.rep keeps standard semantics") {
+  Fixture f;
+  REQUIRE(f.isTrue("return ('ab'):rep(3) == 'ababab' and ('ab'):rep(3, ',') == 'ab,ab,ab'"));
+  REQUIRE(f.isTrue("return ('x'):rep(1, ',') == 'x' and ('x'):rep(0) == '' and ('x'):rep(-1, ',') == ''"));
+  REQUIRE(f.isTrue("return (''):rep(3, ',') == ',,' and (''):rep(1, ',') == '' and (''):rep(5) == ''"));
+  REQUIRE(f.isTrue("return ('a'):rep(2, '') == 'aa' and ('\\0'):rep(3) == '\\0\\0\\0'"));
+  // Contra a montagem ingênua, para vários n (potências de 2 e vizinhos) e tamanhos de pedaço/separador.
+  REQUIRE(f.isTrue("for _, s in ipairs({'', 'a', 'abc', ('q'):rep(37)}) do "
+                   "  for _, sep in ipairs({'', '-', 'xy', ('z'):rep(5)}) do "
+                   "    for n = 1, 70 do "
+                   "      local t = {} for i = 1, n do t[i] = s end "
+                   "      if s:rep(n, sep) ~= table.concat(t, sep) then return false end "
+                   "    end "
+                   "  end "
+                   "end return true"));
+  REQUIRE(f.isTrue("local r = ('ab'):rep(1 << 20) return #r == 2 << 20 and r:find('aa', 1, true) == nil and "
+                   "r:find('bb', 1, true) == nil and r:sub(-2) == 'ab'"));
+}
+
 TEST_CASE("collectgarbage allows only count and step") {
   Fixture f;
   REQUIRE(f.isTrue("return type(collectgarbage('count')) == 'number'"));
@@ -130,6 +150,9 @@ TEST_CASE("collectgarbage allows only count and step") {
 TEST_CASE("print is size and rate limited") {
   Fixture f;
   auto t = guarded("print_flood", [&] { return runRaw(*f.r, "for i = 1, 1e4 do print(string.rep('x', 1000)) end"); });
+  std::printf("TIMING %-28s %5lld ms wall %6.0f ms cpu timedOut=%d\n", "print_flood", t.ms, t.cpuMs,
+              t.res.timedOut ? 1 : 0);
+  INFO(t.res.error);
   REQUIRE(t.res.ok);
   REQUIRE(f.warns.size() <= 205);
   REQUIRE(f.warns.size() >= 200);

@@ -169,7 +169,7 @@ TEST_CASE("mysql: CRUD and type mapping (integers, unsigned, float, DECIMAL, dat
   REQUIRE(nul.rows[0][0].type == DbValue::Type::Null);
   REQUIRE(nul.rows[0][1].s == "x");
   auto m = pool.metrics();
-  REQUIRE(m.queries >= 10);
+  REQUIRE(m.queries == 9);  // CREATE, 2 INSERT, SELECT *, UPDATE, SELECT, DELETE, SELECT, SELECT ? (o DROP vem depois)
   REQUIRE(m.connected >= 1);
 }
 
