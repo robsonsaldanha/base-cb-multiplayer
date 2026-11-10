@@ -17,9 +17,10 @@
 // - O ambiente é montado por lista branca numa tabela nova e depois instalado no _G (o _G original é esvaziado e
 //   recebe só a lista branca, para que sol2 e o registro LUA_RIDX_GLOBALS continuem apontando para a mesma tabela).
 //   Ficam: assert error getmetatable ipairs next pairs pcall rawequal rawget rawlen rawset select tonumber
-//   tostring type _VERSION, string (sem dump), table (move reescrito em Lua), math, utf8, coroutine,
-//   os.{time,clock,date}; load/collectgarbage/setmetatable/xpcall/print/require embrulhados. Sem io, debug, package,
-//   dofile, loadfile, warn, string.dump. As bibliotecas originais só continuam no registro (inalcançável sem debug).
+//   tostring type _VERSION, string (sem dump), table (move/insert/remove em Lua, sort sempre com comparador Lua),
+//   math, utf8, coroutine (resume/wrap/close próprios), os.{time,clock,date}; load/collectgarbage/setmetatable/
+//   xpcall/print/require embrulhados. Sem io, debug, package, dofile, loadfile, warn, string.dump. As bibliotecas
+//   originais só continuam no registro (inalcançável sem debug).
 // - load: sempre modo "t"; ambiente = o 4º argumento se não for nil, senão o sandbox (desvio aceito da spec).
 // - Metatable das strings: __index = string do sandbox e __metatable = false (getmetatable("") devolve false).
 // - setmetatable recusa metatables com __gc: finalizadores rodam fora da vigia (em qualquer alocação/no close).
@@ -29,16 +30,27 @@
 // - Memória: alocador por estado conta bytes; acima do teto devolve NULL (Lua lança erro de memória após tentar
 //   coleta de emergência). O teto só vale enquanto código do script roda (dentro de lua_resume); o código do host
 //   (montar estado, traceback, empilhar argumentos) não é limitado, para nunca cair no panic fora de proteção.
-// - Vigia: hook de contagem (a cada kHookCount instruções) + hook de chamada (toda chamada de função, Lua ou C) em
-//   toda thread (lua_newthread herda o hook de quem cria, então corrotinas do script também são vigiadas). O hook não
-//   lê relógio: compara prazos com um relógio grosso atômico atualizado por uma thread própria (CoarseClock).
-//   Aviso único por chamada após warnAfter; após abortAfter o hook lança erro e passa a disparar a cada instrução
-//   enquanto a chamada não termina, de modo que pcall/xpcall/coroutine.resume não conseguem engolir o aborto.
-//   O erro nasce dentro do hook (o Lua desliga hooks ali), então o handler do xpcall rodaria sem vigia: o xpcall do
-//   sandbox pula o handler do script durante o aborto. Lua com patches (vcpkg-overlays/lua): (C1) hooks religados
-//   antes de rodar __close de thread fechada; (I1) match() de padrões chama kInterrupt a cada 4096 passos.
-//   Limite que sobra: uma única chamada C longa sem callback (string.rep gigante, que o teto de memória limita;
-//   GC de emergência perto do teto) só é interrompida quando volta ao Lua. O ScriptHost precisa de supervisor.
+// - Vigia:
+//   * Hook de chamada (LUA_MASKCALL) permanente em toda thread (lua_newthread herda o hook): confere o prazo a cada
+//     chamada de função, Lua ou C, comparando com um relógio grosso atômico (sem ler o relógio do sistema).
+//     Não há hook de contagem permanente: no Lua 5.4 qualquer hook de contagem põe o interpretador em modo "trap"
+//     em toda instrução (~1,8x mais lento em código normal; medido).
+//   * Escalada assíncrona: uma thread por processo (relógio) vê o prazo de aviso/aborto vencido e chama
+//     lua_sethook(contagem 1) na thread Lua em execução (`running`, protegida por runMu). Isso pega laços sem
+//     chamadas e operadores caros (s < t, s == t, s .. s com strings enormes) na instrução seguinte. `running` é
+//     mantido pelo host (resumeThread) e pelos coroutine.resume/wrap/close do sandbox (C, adaptados do lcorolib),
+//     que publicam a corrotina antes de lua_resume/lua_closethread e devolvem a thread chamadora logo depois — sem
+//     código Lua no meio, então o ponteiro nunca fica velho, e a thread publicada está sempre viva (está na pilha
+//     de quem a retomou). Enquanto vencido, o relógio reaplica a escalada a cada tick (cobre troca de thread e corrida
+//     com o próprio hook restaurando a máscara).
+//   * Aviso único por chamada após warnAfter; após abortAfter o hook lança erro e a thread passa a disparar o hook a
+//     cada instrução enquanto a chamada não termina, de modo que pcall/xpcall/coroutine.resume não engolem o aborto.
+//     O erro nasce dentro do hook (o Lua desliga hooks ali), então o xpcall do sandbox pula o handler do script
+//     durante o aborto. Lua com patches (vcpkg-overlays/lua): (C1) hooks religados antes de rodar __close de thread
+//     fechada; (I1) match() de padrões chama kInterrupt a cada 4096 passos.
+//   * Limite que sobra: uma única operação C sem callback (string.rep gigante, comparação de strings enormes, GC de
+//     emergência perto do teto) só é interrompida quando termina. O teto de memória limita o tamanho; o ScriptHost
+//     precisa de supervisor (ver report).
 
 // Funções chamadas a partir de quadros que o Lua atravessa com longjmp (hook, funções C do sandbox) ficam fora de
 // linha: assim o quadro atravessado não tem objetos C++ com destrutor. No MSVC, um longjmp do lua.dll (C)
@@ -52,7 +64,7 @@
 namespace fs = std::filesystem;
 
 // Contrato do patch I1 (vcpkg-overlays/lua/cbmp-i1-match-interrupt.patch): o extra space de cada thread guarda um
-// ponteiro para esta struct (layout C idêntico).
+// ponteiro para esta struct (layout C idêntico) ou NULL.
 struct cbmp_interrupt {
   void (*check)(lua_State* L);
 };
@@ -61,8 +73,8 @@ namespace cbscript {
 
 namespace {
 
-constexpr int kHookCount = 10000;
-constexpr int kHookMask = LUA_MASKCOUNT | LUA_MASKCALL;
+constexpr int kBaseMask = LUA_MASKCALL;                   // normal: só chamadas, sem contagem
+constexpr int kEscalatedMask = LUA_MASKCALL | LUA_MASKCOUNT;  // escalado: contagem 1 (toda instrução)
 constexpr uintmax_t kMaxScriptBytes = uintmax_t{16} << 20;
 constexpr size_t kMaxNameLen = 64;
 constexpr size_t kMaxPrintBytes = size_t{64} << 10;
@@ -82,22 +94,7 @@ int64_t realMs() noexcept {
 }
 
 // Relógio grosso (~1 ms; no Windows, a granularidade do sleep) lido pelo hook sem chamar o relógio do sistema.
-// Uma thread por processo, iniciada no primeiro Resource e nunca encerrada (estado propositalmente "vazado" para não
-// depender da ordem de destruição de estáticos na saída).
 std::atomic<int64_t> g_coarseNow{0};
-
-void startCoarseClock() {
-  static std::once_flag once;
-  std::call_once(once, [] {
-    g_coarseNow.store(realMs(), std::memory_order_relaxed);
-    std::thread([] {
-      for (;;) {
-        g_coarseNow.store(realMs(), std::memory_order_relaxed);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      }
-    }).detach();
-  });
-}
 
 int64_t coarseNow() noexcept { return g_coarseNow.load(std::memory_order_relaxed); }
 
@@ -108,13 +105,19 @@ struct Resource::Shared {
   size_t used = 0;
   size_t limit = 0;
   bool enforce = false;
-  // vigia
+  // vigia (thread de script)
   std::chrono::milliseconds warnAfter{50}, abortAfter{5000};
   std::chrono::steady_clock::time_point start{};
-  int64_t warnAtMs = 0, abortAtMs = 0;  // prazos no relógio grosso
   int depth = 0;
   bool warned = false;
   bool aborting = false;
+  // vigia (compartilhado com a thread do relógio; campos não atômicos só sob runMu)
+  std::mutex runMu;
+  bool active = false;           // chamada externa em andamento
+  lua_State* running = nullptr;  // thread Lua em execução (viva enquanto publicada)
+  int64_t warnAtMs = 0, abortAtMs = 0;
+  bool warnEscalated = false;
+  std::atomic<bool> warnDue{false}, abortDue{false};
   // print
   std::chrono::steady_clock::time_point printWindow{};
   int printCount = 0;
@@ -212,25 +215,28 @@ Shared* sharedOf(lua_State* L) {
 
 void watchHook(lua_State* L, lua_Debug*);
 
+bool overdue(const Shared* s) noexcept {
+  return s->aborting || s->abortDue.load(std::memory_order_acquire) || coarseNow() >= s->abortAtMs;
+}
+
 // Marca o aborto, deixa a thread disparando o hook a cada instrução e lança o erro (longjmp).
 void raiseTimeout(lua_State* L, Shared* s) {
   s->aborting = true;
-  lua_sethook(L, watchHook, kHookMask, 1);
+  lua_sethook(L, watchHook, kEscalatedMask, 1);
   luaL_error(L, "tempo esgotado: execução passou de %d ms (abortada pela vigia)",
              static_cast<int>(s->abortAfter.count()));
 }
 
 void watchHook(lua_State* L, lua_Debug*) {
   Shared* s = sharedOf(L);
-  // Thread que ficou com contagem 1 de um aborto anterior volta ao normal.
-  if (!s->aborting && lua_gethookcount(L) != kHookCount) lua_sethook(L, watchHook, kHookMask, kHookCount);
-  if (s->depth == 0) return;
-  const int64_t now = coarseNow();
-  if (s->aborting || now >= s->abortAtMs) {
+  if (s->depth > 0 && overdue(s)) {
     raiseTimeout(L, s);
     return;
   }
-  if (!s->warned && now >= s->warnAtMs) {
+  // Escalada de aviso (ou resto de um aborto anterior): volta ao hook só de chamadas.
+  if (lua_gethookmask(L) != kBaseMask) lua_sethook(L, watchHook, kBaseMask, 0);
+  if (s->depth > 0 && !s->warned &&
+      (s->warnDue.load(std::memory_order_acquire) || coarseNow() >= s->warnAtMs)) {
     s->warned = true;
     s->warnRunning();
   }
@@ -239,10 +245,169 @@ void watchHook(lua_State* L, lua_Debug*) {
 // Chamado pelo Lua com patch (I1) de dentro de loops C longos (match de padrões). Fora de hook: hooks seguem ligados.
 void interruptCheck(lua_State* L) {
   Shared* s = sharedOf(L);
-  if (s->depth > 0 && (s->aborting || coarseNow() >= s->abortAtMs)) raiseTimeout(L, s);
+  if (s->depth > 0 && overdue(s)) raiseTimeout(L, s);
 }
 
 const cbmp_interrupt kInterrupt{&interruptCheck};
+
+// Resources vivos, percorridos pela thread do relógio. Estado propositalmente "vazado" (nunca destruído): a thread é
+// desanexada e não pode depender da ordem de destruição de estáticos na saída do processo.
+std::mutex& registryMu() {
+  static auto* m = new std::mutex;
+  return *m;
+}
+std::vector<Shared*>& registry() {
+  static auto* v = new std::vector<Shared*>;
+  return *v;
+}
+
+// Uma thread por processo: atualiza o relógio grosso e escala chamadas vencidas. lua_sethook pode ser chamado de
+// fora da thread do Lua (ldebug.c: "can be called asynchronously"); `running` só é lido sob runMu.
+void clockTick() {
+  const int64_t now = realMs();
+  g_coarseNow.store(now, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lk(registryMu());
+  for (Shared* s : registry()) {
+    std::lock_guard<std::mutex> rl(s->runMu);
+    if (!s->active || s->running == nullptr) continue;
+    if (now >= s->abortAtMs) {
+      s->abortDue.store(true, std::memory_order_release);
+      lua_sethook(s->running, watchHook, kEscalatedMask, 1);  // reaplicado a cada tick enquanto vencido
+    } else if (!s->warnEscalated && now >= s->warnAtMs) {
+      s->warnEscalated = true;
+      s->warnDue.store(true, std::memory_order_release);
+      lua_sethook(s->running, watchHook, kEscalatedMask, 1);
+    }
+  }
+}
+
+void startClock() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    g_coarseNow.store(realMs(), std::memory_order_relaxed);
+    std::thread([] {
+      for (;;) {
+        clockTick();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }).detach();
+  });
+}
+
+CBSCRIPT_NOINLINE void setRunning(Shared* s, lua_State* t) noexcept {
+  std::lock_guard<std::mutex> lk(s->runMu);
+  s->running = t;
+}
+
+// --- coroutine.resume/wrap/close do sandbox: adaptados de lcorolib.c (Lua 5.4.7, licença MIT), publicando a thread
+// em execução para a escalada da vigia. Só API do Lua e setRunning (fora de linha) nestes quadros.
+
+lua_State* getco(lua_State* L) {
+  lua_State* co = lua_tothread(L, 1);
+  luaL_argexpected(L, co, 1, "thread");
+  return co;
+}
+
+int auxresume(Shared* s, lua_State* L, lua_State* co, int narg) {
+  if (!lua_checkstack(co, narg)) {
+    lua_pushliteral(L, "too many arguments to resume");
+    return -1;
+  }
+  lua_xmove(L, co, narg);
+  setRunning(s, co);
+  int nres = 0;
+  int status = lua_resume(co, L, narg, &nres);
+  setRunning(s, L);
+  if (status == LUA_OK || status == LUA_YIELD) {
+    if (!lua_checkstack(L, nres + 1)) {
+      lua_pop(co, nres);
+      lua_pushliteral(L, "too many results to resume");
+      return -1;
+    }
+    lua_xmove(co, L, nres);
+    return nres;
+  }
+  lua_xmove(co, L, 1);
+  return -1;
+}
+
+int luaCoResume(lua_State* L) {
+  auto* s = static_cast<Shared*>(lua_touserdata(L, lua_upvalueindex(1)));
+  lua_State* co = getco(L);
+  int r = auxresume(s, L, co, lua_gettop(L) - 1);
+  if (r < 0) {
+    lua_pushboolean(L, 0);
+    lua_insert(L, -2);
+    return 2;
+  }
+  lua_pushboolean(L, 1);
+  lua_insert(L, -(r + 1));
+  return r + 1;
+}
+
+int luaCoAuxWrap(lua_State* L) {
+  lua_State* co = lua_tothread(L, lua_upvalueindex(1));
+  auto* s = static_cast<Shared*>(lua_touserdata(L, lua_upvalueindex(2)));
+  int r = auxresume(s, L, co, lua_gettop(L));
+  if (r < 0) {
+    int stat = lua_status(co);
+    if (stat != LUA_OK && stat != LUA_YIELD) {  // erro dentro da corrotina: fecha as variáveis to-be-closed
+      setRunning(s, co);
+      stat = lua_closethread(co, L);
+      setRunning(s, L);
+      lua_xmove(co, L, 1);
+    }
+    if (stat != LUA_ERRMEM && lua_type(L, -1) == LUA_TSTRING) {
+      luaL_where(L, 1);
+      lua_insert(L, -2);
+      lua_concat(L, 2);
+    }
+    return lua_error(L);
+  }
+  return r;
+}
+
+int luaCoWrap(lua_State* L) {
+  luaL_checktype(L, 1, LUA_TFUNCTION);
+  lua_State* nl = lua_newthread(L);
+  lua_pushvalue(L, 1);
+  lua_xmove(L, nl, 1);
+  lua_pushvalue(L, lua_upvalueindex(1));  // Shared*
+  lua_pushcclosure(L, luaCoAuxWrap, 2);
+  return 1;
+}
+
+int luaCoClose(lua_State* L) {
+  auto* s = static_cast<Shared*>(lua_touserdata(L, lua_upvalueindex(1)));
+  lua_State* co = getco(L);
+  const char* bad = nullptr;
+  if (co == L) {
+    bad = "running";
+  } else {
+    switch (lua_status(co)) {
+      case LUA_YIELD:
+        break;
+      case LUA_OK: {
+        lua_Debug ar;
+        if (lua_getstack(co, 0, &ar)) bad = "normal";  // tem quadros: está retomando outra
+        break;
+      }
+      default:
+        break;  // morta por erro
+    }
+  }
+  if (bad != nullptr) return luaL_error(L, "cannot close a %s coroutine", bad);
+  setRunning(s, co);
+  int status = lua_closethread(co, L);
+  setRunning(s, L);
+  if (status == LUA_OK) {
+    lua_pushboolean(L, 1);
+    return 1;
+  }
+  lua_pushboolean(L, 0);
+  lua_xmove(co, L, 1);
+  return 2;
+}
 
 int luaIsAborting(lua_State* L) {
   lua_pushboolean(L, static_cast<Shared*>(lua_touserdata(L, lua_upvalueindex(1)))->aborting ? 1 : 0);
@@ -259,11 +424,12 @@ int luaPrintSink(lua_State* L) {
 
 // Roda com o _G original (bibliotecas completas) e o transforma no sandbox. Só usa locais: o _G é esvaziado.
 constexpr const char* kSandboxBoot = R"lua(
-local G, printSink, sandboxRequire, isAborting, foldCase = ...
-local pairs, ipairs, next, type, error, select = pairs, ipairs, next, type, error, select
+local G, printSink, sandboxRequire, isAborting, foldCase, coResume, coWrap, coClose = ...
+local pairs, ipairs, next, type, error, select, tonumber = pairs, ipairs, next, type, error, select, tonumber
 local rawget, tostring, concat, lower = rawget, tostring, table.concat, string.lower
 local rawload, rawcg, rawsetmt, getmt, rawxpcall = load, collectgarbage, setmetatable, getmetatable, xpcall
-local tointeger, maxinteger = math.tointeger, math.maxinteger
+local tointeger, maxinteger, ult = math.tointeger, math.maxinteger, math.ult
+local rawsort = table.sort
 
 local function copy(t, keys)
   local r = {}
@@ -283,6 +449,9 @@ env.table = copy(G.table)
 env.math = copy(G.math)
 env.utf8 = copy(G.utf8)
 env.coroutine = copy(G.coroutine)
+env.coroutine.resume = coResume
+env.coroutine.wrap = coWrap
+env.coroutine.close = coClose
 env.os = copy(G.os, {"clock", "date", "time"})
 
 env.load = function(chunk, chunkname, _, e)
@@ -305,17 +474,36 @@ env.setmetatable = function(t, mt)
   return rawsetmt(t, mt)
 end
 
--- table.move em Lua: o laço do C (até 2^63 iterações) não passa pela vigia.
-local function intArg(v, n)
+-- table.move/insert/remove em Lua e sort sempre com comparador em Lua: os laços do C (até 2^63 iterações com
+-- __len gigante; comparações de strings enormes) não passam pela vigia. Mesmas mensagens do C, com a posição de
+-- quem chamou; só tabelas de verdade são aceitas (sem o caso de userdata com metamétodos).
+local function tabArg(v, n, fname)
+  if type(v) ~= "table" then
+    error("bad argument #" .. n .. " to '" .. fname .. "' (table expected, got " ..
+      type(v) .. ")", 3)
+  end
+end
+local function intArg(v, n, fname)
   local i = tointeger(v)
   if i == nil then
-    error("bad argument #" .. n .. " to 'move' (number has no integer representation)", 3)
+    if type(v) == "number" or (type(v) == "string" and tonumber(v) ~= nil) then
+      error("bad argument #" .. n .. " to '" .. fname .. "' (number has no integer representation)", 3)
+    end
+    error("bad argument #" .. n .. " to '" .. fname .. "' (number expected, got " ..
+      type(v) .. ")", 3)
   end
   return i
 end
+local function lenOf(t)
+  local n = tointeger(#t)
+  if n == nil then error("object length is not an integer", 3) end
+  return n
+end
+
 env.table.move = function(a1, f, e, t, a2)
-  if a2 == nil then a2 = a1 end
-  f, e, t = intArg(f, 2), intArg(e, 3), intArg(t, 4)
+  tabArg(a1, 1, "move")
+  if a2 == nil then a2 = a1 else tabArg(a2, 5, "move") end
+  f, e, t = intArg(f, 2, "move"), intArg(e, 3, "move"), intArg(t, 4, "move")
   if e >= f then
     if not (f > 0 or e < maxinteger + f) then error("bad argument #3 to 'move' (too many elements to move)", 2) end
     if t > maxinteger - (e - f) then error("bad argument #4 to 'move' (destination wrap around)", 2) end
@@ -326,6 +514,45 @@ env.table.move = function(a1, f, e, t, a2)
     end
   end
   return a2
+end
+
+env.table.insert = function(t, ...)
+  local nargs = select("#", ...)
+  tabArg(t, 1, "insert")
+  local e = lenOf(t) + 1  -- primeiro vazio
+  if nargs == 1 then
+    t[e] = ...
+  elseif nargs == 2 then
+    local pos, v = ...
+    pos = intArg(pos, 2, "insert")
+    if not ult(pos - 1, e) then error("bad argument #2 to 'insert' (position out of bounds)", 2) end
+    for i = e, pos + 1, -1 do t[i] = t[i - 1] end
+    t[pos] = v
+  else
+    error("wrong number of arguments to 'insert'", 2)
+  end
+end
+
+env.table.remove = function(t, pos)
+  tabArg(t, 1, "remove")
+  local size = lenOf(t)
+  if pos == nil then pos = size else pos = intArg(pos, 2, "remove") end
+  if pos ~= size and not (pos - 1 == size or ult(pos - 1, size)) then
+    error("bad argument #2 to 'remove' (position out of bounds)", 2)
+  end
+  local result = t[pos]
+  while pos < size do
+    t[pos] = t[pos + 1]
+    pos = pos + 1
+  end
+  t[pos] = nil
+  return result
+end
+
+local function defaultLess(a, b) return a < b end
+env.table.sort = function(t, cmp)
+  if cmp == nil then cmp = defaultLess end
+  return rawsort(t, cmp)
 end
 
 env.print = function(...)
@@ -466,7 +693,7 @@ Resource::Resource(ResourceManifest m, fs::path dir, Limits lim, std::function<v
       dir_(std::move(dir)),
       sh_(std::make_unique<Shared>()),
       lua_(sol::default_at_panic, &luaAlloc, sh_.get()) {
-  startCoarseClock();
+  startClock();
   sh_->limit = lim.memoryBytes;  // só vale com enforce=true (código do script); a montagem abaixo não é limitada
   sh_->warnAfter = lim.warnAfter;
   sh_->abortAfter = lim.abortAfter;
@@ -494,16 +721,28 @@ Resource::Resource(ResourceManifest m, fs::path dir, Limits lim, std::function<v
 #else
   lua_pushboolean(L, 0);
 #endif
-  if (lua_pcall(L, 5, 0, 0) != LUA_OK) {
+  lua_pushlightuserdata(L, sh_.get());
+  lua_pushcclosure(L, luaCoResume, 1);
+  lua_pushlightuserdata(L, sh_.get());
+  lua_pushcclosure(L, luaCoWrap, 1);
+  lua_pushlightuserdata(L, sh_.get());
+  lua_pushcclosure(L, luaCoClose, 1);
+  if (lua_pcall(L, 8, 0, 0) != LUA_OK) {
     std::string e = lua_tostring(L, -1);
     lua_pop(L, 1);
     throw std::runtime_error("cbscript: falha ao montar o sandbox: " + e);
   }
   lua_gc(L, LUA_GCCOLLECT);
-  lua_sethook(L, watchHook, kHookMask, kHookCount);
+  lua_sethook(L, watchHook, kBaseMask, 0);
+  std::lock_guard<std::mutex> lk(registryMu());
+  registry().push_back(sh_.get());
 }
 
-Resource::~Resource() = default;
+Resource::~Resource() {
+  std::lock_guard<std::mutex> lk(registryMu());
+  auto& r = registry();
+  r.erase(std::remove(r.begin(), r.end(), sh_.get()), r.end());
+}
 
 sol::state& Resource::lua() { return lua_; }
 
@@ -637,13 +876,23 @@ Resource::CallResult Resource::resumeThread(lua_State* co, int nargs, sol::threa
   Shared& s = *sh_;
   lua_State* L = lua_.lua_state();
   const bool outer = s.depth == 0;
-  if (outer) {
-    s.start = std::chrono::steady_clock::now();
-    const int64_t startMs = realMs();
-    s.warnAtMs = startMs + s.warnAfter.count();
-    s.abortAtMs = startMs + s.abortAfter.count();
-    s.warned = false;
-    s.aborting = false;
+  lua_State* prevRunning = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(s.runMu);
+    prevRunning = s.running;
+    if (outer) {
+      s.start = std::chrono::steady_clock::now();
+      const int64_t startMs = realMs();
+      s.warnAtMs = startMs + s.warnAfter.count();
+      s.abortAtMs = startMs + s.abortAfter.count();
+      s.warned = false;
+      s.aborting = false;
+      s.warnEscalated = false;
+      s.warnDue.store(false, std::memory_order_relaxed);
+      s.abortDue.store(false, std::memory_order_relaxed);
+      s.active = true;
+    }
+    s.running = co;
   }
   ++s.depth;
   const bool prevEnforce = s.enforce;
@@ -652,6 +901,11 @@ Resource::CallResult Resource::resumeThread(lua_State* co, int nargs, sol::threa
   int st = lua_resume(co, L, nargs, &nres);
   s.enforce = prevEnforce;
   --s.depth;
+  {
+    std::lock_guard<std::mutex> lk(s.runMu);
+    s.running = prevRunning;
+    if (outer) s.active = false;
+  }
 
   EnforceOff off(s);
   CallResult r;

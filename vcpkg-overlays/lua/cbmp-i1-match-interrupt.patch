@@ -1,6 +1,19 @@
-cbmp: periodic host interrupt check in lstrlib match() (pattern backtracking).
-Against Lua 5.4.7. Re-check on upgrade: MatchState, match(), prepstate in lstrlib.c.
+cbmp: periodic host interrupt check in lstrlib match() (pattern backtracking),
+and zeroed extra space for the main thread (lua_newstate) so the check pointer starts NULL.
+Against Lua 5.4.7. Re-check on upgrade: MatchState, match(), prepstate in lstrlib.c; lua_newstate in lstate.c.
 
+--- a/src/lstate.c
++++ b/src/lstate.c
+@@ -369,6 +369,9 @@
+   g->currentwhite = bitmask(WHITE0BIT);
+   L->marked = luaC_white(g);
+   preinit_thread(L, g);
++  /* cbmp patch (I1): the main thread's extra space starts zeroed (no interrupt
++  ** callback); new threads copy it from the main thread. */
++  memset(lua_getextraspace(L), 0, LUA_EXTRASPACE);
+   g->allgc = obj2gco(L);  /* by now, only object is the main thread */
+   L->next = NULL;
+   incnny(L);  /* main thread is always non yieldable */
 --- a/src/lstrlib.c
 +++ b/src/lstrlib.c
 @@ -361,6 +361,7 @@

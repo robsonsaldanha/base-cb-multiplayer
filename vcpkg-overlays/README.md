@@ -11,7 +11,7 @@ baseline `ec48c11e…`) com dois patches pequenos usados pela vigia dos scripts 
 | Patch | Arquivo | O quê |
 |---|---|---|
 | `cbmp-c1-closethread-allowhook.patch` | `lstate.c` (`luaE_resetthread`) | Religa hooks (`allowhook = 1`) antes de rodar `__close` pendentes de uma thread fechada (`coroutine.close`, erro em `coroutine.wrap`). Sem isso, uma corrotina morta por erro lançado no hook roda `__close` sem vigia. |
-| `cbmp-i1-match-interrupt.patch` | `lstrlib.c` (`match`) | A cada 4096 passos do casamento de padrões chama `check(L)` de um `struct cbmp_interrupt*` guardado no extra space da thread (ou nada, se NULL). O host lança erro ali quando o prazo passou. |
+| `cbmp-i1-match-interrupt.patch` | `lstrlib.c` (`match`) | A cada 4096 passos do casamento de padrões chama `check(L)` de um `struct cbmp_interrupt*` guardado no extra space da thread (ou nada, se NULL). O host lança erro ali quando o prazo passou. Também zera o extra space da thread principal em `lua_newstate` (`lstate.c`), para estados que não são do sandbox lerem NULL. |
 
 `port-version` 100 só marca que é o port local.
 

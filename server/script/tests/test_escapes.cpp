@@ -224,3 +224,109 @@ TEST_CASE("resource dir itself reached through a junction still works") {
   std::error_code ec;
   fs::remove(via, ec);
 }
+
+// ---- Fix round 2 ----
+
+TEST_CASE("escape R2: table.insert/remove with a huge __len are aborted") {
+  const Case cases[] = {
+      {"r2_tinsert_len",
+       "local t = setmetatable({}, {__len = function() return math.maxinteger - 1 end}) "
+       "table.insert(t, 1, 'x') return 'done'"},
+      {"r2_tremove_len",
+       "local t = setmetatable({}, {__len = function() return math.maxinteger - 1 end}) "
+       "table.remove(t, 1) return 'done'"},
+  };
+  for (const auto& c : cases) expectAbort(c);
+}
+
+TEST_CASE("escape R2: table.sort without comparator over huge strings is aborted") {
+  expectAbort({"r2_sort_strcmp",
+               "local big = ('a'):rep(1 << 22) local t = {} for i = 1, 3000 do t[i] = big end "
+               "table.sort(t) return 'done'"},
+              shortLimits(size_t{256} << 20));
+}
+
+TEST_CASE("escape R2: loops of one expensive operator are aborted") {
+  Limits big = shortLimits(size_t{256} << 20);
+  const Case cases[] = {
+      {"r2_lt_loop", "local s = ('a'):rep(1 << 25) local t = ('a'):rep(1 << 25) while true do local _ = s < t end"},
+      {"r2_eq_loop", "local s = ('a'):rep(1 << 25) local t = ('a'):rep(1 << 25) while true do local _ = s == t end"},
+      {"r2_concat_op_loop", "local s = ('a'):rep(1 << 24) while true do local _ = s .. s end"},
+      {"r2_empty_loop", "while true do end"},
+      {"r2_loop_after_child_abort",
+       "local co = coroutine.create(function() while true do end end) coroutine.resume(co) while true do end"},
+      {"r2_loop_in_wrapped_child", "coroutine.wrap(function() local s = ('a'):rep(1 << 25) "
+                                   "local t = ('a'):rep(1 << 25) while true do local _ = s < t end end)()"},
+  };
+  for (const auto& c : cases) expectAbort(c, big);
+}
+
+TEST_CASE("table.insert and table.remove keep standard semantics") {
+  Fixture f;
+  REQUIRE(f.isTrue("local t = {1, 2} table.insert(t, 3) return #t == 3 and t[3] == 3"));
+  REQUIRE(f.isTrue("local t = {1, 2} table.insert(t, 1, 0) return t[1] == 0 and t[2] == 1 and t[3] == 2"));
+  REQUIRE(f.isTrue("local t = {1, 2} table.insert(t, 3, 9) return t[3] == 9"));
+  REQUIRE(f.isTrue("local ok, e = pcall(table.insert, {1}, 5, 9) "
+                   "return not ok and e:find('position out of bounds', 1, true) ~= nil"));
+  REQUIRE(f.isTrue("local ok, e = pcall(table.insert, {}, 1, 2, 3) "
+                   "return not ok and e:find(\"wrong number of arguments to 'insert'\", 1, true) ~= nil"));
+  REQUIRE(f.isTrue("local ok, e = pcall(table.insert, nil, 1) "
+                   "return not ok and e:find(\"bad argument #1 to 'insert' (table expected\", 1, true) ~= nil"));
+  REQUIRE(f.isTrue("local t = {1, 2, 3} return table.remove(t) == 3 and #t == 2"));
+  REQUIRE(f.isTrue("local t = {1, 2, 3} return table.remove(t, 1) == 1 and t[1] == 2 and t[2] == 3 and t[3] == nil"));
+  REQUIRE(f.isTrue("local t = {} return table.remove(t) == nil and table.remove(t, 0) == nil"));
+  REQUIRE(f.isTrue("local t = {1} return table.remove(t, 2) == nil and t[1] == 1"));
+  REQUIRE(f.isTrue("local ok, e = pcall(table.remove, {1}, 5) "
+                   "return not ok and e:find('position out of bounds', 1, true) ~= nil"));
+  REQUIRE(f.isTrue("local log = {} local t = setmetatable({}, {__len = function() return 2 end, "
+                   "__index = function(_, k) return k * 10 end, "
+                   "__newindex = function(t, k, v) log[#log + 1] = k rawset(t, k, v) end}) "
+                   "table.insert(t, 1, 'x') return table.concat(log, ',') == '3,2,1'"));
+}
+
+TEST_CASE("table.sort keeps standard behaviour") {
+  Fixture f;
+  REQUIRE(f.isTrue("local t = {3, 1, 2} table.sort(t) return t[1] == 1 and t[2] == 2 and t[3] == 3"));
+  REQUIRE(f.isTrue("local t = {3, 1, 2} table.sort(t, function(a, b) return a > b end) return t[1] == 3"));
+  REQUIRE(f.isTrue("local t = {'b', 'a'} table.sort(t) return t[1] == 'a'"));
+  REQUIRE(f.isTrue("return not pcall(table.sort, {1, 'x', 2})"));
+  REQUIRE(f.isTrue("return not pcall(table.sort, {1, 2}, 5)"));
+  REQUIRE(f.isTrue("local t = {} for i = 1, 100 do t[i] = i % 7 end "
+                   "local ok, e = pcall(table.sort, t, function(a, b) return true end) "
+                   "return not ok and e:find('invalid order function', 1, true) ~= nil"));
+}
+
+TEST_CASE("table.move type-checks its table arguments like C") {
+  Fixture f;
+  REQUIRE(f.isTrue("local ok, e = pcall(table.move, 1, 1, 2, 1) "
+                   "return not ok and e:find(\"bad argument #1 to 'move' (table expected, got number)\", 1, true) ~= nil"));
+  REQUIRE(f.isTrue("local ok, e = pcall(table.move, 1, 5, 1, 1) "
+                   "return not ok and e:find(\"bad argument #1 to 'move' (table expected, got number)\", 1, true) ~= nil"));
+  REQUIRE(f.isTrue("local ok, e = pcall(table.move, {}, 1, 2, 1, 'x') "
+                   "return not ok and e:find(\"bad argument #5 to 'move' (table expected, got string)\", 1, true) ~= nil"));
+  REQUIRE(f.isTrue("return table.move({1, 2}, '1', '2', 3)[4] == 2"));
+}
+
+TEST_CASE("coroutine library keeps standard behaviour") {
+  Fixture f;
+  REQUIRE(f.isTrue("local co = coroutine.create(function(a) local b = coroutine.yield(a + 1) return b * 2 end) "
+                   "local ok1, v1 = coroutine.resume(co, 1) local ok2, v2 = coroutine.resume(co, 10) "
+                   "return ok1 and v1 == 2 and ok2 and v2 == 20 and coroutine.status(co) == 'dead'"));
+  REQUIRE(f.isTrue("local ok, e = coroutine.resume(coroutine.create(function() error('x') end)) "
+                   "return not ok and e:find('x') ~= nil"));
+  REQUIRE(f.isTrue("local co = coroutine.create(function() end) coroutine.resume(co) "
+                   "local ok, e = coroutine.resume(co) return not ok and e == 'cannot resume dead coroutine'"));
+  REQUIRE(f.isTrue("return not pcall(coroutine.resume, 1)"));
+  REQUIRE(f.isTrue("local g = coroutine.wrap(function() coroutine.yield(1) coroutine.yield(2) end) "
+                   "return g() == 1 and g() == 2"));
+  REQUIRE(f.isTrue("local ok, e = pcall(coroutine.wrap(function() error('boom') end)) "
+                   "return not ok and e:find('boom') ~= nil"));
+  REQUIRE(f.isTrue("local closed = false local co = coroutine.create(function() "
+                   "local x <close> = setmetatable({}, {__close = function() closed = true end}) coroutine.yield() end) "
+                   "coroutine.resume(co) return coroutine.close(co) == true and closed"));
+  REQUIRE(f.isTrue("return not pcall(coroutine.close, coroutine.running())"));
+  REQUIRE(f.isTrue("local A local B = coroutine.create(function() return pcall(coroutine.close, A) end) "
+                   "A = coroutine.create(function() return coroutine.resume(B) end) "
+                   "local ok1, ok2, pok, perr = coroutine.resume(A) "
+                   "return ok1 and ok2 and not pok and perr:find('normal') ~= nil"));
+}
