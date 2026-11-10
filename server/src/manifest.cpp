@@ -1,12 +1,13 @@
 #include "cbserver/manifest.hpp"
 
+#include <cbmp/safe_path.hpp>
+
 #include <sodium.h>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <fstream>
-#include <regex>
 #include <set>
 #include <stdexcept>
 
@@ -42,20 +43,7 @@ bool isWhitelisted(const std::string& ext, bool inUi) {
   return kAlways.count(ext) > 0;
 }
 
-// ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ sem segmentos "." ou "..".
-bool safePath(const std::string& rel) {
-  static const std::regex re("^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$");
-  if (!std::regex_match(rel, re)) return false;
-  size_t start = 0;
-  while (start <= rel.size()) {
-    size_t end = rel.find('/', start);
-    if (end == std::string::npos) end = rel.size();
-    std::string seg = rel.substr(start, end - start);
-    if (seg == "." || seg == "..") return false;
-    start = end + 1;
-  }
-  return true;
-}
+bool safePath(const std::string& rel) { return cbmp::safeRelPath(rel); }
 
 std::string hashFile(const fs::path& p, uint64_t& size) {
   std::ifstream f(p, std::ios::binary);

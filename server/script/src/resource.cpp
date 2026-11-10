@@ -1,0 +1,603 @@
+#include "cbscript/resource.hpp"
+
+#include <cbmp/safe_path.hpp>
+
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <stdexcept>
+#include <string_view>
+
+// Sandbox (decisões; ver também .superpowers/sdd/sub3/task-2-report.md):
+// - O ambiente é montado por lista branca numa tabela nova e depois instalado no _G (o _G original é esvaziado e
+//   recebe só a lista branca, para que sol2 e o registro LUA_RIDX_GLOBALS continuem apontando para a mesma tabela).
+//   Ficam: assert error getmetatable ipairs next pairs pcall rawequal rawget rawlen rawset select tonumber
+//   tostring type _VERSION, string (sem dump), table, math, utf8, coroutine, os.{time,clock,date};
+//   load/collectgarbage/setmetatable/xpcall/print embrulhados; require próprio. Sem io, debug, package, dofile, loadfile,
+//   warn, string.dump. As bibliotecas originais só continuam no registro (inalcançável sem debug).
+// - load: sempre modo "t"; ambiente = o 4º argumento se não for nil, senão o sandbox.
+// - Metatable das strings: __index = string do sandbox e __metatable = false (getmetatable("") devolve false).
+// - setmetatable recusa metatables com __gc: finalizadores rodam fora da vigia (em qualquer alocação/no close).
+// - collectgarbage: só "count", "collect", "step", "isrunning".
+// - print: vai para o callback `warn` como "[<resource>] print: ...".
+// - Memória: alocador por estado conta bytes; acima do teto devolve NULL (Lua lança erro de memória após tentar
+//   coleta de emergência). O teto só vale enquanto código do script roda (dentro de lua_resume); o código do host
+//   (montar estado, traceback, empilhar argumentos) não é limitado, para nunca cair no panic fora de proteção.
+// - Vigia: hook de contagem (a cada kHookCount instruções) em toda thread (lua_newthread herda o hook de quem cria,
+//   então corrotinas do script também são vigiadas). Aviso único por chamada após warnAfter; após abortAfter o hook
+//   lança erro e passa a disparar a cada instrução enquanto a chamada não termina, de modo que pcall/xpcall/
+//   coroutine.resume não conseguem engolir o aborto. O erro nasce dentro do hook (o Lua desliga hooks ali), então
+//   o handler do xpcall rodaria sem vigia: o xpcall do sandbox pula o handler do script durante o aborto.
+//   Funções C longas (string.rep enorme, padrões patológicos em
+//   string.find/gsub) não são interrompíveis pelo hook; o teto de memória limita a maioria. Perto do teto, um
+//   script que gera muito lixo faz o GC de emergência rodar a cada alocação (lento, mas a vigia aborta).
+
+// Funções chamadas a partir de quadros que o Lua atravessa com longjmp (hook, funções C do sandbox) ficam fora de
+// linha: assim o quadro atravessado não tem objetos C++ com destrutor. No MSVC, um longjmp do lua.dll (C)
+// atravessando um quadro C++ com estado de EH derrubou o processo (0xC0000409/0xC0000374) — visto no require.
+#if defined(_MSC_VER)
+#define CBSCRIPT_NOINLINE __declspec(noinline)
+#else
+#define CBSCRIPT_NOINLINE __attribute__((noinline))
+#endif
+
+namespace fs = std::filesystem;
+
+namespace cbscript {
+
+namespace {
+
+constexpr int kHookCount = 10000;
+constexpr uintmax_t kMaxScriptBytes = uintmax_t{16} << 20;
+constexpr size_t kMaxNameLen = 64;
+char kLoadingSentinel;  // endereço usado como light userdata no cache do require
+
+std::string u8(const fs::path& p) {
+  auto s = p.generic_u8string();
+  return std::string(s.begin(), s.end());
+}
+
+fs::path fromU8(std::string_view s) { return fs::path(std::u8string(s.begin(), s.end())); }
+
+}  // namespace
+
+struct Resource::Shared {
+  // alocador
+  size_t used = 0;
+  size_t limit = 0;
+  bool enforce = false;
+  // vigia
+  std::chrono::milliseconds warnAfter{50}, abortAfter{5000};
+  std::chrono::steady_clock::time_point start{};
+  int depth = 0;
+  bool warned = false;
+  bool aborting = false;
+  // saída
+  std::string name;
+  std::function<void(std::string)> warn;
+
+  CBSCRIPT_NOINLINE void emit(std::string msg) noexcept {
+    if (!warn) return;
+    try {
+      warn(std::move(msg));
+    } catch (...) {
+    }
+  }
+  CBSCRIPT_NOINLINE void warnRunning() noexcept {
+    try {
+      emit("[" + name + "] vigia: execução passou de " + std::to_string(warnAfter.count()) +
+           " ms e continua rodando (aborto em " + std::to_string(abortAfter.count()) + " ms)");
+    } catch (...) {
+    }
+  }
+  CBSCRIPT_NOINLINE void warnSlow(long long ms) noexcept {
+    try {
+      emit("[" + name + "] vigia: execução levou " + std::to_string(ms) + " ms (aviso a partir de " +
+           std::to_string(warnAfter.count()) + " ms)");
+    } catch (...) {
+    }
+  }
+  CBSCRIPT_NOINLINE void printLine(const char* p, size_t n) noexcept {
+    try {
+      emit("[" + name + "] print: " + std::string(p, n));
+    } catch (...) {
+    }
+  }
+};
+
+namespace {
+
+using Shared = Resource::Shared;
+
+struct EnforceOff {
+  Shared& s;
+  bool prev;
+  explicit EnforceOff(Shared& sh) : s(sh), prev(sh.enforce) { s.enforce = false; }
+  ~EnforceOff() { s.enforce = prev; }
+  EnforceOff(const EnforceOff&) = delete;
+  EnforceOff& operator=(const EnforceOff&) = delete;
+};
+
+void* luaAlloc(void* ud, void* ptr, size_t osize, size_t nsize) {
+  auto* s = static_cast<Shared*>(ud);
+  if (ptr == nullptr) osize = 0;  // osize codifica o tipo do objeto quando ptr é NULL
+  if (nsize == 0) {
+    std::free(ptr);
+    s->used -= osize;
+    return nullptr;
+  }
+  if (s->enforce && nsize > osize && (s->used >= s->limit || nsize - osize > s->limit - s->used)) return nullptr;
+  void* p = std::realloc(ptr, nsize);
+  if (p == nullptr) return nullptr;
+  s->used = s->used - osize + nsize;
+  return p;
+}
+
+Shared* sharedOf(lua_State* L) {
+  void* ud = nullptr;
+  lua_getallocf(L, &ud);
+  return static_cast<Shared*>(ud);
+}
+
+void watchHook(lua_State* L, lua_Debug*) {
+  Shared* s = sharedOf(L);
+  // Thread que ficou com contagem 1 de um aborto anterior volta ao normal.
+  if (!s->aborting && lua_gethookcount(L) != kHookCount) lua_sethook(L, watchHook, LUA_MASKCOUNT, kHookCount);
+  if (s->depth == 0) return;
+  auto elapsed = std::chrono::steady_clock::now() - s->start;
+  if (s->aborting || elapsed >= s->abortAfter) {
+    s->aborting = true;
+    lua_sethook(L, watchHook, LUA_MASKCOUNT, 1);
+    luaL_error(L, "tempo esgotado: execução passou de %d ms (abortada pela vigia)",
+               static_cast<int>(s->abortAfter.count()));
+    return;
+  }
+  if (!s->warned && elapsed >= s->warnAfter) {
+    s->warned = true;
+    s->warnRunning();
+  }
+}
+
+int luaIsAborting(lua_State* L) {
+  lua_pushboolean(L, static_cast<Shared*>(lua_touserdata(L, lua_upvalueindex(1)))->aborting ? 1 : 0);
+  return 1;
+}
+
+int luaPrintSink(lua_State* L) {
+  auto* s = static_cast<Shared*>(lua_touserdata(L, lua_upvalueindex(1)));
+  size_t n = 0;
+  const char* p = luaL_checklstring(L, 1, &n);
+  s->printLine(p, n);
+  return 0;
+}
+
+// Roda com o _G original (bibliotecas completas) e o transforma no sandbox. Só usa locais: o _G é esvaziado.
+constexpr const char* kSandboxBoot = R"lua(
+local G, printSink, sandboxRequire, isAborting = ...
+local pairs, ipairs, next, type, error, select = pairs, ipairs, next, type, error, select
+local rawget, tostring, concat = rawget, tostring, table.concat
+local rawload, rawcg, rawsetmt, getmt, rawxpcall = load, collectgarbage, setmetatable, getmetatable, xpcall
+
+local function copy(t, keys)
+  local r = {}
+  if keys then
+    for _, k in ipairs(keys) do r[k] = t[k] end
+  else
+    for k, v in pairs(t) do r[k] = v end
+  end
+  return r
+end
+
+local env = copy(G, {"assert", "error", "getmetatable", "ipairs", "next", "pairs", "pcall", "rawequal", "rawget",
+  "rawlen", "rawset", "select", "tonumber", "tostring", "type", "xpcall", "_VERSION"})
+env.string = copy(G.string)
+env.string.dump = nil
+env.table = copy(G.table)
+env.math = copy(G.math)
+env.utf8 = copy(G.utf8)
+env.coroutine = copy(G.coroutine)
+env.os = copy(G.os, {"clock", "date", "time"})
+
+env.load = function(chunk, chunkname, _, e)
+  if e == nil then e = G end
+  return rawload(chunk, chunkname, "t", e)
+end
+
+local gcAllowed = {count = true, collect = true, step = true, isrunning = true}
+env.collectgarbage = function(opt, ...)
+  if opt == nil then opt = "collect" end
+  if not gcAllowed[opt] then
+    error("collectgarbage: opção não permitida no sandbox: " .. tostring(opt), 2)
+  end
+  return rawcg(opt, ...)
+end
+
+env.setmetatable = function(t, mt)
+  if type(mt) == "table" and rawget(mt, "__gc") ~= nil then
+    error("setmetatable: __gc não é permitido no sandbox", 2)
+  end
+  return rawsetmt(t, mt)
+end
+
+env.print = function(...)
+  local n = select("#", ...)
+  local t = {...}
+  for i = 1, n do t[i] = tostring(t[i]) end
+  printSink(concat(t, "\t", 1, n))
+end
+
+-- O erro de aborto nasce dentro do hook, onde o Lua desliga os hooks; o handler do xpcall rodaria sem vigia.
+-- Durante o aborto o handler do script é pulado.
+env.xpcall = function(f, msgh, ...)
+  return rawxpcall(f, function(e)
+    if isAborting() then return e end
+    return msgh(e)
+  end, ...)
+end
+
+env.require = sandboxRequire
+
+local smt = getmt("")
+smt.__index = env.string
+smt.__metatable = false
+
+for k in next, G do G[k] = nil end
+for k, v in next, env do G[k] = v end
+G._G = G
+)lua";
+
+// "util.mod" → "server/util/mod.lua"; vazio se o nome não for seguro.
+std::string moduleRel(std::string_view name) {
+  if (name.empty() || name.size() > 128) return {};
+  std::string p;
+  for (char c : name) {
+    if (c == '.')
+      p += '/';
+    else if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')
+      p += c;
+    else
+      return {};
+  }
+  std::string rel = "server/" + p + ".lua";
+  return cbmp::safeRelPath(rel) ? rel : std::string{};
+}
+
+bool isScriptPath(const std::string& rel) {
+  return rel.size() > 11 && rel.starts_with("server/") && rel.ends_with(".lua") && cbmp::safeRelPath(rel);
+}
+
+}  // namespace
+
+// Parte C++ do require, isolada num quadro próprio: aqui só há operações protegidas (luaL_loadbufferx) ou sem
+// limite de memória, então nenhum longjmp do Lua atravessa objetos C++ vivos. Empilha o chunk ou a mensagem de erro.
+CBSCRIPT_NOINLINE int prepareModule(Resource* self, lua_State* L) {
+  EnforceOff off(*self->sh_);
+  size_t n = 0;
+  const char* name = lua_tolstring(L, 1, &n);
+  std::string rel = moduleRel(std::string_view(name, n));
+  if (rel.empty()) {
+    std::string msg = "require: nome de módulo inválido '" + std::string(name, n) +
+                      "' (use só A-Z a-z 0-9 _ e '.' como separador de pasta)";
+    lua_pushlstring(L, msg.data(), msg.size());
+    return LUA_ERRRUN;
+  }
+  std::string err;
+  int st = self->loadFile(L, rel, err);
+  if (st != LUA_OK) {
+    std::string msg = "require: módulo '" + std::string(name, n) + "': " + err;
+    lua_pushlstring(L, msg.data(), msg.size());
+  }
+  return st;
+}
+
+// upvalue 1 = Resource*, upvalue 2 = tabela de cache (nome → valor do módulo | sentinela "carregando").
+int luaRequire(lua_State* L) {
+  auto* self = static_cast<Resource*>(lua_touserdata(L, lua_upvalueindex(1)));
+  if (lua_type(L, 1) != LUA_TSTRING) return luaL_error(L, "require: o nome do módulo deve ser texto");
+  lua_settop(L, 1);
+  lua_pushvalue(L, 1);
+  lua_rawget(L, lua_upvalueindex(2));
+  if (!lua_isnil(L, -1)) {
+    if (lua_touserdata(L, -1) == &kLoadingSentinel)
+      return luaL_error(L, "require: dependência circular no módulo '%s'", lua_tostring(L, 1));
+    return 1;
+  }
+  lua_pop(L, 1);
+
+  int st = prepareModule(self, L);
+  if (st != LUA_OK) return lua_error(L);
+
+  lua_pushvalue(L, 1);
+  lua_pushlightuserdata(L, &kLoadingSentinel);
+  lua_rawset(L, lua_upvalueindex(2));
+  lua_pushvalue(L, 1);  // o módulo recebe o próprio nome em `...`
+  if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+    lua_pushvalue(L, 1);
+    lua_pushnil(L);
+    lua_rawset(L, lua_upvalueindex(2));
+    return lua_error(L);
+  }
+  if (lua_isnil(L, -1)) {
+    lua_pop(L, 1);
+    lua_pushboolean(L, 1);
+  }
+  lua_pushvalue(L, 1);
+  lua_pushvalue(L, -2);
+  lua_rawset(L, lua_upvalueindex(2));
+  return 1;
+}
+
+Resource::Resource(ResourceManifest m, fs::path dir, Limits lim, std::function<void(std::string)> warn)
+    : manifest_(std::move(m)),
+      dir_(std::move(dir)),
+      sh_(std::make_unique<Shared>()),
+      lua_(sol::default_at_panic, &luaAlloc, sh_.get()) {
+  sh_->limit = lim.memoryBytes;  // só vale com enforce=true (código do script); a montagem abaixo não é limitada
+  sh_->warnAfter = lim.warnAfter;
+  sh_->abortAfter = lim.abortAfter;
+  sh_->name = manifest_.name;
+  sh_->warn = std::move(warn);
+
+  lua_.open_libraries(sol::lib::base, sol::lib::string, sol::lib::table, sol::lib::math, sol::lib::utf8,
+                      sol::lib::coroutine, sol::lib::os);
+  lua_State* L = lua_.lua_state();
+  if (luaL_loadbufferx(L, kSandboxBoot, std::strlen(kSandboxBoot), "=cbscript_sandbox", "t") != LUA_OK)
+    throw std::runtime_error(std::string("cbscript: sandbox não compila: ") + lua_tostring(L, -1));
+  lua_pushglobaltable(L);
+  lua_pushlightuserdata(L, sh_.get());
+  lua_pushcclosure(L, luaPrintSink, 1);
+  lua_pushlightuserdata(L, this);
+  lua_newtable(L);  // cache do require
+  lua_pushcclosure(L, luaRequire, 2);
+  lua_pushlightuserdata(L, sh_.get());
+  lua_pushcclosure(L, luaIsAborting, 1);
+  if (lua_pcall(L, 4, 0, 0) != LUA_OK) {
+    std::string e = lua_tostring(L, -1);
+    lua_pop(L, 1);
+    throw std::runtime_error("cbscript: falha ao montar o sandbox: " + e);
+  }
+  lua_gc(L, LUA_GCCOLLECT);
+  lua_sethook(L, watchHook, LUA_MASKCOUNT, kHookCount);
+}
+
+Resource::~Resource() = default;
+
+sol::state& Resource::lua() { return lua_; }
+
+size_t Resource::memoryUsed() const { return sh_->used; }
+
+int Resource::loadFile(lua_State* L, const std::string& rel, std::string& err) {
+  if (!cbmp::safeRelPath(rel)) {
+    err = "caminho não permitido: " + rel;
+    return LUA_ERRFILE;
+  }
+  fs::path p = dir_ / fromU8(rel);
+  std::error_code ec;
+  auto st = fs::symlink_status(p, ec);
+  if (ec || !fs::is_regular_file(st)) {
+    err = fs::is_symlink(st) ? "links simbólicos não são permitidos: " + rel : "arquivo não encontrado: " + rel;
+    return LUA_ERRFILE;
+  }
+  auto size = fs::file_size(p, ec);
+  if (ec || size > kMaxScriptBytes) {
+    err = "arquivo grande demais ou ilegível: " + rel;
+    return LUA_ERRFILE;
+  }
+  std::string code(static_cast<size_t>(size), char{0}); //' ');
+  std::ifstream f(p, std::ios::binary);
+  if (!f || (size > 0 && !f.read(code.data(), static_cast<std::streamsize>(size)))) {
+    err = "não foi possível ler: " + rel;
+    return LUA_ERRFILE;
+  }
+  std::string chunk = "@" + manifest_.name + "/" + rel;
+  int r = luaL_loadbufferx(L, code.data(), code.size(), chunk.c_str(), "t");
+  if (r != LUA_OK) {
+    const char* m = lua_tostring(L, -1);
+    err = m ? m : "erro ao compilar";
+    lua_pop(L, 1);
+  }
+  return r;
+}
+
+bool Resource::runMain(std::string& err) {
+  lua_State* L = lua_.lua_state();
+  sol::object last;
+  for (const auto& rel : manifest_.serverScripts) {
+    std::string e;
+    int st;
+    {
+      EnforceOff off(*sh_);
+      st = loadFile(L, rel, e);
+    }
+    if (st != LUA_OK) {
+      err = "[" + manifest_.name + "] erro ao carregar " + rel + ": " + e;
+      return false;
+    }
+    sol::protected_function fn(L, -1);
+    lua_pop(L, 1);
+    CallResult r = call(fn);
+    if (!r.ok) {
+      err = r.error;
+      return false;
+    }
+    if (r.yielded) {
+      err = "[" + manifest_.name + "] " + rel + ": o script principal não pode ceder (coroutine.yield) no nível de cima";
+      return false;
+    }
+    last = r.value;
+  }
+  exports_ = last;
+  return true;
+}
+
+Resource::CallResult Resource::call(const sol::reference& fn, std::span<const sol::object> args) {
+  lua_State* L = lua_.lua_state();
+  CallResult r;
+  lua_State* co = nullptr;
+  sol::thread th;
+  {
+    EnforceOff off(*sh_);
+    co = lua_newthread(L);
+    th = sol::thread(L, -1);
+    lua_pop(L, 1);
+    if (!lua_checkstack(co, static_cast<int>(args.size()) + 1)) {
+      r.error = "[" + manifest_.name + "] argumentos demais";
+      return r;
+    }
+    fn.push(co);
+    for (const auto& a : args) a.push(co);
+  }
+  return resumeThread(co, static_cast<int>(args.size()), std::move(th));
+}
+
+Resource::CallResult Resource::resume(const sol::thread& co, std::span<const sol::object> args) {
+  CallResult r;
+  lua_State* c = co.valid() ? co.thread_state() : nullptr;
+  if (c == nullptr || lua_status(c) != LUA_YIELD) {
+    r.error = "[" + manifest_.name + "] a corrotina não está suspensa";
+    return r;
+  }
+  {
+    EnforceOff off(*sh_);
+    lua_settop(c, 0);
+    if (!lua_checkstack(c, static_cast<int>(args.size()))) {
+      r.error = "[" + manifest_.name + "] argumentos demais";
+      return r;
+    }
+    for (const auto& a : args) a.push(c);
+  }
+  return resumeThread(c, static_cast<int>(args.size()), co);
+}
+
+Resource::CallResult Resource::resumeThread(lua_State* co, int nargs, sol::thread th) {
+  Shared& s = *sh_;
+  lua_State* L = lua_.lua_state();
+  const bool outer = s.depth == 0;
+  if (outer) {
+    s.start = std::chrono::steady_clock::now();
+    s.warned = false;
+    s.aborting = false;
+  }
+  ++s.depth;
+  const bool prevEnforce = s.enforce;
+  s.enforce = true;
+  int nres = 0;
+  int st = lua_resume(co, L, nargs, &nres);
+  s.enforce = prevEnforce;
+  --s.depth;
+
+  EnforceOff off(s);
+  CallResult r;
+  r.timedOut = s.aborting;
+  if ((st == LUA_OK || st == LUA_YIELD) && !s.aborting) {
+    r.ok = true;
+    r.yielded = st == LUA_YIELD;
+    if (nres > 0) {
+      lua_pushvalue(co, -nres);
+      lua_xmove(co, L, 1);
+      r.value = sol::object(L, -1);
+      lua_pop(L, 1);
+    }
+    lua_pop(co, nres);
+    if (r.yielded) r.thread = std::move(th);
+  } else {
+    std::string msg;
+    if (s.aborting) {
+      msg = "tempo esgotado: execução passou de " + std::to_string(s.abortAfter.count()) +
+            " ms e foi abortada pela vigia";
+    } else {
+      int t = lua_type(co, -1);
+      if (t == LUA_TSTRING || t == LUA_TNUMBER) msg = lua_tostring(co, -1);
+      else msg = std::string("erro não textual (") + lua_typename(co, t) + ")";
+      if (st == LUA_ERRMEM || msg.find("not enough memory") != std::string::npos)
+        msg = "memória esgotada (limite " + std::to_string(s.limit >> 20) + " MiB): " + msg;
+    }
+    msg = "[" + manifest_.name + "] " + msg;
+    luaL_traceback(L, co, msg.c_str(), 0);
+    r.error = lua_tostring(L, -1);
+    lua_pop(L, 1);
+  }
+  if (outer) {
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - s.start);
+    if (!s.warned && ms >= s.warnAfter) {
+      s.warned = true;
+      s.warnSlow(static_cast<long long>(ms.count()));
+    }
+    s.aborting = false;
+  }
+  return r;
+}
+
+ResourceManifest loadManifest(const fs::path& dir) {
+  const std::string where = u8(dir);
+  auto fail = [&](const std::string& why) {
+    return std::runtime_error("resource.json inválido em '" + where + "': " + why);
+  };
+  std::ifstream f(dir / "resource.json", std::ios::binary);
+  if (!f) throw std::runtime_error("resource.json não encontrado em '" + where + "'");
+  nlohmann::json j;
+  try {
+    j = nlohmann::json::parse(f);
+  } catch (const std::exception& e) {
+    throw fail(std::string("JSON malformado: ") + e.what());
+  }
+  if (!j.is_object()) throw fail("o conteúdo deve ser um objeto JSON");
+
+  auto validName = [](const std::string& n) { return n.size() <= kMaxNameLen && cbmp::safeSegment(n); };
+  auto stringArray = [&](const char* key) {
+    std::vector<std::string> out;
+    if (!j.contains(key)) return out;
+    const auto& a = j[key];
+    if (!a.is_array()) throw fail(std::string("'") + key + "' deve ser uma lista de textos");
+    for (const auto& v : a) {
+      if (!v.is_string()) throw fail(std::string("'") + key + "' deve ser uma lista de textos");
+      out.push_back(v.get<std::string>());
+    }
+    return out;
+  };
+
+  ResourceManifest m;
+  if (!j.contains("name") || !j["name"].is_string()) throw fail("falta 'name' (texto)");
+  m.name = j["name"].get<std::string>();
+  if (!validName(m.name))
+    throw fail("nome de resource inválido '" + m.name + "' (use só A-Z a-z 0-9 . _ -, até 64 caracteres)");
+  if (!j.contains("version") || !j["version"].is_string() || j["version"].get<std::string>().empty())
+    throw fail("falta 'version' (texto)");
+  m.version = j["version"].get<std::string>();
+
+  m.serverScripts = stringArray("server");
+  for (const auto& s : m.serverScripts)
+    if (!isScriptPath(s)) throw fail("script de servidor inválido '" + s + "' (precisa ser server/....lua seguro)");
+  m.dependencies = stringArray("dependencies");
+  for (const auto& d : m.dependencies)
+    if (!validName(d)) throw fail("dependência com nome inválido '" + d + "'");
+  if (j.contains("config")) m.config = j["config"];
+
+  if (j.contains("permissions")) {
+    const auto& p = j["permissions"];
+    if (!p.is_object()) throw fail("'permissions' deve ser um objeto");
+    if (p.contains("db")) {
+      if (!p["db"].is_boolean()) throw fail("'permissions.db' deve ser true/false");
+      m.db = p["db"].get<bool>();
+    }
+    if (p.contains("http")) {
+      if (!p["http"].is_array()) throw fail("'permissions.http' deve ser uma lista de domínios");
+      for (const auto& h : p["http"]) {
+        if (!h.is_string()) throw fail("'permissions.http' deve ser uma lista de domínios");
+        std::string host = h.get<std::string>();
+        bool ok = !host.empty() && host.size() <= 253 && host.front() != '.' && host.back() != '.' &&
+                  host.front() != '-';
+        for (char& c : host) {
+          if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+          if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '-')) ok = false;
+        }
+        if (!ok) throw fail("domínio inválido em 'permissions.http': '" + h.get<std::string>() + "' (só o host)");
+        m.httpAllow.push_back(std::move(host));
+      }
+    }
+  }
+  return m;
+}
+
+}  // namespace cbscript
