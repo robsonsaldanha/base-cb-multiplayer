@@ -42,5 +42,5 @@ node tools/dev-env.mjs --run                     # Hub local + cb-server de test
 ```
 
 Workflows: `launcher` (testes, e2e e os dois instaladores, oficial e "Teste local", como artefatos) e `release`
-(manual: assina e publica `launcher-vX.Y.Z` ou `mod-pN-vX.Y.Z`; exige o secret `CBMP_UPDATE_KEY` e recusa a chave
-de desenvolvimento). Roteiro dos testes manuais: `docs/TESTES-MANUAIS-SUB4.md`.
+(manual: assina e publica `launcher-vX.Y.Z` ou `mod-pN-vX.Y.Z`; só a partir da `main`, no environment `release` com o
+secret `CBMP_UPDATE_KEY`; recusa a chave de desenvolvimento). Roteiro dos testes manuais: `docs/TESTES-MANUAIS-SUB4.md`.

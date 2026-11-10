@@ -5,8 +5,11 @@ name: release
 #   kind=mod      → tag mod-pN-vX.Y.Z: cbmp-mod-pN-vX.Y.Z.zip + .zip.sig (comentário confiável exato
 #                   "cbmp-mod protocol=N version=X.Y.Z sha256=<hex>") + .zip.sha256. O zip vem do artefato "cbmp-mod"
 #                   de outra execução de workflow (mod_run_id), gerado pelo build do mod (subprojeto 5).
-# A chave privada só existe no secret CBMP_UPDATE_KEY (formato do Tauri; senha em CBMP_UPDATE_KEY_PASSWORD, opcional)
-# e só chega aos passos que assinam. Recusa assinar enquanto keys/update.pub for a chave de desenvolvimento
+# A chave privada só existe no secret CBMP_UPDATE_KEY (formato do Tauri; senha em CBMP_UPDATE_KEY_PASSWORD, opcional),
+# guardado como secret do ENVIRONMENT "release" (restrito à branch main, com revisores; nunca secret do repositório),
+# e só chega aos passos que assinam. O job só roda a partir de refs/heads/main.
+# kind=mod só assina o artefato de uma execução confiável: deste repositório, do workflow MOD_WORKFLOW, disparada por
+# push/workflow_dispatch na main e concluída com sucesso (nunca pull_request). Recusa assinar enquanto keys/update.pub for a chave de desenvolvimento
 # (key id BDCB478091E91629). Tudo é conferido com a chave pública embutida, como o launcher confere, antes de publicar.
 on:
   workflow_dispatch:
@@ -30,6 +33,11 @@ on:
         required: false
         type: string
         default: ''
+      dry_run:
+        description: 'Ensaio: faz tudo (inclusive assinar e conferir) mas não cria a tag nem o Release'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -43,6 +51,8 @@ jobs:
   release:
     runs-on: windows-2025
     timeout-minutes: 60
+    # Secrets de assinatura só existem neste environment (regras de proteção: só main, revisores obrigatórios).
+    environment: release
     permissions:
       contents: write # criar a tag e o Release
       actions: read # baixar o artefato do mod de outra execução
@@ -52,11 +62,19 @@ jobs:
       VERSION: ${{ inputs.version }}
       PROTOCOL: ${{ inputs.protocol }}
       MOD_RUN_ID: ${{ inputs.mod_run_id }}
+      DRY_RUN: ${{ inputs.dry_run }}
       GH_TOKEN: ${{ github.token }}
+      # Único workflow cujo artefato "cbmp-mod" pode ser assinado (o build do mod, subprojeto 5).
+      MOD_WORKFLOW: .github/workflows/mod.yml
     defaults:
       run:
         shell: bash
     steps:
+      # Antes de tudo: release só a partir da main (o environment também restringe; aqui falha mesmo sem a regra).
+      - name: Exigir a main
+        run: |
+          [[ "$GITHUB_REF" == refs/heads/main ]] || { echo "release só a partir de refs/heads/main (veio de '$GITHUB_REF')"; exit 1; }
+
       - uses: actions/checkout@v4
 
       - name: Conferir entradas e tag
@@ -145,13 +163,37 @@ jobs:
             --installer "../../$dst" --sig "../../$dst.sig" --version "$VERSION"
 
       # ------------------------------------------------------------------------------------------------------ mod
+      # Proveniência: só assina o artefato de uma execução confiável. Falha fechado em qualquer campo diferente.
+      - name: Conferir a execução do mod
+        if: env.KIND == 'mod'
+        run: |
+          set -euo pipefail
+          # Um campo por linha (nenhum deles pode conter quebra de linha); ausente vira "-".
+          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$MOD_RUN_ID" \
+            --jq '[.repository.full_name, .head_repository.full_name, .path, .event, .head_branch, .status, .conclusion, .head_sha] | .[] | (. // "-") | tostring') \
+            || { echo "execução $MOD_RUN_ID não encontrada neste repositório"; exit 1; }
+          mapfile -t f <<<"$run"
+          [[ ${#f[@]} -eq 8 ]] || { echo "resposta inesperada da API para a execução $MOD_RUN_ID"; exit 1; }
+          repo=${f[0]} head_repo=${f[1]} path=${f[2]} event=${f[3]} branch=${f[4]} status=${f[5]} conclusion=${f[6]} sha=${f[7]}
+          ok=1
+          [[ "$repo" == "$GITHUB_REPOSITORY" ]] || { echo "repositório da execução: '$repo'"; ok=0; }
+          [[ "$head_repo" == "$GITHUB_REPOSITORY" ]] || { echo "código da execução veio de '$head_repo' (fork?)"; ok=0; }
+          [[ "$path" == "$MOD_WORKFLOW" ]] || { echo "workflow da execução: '$path' (esperado $MOD_WORKFLOW)"; ok=0; }
+          [[ "$event" == push || "$event" == workflow_dispatch ]] || { echo "evento da execução: '$event' (só push/workflow_dispatch)"; ok=0; }
+          [[ "$branch" == main ]] || { echo "branch da execução: '$branch' (só main)"; ok=0; }
+          [[ "$status" == completed && "$conclusion" == success ]] || { echo "execução não concluída com sucesso: $status/$conclusion"; ok=0; }
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "head_sha inválido: '$sha'"; ok=0; }
+          [[ $ok == 1 ]] || { echo "recusado: o artefato da execução $MOD_RUN_ID não é de origem confiável"; exit 1; }
+          echo "MOD_HEAD_SHA=$sha" >> "$GITHUB_ENV"
+          echo "execução $MOD_RUN_ID confiável: $path, $event em main, commit $sha"
+
       - name: Baixar o zip do mod
         if: env.KIND == 'mod'
         uses: actions/download-artifact@v4
         with:
           name: cbmp-mod
           path: mod-in
-          run-id: ${{ inputs.mod_run_id }}
+          run-id: ${{ env.MOD_RUN_ID }}
           github-token: ${{ github.token }}
 
       - name: Assinar e conferir o mod
@@ -182,6 +224,11 @@ jobs:
           if [[ "$KIND" == launcher ]]; then
             notes="CB Multiplayer $VERSION (instalador NSIS, Windows x64). Assinado para o updater do launcher."
           else
-            notes="Mod do cliente $VERSION para o protocolo $PROTOCOL. Assinado; o launcher instala pelo Hub."
+            notes="Mod do cliente $VERSION para o protocolo $PROTOCOL. Assinado; o launcher instala pelo Hub. Build: execução $MOD_RUN_ID, commit $MOD_HEAD_SHA."
+          fi
+          if [[ "$DRY_RUN" == true ]]; then
+            echo "dry_run: tudo conferido; nenhuma tag nem Release criados ($TAG)"
+            echo "notas: $notes"
+            exit 0
           fi
           gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "$TAG" --notes "$notes" --latest=false

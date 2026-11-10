@@ -25,7 +25,9 @@ das tasks).
   decidir se admins de jogo devem ter uma lista separada da do painel. Dono: sub5.
 - **Mod real e a entrega pelo launcher** (sub4 entregou só o canal): o launcher instala o mod por `protocol` a partir
   do Hub (`mod-pN-vX.Y.Z`, assinado). Falta o mod em si e um build que publique o zip como artefato `cbmp-mod` (um
-  único `.zip`) para o `release.yml` (`kind=mod`, `mod_run_id`) assinar e publicar. Enquanto não houver mod com
+  único `.zip`) para o `release.yml` (`kind=mod`, `mod_run_id`) assinar e publicar. Esse build tem de ser
+  `.github/workflows/mod.yml` e o artefato usado tem de vir de um `push`/`workflow_dispatch` na `main` concluído com
+  sucesso: o `release.yml` recusa qualquer outra execução (`MOD_WORKFLOW`, `launcher/README.md`). Enquanto não houver mod com
   `protocol` compatível, o launcher fica em "Modo simular".
 - **Contrato do `connect.json` para o mod** (escrito pelo launcher em `<dados>\run\connect.json`, `launcher/README.md`):
   `{host, port, ticket, serverId, contentDir, protocol, contentReadOnly: true}`, UTF-8, DACL só do usuário. O mod lê,

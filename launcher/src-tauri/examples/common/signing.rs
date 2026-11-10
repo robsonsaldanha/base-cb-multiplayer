@@ -149,7 +149,8 @@ pub fn verify_launcher(
         .map_err(|_| {
             format!("assinatura do instalador não confere com a chave pública ou não é da versão {version}")
         })?;
-    // O launcher só exige `version:`; aqui também que ela seja exatamente a pedida (sem `v`).
+    // O launcher só exige `version:`; aqui também que ela seja exatamente a pedida (sem `v`). A assinatura é conferida
+    // de novo só porque `verify_launcher_package` não devolve o comentário confiável; é o mesmo par chave/arquivo.
     let comment = cbmp_launcher_lib::modpkg::verify_minisign(installer, sig_b64.trim(), pubkey)
         .map_err(|_| "assinatura do instalador não confere")?;
     if !comment

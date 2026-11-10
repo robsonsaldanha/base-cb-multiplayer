@@ -153,8 +153,8 @@ Um único par Ed25519 (minisign, formato do Tauri) assina o launcher e o mod.
 - **Pública**: `src-tauri/keys/update.pub` e `plugins.updater.pubkey` no `tauri.conf.json` (mesmo conteúdo). Fica no
   repositório.
 - **Privada**: **nunca** no repositório, em issue, log ou artefato. Só fora do repo, na máquina de quem gerou (com
-  backup seguro), e no secret `CBMP_UPDATE_KEY` do workflow de release (senha, se houver, em
-  `CBMP_UPDATE_KEY_PASSWORD`).
+  backup seguro), e no secret `CBMP_UPDATE_KEY` do environment `release` (senha, se houver, em
+  `CBMP_UPDATE_KEY_PASSWORD`; nunca como secret do repositório, veja "Chaves" abaixo).
 
 > **A chave atual é de DESENVOLVIMENTO** (key id `BDCB478091E91629`; a privada está em
 > `%USERPROFILE%\.cbmp-devkeys\update.key`, fora do repo). O `release.yml` recusa assinar enquanto ela estiver em
@@ -168,15 +168,21 @@ Gerar o par de produção e trocar (antes do primeiro release real):
    embutida, ou decida embutir a pública dev só no perfil `local-test`.
 2. `npm run tauri -w launcher/ui -- signer generate -w <pasta fora do repo>\cbmp-update.key` (com senha forte).
 3. Copie o conteúdo de `cbmp-update.key.pub` para `src-tauri/keys/update.pub` e para `plugins.updater.pubkey`.
-4. No GitHub (Settings → Secrets and variables → Actions), crie `CBMP_UPDATE_KEY` com o conteúdo de
-   `cbmp-update.key` e `CBMP_UPDATE_KEY_PASSWORD` com a senha.
+4. No GitHub (Settings → Environments), crie o environment `release`: em "Deployment branches and tags" restrinja a
+   `main` (só a branch `main`) e ligue "Required reviewers". Dentro dele (Environment secrets), crie
+   `CBMP_UPDATE_KEY` com o conteúdo de `cbmp-update.key` e `CBMP_UPDATE_KEY_PASSWORD` com a senha. **Nunca** como
+   secret do repositório (Settings → Secrets → Actions): esses ficam legíveis por qualquer workflow de qualquer
+   branch. O `release.yml` só roda no environment `release` e recusa qualquer ref que não seja `refs/heads/main`.
 5. Commit da pública e `cargo test` (o `config_guard` confere as duas cópias). Launchers já instalados com a chave
    antiga não aceitam updates assinados com a nova: a troca tem de acontecer antes de distribuir qualquer instalador.
 
 ## Publicar um release
 
-Workflow manual `.github/workflows/release.yml` (Actions → release → Run workflow), num repositório que o Hub lê
-(`HUB_RELEASES_REPO`, com `HUB_GITHUB_TOKEN` só no servidor do Hub):
+Workflow manual `.github/workflows/release.yml` (Actions → release → Run workflow, **sempre a partir da `main`**),
+num repositório que o Hub lê (`HUB_RELEASES_REPO`, com `HUB_GITHUB_TOKEN` só no servidor do Hub). O job usa o
+environment `release` (passo 4 de "Chaves"), então espera a aprovação de um revisor antes de ter acesso à chave.
+`dry_run=true` faz tudo (testes, build, assinatura e conferência) sem criar a tag nem o Release: use com um par de
+chaves descartável para ensaiar o workflow antes do primeiro release real.
 
 - `kind=launcher`, `version=X.Y.Z`: roda os testes, faz o build oficial com `version` e `createUpdaterArtifacts`
   ligados, assinando com `CBMP_UPDATE_KEY`; confere a assinatura com `keys/update.pub` e `version:X.Y.Z` no comentário
@@ -186,6 +192,11 @@ Workflow manual `.github/workflows/release.yml` (Actions → release → Run wor
   zip, assina com o comentário confiável exato `cbmp-mod protocol=N version=X.Y.Z sha256=<hex>`, confere e cria o
   Release `mod-pN-vX.Y.Z` com `cbmp-mod-pN-vX.Y.Z.zip`, `.zip.sig` e `.zip.sha256`. O build que gera o artefato
   `cbmp-mod` é do subprojeto 5.
+  - **Proveniência (falha fechado):** antes de baixar, o workflow consulta a execução `mod_run_id` na API e só segue
+    se ela for deste repositório (código e fork incluídos), do workflow `.github/workflows/mod.yml`, disparada por
+    `push` ou `workflow_dispatch` (nunca `pull_request`/`pull_request_target`) na `main` e concluída com sucesso. O
+    `head_sha` dessa execução vai para as notas do Release. O workflow do mod (subprojeto 5) tem de ter exatamente
+    esse caminho; se mudar, mude `MOD_WORKFLOW` no `release.yml` junto.
 
 O workflow recusa: chave dev em `keys/update.pub`, secret ausente, versão fora de `X.Y.Z`, tag já existente,
 assinatura que não confere. Assinar e conferir fica em `examples/release_sign.rs` (testado no `cargo test` com pares
