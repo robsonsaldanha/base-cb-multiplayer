@@ -24,6 +24,13 @@ pub fn run() {
         Arc::new(auth::KeyringVault::default()),
     ));
 
+    let content = commands::content_store();
+    {
+        // Sobras de downloads e arquivos do cache fora do índice (queda no meio de uma gravação).
+        let content = content.clone();
+        std::thread::spawn(move || content.startup());
+    }
+
     tauri::Builder::default()
         // Precisa ser o primeiro plugin: a 2ª instância repassa os argumentos à 1ª e sai. Com o recurso
         // `deep-link`, o plugin entrega o `cbmp://` do argv ao `on_open_url` abaixo antes deste callback.
@@ -43,6 +50,8 @@ pub fn run() {
         // Só o seletor de pasta do jogo, chamado pelo Rust; nenhuma permissão `dialog:` é dada à UI.
         .plugin(tauri_plugin_dialog::init())
         .manage(state)
+        // Uma loja de conteúdo só (índice e pastas de download coordenados por ela); usada pelo `play` (Task 7).
+        .manage(content.clone())
         .manage(auth.clone())
         .setup(move |app| {
             // Em dev o instalador não registrou o esquema: registra para o executável atual.

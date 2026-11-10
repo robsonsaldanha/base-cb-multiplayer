@@ -1,10 +1,15 @@
 //! Conteúdo do servidor: manifest → validação → diff com o cache → download paralelo verificado → montagem.
 //!
-//! - Cache global endereçado por conteúdo: `cache\<sha256>` (somente leitura depois de verificado), downloads em
-//!   `cache\tmp\<sha256>.part` com o hash calculado durante a escrita e `rename` no fim; uso de cada hash em
-//!   `cache\index.json` (gravado de forma atômica) para o LRU.
-//! - Montagem: `servers\<serverId>\<resource>\<path>` por hard link (cópia se não der); o que estava montado fica
-//!   registrado em `servers\.mounts\<serverId>.json`.
+//! - Cache global endereçado por conteúdo: `cache\<sha256>` (somente leitura depois de verificado). Cada download
+//!   usa a sua pasta `cache\tmp\<job>\` (`<sha256>.part`, hash calculado durante a escrita, `fsync` e `rename` no
+//!   fim), apagada ao terminar de qualquer jeito: dados parciais de um servidor nunca são retomados para outro.
+//! - `cache\index.json` (gravado de forma atômica) lista só arquivos verificados e já renomeados, com a marca de uso
+//!   para o LRU. Arquivo do cache fora do índice não é confiável: conta como ausente e sai no
+//!   [`ContentStore::startup`].
+//! - Montagem: `servers\<serverId>\<resource>\<path>` por hard link (cópia se não der); o que está montado fica
+//!   registrado em `servers\.mounts\<serverId>.json` (marcado incompleto enquanto a pasta muda).
+//! - Limite do cache: conta cache + `tmp` + cópias montadas; ao despejar um hash, desmonta antes os servidores fora de
+//!   favoritos/recentes que o usam, para o espaço sair de fato do disco.
 //! - Nada aqui é executado nem aberto: só bytes conferidos por hash.
 //!
 //! O manifest vem de um servidor de jogo qualquer (não confiável): tudo é validado antes de qualquer download, e o
@@ -40,7 +45,14 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MANIFEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// Espera antes da 2ª tentativa; dobra a cada falha.
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+/// Abaixo desta média (depois da carência) a tentativa é abandonada e repetida: servidor que pinga 1 byte a cada
+/// 29 s não prende a entrada para sempre.
+const MIN_RATE_BYTES_PER_SEC: u64 = 16 * 1024;
+const SLOW_GRACE: Duration = Duration::from_secs(60);
 const MAX_NAME: usize = 64;
+/// Segmento e caminho curtos o bastante para `servers\<id>\<resource>\<caminho>` ficar abaixo do MAX_PATH do jogo.
+const MAX_SEGMENT: usize = 100;
+const MAX_PATH_LEN: usize = 180;
 const TMP_DIR: &str = "tmp";
 const INDEX_FILE: &str = "index.json";
 const MOUNTS_DIR: &str = ".mounts";
@@ -111,10 +123,19 @@ pub struct Progress {
     pub current: String,
 }
 
-/// Texto vindo do servidor dentro de mensagem: curto e entre aspas (a UI mostra sempre como texto).
+/// Texto vindo do servidor dentro de mensagem: curto, entre aspas e só ASCII visível (controle, bidi e o resto viram
+/// `\u{…}`; a UI mostra sempre como texto).
 fn quoted(s: &str) -> String {
-    let short: String = s.chars().take(MAX_NAME + 16).collect();
-    format!("\"{short}\"")
+    let mut out = String::from("\"");
+    for c in s.chars().take(MAX_NAME + 16) {
+        if c.is_ascii_graphic() || c == ' ' {
+            out.push(c);
+        } else {
+            out.extend(c.escape_unicode());
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn invalid(resource: &str, what: impl std::fmt::Display) -> AppError {
@@ -158,7 +179,7 @@ fn cancelled() -> AppError {
 /// `[A-Za-z0-9._-]`, não vazio, diferente de `.`/`..` (mesma regra de `cbmp::safeSegment`). Além disso recusa o
 /// que o Windows trataria de outro jeito: ponto no fim (o Windows o remove) e nomes de dispositivo (`CON`, `NUL`…).
 fn safe_segment(s: &str) -> bool {
-    if s.is_empty() || s == "." || s == ".." || s.ends_with('.') {
+    if s.is_empty() || s.len() > MAX_SEGMENT || s == "." || s == ".." || s.ends_with('.') {
         return false;
     }
     if !s
@@ -182,9 +203,10 @@ pub fn valid_resource_name(s: &str) -> bool {
     s.len() <= MAX_NAME && safe_segment(s)
 }
 
-/// Caminho relativo `seg(/seg)*` com segmentos seguros: sem `..`, `\`, `:`, absoluto ou segmento vazio.
+/// Caminho relativo `seg(/seg)*` com segmentos seguros: sem `..`, `\`, `:`, absoluto ou segmento vazio; no máximo
+/// 180 caracteres (100 por segmento).
 pub fn safe_rel_path(rel: &str) -> bool {
-    !rel.is_empty() && rel.split('/').all(safe_segment)
+    !rel.is_empty() && rel.len() <= MAX_PATH_LEN && rel.split('/').all(safe_segment)
 }
 
 /// Id do servidor vira nome de pasta: segmento seguro que não começa com ponto (`.mounts` é nosso).
@@ -392,6 +414,8 @@ pub async fn fetch_manifest(base: &Url) -> AppResult<Manifest> {
 
 // ----- índice de uso (LRU) -----
 
+/// Só hashes verificados e já renomeados para o cache: ter entrada aqui é o que torna um arquivo do cache confiável
+/// (depois disso basta conferir o tamanho).
 #[derive(Default, Serialize, Deserialize)]
 struct Index {
     /// sha256 → marca de uso (ms desde a época, estritamente crescente entre chamadas).
@@ -405,6 +429,14 @@ struct IndexState {
 }
 
 impl IndexState {
+    fn new(root: &Path) -> Self {
+        Self {
+            path: root.join(INDEX_FILE),
+            loaded: None,
+            last_tick: 0,
+        }
+    }
+
     fn get(&mut self) -> &mut Index {
         let path = &self.path;
         self.loaded.get_or_insert_with(|| {
@@ -415,7 +447,12 @@ impl IndexState {
         })
     }
 
-    fn touch<'a>(&mut self, hashes: impl IntoIterator<Item = &'a str>) -> AppResult<()> {
+    fn contains(&mut self, sha: &str) -> bool {
+        self.get().used.contains_key(sha)
+    }
+
+    /// Marca uso (e inclui no índice). Falha ao gravar só vai para o log: não derruba a entrada no servidor.
+    fn touch<'a>(&mut self, hashes: impl IntoIterator<Item = &'a str>) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -427,25 +464,49 @@ impl IndexState {
         for h in hashes {
             idx.used.insert(h.to_string(), tick);
         }
-        self.save()
+        self.save_logged();
     }
 
-    fn save(&mut self) -> AppResult<()> {
+    fn save_logged(&mut self) {
         let body = serde_json::to_vec(self.get()).expect("índice serializável");
-        write_atomic(&self.path, &body)
+        if let Err(e) = write_atomic(&self.path, &body) {
+            log::warn!("índice do cache não gravado: {}", e.code);
+        }
     }
 }
 
+/// Grava em `<arquivo>.tmp` com `fsync` e troca pelo `rename`.
 fn write_atomic(path: &Path, body: &[u8]) -> AppResult<()> {
+    use std::io::Write as _;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| AppError::io(dir, &e))?;
     }
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, body).map_err(|e| AppError::io(&tmp, &e))?;
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(body)?;
+        f.sync_all()
+    };
+    write().map_err(|e| AppError::io(&tmp, &e))?;
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         AppError::io(path, &e)
-    })
+    })?;
+    if let Some(dir) = path.parent() {
+        sync_dir(dir);
+    }
+    Ok(())
+}
+
+/// `fsync` da pasta depois de um `rename`, onde o sistema permite. No Windows não há como abrir pasta pela std; lá o
+/// NTFS registra o `rename` no journal e o que importa é o `sync_all` do arquivo antes dele.
+fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
+    if let Ok(f) = std::fs::File::open(dir) {
+        let _ = f.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 fn set_readonly(path: &Path) -> std::io::Result<()> {
@@ -454,7 +515,7 @@ fn set_readonly(path: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, p)
 }
 
-/// Remove arquivo (mesmo somente leitura) ou link; ausente não é erro.
+/// Remove arquivo (mesmo somente leitura), pasta ou link; ausente não é erro.
 fn remove_entry(path: &Path) -> std::io::Result<()> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
@@ -468,6 +529,20 @@ fn remove_entry(path: &Path) -> std::io::Result<()> {
         // Link para pasta (junção) sai com `remove_dir`.
         std::fs::remove_file(path).or_else(|_| std::fs::remove_dir(path))
     }
+}
+
+/// Soma dos arquivos sob `dir` (sem seguir links).
+fn dir_size(dir: &Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    rd.flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => dir_size(&e.path()),
+            Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
 }
 
 // ----- progresso -----
@@ -514,6 +589,35 @@ impl Tracker {
     }
 }
 
+// ----- montagens -----
+
+/// `servers\.mounts\<id>.json`: o que está em `servers\<id>`. `complete = false` enquanto a pasta muda; registro
+/// incompleto (queda no meio) não protege nada e a montagem é refeita/apagada.
+#[derive(Default, Serialize, Deserialize)]
+struct MountRecord {
+    complete: bool,
+    /// "resource/caminho" → arquivo montado.
+    files: HashMap<String, Mounted>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Mounted {
+    sha256: String,
+    size: u64,
+    /// Cópia (não hard link): ocupa espaço próprio e conta no limite do cache.
+    copied: bool,
+}
+
+impl MountRecord {
+    fn copied_bytes(&self) -> u64 {
+        self.files
+            .values()
+            .filter(|f| f.copied)
+            .map(|f| f.size)
+            .sum()
+    }
+}
+
 // ----- loja -----
 
 struct Inner {
@@ -523,44 +627,69 @@ struct Inner {
     retry_delay: Duration,
     hard_links: bool,
     index: Mutex<IndexState>,
+    /// Downloads em andamento: só as pastas deles sobrevivem à varredura de `tmp`.
+    jobs: Mutex<HashSet<String>>,
 }
 
-/// Cache de conteúdo + montagem por servidor. Barato de clonar (estado compartilhado).
+/// Cache de conteúdo + montagem por servidor. Barato de clonar (estado compartilhado): use uma instância só por
+/// processo (o índice e as pastas de download são coordenados por ela). Métodos síncronos fazem E/S de disco
+/// (até copiar 2 GB na montagem por cópia): chame-os por `spawn_blocking`.
 #[derive(Clone)]
 pub struct ContentStore {
     inner: Arc<Inner>,
 }
 
-/// Falha de uma tentativa: `Retry` tenta de novo (rede, 5xx, corpo curto); `Fatal` encerra o download todo.
+/// Falha de uma tentativa: `Retry` tenta de novo (rede, 5xx, corpo curto, lento); `Fatal` encerra o download todo.
 enum Failure {
     Retry(AppError),
     Fatal(AppError),
 }
 
+/// Pasta `cache\tmp\<job>` de um download: apagada (com os `.part`) quando o download termina de qualquer jeito,
+/// inclusive se o future for abandonado.
+struct Job {
+    store: ContentStore,
+    id: String,
+    dir: PathBuf,
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        if let Err(e) = remove_entry(&self.dir) {
+            log::warn!("pasta de download não apagada: {e}");
+        }
+        lock(&self.store.inner.jobs).remove(&self.id);
+    }
+}
+
 impl ContentStore {
     /// `root` = `cache\`, `servers` = `servers\` (ver [`crate::paths`]).
     pub fn new(root: PathBuf, servers: PathBuf) -> Self {
-        let index = IndexState {
-            path: root.join(INDEX_FILE),
-            loaded: None,
-            last_tick: 0,
-        };
         Self {
             inner: Arc::new(Inner {
+                index: Mutex::new(IndexState::new(&root)),
                 root,
                 servers,
                 http: content_client(),
                 retry_delay: RETRY_DELAY,
                 hard_links: true,
-                index: Mutex::new(index),
+                jobs: Mutex::new(HashSet::new()),
             }),
         }
     }
 
-    fn rebuild(self, f: impl FnOnce(&mut Inner)) -> Self {
-        let inner =
-            Arc::try_unwrap(self.inner).unwrap_or_else(|_| panic!("configurar antes de usar"));
-        let mut inner = inner;
+    /// Nova loja com as mesmas pastas e cliente, e a configuração alterada (estado em memória novo).
+    fn rebuild(&self, f: impl FnOnce(&mut Inner)) -> Self {
+        let i = &self.inner;
+        let mut inner = Inner {
+            root: i.root.clone(),
+            servers: i.servers.clone(),
+            http: i.http.clone(),
+            retry_delay: i.retry_delay,
+            hard_links: i.hard_links,
+            index: Mutex::new(IndexState::new(&i.root)),
+            jobs: Mutex::new(HashSet::new()),
+        };
         f(&mut inner);
         Self {
             inner: Arc::new(inner),
@@ -585,16 +714,70 @@ impl ContentStore {
         self.inner.root.join(sha)
     }
 
-    fn part_path(&self, sha: &str) -> PathBuf {
-        self.inner.root.join(TMP_DIR).join(format!("{sha}.part"))
+    fn tmp_dir(&self) -> PathBuf {
+        self.inner.root.join(TMP_DIR)
     }
 
     fn index(&self) -> MutexGuard<'_, IndexState> {
-        self.inner.index.lock().unwrap_or_else(|e| e.into_inner())
+        lock(&self.inner.index)
     }
 
-    /// Hashes do manifest que não estão no cache (um por hash, na ordem do manifest).
+    /// Na abertura do launcher: apaga sobras de downloads e arquivos do cache sem entrada no índice (podem ter sido
+    /// gravados pela metade antes de uma queda); tira do índice o que não existe mais.
+    pub fn startup(&self) {
+        self.sweep_tmp();
+        let root = &self.inner.root;
+        let mut idx = self.index();
+        if let Ok(rd) = std::fs::read_dir(root) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if valid_sha(&name) && !idx.contains(&name) {
+                    if let Err(err) = remove_entry(&e.path()) {
+                        log::warn!("arquivo do cache fora do índice não apagado: {err}");
+                    }
+                }
+            }
+        }
+        idx.get().used.retain(|h, _| root.join(h).is_file());
+        idx.save_logged();
+    }
+
+    /// Apaga de `cache\tmp` tudo que não pertence a um download em andamento.
+    fn sweep_tmp(&self) {
+        let jobs = lock(&self.inner.jobs);
+        let Ok(rd) = std::fs::read_dir(self.tmp_dir()) else {
+            return;
+        };
+        for e in rd.flatten() {
+            if !jobs.contains(e.file_name().to_string_lossy().as_ref()) {
+                if let Err(err) = remove_entry(&e.path()) {
+                    log::warn!("sobra de download não apagada: {err}");
+                }
+            }
+        }
+    }
+
+    fn begin_job(&self) -> AppResult<Job> {
+        let mut raw = [0u8; 16];
+        getrandom::fill(&mut raw)
+            .map_err(|_| AppError::new("internal_error", "Falha interna no download."))?;
+        let id = hex(&raw);
+        let dir = self.tmp_dir().join(&id);
+        // Registrado antes de criar a pasta: a varredura (com o mesmo lock) nunca apaga um download vivo.
+        lock(&self.inner.jobs).insert(id.clone());
+        let job = Job {
+            store: self.clone(),
+            id,
+            dir,
+        };
+        std::fs::create_dir_all(&job.dir).map_err(|e| AppError::io(&job.dir, &e))?;
+        Ok(job)
+    }
+
+    /// Hashes do manifest que não estão no cache (um por hash, na ordem do manifest). Só conta como presente o que
+    /// está no índice (verificado) e com o tamanho certo.
     pub fn missing(&self, m: &Manifest) -> Vec<FileRef> {
+        let mut idx = self.index();
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for r in &m.resources {
@@ -602,8 +785,10 @@ impl ContentStore {
                 if !seen.insert(f.sha256.as_str()) {
                     continue;
                 }
-                let present = std::fs::metadata(self.cache_path(&f.sha256))
-                    .is_ok_and(|md| md.is_file() && md.len() == f.size);
+                let present = valid_sha(&f.sha256)
+                    && idx.contains(&f.sha256)
+                    && std::fs::metadata(self.cache_path(&f.sha256))
+                        .is_ok_and(|md| md.is_file() && md.len() == f.size);
                 if !present {
                     out.push(FileRef {
                         sha256: f.sha256.clone(),
@@ -618,8 +803,8 @@ impl ContentStore {
     }
 
     /// Baixa `files` de `<base>/cb/files/<sha256>`: 4 por vez, 3 tentativas cada com espera crescente, retomada por
-    /// `Range`. Progresso no máx. 10/s (+ um evento final). O primeiro erro fatal interrompe os demais (os `.part`
-    /// ficam para retomar); cancelamento apaga os `.part` deste download.
+    /// `Range` dentro deste download. Progresso no máx. 10/s (+ um evento final). O primeiro erro fatal interrompe os
+    /// demais. A pasta de trabalho deste download é apagada ao terminar, com sucesso ou não.
     pub async fn download(
         &self,
         base: &Url,
@@ -628,8 +813,12 @@ impl ContentStore {
         cancel: CancellationToken,
     ) -> AppResult<()> {
         check_base(base)?;
-        let tmp = self.inner.root.join(TMP_DIR);
-        std::fs::create_dir_all(&tmp).map_err(|e| AppError::io(&tmp, &e))?;
+        if files.iter().any(|f| !valid_sha(&f.sha256)) {
+            return Err(invalid_body());
+        }
+        self.sweep_tmp();
+        let job = self.begin_job()?;
+        let job_dir = Arc::new(job.dir.clone());
         let tracker = Arc::new(Mutex::new(Tracker {
             total: files.iter().map(|f| f.size).sum(),
             done: 0,
@@ -639,24 +828,32 @@ impl ContentStore {
             current: String::new(),
             sink: Arc::new(progress),
         }));
+        let finished = Arc::new(Mutex::new(Vec::<String>::new()));
         let abort = cancel.child_token();
         let permits = Arc::new(Semaphore::new(PARALLEL));
         let mut tasks = JoinSet::new();
         for f in files {
             let f = f.clone();
-            let (store, base, abort, permits, tracker) = (
+            let (store, base, abort, permits, tracker, job_dir, finished) = (
                 self.clone(),
                 base.clone(),
                 abort.clone(),
                 permits.clone(),
                 tracker.clone(),
+                job_dir.clone(),
+                finished.clone(),
             );
             tasks.spawn(async move {
                 let _permit = tokio::select! {
                     p = permits.acquire_owned() => p.expect("semáforo aberto"),
                     _ = abort.cancelled() => return Err(cancelled()),
                 };
-                store.fetch_with_retries(&base, &f, &tracker, &abort).await
+                let part = job_dir.join(format!("{}.part", f.sha256));
+                store
+                    .fetch_with_retries(&base, &f, &part, &tracker, &abort)
+                    .await?;
+                lock(&finished).push(f.sha256.clone());
+                Ok(())
             });
         }
         let mut first_err: Option<AppError> = None;
@@ -674,30 +871,37 @@ impl ContentStore {
                 }
             }
         }
+        // Só agora (depois do `rename`) os arquivos verificados entram no índice, mesmo se outro falhou.
+        let done = std::mem::take(&mut *lock(&finished));
+        if !done.is_empty() {
+            self.index().touch(done.iter().map(String::as_str));
+        }
+        drop(job);
         if cancel.is_cancelled() {
-            for f in files {
-                let _ = std::fs::remove_file(self.part_path(&f.sha256));
-            }
             return Err(cancelled());
         }
         if let Some(e) = first_err {
             return Err(e);
         }
         lock(&tracker).emit(true);
-        self.index().touch(files.iter().map(|f| f.sha256.as_str()))
+        Ok(())
     }
 
     async fn fetch_with_retries(
         &self,
         base: &Url,
         f: &FileRef,
+        part: &Path,
         tracker: &Mutex<Tracker>,
         abort: &CancellationToken,
     ) -> AppResult<()> {
         let mut delay = self.inner.retry_delay;
         let mut counted: u64 = 0;
         for attempt in 1..=ATTEMPTS {
-            match self.fetch_once(base, f, tracker, abort, &mut counted).await {
+            match self
+                .fetch_once(base, f, part, tracker, abort, &mut counted)
+                .await
+            {
                 Ok(()) => return Ok(()),
                 Err(Failure::Fatal(e)) => return Err(e),
                 Err(Failure::Retry(e)) if attempt == ATTEMPTS => return Err(e),
@@ -713,43 +917,55 @@ impl ContentStore {
         unreachable!("o laço sempre retorna")
     }
 
-    /// Uma tentativa. `counted` = bytes deste arquivo já somados ao progresso (sobrevive entre tentativas).
+    /// Uma tentativa. `counted` = bytes deste arquivo já somados ao progresso (sobrevive entre tentativas). O `.part`
+    /// só existe dentro deste download (tentativa anterior contra o mesmo servidor).
     async fn fetch_once(
         &self,
         base: &Url,
         f: &FileRef,
+        part: &Path,
         tracker: &Mutex<Tracker>,
         abort: &CancellationToken,
         counted: &mut u64,
     ) -> Result<(), Failure> {
         let label = format!("{}/{}", f.resource, f.path);
-        let part = self.part_path(&f.sha256);
         let io = |p: &Path, e: std::io::Error| Failure::Fatal(AppError::io(p, &e));
         let set_counted = |n: u64, net: u64, counted: &mut u64| {
             lock(tracker).add(n as i64 - *counted as i64, net, &label);
             *counted = n;
         };
+        let size_error = |what: &str| {
+            Failure::Fatal(AppError::new(
+                "size_mismatch",
+                format!(
+                    "{what} no resource {} ({}).",
+                    quoted(&f.resource),
+                    quoted(&f.path)
+                ),
+            ))
+        };
+        let oversize = || size_error("Arquivo maior que o declarado");
 
         // Retomada: hash do que já está no `.part`. Sobra maior que o arquivo, ou completa mas errada, recomeça.
         let mut hasher = Sha256::new();
-        let mut have: u64 = match std::fs::metadata(&part) {
+        let mut have: u64 = match std::fs::metadata(part) {
             Ok(md) if md.len() <= f.size => md.len(),
             Ok(_) => {
-                std::fs::remove_file(&part).map_err(|e| io(&part, e))?;
+                std::fs::remove_file(part).map_err(|e| io(part, e))?;
                 0
             }
             Err(_) => 0,
         };
         if have > 0 {
-            hash_file_into(&part, &mut hasher)
+            hash_file_into(part, &mut hasher)
                 .await
-                .map_err(|e| io(&part, e))?;
+                .map_err(|e| io(part, e))?;
             if have == f.size {
                 if hex(&hasher.clone().finalize()) == f.sha256 {
                     set_counted(have, 0, counted);
-                    return self.finish(f, &part, hasher);
+                    return self.finish(f, part, hasher, false);
                 }
-                std::fs::remove_file(&part).map_err(|e| io(&part, e))?;
+                std::fs::remove_file(part).map_err(|e| io(part, e))?;
                 hasher = Sha256::new();
                 have = 0;
             }
@@ -768,26 +984,16 @@ impl ContentStore {
             _ = abort.cancelled() => return Err(Failure::Fatal(cancelled())),
         };
         let status = resp.status();
-        let oversize = || {
-            Failure::Fatal(AppError::new(
-                "size_mismatch",
-                format!(
-                    "Arquivo maior que o declarado no resource {} ({}).",
-                    quoted(&f.resource),
-                    quoted(&f.path)
-                ),
-            ))
-        };
         let append = if status == reqwest::StatusCode::PARTIAL_CONTENT && have > 0 {
             match content_range(resp.headers()) {
                 Some((start, total)) if start == have && total.is_none_or(|t| t == f.size) => true,
                 Some((_, Some(t))) if t != f.size => {
-                    let _ = std::fs::remove_file(&part);
-                    return Err(oversize());
+                    let _ = std::fs::remove_file(part);
+                    return Err(size_error("Tamanho do arquivo diferente do declarado"));
                 }
                 _ => {
                     // Faixa diferente da pedida: recomeça do zero na próxima tentativa.
-                    let _ = std::fs::remove_file(&part);
+                    let _ = std::fs::remove_file(part);
                     set_counted(0, 0, counted);
                     return Err(Failure::Retry(unavailable_for(f)));
                 }
@@ -795,7 +1001,7 @@ impl ContentStore {
         } else if status == reqwest::StatusCode::OK {
             false
         } else if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-            let _ = std::fs::remove_file(&part);
+            let _ = std::fs::remove_file(part);
             set_counted(0, 0, counted);
             return Err(Failure::Retry(unavailable_for(f)));
         } else if status.is_server_error()
@@ -812,7 +1018,7 @@ impl ContentStore {
             set_counted(0, 0, counted);
         }
         if resp.content_length().is_some_and(|n| n > f.size - have) {
-            let _ = std::fs::remove_file(&part);
+            let _ = std::fs::remove_file(part);
             return Err(oversize());
         }
 
@@ -821,9 +1027,11 @@ impl ContentStore {
             .write(true)
             .append(append)
             .truncate(!append)
-            .open(&part)
+            .open(part)
             .await
-            .map_err(|e| io(&part, e))?;
+            .map_err(|e| io(part, e))?;
+        let started = Instant::now();
+        let mut received: u64 = 0;
         loop {
             let chunk = tokio::select! {
                 c = resp.chunk() => c,
@@ -833,34 +1041,56 @@ impl ContentStore {
                 Ok(Some(c)) => c,
                 Ok(None) => break,
                 Err(_) => {
-                    // Queda/ociosidade: o `.part` fica para a retomada.
+                    // Queda/ociosidade: o `.part` fica para a próxima tentativa deste download.
                     let _ = out.flush().await;
                     return Err(Failure::Retry(unavailable_for(f)));
                 }
             };
             if have + chunk.len() as u64 > f.size {
                 drop(out);
-                let _ = std::fs::remove_file(&part);
+                let _ = std::fs::remove_file(part);
                 return Err(oversize());
             }
-            out.write_all(&chunk).await.map_err(|e| io(&part, e))?;
+            out.write_all(&chunk).await.map_err(|e| io(part, e))?;
             hasher.update(&chunk);
             have += chunk.len() as u64;
+            received += chunk.len() as u64;
             set_counted(have, chunk.len() as u64, counted);
+            let elapsed = started.elapsed();
+            if have < f.size
+                && elapsed > SLOW_GRACE
+                && received < MIN_RATE_BYTES_PER_SEC.saturating_mul(elapsed.as_secs())
+            {
+                let _ = out.flush().await;
+                return Err(Failure::Retry(unavailable_for(f)));
+            }
         }
-        out.flush().await.map_err(|e| io(&part, e))?;
-        drop(out);
         if have < f.size {
+            let _ = out.flush().await;
             return Err(Failure::Retry(unavailable_for(f)));
         }
-        self.finish(f, &part, hasher)
+        // Dados no disco antes do `rename`: depois de uma queda de energia, nada com tamanho certo e conteúdo errado.
+        out.flush().await.map_err(|e| io(part, e))?;
+        out.sync_all().await.map_err(|e| io(part, e))?;
+        drop(out);
+        self.finish(f, part, hasher, append)
     }
 
-    /// Confere o hash; certo → somente leitura + `rename` para o cache; errado → apaga e erro com o resource.
-    fn finish(&self, f: &FileRef, part: &Path, hasher: Sha256) -> Result<(), Failure> {
+    /// Confere o hash; certo → somente leitura + `rename` para o cache; errado → apaga. Se o `.part` era retomado, o
+    /// erro pode estar no começo já gravado: tenta de novo do zero; baixado inteiro de uma vez → `hash_mismatch`.
+    fn finish(
+        &self,
+        f: &FileRef,
+        part: &Path,
+        hasher: Sha256,
+        resumed: bool,
+    ) -> Result<(), Failure> {
         let got = hex(&hasher.finalize());
         if got != f.sha256 {
             let _ = std::fs::remove_file(part);
+            if resumed {
+                return Err(Failure::Retry(unavailable_for(f)));
+            }
             return Err(Failure::Fatal(AppError::new(
                 "hash_mismatch",
                 format!(
@@ -873,13 +1103,15 @@ impl ContentStore {
         let dest = self.cache_path(&f.sha256);
         let io = |p: &Path, e: std::io::Error| Failure::Fatal(AppError::io(p, &e));
         set_readonly(part).map_err(|e| io(part, e))?;
-        // `rename` não substitui arquivo somente leitura no Windows: remove antes (sobra com tamanho errado).
+        // `rename` não substitui arquivo somente leitura no Windows: remove antes (sobra fora do índice).
         remove_entry(&dest).map_err(|e| io(&dest, e))?;
-        std::fs::rename(part, &dest).map_err(|e| io(&dest, e))
+        std::fs::rename(part, &dest).map_err(|e| io(&dest, e))?;
+        sync_dir(&self.inner.root);
+        Ok(())
     }
 
     /// Monta o manifest em `servers\<serverId>` (hard link do cache, ou cópia) e remove o que não faz mais parte.
-    /// Todos os arquivos precisam estar no cache.
+    /// Todos os arquivos precisam estar no cache (verificados).
     pub fn mount(&self, server_id: &str, m: &Manifest) -> AppResult<PathBuf> {
         if !valid_server_id(server_id) {
             return Err(AppError::new(
@@ -887,26 +1119,47 @@ impl ContentStore {
                 "Identificador de servidor inválido.",
             ));
         }
+        // Defesa extra (o chamador já passou por `validate_manifest`): nada de caminho fora da pasta.
+        for r in &m.resources {
+            if !valid_resource_name(&r.name) {
+                return Err(invalid(&r.name, "nome de resource inválido"));
+            }
+            for f in &r.files {
+                if !safe_rel_path(&f.path) || !valid_sha(&f.sha256) {
+                    return Err(invalid(
+                        &r.name,
+                        format_args!("caminho não permitido {}", quoted(&f.path)),
+                    ));
+                }
+            }
+        }
         let dir = self.inner.servers.join(server_id);
-        let record_path = self.record_path(server_id);
-        let old = self.read_record(server_id);
 
-        // "resource/caminho" → arquivo do manifest. Caminhos já validados.
+        // "resource/caminho" → arquivo do manifest.
         let mut want: HashMap<String, &ManifestFile> = HashMap::new();
         for r in &m.resources {
             for f in &r.files {
                 want.insert(format!("{}/{}", r.name, f.path), f);
             }
         }
-        for f in want.values() {
-            let src = self.cache_path(&f.sha256);
-            if !std::fs::metadata(&src).is_ok_and(|md| md.is_file() && md.len() == f.size) {
-                return Err(AppError::new(
-                    "content_missing",
-                    "Conteúdo do servidor incompleto no cache. Tente entrar de novo.",
-                ));
+        {
+            let mut idx = self.index();
+            for f in want.values() {
+                let ok = idx.contains(&f.sha256)
+                    && std::fs::metadata(self.cache_path(&f.sha256))
+                        .is_ok_and(|md| md.is_file() && md.len() == f.size);
+                if !ok {
+                    return Err(AppError::new(
+                        "content_missing",
+                        "Conteúdo do servidor incompleto no cache. Tente entrar de novo.",
+                    ));
+                }
             }
         }
+
+        // Incompleto enquanto a pasta muda: uma queda no meio não deixa o registro antigo valendo.
+        let old = self.read_record(server_id).unwrap_or_default();
+        self.write_record(server_id, &MountRecord::default())?;
 
         // A pasta do servidor não pode ser link: removê-lo não toca o destino.
         if std::fs::symlink_metadata(&dir).is_ok_and(|md| !md.is_dir()) {
@@ -914,17 +1167,35 @@ impl ContentStore {
         }
         std::fs::create_dir_all(&dir).map_err(|e| AppError::io(&dir, &e))?;
 
-        // Sobras: tudo que não está no manifest novo, ou que mudou de hash, ou com tamanho diferente.
+        // Sobras: tudo que não está no manifest novo, que mudou de hash ou de tamanho, ou sem registro completo.
         let keep = |rel: &str, len: u64| {
-            want.get(rel)
-                .is_some_and(|f| f.size == len && old.get(rel).is_some_and(|h| *h == f.sha256))
+            want.get(rel).is_some_and(|f| {
+                f.size == len
+                    && old.complete
+                    && old
+                        .files
+                        .get(rel)
+                        .is_some_and(|o| o.sha256 == f.sha256 && o.size == len)
+            })
         };
         prune(&dir, &dir, &keep).map_err(|e| AppError::io(&dir, &e))?;
 
+        let mut record = MountRecord {
+            complete: true,
+            files: HashMap::new(),
+        };
         for (rel, f) in &want {
             let target = rel.split('/').fold(dir.clone(), |p, s| p.join(s));
+            let mounted = |copied| Mounted {
+                sha256: f.sha256.clone(),
+                size: f.size,
+                copied,
+            };
             if std::fs::symlink_metadata(&target).is_ok() {
-                continue; // mantido pelo `prune`
+                // Mantido pelo `prune`.
+                let kept = old.files.get(rel).cloned().unwrap_or_else(|| mounted(true));
+                record.files.insert(rel.clone(), kept);
+                continue;
             }
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| AppError::io(parent, &e))?;
@@ -935,37 +1206,67 @@ impl ContentStore {
                 std::fs::copy(&src, &target).map_err(|e| AppError::io(&target, &e))?;
                 set_readonly(&target).map_err(|e| AppError::io(&target, &e))?;
             }
+            record.files.insert(rel.clone(), mounted(!linked));
         }
-
-        let record: HashMap<&str, &str> = want
-            .iter()
-            .map(|(rel, f)| (rel.as_str(), f.sha256.as_str()))
-            .collect();
-        write_atomic(
-            &record_path,
-            &serde_json::to_vec(&record).expect("registro serializável"),
-        )?;
-        self.index()
-            .touch(want.values().map(|f| f.sha256.as_str()))?;
+        self.write_record(server_id, &record)?;
+        self.index().touch(want.values().map(|f| f.sha256.as_str()));
         Ok(dir)
     }
 
-    fn record_path(&self, server_id: &str) -> PathBuf {
-        self.inner
-            .servers
-            .join(MOUNTS_DIR)
-            .join(format!("{server_id}.json"))
+    fn records_dir(&self) -> PathBuf {
+        self.inner.servers.join(MOUNTS_DIR)
     }
 
-    /// "resource/caminho" → sha256 montado. Registro ausente ou ilegível = nada montado.
-    fn read_record(&self, server_id: &str) -> HashMap<String, String> {
+    fn record_path(&self, server_id: &str) -> PathBuf {
+        self.records_dir().join(format!("{server_id}.json"))
+    }
+
+    fn read_record(&self, server_id: &str) -> Option<MountRecord> {
         std::fs::read(self.record_path(server_id))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
     }
 
-    /// Hashes montados para estes servidores (favoritos/recentes → `keep` do [`Self::enforce_limit`]).
+    fn write_record(&self, server_id: &str, r: &MountRecord) -> AppResult<()> {
+        let body = serde_json::to_vec(r).expect("registro serializável");
+        write_atomic(&self.record_path(server_id), &body)
+    }
+
+    /// Ids com pasta montada ou registro.
+    fn mounted_ids(&self) -> Vec<String> {
+        let mut ids: HashSet<String> = HashSet::new();
+        if let Ok(rd) = std::fs::read_dir(&self.inner.servers) {
+            ids.extend(
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| valid_server_id(n)),
+            );
+        }
+        if let Ok(rd) = std::fs::read_dir(self.records_dir()) {
+            ids.extend(rd.flatten().filter_map(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.strip_suffix(".json")
+                    .filter(|id| valid_server_id(id))
+                    .map(str::to_string)
+            }));
+        }
+        let mut ids: Vec<String> = ids.into_iter().collect();
+        ids.sort();
+        ids
+    }
+
+    /// Apaga a montagem (pasta + registro). Devolve os bytes de cópias que ela ocupava.
+    fn unmount(&self, server_id: &str) -> std::io::Result<u64> {
+        let copied = self
+            .read_record(server_id)
+            .map(|r| r.copied_bytes())
+            .unwrap_or(0);
+        remove_entry(&self.inner.servers.join(server_id))?;
+        remove_entry(&self.record_path(server_id))?;
+        Ok(copied)
+    }
+
+    /// Hashes montados (registro completo) para estes servidores.
     pub fn mounted_hashes<'a>(
         &self,
         server_ids: impl IntoIterator<Item = &'a str>,
@@ -973,61 +1274,149 @@ impl ContentStore {
         server_ids
             .into_iter()
             .filter(|id| valid_server_id(id))
-            .flat_map(|id| self.read_record(id).into_values())
+            .filter_map(|id| self.read_record(id))
+            .filter(|r| r.complete)
+            .flat_map(|r| r.files.into_values().map(|f| f.sha256))
             .collect()
     }
 
-    /// Acima de `limit_bytes`, apaga os arquivos do cache usados há mais tempo, nunca os de `keep`. Devolve os bytes
-    /// liberados.
-    pub fn enforce_limit(&self, limit_bytes: u64, keep: &HashSet<String>) -> AppResult<u64> {
-        let root = &self.inner.root;
-        let rd = match std::fs::read_dir(root) {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(e) => return Err(AppError::io(root, &e)),
-        };
-        let mut files = Vec::new();
-        let mut total: u64 = 0;
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if !valid_sha(&name) {
-                continue;
-            }
-            match e.metadata() {
-                Ok(md) if md.is_file() => {
-                    total += md.len();
-                    files.push((name, md.len()));
+    /// Espaço em disco do conteúdo: arquivos do cache, downloads em andamento e cópias montadas (hard links não
+    /// ocupam espaço próprio). Montagem sem registro completo conta inteira.
+    pub fn disk_usage(&self) -> u64 {
+        let mut total = dir_size(&self.tmp_dir());
+        if let Ok(rd) = std::fs::read_dir(&self.inner.root) {
+            for e in rd.flatten() {
+                if valid_sha(&e.file_name().to_string_lossy()) {
+                    total += e
+                        .metadata()
+                        .ok()
+                        .filter(|m| m.is_file())
+                        .map_or(0, |m| m.len());
                 }
-                _ => {}
             }
         }
-        if total <= limit_bytes {
+        for id in self.mounted_ids() {
+            total += match self.read_record(&id) {
+                Some(r) if r.complete => r.copied_bytes(),
+                _ => dir_size(&self.inner.servers.join(&id)),
+            };
+        }
+        total
+    }
+
+    /// Mantém o conteúdo em até `limit_bytes` ([`Self::disk_usage`]). Montagens quebradas saem sempre. Depois, dos
+    /// hashes que nenhum servidor de `keep_servers` (favoritos/recentes) usa, apaga os usados há mais tempo, junto
+    /// com as montagens de outros servidores que os usam (senão o hard link mantém os dados no disco). Se ainda
+    /// passar, apaga as cópias montadas de servidores fora de `keep_servers`. Devolve os bytes de fato liberados.
+    pub fn enforce_limit(
+        &self,
+        limit_bytes: u64,
+        keep_servers: &HashSet<String>,
+    ) -> AppResult<u64> {
+        self.sweep_tmp();
+        let mut live: Vec<(String, MountRecord)> = Vec::new();
+        for id in self.mounted_ids() {
+            match self.read_record(&id) {
+                Some(r) if r.complete && self.inner.servers.join(&id).is_dir() => {
+                    live.push((id, r))
+                }
+                _ => {
+                    if let Err(e) = self.unmount(&id) {
+                        log::warn!("montagem quebrada não apagada: {e}");
+                    }
+                }
+            }
+        }
+        let mut usage = self.disk_usage();
+        if usage <= limit_bytes {
             return Ok(0);
         }
+        let kept: HashSet<&str> = live
+            .iter()
+            .filter(|(id, _)| keep_servers.contains(id))
+            .flat_map(|(_, r)| r.files.values().map(|f| f.sha256.as_str()))
+            .collect();
+        let root = &self.inner.root;
+        let mut cache_files = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(root) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if valid_sha(&name) && !kept.contains(name.as_str()) {
+                    if let Ok(md) = e.metadata().map(|m| m.len()) {
+                        cache_files.push((name, md));
+                    }
+                }
+            }
+        }
         let mut index = self.index();
-        let used = &index.get().used;
-        let mut candidates: Vec<(u64, String, u64)> = files
+        let mut candidates: Vec<(u64, String, u64)> = cache_files
             .into_iter()
-            .filter(|(h, _)| !keep.contains(h))
-            .map(|(h, len)| (used.get(&h).copied().unwrap_or(0), h, len))
+            .map(|(h, len)| {
+                let used = index.get().used.get(&h).copied().unwrap_or(0);
+                (used, h, len)
+            })
             .collect();
         candidates.sort();
-        let mut freed = 0;
+
+        let mut freed = 0u64;
+        let mut removed: HashSet<String> = HashSet::new();
+        let mut unmount = |id: &str, usage: &mut u64, freed: &mut u64| -> bool {
+            if removed.contains(id) {
+                return true;
+            }
+            match self.unmount(id) {
+                Ok(copied) => {
+                    *usage = usage.saturating_sub(copied);
+                    *freed += copied;
+                    removed.insert(id.to_string());
+                    true
+                }
+                Err(e) => {
+                    log::warn!("montagem não apagada (em uso?): {e}");
+                    false
+                }
+            }
+        };
         for (_, h, len) in candidates {
-            if total <= limit_bytes {
+            if usage <= limit_bytes {
                 break;
             }
-            let p = root.join(&h);
-            remove_entry(&p).map_err(|e| AppError::io(&p, &e))?;
-            index.get().used.remove(&h);
-            total -= len;
-            freed += len;
+            let users: Vec<&str> = live
+                .iter()
+                .filter(|(id, r)| {
+                    !keep_servers.contains(id) && r.files.values().any(|f| f.sha256 == h)
+                })
+                .map(|(id, _)| id.as_str())
+                .collect();
+            let mut all_gone = true;
+            for id in users {
+                all_gone &= unmount(id, &mut usage, &mut freed);
+            }
+            if !all_gone {
+                continue; // ainda há link para os dados: apagar o arquivo do cache não liberaria nada
+            }
+            match remove_entry(&root.join(&h)) {
+                Ok(()) => {
+                    index.get().used.remove(&h);
+                    usage = usage.saturating_sub(len);
+                    freed += len;
+                }
+                Err(e) => log::warn!("arquivo do cache não apagado (em uso?): {e}"),
+            }
         }
-        index.save()?;
+        for (id, r) in &live {
+            if usage <= limit_bytes {
+                break;
+            }
+            if !keep_servers.contains(id) && r.copied_bytes() > 0 {
+                unmount(id, &mut usage, &mut freed);
+            }
+        }
+        index.save_logged();
         Ok(freed)
     }
 
-    /// "Limpar cache": apaga o cache (arquivos, `.part`, índice) e as montagens dos servidores.
+    /// "Limpar cache": apaga o cache (arquivos, downloads, índice) e as montagens dos servidores.
     pub fn clear(&self) -> AppResult<()> {
         let mut index = self.index();
         for dir in [&self.inner.root, &self.inner.servers] {
@@ -1101,6 +1490,13 @@ fn content_range(h: &reqwest::header::HeaderMap) -> Option<(u64, Option<u64>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn texto_do_servidor_em_mensagem_e_escapado() {
+        assert_eq!(quoted("mapa-1"), "\"mapa-1\"");
+        assert_eq!(quoted("a\u{202e}b\n"), "\"a\\u{202e}b\\u{a}\"");
+        assert_eq!(quoted(&"x".repeat(500)).len(), 80 + 2);
+    }
 
     #[test]
     fn segmentos_seguros() {

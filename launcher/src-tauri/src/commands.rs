@@ -169,7 +169,8 @@ pub async fn me(auth: State<'_, Arc<Auth>>) -> AppResult<Profile> {
 
 // ----- conteúdo do servidor (orquestrado pelo `play` da Task 7) -----
 
-/// Cache e montagens nas pastas do launcher.
+/// Cache e montagens nas pastas do launcher. Criada uma vez em `lib::run` (estado gerenciado do Tauri): o índice e
+/// as pastas de download são coordenados por uma instância só.
 pub fn content_store() -> ContentStore {
     ContentStore::new(paths::cache_dir(), paths::servers_dir())
 }
@@ -184,9 +185,9 @@ pub fn cache_limit_bytes(s: &Settings) -> u64 {
     s.cache_limit_mb.saturating_mul(1024 * 1024)
 }
 
-/// Hashes que o LRU nunca apaga: os montados para servidores favoritos ou recentes.
-pub fn cache_keep(store: &ContentStore, s: &Settings) -> HashSet<String> {
-    store.mounted_hashes(s.favorites.iter().chain(&s.recent).map(String::as_str))
+/// Servidores cujo conteúdo montado o limite do cache nunca apaga: favoritos e recentes.
+pub fn keep_servers(s: &Settings) -> HashSet<String> {
+    s.favorites.iter().chain(&s.recent).cloned().collect()
 }
 
 /// Repassa o progresso do download à UI como `content://progress` (o `ContentStore` já limita a 10/s).
@@ -280,50 +281,18 @@ mod tests {
 
     #[test]
     fn conteudo_usa_limites_e_keep_das_configuracoes() {
-        use crate::content::{Manifest, ManifestFile, ResourceEntry};
-        use sha2::{Digest, Sha256};
-
         let s = Settings {
             favorites: vec!["srv_fav".into()],
-            recent: vec!["srv_rec".into()],
+            recent: vec!["srv_rec".into(), "srv_fav".into()],
             cache_limit_mb: 3,
             max_server_content_mb: 5,
             ..Settings::default()
         };
         assert_eq!(content_limits(&s), Limits::new(5));
         assert_eq!(cache_limit_bytes(&s), 3 * 1024 * 1024);
-
-        let dir = tempfile::tempdir().unwrap();
-        let store = ContentStore::new(dir.path().join("cache"), dir.path().join("servers"));
-        let mut manifests = vec![];
-        for (i, id) in ["srv_fav", "srv_rec", "srv_outro"].iter().enumerate() {
-            let data = vec![i as u8; 8];
-            let sha: String = Sha256::digest(&data)
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect();
-            std::fs::create_dir_all(store.root()).unwrap();
-            std::fs::write(store.root().join(&sha), &data).unwrap();
-            let m = Manifest {
-                server_id: id.to_string(),
-                protocol: 1,
-                resources: vec![ResourceEntry {
-                    name: "r".into(),
-                    version: "1".into(),
-                    files: vec![ManifestFile {
-                        path: "a.lua".into(),
-                        sha256: sha.clone(),
-                        size: 8,
-                    }],
-                }],
-                total_size: 8,
-            };
-            store.mount(id, &m).unwrap();
-            manifests.push(sha);
-        }
         assert_eq!(
-            cache_keep(&store, &s),
-            HashSet::from([manifests[0].clone(), manifests[1].clone()])
+            keep_servers(&s),
+            HashSet::from(["srv_fav".to_string(), "srv_rec".to_string()])
         );
     }
 

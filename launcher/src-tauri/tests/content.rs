@@ -49,14 +49,58 @@ enum Mode {
     Oversize,
     /// Corpo maior que o declarado, sem `Content-Length` (chunked).
     OversizeChunked,
-    /// 1ª resposta cai no meio; as seguintes servem normalmente (com Range).
-    DropOnce,
+    /// 1ª resposta manda metade (do arquivo, ou lixo se `garbage`) e cai; as seguintes seguem `then`.
+    Drop { garbage: bool, then: Then },
     /// As N primeiras respostas são 503.
     Fail5xx(u32),
     /// 1 KiB a cada 20 ms, para testar cancelamento.
     Slow,
     /// Redireciona para outro endereço.
     Redirect,
+}
+
+/// Resposta depois da queda (pedido com `Range`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Then {
+    /// 206 certo.
+    Range,
+    /// Ignora o Range: 200 com o arquivo inteiro.
+    Full,
+    /// 206 com `Content-Range` começando em outro lugar.
+    BadStart,
+    /// 416.
+    Status416,
+    /// 206 com total diferente do declarado.
+    WrongTotal,
+    /// Cai de novo, sempre.
+    Again,
+}
+
+fn drop_half(data: &[u8], garbage: bool) -> Response {
+    // Metade, uma pausa (para o hyper enviar o que tem) e a conexão cai.
+    let mut half = data[..data.len() / 2].to_vec();
+    if garbage {
+        half.iter_mut().for_each(|b| *b ^= 0x5a);
+    }
+    let half = Bytes::from(half);
+    let stream = futures_util::stream::unfold(0u8, move |step| {
+        let half = half.clone();
+        async move {
+            match step {
+                0 => Some((Ok(half), 1)),
+                1 => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Some((Err(std::io::Error::other("queda")), 2))
+                }
+                _ => None,
+            }
+        }
+    });
+    (
+        [(header::CONTENT_LENGTH, data.len().to_string())],
+        Body::from_stream(stream),
+    )
+        .into_response()
 }
 
 #[derive(Default)]
@@ -132,29 +176,37 @@ async fn file_handler(
                 .collect();
             Body::from_stream(futures_util::stream::iter(chunks)).into_response()
         }
-        Mode::DropOnce if hit == 1 => {
-            // Metade, uma pausa (para o hyper enviar o que tem) e a conexão cai.
-            let half = Bytes::copy_from_slice(&data[..data.len() / 2]);
-            let stream = futures_util::stream::unfold(0u8, move |step| {
-                let half = half.clone();
-                async move {
-                    match step {
-                        0 => Some((Ok(half), 1)),
-                        1 => {
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                            Some((Err(std::io::Error::other("queda")), 2))
-                        }
-                        _ => None,
-                    }
-                }
-            });
-            (
-                [(header::CONTENT_LENGTH, data.len().to_string())],
-                Body::from_stream(stream),
-            )
-                .into_response()
+        Mode::Drop { garbage, then } if hit == 1 || then == Then::Again => {
+            drop_half(&data, garbage)
         }
-        Mode::DropOnce => serve(data),
+        Mode::Drop { then, .. } => {
+            let n = data.len();
+            let start = range
+                .as_deref()
+                .and_then(|r| r.strip_prefix("bytes="))
+                .and_then(|r| r.strip_suffix('-'))
+                .and_then(|v| v.parse::<usize>().ok());
+            match (then, start) {
+                (Then::Full, _) => data.into_response(),
+                (Then::BadStart, Some(_)) => (
+                    StatusCode::PARTIAL_CONTENT,
+                    [(header::CONTENT_RANGE, format!("bytes 0-{}/{n}", n - 1))],
+                    data,
+                )
+                    .into_response(),
+                (Then::Status416, Some(_)) => StatusCode::RANGE_NOT_SATISFIABLE.into_response(),
+                (Then::WrongTotal, Some(s)) => (
+                    StatusCode::PARTIAL_CONTENT,
+                    [(
+                        header::CONTENT_RANGE,
+                        format!("bytes {s}-{}/{}", n - 1, n + 1),
+                    )],
+                    data[s..].to_vec(),
+                )
+                    .into_response(),
+                _ => serve(data),
+            }
+        }
         Mode::Fail5xx(n) if hit <= n => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         Mode::Fail5xx(_) => serve(data),
         Mode::Slow => {
@@ -255,11 +307,24 @@ fn env() -> Env {
     }
 }
 
+/// Arquivos sob `cache/tmp` (em qualquer pasta de download).
 fn parts(cache: &Path) -> Vec<PathBuf> {
-    match std::fs::read_dir(cache.join("tmp")) {
-        Ok(rd) => rd.map(|e| e.unwrap().path()).collect(),
-        Err(_) => vec![],
+    fn walk(d: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(d) else {
+            return;
+        };
+        for e in rd {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else {
+                out.push(p);
+            }
+        }
     }
+    let mut out = vec![];
+    walk(&cache.join("tmp"), &mut out);
+    out
 }
 
 fn limits() -> Limits {
@@ -411,7 +476,16 @@ async fn corpo_maior_que_o_declarado_aborta() {
 async fn queda_no_meio_retoma_por_range() {
     let a = blob(5, 300_000);
     let mut fake = Fake::default();
-    fake.files.insert(sha(&a), (a.clone(), Mode::DropOnce));
+    fake.files.insert(
+        sha(&a),
+        (
+            a.clone(),
+            Mode::Drop {
+                garbage: false,
+                then: Then::Range,
+            },
+        ),
+    );
     let (base, st) = start(fake).await;
     let env = env();
     let m = manifest(vec![("r", vec![file("files/a.png", &a)])]);
@@ -591,6 +665,25 @@ fn caminhos_e_nomes_maliciosos_sao_recusados() {
             .code,
         "invalid_manifest"
     );
+    // Comprimento: segmento até 100, caminho até 180.
+    let long_seg = format!("files/{}.lua", "a".repeat(101));
+    let long_path = format!("{}/x.lua", ["abcdefghij"; 17].join("/"));
+    for p in [&long_seg, &long_path] {
+        assert_eq!(
+            validate_manifest(&one(p), SRV, PROTO, &limits())
+                .unwrap_err()
+                .code,
+            "invalid_manifest",
+            "{p}"
+        );
+    }
+    validate_manifest(
+        &one(&format!("files/{}.lua", "a".repeat(96))),
+        SRV,
+        PROTO,
+        &limits(),
+    )
+    .unwrap();
     validate_manifest(&one("client/sub-dir/a_b.v2.lua"), SRV, PROTO, &limits()).unwrap();
 }
 
@@ -880,41 +973,260 @@ async fn montagem_sem_arquivo_no_cache_falha() {
 async fn lru_remove_os_menos_usados_e_respeita_keep() {
     let env = env();
     let blobs: Vec<Vec<u8>> = (0..4).map(|i| blob(20 + i, 1000)).collect();
-    // Baixados em ordem 0,1,2,3: o 0 é o menos usado.
+    // Baixados em ordem 0,1,2,3.
     for (i, d) in blobs.iter().enumerate() {
         cached(&env, &[(d, "r", &format!("files/{i}.png"))]).await;
     }
     let h: Vec<String> = blobs.iter().map(|d| sha(d)).collect();
-    // Usar o 1 de novo (montagem) o torna o mais recente.
-    let m1 = manifest(vec![("r", vec![file("files/1.png", &blobs[1])])]);
-    env.store.mount("srv_fav", &m1).unwrap();
+    let m = |i: usize| {
+        manifest(vec![(
+            "r",
+            vec![file(&format!("files/{i}.png"), &blobs[i])],
+        )])
+    };
+    env.store.mount("srv_fav", &m(0)).unwrap();
+    // Montar o 1 o torna o mais recente.
+    env.store.mount("srv_x", &m(1)).unwrap();
+    let keep = HashSet::from(["srv_fav".to_string()]);
+    assert_eq!(
+        env.store.disk_usage(),
+        4000,
+        "hard link não ocupa espaço próprio"
+    );
 
-    let keep = HashSet::from([h[0].clone()]);
     assert_eq!(
         env.store.enforce_limit(4000, &keep).unwrap(),
         0,
         "dentro do limite"
     );
-    let freed = env.store.enforce_limit(2500, &keep).unwrap();
-    assert_eq!(freed, 2000);
-    assert!(
-        env.cache.join(&h[0]).exists(),
-        "keep fica mesmo sendo o mais antigo"
-    );
-    assert!(!env.cache.join(&h[2]).exists());
+    assert_eq!(env.store.enforce_limit(2500, &keep).unwrap(), 2000);
+    assert!(!env.cache.join(&h[2]).exists() && !env.cache.join(&h[3]).exists());
     assert!(env.cache.join(&h[1]).exists(), "usado por último fica");
-    assert!(!env.cache.join(&h[3]).exists());
+    assert!(env.servers.join("srv_x").exists());
 
-    // Tudo em keep: passa do limite, mas nada é apagado.
-    let keep: HashSet<String> = h.iter().cloned().collect();
-    assert_eq!(env.store.enforce_limit(0, &keep).unwrap(), 0);
-    assert!(env.cache.join(&h[0]).exists() && env.cache.join(&h[1]).exists());
+    // Limite 0: o 1 sai junto com a montagem de srv_x (senão o hard link manteria os dados no disco); o do favorito
+    // fica mesmo passando do limite.
+    assert_eq!(env.store.enforce_limit(0, &keep).unwrap(), 1000);
+    assert!(!env.cache.join(&h[1]).exists());
+    assert!(!env.servers.join("srv_x").exists());
+    assert!(env.store.mounted_hashes(["srv_x"]).is_empty());
+    assert!(env.cache.join(&h[0]).exists());
+    assert!(env.servers.join("srv_fav/r/files/0.png").exists());
+    assert_eq!(env.store.disk_usage(), 1000);
 
-    // O índice sobrevive a uma nova instância (gravado em disco).
+    // Índice e registros em disco: outra instância, sem keep, apaga o resto.
     let again = ContentStore::new(env.cache.clone(), env.servers.clone());
-    assert_eq!(again.enforce_limit(1000, &HashSet::new()).unwrap(), 1000);
-    assert!(env.cache.join(&h[1]).exists());
+    assert_eq!(again.enforce_limit(0, &HashSet::new()).unwrap(), 1000);
+    assert_eq!(again.disk_usage(), 0);
+    assert!(!env.servers.join("srv_fav").exists());
     assert!(env.cache.join("index.json").exists());
+}
+
+#[tokio::test]
+async fn limite_conta_e_apaga_copias_montadas() {
+    let base_env = env();
+    let (a, b) = (blob(40, 1000), blob(41, 1000));
+    let ma = cached(&base_env, &[(&a, "r", "files/a.png")]).await;
+    let mb = cached(&base_env, &[(&b, "r", "files/b.png")]).await;
+    let store =
+        ContentStore::new(base_env.cache.clone(), base_env.servers.clone()).with_hard_links(false);
+    store.mount("srv_fav", &mb).unwrap();
+    store.mount("srv_x", &ma).unwrap();
+    assert_eq!(store.disk_usage(), 4000, "cópias contam");
+    let keep = HashSet::from(["srv_fav".to_string()]);
+    assert_eq!(store.enforce_limit(2000, &keep).unwrap(), 2000);
+    assert!(!base_env.servers.join("srv_x").exists());
+    assert!(!base_env.cache.join(sha(&a)).exists());
+    assert!(base_env.cache.join(sha(&b)).exists());
+    assert!(base_env.servers.join("srv_fav/r/files/b.png").exists());
+    assert_eq!(store.disk_usage(), 2000);
+}
+
+/// Sobe um servidor com um único arquivo neste modo e baixa `data` dele.
+async fn try_mode(mode: Mode, data: &[u8]) -> (Env, Shared, Result<(), AppError>) {
+    let mut fake = Fake::default();
+    fake.files.insert(sha(data), (data.to_vec(), mode));
+    let (base, st) = start(fake).await;
+    let env = env();
+    let m = manifest(vec![("r", vec![file("files/a.png", data)])]);
+    let r = download(&env, &base, &env.store.missing(&m)).await;
+    (env, st, r)
+}
+
+fn requests(st: &Shared) -> Vec<Option<String>> {
+    st.lock()
+        .unwrap()
+        .ranges
+        .iter()
+        .map(|(_, r)| r.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn retomada_com_respostas_estranhas() {
+    let a = blob(42, 200_000);
+    let drop_then = |then| Mode::Drop {
+        garbage: false,
+        then,
+    };
+
+    // 200 ao pedido com Range: recomeça do zero na mesma resposta.
+    let (env, st, r) = try_mode(drop_then(Then::Full), &a).await;
+    r.unwrap();
+    assert_eq!(std::fs::read(env.cache.join(sha(&a))).unwrap(), a);
+    let req = requests(&st);
+    assert_eq!(req.len(), 2);
+    assert!(req[1].is_some());
+
+    // 206 começando em outro lugar, ou 416: descarta o `.part` e a 3ª tentativa pede o arquivo inteiro.
+    for then in [Then::BadStart, Then::Status416] {
+        let (env, st, r) = try_mode(drop_then(then), &a).await;
+        r.unwrap_or_else(|e| panic!("{then:?}: {e}"));
+        assert_eq!(std::fs::read(env.cache.join(sha(&a))).unwrap(), a);
+        let req = requests(&st);
+        assert_eq!(req.len(), 3, "{then:?}");
+        assert!(req[1].is_some() && req[2].is_none(), "{then:?}");
+        assert!(parts(&env.cache).is_empty());
+    }
+
+    // Começo retomado com lixo: o hash final falha, mas a culpa pode ser do pedaço antigo → recomeça do zero.
+    let (env, st, r) = try_mode(
+        Mode::Drop {
+            garbage: true,
+            then: Then::Range,
+        },
+        &a,
+    )
+    .await;
+    r.unwrap();
+    assert_eq!(std::fs::read(env.cache.join(sha(&a))).unwrap(), a);
+    let req = requests(&st);
+    assert_eq!(req.len(), 3);
+    assert!(req[1].is_some() && req[2].is_none());
+
+    // Total do Content-Range diferente do declarado: aborta.
+    let (env, _, r) = try_mode(drop_then(Then::WrongTotal), &a).await;
+    assert_eq!(r.unwrap_err().code, "size_mismatch");
+    assert!(parts(&env.cache).is_empty());
+    assert!(!env.cache.join(sha(&a)).exists());
+}
+
+#[tokio::test]
+async fn sobras_de_um_servidor_nao_contaminam_outro() {
+    let a = blob(43, 100_000);
+    // Servidor hostil: manda quase tudo do hash de outro servidor, com lixo, e derruba; sempre.
+    let (env, _, r) = try_mode(
+        Mode::Drop {
+            garbage: true,
+            then: Then::Again,
+        },
+        &a,
+    )
+    .await;
+    assert!(r.is_err());
+    assert!(parts(&env.cache).is_empty(), "nada fica em tmp");
+    assert_eq!(
+        std::fs::read_dir(env.cache.join("tmp")).unwrap().count(),
+        0,
+        "nem a pasta do download"
+    );
+
+    // O servidor honesto com o mesmo hash baixa do zero, sem Range, e dá certo.
+    let mut fake = Fake::default();
+    fake.files.insert(sha(&a), (a.clone(), Mode::Ok));
+    let (good, st) = start(fake).await;
+    let m = manifest(vec![("alvo", vec![file("files/a.png", &a)])]);
+    download(&env, &good, &env.store.missing(&m)).await.unwrap();
+    assert_eq!(requests(&st), vec![None]);
+    assert_eq!(std::fs::read(env.cache.join(sha(&a))).unwrap(), a);
+}
+
+#[tokio::test]
+async fn falha_apaga_os_part_do_download() {
+    // Um arquivo esgota as tentativas no meio e outro ainda estava baixando: nada fica em tmp.
+    let a = blob(44, 100_000);
+    let slow = blob(45, 400_000);
+    let mut fake = Fake::default();
+    fake.files.insert(
+        sha(&a),
+        (
+            a.clone(),
+            Mode::Drop {
+                garbage: false,
+                then: Then::Again,
+            },
+        ),
+    );
+    fake.files.insert(sha(&slow), (slow.clone(), Mode::Slow));
+    let (base, _) = start(fake).await;
+    let env = env();
+    let m = manifest(vec![(
+        "r",
+        vec![file("files/a.png", &a), file("files/s.webm", &slow)],
+    )]);
+    assert!(download(&env, &base, &env.store.missing(&m)).await.is_err());
+    assert!(parts(&env.cache).is_empty());
+    assert!(!env.cache.join(sha(&slow)).exists());
+}
+
+#[tokio::test]
+async fn startup_apaga_sobras_e_arquivos_fora_do_indice() {
+    let env = env();
+    let a = blob(46, 100);
+    let m = cached(&env, &[(&a, "r", "client/a.lua")]).await;
+    // Sobra de um download antigo e arquivo do cache sem entrada no índice (queda antes de indexar).
+    let stale = env.cache.join("tmp").join("antigo");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("x.part"), b"meio").unwrap();
+    let orphan = env.cache.join(sha(b"orfao"));
+    std::fs::write(&orphan, b"orfao").unwrap();
+    let m2 = manifest(vec![("r", vec![file("client/o.lua", b"orfao")])]);
+    assert_eq!(
+        env.store.missing(&m2).len(),
+        1,
+        "fora do índice não é confiável"
+    );
+    assert_eq!(
+        env.store.mount(SRV, &m2).unwrap_err().code,
+        "content_missing"
+    );
+
+    env.store.startup();
+    assert!(!stale.exists());
+    assert!(!orphan.exists());
+    assert!(env.cache.join(sha(&a)).exists());
+    assert!(env.store.missing(&m).is_empty());
+
+    // A varredura também roda antes de cada download.
+    std::fs::create_dir_all(&stale).unwrap();
+    let (base, _) = start(Fake::default()).await;
+    download(&env, &base, &[]).await.unwrap();
+    assert!(!stale.exists());
+}
+
+#[tokio::test]
+async fn montagem_interrompida_nao_deixa_registro_valendo() {
+    let env = env();
+    let (a, b) = (blob(47, 300), blob(48, 300));
+    let ma = cached(&env, &[(&a, "r", "client/x.lua")]).await;
+    let mb = cached(&env, &[(&b, "r", "client/x.lua")]).await;
+    env.store.mount(SRV, &ma).unwrap();
+    // Simula queda no meio de montar `mb`: o arquivo já virou b, mas o registro ficou como antes.
+    let target = env.servers.join(SRV).join("r/client/x.lua");
+    std::fs::remove_file(&target).unwrap();
+    std::fs::copy(env.cache.join(sha(&b)), &target).unwrap();
+    let rec = env.servers.join(".mounts").join(format!("{SRV}.json"));
+    let body = std::fs::read_to_string(&rec).unwrap();
+    assert!(body.contains("\"complete\":true"));
+    // O registro é marcado incompleto antes de mexer na pasta: com ele assim, nada é mantido às cegas.
+    std::fs::write(
+        &rec,
+        body.replace("\"complete\":true", "\"complete\":false"),
+    )
+    .unwrap();
+    env.store.mount(SRV, &ma).unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), a);
+    let _ = mb;
 }
 
 #[tokio::test]
