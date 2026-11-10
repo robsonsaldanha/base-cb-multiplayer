@@ -8,6 +8,12 @@ fn main() {
         "login",
         "logout",
         "me",
+        "pick_game_dir",
+        "play",
+        "cancel_play",
+        "clear_cache",
+        "check_update",
+        "install_update",
     ]);
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(manifest))
         .expect("falha no tauri-build");

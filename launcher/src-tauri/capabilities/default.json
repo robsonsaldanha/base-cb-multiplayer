@@ -11,6 +11,12 @@
     "allow-app-version",
     "allow-login",
     "allow-logout",
-    "allow-me"
+    "allow-me",
+    "allow-pick-game-dir",
+    "allow-play",
+    "allow-cancel-play",
+    "allow-clear-cache",
+    "allow-check-update",
+    "allow-install-update"
   ]
 }

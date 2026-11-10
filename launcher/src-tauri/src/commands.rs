@@ -3,8 +3,13 @@
 use crate::auth::{self, Auth};
 use crate::content::{ContentStore, Limits, Progress};
 use crate::error::{AppError, AppResult};
+use crate::game::{self, GameInstall};
+use crate::launch::{LaunchOutcome, CONNECT_TTL};
+use crate::modpkg::ModInstaller;
 use crate::paths;
+use crate::play::{PlayContext, PlayGate, Stage};
 use crate::settings::{validate_game_dir, Settings, SettingsUpdate};
+use crate::update::{self, UpdateStatus};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -15,6 +20,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 pub const AUTH_CHANGED: &str = "auth://changed";
 /// Progresso do download do conteúdo do servidor (`content::Progress`, no máx. 10/s).
 pub const CONTENT_PROGRESS: &str = "content://progress";
+/// Etapa do Jogar que começou ([`PlayStageEvent`]).
+pub const PLAY_STAGE: &str = "play://stage";
 
 pub struct AppState {
     settings_path: PathBuf,
@@ -195,6 +202,153 @@ pub fn progress_emitter(app: AppHandle) -> impl Fn(Progress) + Send + Sync + 'st
     move |p| {
         let _ = app.emit(CONTENT_PROGRESS, p);
     }
+}
+
+/// "Limpar cache" (Configurações): apaga cache e montagens. Não corre junto com um play.
+#[tauri::command]
+pub async fn clear_cache(
+    content: State<'_, ContentStore>,
+    gate: State<'_, PlayGate>,
+) -> AppResult<()> {
+    let _run = gate.try_begin()?;
+    let store = content.inner().clone();
+    tokio::task::spawn_blocking(move || store.clear())
+        .await
+        .map_err(|_| AppError::new("internal_error", "Falha interna ao limpar o cache."))?
+}
+
+// ----- jogo -----
+
+/// Pasta do jogo: a das configurações se ainda for válida; senão procura na Steam/Epic e grava o que achar.
+pub fn resolve_game(state: &AppState) -> Option<GameInstall> {
+    if let Some(dir) = state.get_settings().game_dir {
+        if let Ok(g) = game::validate_game_dir(&dir) {
+            return Some(g);
+        }
+        log::warn!("pasta do jogo configurada não é mais válida; procurando de novo");
+    }
+    let found = game::locate(&game::SystemRegistry, &game::Roots::system())?;
+    if let Err(e) = state.set_game_dir(Some(found.dir.clone())) {
+        log::warn!("pasta do jogo encontrada, mas não gravada: {}", e.code);
+    }
+    Some(found)
+}
+
+/// Seletor de pasta (plugin dialog, chamado só daqui) → valida que é o Hogwarts Legacy → grava `gameDir`.
+/// Cancelar o seletor não muda nada.
+#[tauri::command]
+pub async fn pick_game_dir(app: AppHandle, state: State<'_, AppState>) -> AppResult<Settings> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut dialog = app.dialog().file().set_title("Pasta do Hogwarts Legacy");
+    if let Some(w) = app.get_webview_window("main") {
+        dialog = dialog.set_parent(&w);
+    }
+    dialog.pick_folder(move |p| {
+        let _ = tx.send(p);
+    });
+    let Some(picked) = rx.await.ok().flatten() else {
+        return Ok(state.get_settings());
+    };
+    let dir = picked.into_path().map_err(|_| {
+        AppError::new(
+            "game_invalid",
+            "Escolha uma pasta do computador com o Hogwarts Legacy.",
+        )
+    })?;
+    let g = game::validate_game_dir(&dir)?;
+    state.set_game_dir(Some(g.dir))
+}
+
+// ----- jogar -----
+
+/// Carga de `play://stage`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayStageEvent {
+    pub server_id: String,
+    pub stage: Stage,
+}
+
+/// Jogar: ticket → manifest → download → montagem → mod (se não simular) → conexão → abrir. Etapas por
+/// `play://stage`, progresso por `content://progress`. Um por vez (`busy`); `cancel_play` interrompe.
+#[tauri::command]
+pub async fn play(
+    app: AppHandle,
+    server_id: String,
+    state: State<'_, AppState>,
+    auth: State<'_, Arc<Auth>>,
+    content: State<'_, ContentStore>,
+    gate: State<'_, PlayGate>,
+) -> AppResult<LaunchOutcome> {
+    let run = gate.try_begin()?;
+    let settings = state.get_settings();
+    // Simulando, o jogo não é necessário (nem procurado). Senão: leitura curta de registro/disco.
+    let game = if settings.simulate_launch {
+        None
+    } else {
+        resolve_game(state.inner())
+    };
+    let ctx = PlayContext {
+        auth: auth.inner().clone(),
+        content: content.inner().clone(),
+        mods: ModInstaller::system(),
+        run_dir: paths::run_dir(),
+        clock: auth::monotonic_clock(),
+        simulate: settings.simulate_launch,
+        game,
+        limits: content_limits(&settings),
+        cache_limit_bytes: cache_limit_bytes(&settings),
+        keep: keep_servers(&settings),
+        connect_ttl: CONNECT_TTL,
+    };
+    let stage_app = app.clone();
+    let id = server_id.clone();
+    let on_stage = move |stage: Stage| {
+        let _ = stage_app.emit(
+            PLAY_STAGE,
+            PlayStageEvent {
+                server_id: id.clone(),
+                stage,
+            },
+        );
+    };
+    let r = crate::play::play(
+        &ctx,
+        &server_id,
+        &on_stage,
+        progress_emitter(app),
+        run.cancel.clone(),
+    )
+    .await;
+    if let Err(e) = &r {
+        log::warn!("jogar em {server_id:?} falhou: {}", e.code);
+    }
+    r
+}
+
+/// Cancela o play em andamento (`false` se não houver).
+#[tauri::command]
+pub fn cancel_play(gate: State<'_, PlayGate>) -> bool {
+    gate.cancel()
+}
+
+// ----- atualização do launcher -----
+
+#[tauri::command]
+pub async fn check_update(app: AppHandle, state: State<'_, AppState>) -> AppResult<UpdateStatus> {
+    update::check(&app, &state.get_settings().hub_url).await
+}
+
+/// Baixa, confere e instala a versão nova (o instalador fecha o launcher). Não corre durante um play.
+#[tauri::command]
+pub async fn install_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    gate: State<'_, PlayGate>,
+) -> AppResult<()> {
+    let _run = gate.try_begin()?;
+    update::install(&app, &state.get_settings().hub_url).await
 }
 
 #[cfg(test)]

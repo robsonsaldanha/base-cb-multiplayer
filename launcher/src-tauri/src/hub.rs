@@ -114,6 +114,17 @@ impl fmt::Debug for Tokens {
     }
 }
 
+/// `GET /v1/mod/latest?protocol=N` (contrato `ModInfo`). `signature` é o conteúdo do `.sig` (minisign).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ModInfo {
+    pub version: String,
+    pub protocol: u32,
+    pub url: String,
+    pub sha256: String,
+    pub size: u64,
+    pub signature: String,
+}
+
 #[derive(Deserialize)]
 struct TicketResponse {
     ticket: String,
@@ -163,6 +174,32 @@ pub fn http_client() -> reqwest::Client {
         .expect("cliente HTTP")
 }
 
+/// Cliente para arquivos grandes do Hub (mod, update): sem prazo total, mas conexão em 10 s e no máx. 30 s sem bytes.
+/// O Hub derruba quem fica abaixo de 32 KiB/s por 30 s e não serve `Range`: quem chama tenta de novo do zero.
+pub fn download_client() -> reqwest::Client {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("CBMultiplayer/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .expect("cliente HTTP")
+}
+
+/// Download do Hub que caiu ou ficou lento demais em todas as tentativas. `what`: "o mod", "a atualização".
+pub fn download_slow(what: &str) -> AppError {
+    AppError::new(
+        "download_slow",
+        format!(
+            "A conexão está lenta demais ou caiu ao baixar {what} (o Hub exige pelo menos 32 KiB/s). Tente de \
+             novo em instantes ou em outra rede."
+        ),
+    )
+}
+
 fn unreachable_err() -> AppError {
     AppError::new(
         "hub_unreachable",
@@ -196,6 +233,10 @@ pub fn map_hub_error(status: u16, code: Option<&str>) -> AppError {
         "forbidden" => ("forbidden", "Acesso negado pelo Hub."),
         "invalid_body" => ("hub_rejected", "O Hub recusou o pedido do launcher."),
         "updates_disabled" => ("updates_disabled", "Atualizações indisponíveis no momento."),
+        "no_mod" => (
+            "mod_unavailable",
+            "Ainda não há mod publicado para a versão deste servidor.",
+        ),
         "busy" | "too_many_downloads" => ("hub_busy", "O Hub está ocupado. Tente daqui a pouco."),
         _ => {
             return AppError::new(
@@ -316,6 +357,18 @@ impl HubClient {
             )
             .await?;
         Ok(r.ticket)
+    }
+
+    /// Mod mais novo publicado para `protocol`; `None` quando o Hub responde `404 no_mod`.
+    pub async fn mod_latest(&self, protocol: u32) -> AppResult<Option<ModInfo>> {
+        let mut u = self.url("v1/mod/latest");
+        u.query_pairs_mut()
+            .append_pair("protocol", &protocol.to_string());
+        match self.send(self.http.get(u)).await {
+            Ok(m) => Ok(Some(m)),
+            Err(e) if e.code == "mod_unavailable" => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn me(&self, access: &str) -> AppResult<Me> {
@@ -440,6 +493,7 @@ mod tests {
             "rate_limited"
         );
         assert_eq!(map_hub_error(503, Some("busy")).code, "hub_busy");
+        assert_eq!(map_hub_error(404, Some("no_mod")).code, "mod_unavailable");
         let e = map_hub_error(500, Some("internal"));
         assert_eq!(e.code, "hub_error");
         assert!(e.message.contains("500"));

@@ -1,6 +1,8 @@
 //! Pastas do launcher em `%LOCALAPPDATA%\CBMultiplayer`.
 //!
-//! `CBMP_DATA_DIR` troca a raiz, mas só em builds de debug (testes/dev); o release ignora a variável.
+//! No Windows a raiz vem da pasta conhecida `FOLDERID_LocalAppData` (`SHGetKnownFolderPath`), não da variável de
+//! ambiente (que qualquer processo pai pode trocar). `CBMP_DATA_DIR` troca a raiz, mas só em builds de debug
+//! (testes/dev); o release ignora a variável.
 
 use std::path::PathBuf;
 
@@ -15,8 +17,9 @@ pub fn data_dir() -> PathBuf {
 }
 
 fn default_data_dir() -> PathBuf {
-    if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|d| !d.is_empty()) {
-        return PathBuf::from(local).join(APP_DIR);
+    #[cfg(windows)]
+    if let Some(local) = local_app_data() {
+        return local.join(APP_DIR);
     }
     // Fora do Windows (não suportado oficialmente): convenção XDG.
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|d| !d.is_empty()) {
@@ -29,6 +32,37 @@ fn default_data_dir() -> PathBuf {
             .join(APP_DIR);
     }
     std::env::temp_dir().join(APP_DIR)
+}
+
+/// `FOLDERID_LocalAppData` do usuário atual (`None` se a API falhar).
+#[cfg(windows)]
+pub fn local_app_data() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_LocalAppData, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
+    };
+    let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: GUID estático; `raw` recebe um buffer alocado pela API que liberamos com CoTaskMemFree em qualquer caso.
+    let hr = unsafe {
+        SHGetKnownFolderPath(
+            &FOLDERID_LocalAppData,
+            KF_FLAG_DEFAULT as _,
+            std::ptr::null_mut(),
+            &mut raw,
+        )
+    };
+    let out = if hr >= 0 && !raw.is_null() {
+        // SAFETY: em sucesso `raw` é uma string UTF-16 terminada em zero.
+        let len = unsafe { (0..).take_while(|&i| *raw.add(i) != 0).count() };
+        let slice = unsafe { std::slice::from_raw_parts(raw, len) };
+        Some(PathBuf::from(std::ffi::OsString::from_wide(slice)))
+    } else {
+        None
+    };
+    // SAFETY: liberar nulo é permitido.
+    unsafe { CoTaskMemFree(raw as *const _) };
+    out.filter(|p| p.is_absolute())
 }
 
 pub fn cache_dir() -> PathBuf {
@@ -73,5 +107,13 @@ mod tests {
         assert_eq!(settings_file(), tmp.path().join("settings.json"));
         std::env::remove_var("CBMP_DATA_DIR");
         assert!(data_dir().ends_with(APP_DIR));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raiz_vem_da_pasta_conhecida_e_nao_da_variavel() {
+        let known = local_app_data().expect("FOLDERID_LocalAppData");
+        assert!(known.is_absolute() && known.is_dir());
+        assert_eq!(default_data_dir(), known.join(APP_DIR));
     }
 }

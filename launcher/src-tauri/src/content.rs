@@ -516,7 +516,7 @@ fn set_readonly(path: &Path) -> std::io::Result<()> {
 }
 
 /// Remove arquivo (mesmo somente leitura), pasta ou link; ausente não é erro.
-fn remove_entry(path: &Path) -> std::io::Result<()> {
+pub(crate) fn remove_entry(path: &Path) -> std::io::Result<()> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1458,7 +1458,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn hex(b: &[u8]) -> String {
+pub(crate) fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 

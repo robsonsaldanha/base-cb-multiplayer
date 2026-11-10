@@ -5,8 +5,12 @@ pub mod auth;
 pub mod commands;
 pub mod content;
 pub mod error;
+pub mod game;
 pub mod hub;
+pub mod launch;
+pub mod modpkg;
 pub mod paths;
+pub mod play;
 pub mod settings;
 pub mod update;
 
@@ -25,11 +29,7 @@ pub fn run() {
     ));
 
     let content = commands::content_store();
-    {
-        // Sobras de downloads e arquivos do cache fora do índice (queda no meio de uma gravação).
-        let content = content.clone();
-        std::thread::spawn(move || content.startup());
-    }
+    let hub_url = state.get_settings().hub_url;
 
     tauri::Builder::default()
         // Precisa ser o primeiro plugin: a 2ª instância repassa os argumentos à 1ª e sai. Com o recurso
@@ -50,10 +50,33 @@ pub fn run() {
         // Só o seletor de pasta do jogo, chamado pelo Rust; nenhuma permissão `dialog:` é dada à UI.
         .plugin(tauri_plugin_dialog::init())
         .manage(state)
-        // Uma loja de conteúdo só (índice e pastas de download coordenados por ela); usada pelo `play` (Task 7).
+        // Uma loja de conteúdo só (índice e pastas de download coordenados por ela); usada pelo `play`.
         .manage(content.clone())
         .manage(auth.clone())
+        // Um play por vez (também trava "limpar cache", a faxina da abertura e a instalação de update).
+        .manage(play::PlayGate::default())
         .setup(move |app| {
+            // Ticket de uma execução anterior que o mod não leu.
+            launch::remove_stale(&paths::run_dir());
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                // Sobras de downloads e arquivos do cache fora do índice, sob a trava do play (não corre junto
+                // com o primeiro download).
+                let gate = handle.state::<play::PlayGate>();
+                let _run = gate.begin().await;
+                let store = content.clone();
+                let _ = tokio::task::spawn_blocking(move || store.startup()).await;
+                // Jogo ainda não configurado: procura na Steam/Epic e grava se achar.
+                let state = handle.state::<AppState>();
+                if state.get_settings().game_dir.is_none()
+                    && commands::resolve_game(&state).is_none()
+                {
+                    log::info!("Hogwarts Legacy não encontrado automaticamente");
+                }
+            });
+            // Atualização do launcher: ao iniciar e a cada 6 h; só avisa a UI.
+            update::spawn_periodic(app.handle().clone(), hub_url.clone());
+
             // Em dev o instalador não registrou o esquema: registra para o executável atual.
             #[cfg(debug_assertions)]
             if let Err(e) = app.deep_link().register_all() {
@@ -73,7 +96,13 @@ pub fn run() {
             commands::app_version,
             commands::login,
             commands::logout,
-            commands::me
+            commands::me,
+            commands::pick_game_dir,
+            commands::play,
+            commands::cancel_play,
+            commands::clear_cache,
+            commands::check_update,
+            commands::install_update
         ])
         .run(tauri::generate_context!())
         .expect("falha ao iniciar o CB Multiplayer");

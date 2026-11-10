@@ -34,19 +34,35 @@ log = "=0.4.35"
 httpdate = "=1.0.3"
 # Cofre: Windows Credential Manager (serviço `CBMultiplayer`).
 keyring = { version = "=3.6.3", features = ["windows-native"] }
+# Mod do cliente: assinatura minisign (a mesma verificação do plugin updater), zip só com deflate, semver do Hub.
+minisign-verify = "=0.3.0"
+zip = { version = "=9.5.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+semver = "=1.0.28"
 
 [target.'cfg(windows)'.dependencies]
 # Abrir o navegador do sistema (ShellExecuteW) só a partir do Rust; nada de plugin opener/shell.
-windows-sys = { version = "=0.61.2", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+# Também: registro (Steam), pasta conhecida LocalAppData, ACL do `connect.json` (só o usuário atual).
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
 tempfile = "=3.27.0"
 toml = "=1.2.1"
 # Hub falso dos testes.
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
-tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
+tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "test-util"] }
 # Corpo em stream do cb-server falso (queda no meio, lento, chunked).
 futures-util = { version = "=0.3.34", default-features = false }
+# Par de chaves minisign gerado no próprio teste (nunca a chave de dev nem a de release).
+minisign = "=0.10.0"
 
 [profile.release]
 codegen-units = 1
