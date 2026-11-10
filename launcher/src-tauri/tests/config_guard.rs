@@ -700,17 +700,10 @@ fn overlay_de_teste_local_so_muda_o_permitido_e_passa_no_guarda() {
     // A janela continua a mesma (label e tamanhos que o resto do app espera); só o título muda.
     let (w, base_w) = (&merged["app"]["windows"][0], &base["app"]["windows"][0]);
     assert_eq!(merged["app"]["windows"].as_array().unwrap().len(), 1);
-    for k in [
-        "label",
-        "width",
-        "height",
-        "minWidth",
-        "minHeight",
-        "center",
-    ] {
-        assert_eq!(w[k], base_w[k], "{k}");
-    }
-    assert_eq!(w["title"], "CB Multiplayer (Teste local)");
+    // Janela inteira igual à oficial, só com outro título (nada de devtools, url, args extras…).
+    let mut expected = base_w.clone();
+    expected["title"] = serde_json::json!("CB Multiplayer (Teste local)");
+    assert_eq!(w, &expected);
 
     // O endpoint é o que o Rust monta para o Hub local do build de teste.
     assert_eq!(
@@ -742,6 +735,15 @@ fn feature_local_test_so_por_flag_explicita() {
         features.len(),
         1,
         "feature nova precisa ser revisada aqui: {features:?}"
+    );
+    // Pasta de dados: a oficial é `CBMultiplayer` (restrição global); a de teste local é outra.
+    assert_eq!(
+        cbmp_launcher_lib::paths::APP_DIR,
+        if cfg!(feature = "local-test") {
+            "CBMultiplayer-TesteLocal"
+        } else {
+            "CBMultiplayer"
+        }
     );
     if !cfg!(feature = "local-test") {
         assert_eq!(

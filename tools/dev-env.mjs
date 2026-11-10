@@ -114,8 +114,28 @@ function killTree(pid) {
   else { try { process.kill(pid, 'SIGTERM'); } catch { /* já saiu */ } }
 }
 
-function pidAlive(pid) {
-  try { process.kill(pid, 0); return true; } catch { return false; }
+/**
+ * Identidade de processos vivos: pid → { name, start } (nome da imagem sem extensão, minúsculo; início em UTC).
+ * Um pid gravado só é morto se nome E hora de início ainda baterem: o Windows reaproveita pids, e um pids.json velho
+ * (janela fechada, reboot) não pode derrubar o navegador ou o jogo de ninguém.
+ */
+function identities(pids) {
+  const list = pids.filter((n) => Number.isInteger(n) && n > 0);
+  const out = new Map();
+  if (list.length === 0) return out;
+  let rows = [];
+  if (process.platform === 'win32') {
+    const cmd = `Get-Process -Id ${list.join(',')} -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Id)|$($_.ProcessName)|$($_.StartTime.ToUniversalTime().ToString('o'))" }`;
+    const text = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', cmd], { encoding: 'utf8' }).stdout ?? '';
+    rows = text.split(/\r?\n/).map((l) => l.trim().split('|'));
+  } else {
+    const text = spawnSync('ps', ['-o', 'pid=,comm=,lstart=', '-p', list.join(',')], { encoding: 'utf8' }).stdout ?? '';
+    rows = text.split(/\r?\n/).map((l) => /^\s*(\d+)\s+(\S+)\s+(.+?)\s*$/.exec(l)?.slice(1) ?? []);
+  }
+  for (const [id, name, start] of rows) {
+    if (id && name && start) out.set(Number(id), { name: name.toLowerCase().replace(/\.exe$/, ''), start });
+  }
+  return out;
 }
 
 // -------------------------------------------------------------------------------------------------------- releases
@@ -288,10 +308,21 @@ function startChild(name, cmd, args, opts, logFile) {
 }
 
 function stopFromPidFile(p, quiet = false) {
-  let pids;
-  try { pids = JSON.parse(readFileSync(p.pids, 'utf8')); } catch { if (!quiet) log('nada rodando (sem pids.json)'); return; }
-  for (const [name, pid] of Object.entries(pids)) {
-    if (pid && pid !== process.pid && pidAlive(pid)) { killTree(pid); if (!quiet) log(`${name} (pid ${pid}) encerrado`); }
+  let saved;
+  try { saved = JSON.parse(readFileSync(p.pids, 'utf8')); } catch { if (!quiet) log('nada rodando (sem pids.json)'); return; }
+  // Só entradas completas (pid + nome + início); formato antigo (só o pid) é ignorado: sem identidade, não mata.
+  const entries = Object.entries(saved).filter(([, e]) => e && typeof e === 'object' && Number.isInteger(e.pid) && e.name && e.start);
+  const live = identities(entries.map(([, e]) => e.pid));
+  for (const [what, e] of entries) {
+    if (e.pid === process.pid) continue;
+    const now = live.get(e.pid);
+    if (!now) { if (!quiet) log(`${what} (pid ${e.pid}) já tinha terminado`); continue; }
+    if (now.name !== e.name || now.start !== e.start) {
+      log(`${what}: o pid ${e.pid} agora é outro processo (${now.name}); não mexi nele`);
+      continue;
+    }
+    killTree(e.pid);
+    if (!quiet) log(`${what} (pid ${e.pid}) encerrado`);
   }
   rmSync(p.pids, { force: true });
 }
@@ -311,14 +342,26 @@ async function run(p) {
     if (stopping) return;
     stopping = true;
     log('encerrando…');
-    for (const c of Object.values(children)) killTree(c.pid);
+    // Filhos deste processo: o pid é deles enquanto não saíram.
+    for (const c of Object.values(children)) if (c.exitCode === null && c.signalCode === null) killTree(c.pid);
     rmSync(p.pids, { force: true });
     process.exit(code);
   };
   process.on('SIGINT', () => stopAll(0));
   process.on('SIGTERM', () => stopAll(0));
-  process.on('SIGBREAK', () => stopAll(0));
-  const savePids = () => writeFileSync(p.pids, JSON.stringify({ 'dev-env': process.pid, ...Object.fromEntries(Object.entries(children).map(([k, c]) => [k, c.pid])) }));
+  process.on('SIGBREAK', () => stopAll(0)); // Ctrl+Break
+  process.on('SIGHUP', () => stopAll(0)); // janela do console fechada (o Windows dá ~10 s para limpar)
+  // pid + nome + hora de início de cada processo: o --stop/--run seguinte só mata o que ainda for nosso.
+  const savePids = () => {
+    const pids = { 'dev-env': process.pid, ...Object.fromEntries(Object.entries(children).map(([k, c]) => [k, c.pid])) };
+    const ids = identities(Object.values(pids));
+    const out = {};
+    for (const [k, pid] of Object.entries(pids)) {
+      const id = ids.get(pid);
+      if (id) out[k] = { pid, ...id };
+    }
+    writeFileSync(p.pids, JSON.stringify(out, null, 2));
+  };
 
   // Hub: só 127.0.0.1, login de dev, servidores em IP privado, releases da pasta local. Nada de token do GitHub.
   const hubEnv = { ...process.env };
@@ -391,7 +434,8 @@ ${haveInstaller ? '' : `
   3. A lista mostra "${SERVER_NAME}" em destaque. Jogar baixa o hello-client e o mod de teste; com
      "simular abertura" ligado o launcher para em "Pronto para abrir" sem abrir o jogo.
   4. Auto-update: o launcher 0.1.0 encontra a 0.1.1 neste Hub (Configurações → atualizar).
-  5. Pastas: %LOCALAPPDATA%\\CBMultiplayer (cache, servers, mods, logs\\launcher.log).
+  5. Pastas: %LOCALAPPDATA%\\CBMultiplayer-TesteLocal (cache, servers, mods, logs\\launcher.log); o build de
+     teste local tem pasta própria (o oficial usa %LOCALAPPDATA%\\CBMultiplayer).
 
  Painel do Hub: ${HUB_URL}/panel   Logs: ${p.logs}   Dados: ${p.dir}
  Ctrl+C encerra tudo (ou, de outro terminal: node tools/dev-env.mjs --stop).

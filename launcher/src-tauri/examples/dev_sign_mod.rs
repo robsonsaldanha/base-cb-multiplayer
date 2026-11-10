@@ -107,7 +107,10 @@ fn run() -> Result<(), String> {
     .map_err(|_| "a chave privada não é o par de keys/update.pub")?;
     let signed = cbmp_launcher_lib::modpkg::parse_mod_comment(&got)
         .ok_or("comentário confiável fora do formato exigido")?;
-    if signed.sha256 != sha || signed.protocol != a.protocol {
+    if signed.sha256 != sha
+        || signed.protocol != a.protocol
+        || signed.version.to_string() != a.version
+    {
         return Err("assinatura não confere".into());
     }
 

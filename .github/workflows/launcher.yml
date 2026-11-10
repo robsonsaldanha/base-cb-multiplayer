@@ -45,6 +45,13 @@ jobs:
       # bash (Git Bash do runner): passa o JSON intacto até a CLI, como no build local.
       - run: npm run tauri -w launcher/ui -- build --ci --config '{"bundle":{"createUpdaterArtifacts":false}}' -- --locked
         shell: bash
+      # Tripwire: o binário oficial não pode carregar nada do perfil de teste local (Hub local, nome, pasta).
+      - run: |
+          for s in '127.0.0.1:8787' 'Teste local' 'localtest' 'TesteLocal'; do
+            if grep -q -a -F "$s" CBMultiplayer.exe; then echo "binário oficial contém '$s'"; exit 1; fi
+          done
+        shell: bash
+        working-directory: launcher/src-tauri/target/release
       - uses: actions/upload-artifact@v4
         with:
           name: cb-multiplayer-nsis
@@ -57,6 +64,9 @@ jobs:
         working-directory: launcher/src-tauri
       - run: npm run tauri -w launcher/ui -- build --ci --features local-test --config ../src-tauri/tauri.localtest.conf.json --config '{"bundle":{"createUpdaterArtifacts":false}}' -- --locked
         shell: bash
+      - run: grep -q -a -F '127.0.0.1:8787' CBMultiplayerTesteLocal.exe
+        shell: bash
+        working-directory: launcher/src-tauri/target/release
       - uses: actions/upload-artifact@v4
         with:
           name: cb-multiplayer-teste-local-nsis

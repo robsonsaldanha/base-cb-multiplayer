@@ -369,3 +369,44 @@ fn guarda_pega_log_com_segredo() {
     let ok = r#"log::info!("ticket renovado antes de abrir");"#;
     assert!(!formatted_names(&log_calls(ok)[0]).contains("ticket"));
 }
+
+/// Arquivo atual preso por outro processo (sem FILE_SHARE_DELETE): a rotação falha e os antigos ficam intactos, em
+/// vez de a cadeia girar (e apagar o histórico) a cada linha.
+#[cfg(windows)]
+#[test]
+fn rotacao_bloqueada_nao_apaga_os_antigos() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    for n in 1..=3 {
+        std::fs::write(
+            dir.path().join(format!("{FILE_NAME}.{n}")),
+            format!("antigo {n}"),
+        )
+        .unwrap();
+    }
+    let logger = FileLogger::open(dir.path(), 500, 3).unwrap();
+    // Outro "processo": leitura e escrita compartilhadas, mas não exclusão/renomeação.
+    let _hold = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1 | 2)
+        .open(logger.path())
+        .unwrap();
+    for i in 0..100 {
+        logger.write_line(
+            log::Level::Info,
+            "cbmp_launcher_lib::x",
+            &format!("linha {i:03} {}", "y".repeat(30)),
+        );
+    }
+    for n in 1..=3 {
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(format!("{FILE_NAME}.{n}"))).unwrap(),
+            format!("antigo {n}")
+        );
+    }
+    let cur = std::fs::read_to_string(logger.path()).unwrap();
+    assert!(
+        cur.contains("linha 099"),
+        "o atual continua recebendo linhas"
+    );
+}

@@ -100,6 +100,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
     throw new Error('HUB_RELEASES_REPO (dono/repo) é obrigatório quando HUB_GITHUB_TOKEN está definido');
   }
   if (cfg.releasesDir) {
+    // NODE_ENV não é definido pelo deploy deste projeto: a trava que vale é o dev-login, que já prende o Hub a
+    // HUB_HOST/HUB_PUBLIC_URL locais e sem proxy (assertDevLoginSafe).
+    if (!devLogin) throw new Error('HUB_RELEASES_DIR (releases locais, só para testes) exige HUB_DEV_LOGIN=1, que prende o Hub a esta máquina');
     if (cfg.githubToken) throw new Error('HUB_RELEASES_DIR e HUB_GITHUB_TOKEN são mutuamente exclusivos (pasta local de releases é só para testes)');
     if ((env.NODE_ENV ?? '').trim() === 'production') throw new Error('HUB_RELEASES_DIR (releases locais, só para testes) é recusado com NODE_ENV=production');
   }

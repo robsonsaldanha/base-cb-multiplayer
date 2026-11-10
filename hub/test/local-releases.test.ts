@@ -56,6 +56,12 @@ describe('HUB_RELEASES_DIR (config)', () => {
     expect(() => loadConfig({ ...dev, HUB_RELEASES_DIR: dir, HUB_GITHUB_TOKEN: 't', HUB_RELEASES_REPO: 'a/b' }))
       .toThrow(/HUB_RELEASES_DIR.*HUB_GITHUB_TOKEN/);
   });
+  it('exige HUB_DEV_LOGIN=1 (Hub provadamente local)', () => {
+    const prod = { DISCORD_CLIENT_ID: 'cid', DISCORD_CLIENT_SECRET: 's' };
+    expect(() => loadConfig({ ...prod, HUB_RELEASES_DIR: dir })).toThrow(/HUB_RELEASES_DIR.*HUB_DEV_LOGIN=1/);
+    expect(() => loadConfig({ ...prod, HUB_DEV_LOGIN: '0', HUB_RELEASES_DIR: dir })).toThrow(/HUB_DEV_LOGIN=1/);
+    expect(loadConfig({ ...prod, HUB_DEV_LOGIN: '1', HUB_RELEASES_DIR: dir }).releasesDir).toBe(dir);
+  });
   it('é recusado com NODE_ENV=production', () => {
     expect(() => loadConfig({ ...dev, HUB_RELEASES_DIR: dir, NODE_ENV: 'production' })).toThrow(/HUB_RELEASES_DIR.*production/);
     expect(loadConfig({ ...dev, NODE_ENV: 'production' }).releasesDir).toBe('');

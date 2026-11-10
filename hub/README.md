@@ -24,7 +24,7 @@ Veja `.env.example` para a lista completa. Updates do launcher, mod e downloads 
 |---|---|
 | `HUB_GITHUB_TOKEN` | token do GitHub com leitura de Releases (fine-grained, só *Contents: read* no repo privado). Vazio → as três rotas respondem `503 updates_disabled`. Nunca vai para log nem para o cliente. |
 | `HUB_RELEASES_REPO` | `dono/repo` dos Releases; obrigatório quando há token. Tags `launcher-vX.Y.Z` (instalador `*-setup.exe` + `.sig`) e `mod-pN-vX.Y.Z` (`cbmp-mod-pN-vX.Y.Z.zip` + `.sig` + `.sha256`). |
-| `HUB_RELEASES_DIR` | **só testes locais**: pasta com `<tag>/<asset>` (e `notes.txt` opcional com as notas) servida no lugar do GitHub. Mutuamente exclusivo com `HUB_GITHUB_TOKEN`; recusado com `NODE_ENV=production`. Links simbólicos/junções e nomes fora de `[A-Za-z0-9 ._()+-]` são ignorados. É o que `tools/dev-env.mjs` usa. |
+| `HUB_RELEASES_DIR` | **só testes locais**: pasta com `<tag>/<asset>` (e `notes.txt` opcional com as notas) servida no lugar do GitHub. Exige `HUB_DEV_LOGIN=1` (Hub preso a esta máquina); mutuamente exclusivo com `HUB_GITHUB_TOKEN`; recusado com `NODE_ENV=production`. Links simbólicos/junções e nomes fora de `[A-Za-z0-9 ._()+-]` são ignorados. É o que `tools/dev-env.mjs` usa. |
 | `HUB_DL_MAX_CONCURRENT` | downloads de `/v1/dl` repassados ao mesmo tempo, somando todos os clientes (padrão 32; inteiro ≥ 1). Cada IP tem no máximo 2. |
 | `HUB_DL_STALL_SECONDS` | download cujo cliente não drena o socket por este tempo é derrubado (padrão 30; 1–3600). |
 | `HUB_DL_MIN_KBPS` | taxa mínima em KiB/s (média dos últimos 30 s, após 30 s de carência); abaixo dela o download é derrubado (padrão 32; 0 desliga). |

@@ -219,6 +219,9 @@ pub fn utc_timestamp(t: SystemTime) -> String {
 struct Sink {
     file: Option<File>,
     size: u64,
+    /// O arquivo atual não pôde ser renomeado (outro processo o segura): não tenta girar de novo nesta sessão, para
+    /// não apagar o histórico girando a cadeia a cada linha.
+    rotation_blocked: bool,
 }
 
 /// Logger em arquivo com rotação. Use [`init`] no app; os testes criam o seu com [`FileLogger::open`].
@@ -248,6 +251,7 @@ impl FileLogger {
             sink: Mutex::new(Sink {
                 file: None,
                 size: 0,
+                rotation_blocked: false,
             }),
         };
         {
@@ -278,19 +282,25 @@ impl FileLogger {
         Ok(())
     }
 
-    /// `launcher.log` → `.1` → `.2` … (o mais velho além de `keep` some). Falha de rotação não derruba o app: o
-    /// arquivo atual continua sendo usado.
+    /// `launcher.log` → `.1` → `.2` … (o mais velho além de `keep` some). Primeiro tira o arquivo atual do caminho
+    /// (`.rotating`); só se isso der certo a cadeia anda. Se não der (arquivo preso por outro processo), os antigos
+    /// ficam intactos, o atual continua sendo usado e a rotação para nesta sessão. Nunca derruba o app.
     fn rotate(&self, sink: &mut Sink) {
         sink.file = None; // fecha antes de renomear (Windows)
-        if self.keep == 0 {
-            let _ = std::fs::remove_file(self.path());
+        let pending = self.dir.join(format!("{FILE_NAME}.rotating"));
+        let moved = if self.keep == 0 {
+            std::fs::remove_file(self.path()).is_ok()
         } else {
+            std::fs::rename(self.path(), &pending).is_ok()
+        };
+        if moved && self.keep > 0 {
             let _ = std::fs::remove_file(self.rotated(self.keep));
             for n in (1..self.keep).rev() {
                 let _ = std::fs::rename(self.rotated(n), self.rotated(n + 1));
             }
-            let _ = std::fs::rename(self.path(), self.rotated(1));
+            let _ = std::fs::rename(&pending, self.rotated(1));
         }
+        sink.rotation_blocked = !moved;
         let _ = self.reopen(sink);
     }
 
@@ -321,7 +331,8 @@ impl FileLogger {
             text
         );
         let mut sink = self.sink.lock().unwrap_or_else(|p| p.into_inner());
-        if sink.size > 0 && sink.size + line.len() as u64 > self.max_bytes {
+        if !sink.rotation_blocked && sink.size > 0 && sink.size + line.len() as u64 > self.max_bytes
+        {
             self.rotate(&mut sink);
         }
         if let Some(f) = sink.file.as_mut() {
