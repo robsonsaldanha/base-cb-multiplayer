@@ -1,7 +1,13 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Janela principal: núcleo padrão do Tauri e os comandos do app. Sem fs/shell/http/opener/dialog.",
+  "description": "Janela principal: só ouvir eventos do Rust e os comandos do app. Sem core:default, fs/shell/http/opener/dialog.",
   "windows": ["main"],
-  "permissions": ["core:default", "allow-get-settings", "allow-set-settings", "allow-app-version"]
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-get-settings",
+    "allow-set-settings",
+    "allow-app-version"
+  ]
 }

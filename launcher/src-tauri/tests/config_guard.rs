@@ -1,5 +1,10 @@
-//! Guarda de segurança da configuração: lê `tauri.conf.json` e `capabilities/*.json` de verdade e falha se a UI
-//! ganhar acesso a fs/shell/http/opener, se a CSP afrouxar ou se a configuração exigida mudar.
+//! Guarda de segurança da configuração. Lê de verdade `tauri.conf.json`, `capabilities/**/*` (como o tauri-build),
+//! `src/lib.rs` e `Cargo.toml`, e falha se:
+//! - a UI ganhar `fs:`/`shell:`/`http:`/`opener:`, `core:default` ou permissões core perigosas (image/tray/menu,
+//!   emitir eventos, alternar devtools);
+//! - aparecer capability remota, em formato não verificado, ou o `assetProtocol` for ligado;
+//! - a CSP mudar ou tiver `unsafe-`;
+//! - um plugin fora da lista (deep-link, single-instance, updater, dialog) for registrado ou virar dependência direta.
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -7,47 +12,83 @@ use std::path::{Path, PathBuf};
 const REQUIRED_CSP: &str =
     "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost";
 
+const FORBIDDEN_PREFIXES: [&str; 7] = [
+    "fs:",
+    "shell:",
+    "http:",
+    "opener:",
+    "core:image",
+    "core:tray",
+    "core:menu",
+];
+const FORBIDDEN_EXACT: [&str; 6] = [
+    "core:default",
+    "core:event:default",
+    "core:event:allow-emit",
+    "core:event:allow-emit-to",
+    "core:webview:default",
+    "core:webview:allow-internal-toggle-devtools",
+];
+const FORBIDDEN_PLUGINS: [&str; 4] = ["fs", "shell", "http", "opener"];
+/// Plugins permitidos (nome do crate sem `tauri_plugin_`, com `_`).
+const ALLOWED_PLUGINS: [&str; 4] = ["deep_link", "single_instance", "updater", "dialog"];
+
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn read_json(p: &Path) -> Value {
-    let text = std::fs::read_to_string(p).unwrap_or_else(|e| panic!("ler {}: {e}", p.display()));
-    serde_json::from_str(&text).unwrap_or_else(|e| panic!("JSON inválido em {}: {e}", p.display()))
+fn read(p: &Path) -> String {
+    std::fs::read_to_string(p).unwrap_or_else(|e| panic!("ler {}: {e}", p.display()))
 }
 
 fn conf() -> Value {
-    read_json(&root().join("tauri.conf.json"))
+    serde_json::from_str(&read(&root().join("tauri.conf.json"))).expect("tauri.conf.json inválido")
 }
 
-fn capability_files() -> Vec<(String, Value)> {
-    let dir = root().join("capabilities");
-    let mut out: Vec<_> = std::fs::read_dir(&dir)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.is_file())
-        .map(|p| {
-            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-            assert_eq!(
-                ext,
-                "json",
-                "capability fora de JSON não é verificada: {}",
-                p.display()
-            );
-            (
-                p.file_name().unwrap().to_string_lossy().into_owned(),
-                read_json(&p),
-            )
-        })
-        .collect();
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
+// ----- leitura das capabilities (mesmo alcance do tauri-build: `capabilities/**/*`) -----
+
+/// Capabilities encontradas e problemas (arquivo em formato que o guarda não verifica, ou ilegível).
+fn load_capabilities(dir: &Path) -> (Vec<(String, Value)>, Vec<String>) {
+    let mut caps = Vec::new();
+    let mut problems = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let name = p
+                .strip_prefix(dir)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = read(&p);
+            let parsed: Result<Value, String> =
+                match p.extension().and_then(|e| e.to_str()).unwrap_or("") {
+                    "json" => serde_json::from_str(&text).map_err(|e| e.to_string()),
+                    "toml" => toml::from_str(&text).map_err(|e| e.to_string()),
+                    other => Err(format!("formato não verificado pelo guarda (.{other})")),
+                };
+            match parsed {
+                // Um arquivo pode ter uma capability ou uma lista delas.
+                Ok(Value::Array(list)) => {
+                    caps.extend(list.into_iter().map(|c| (name.clone(), c)));
+                }
+                Ok(Value::Object(mut o)) if o.contains_key("capabilities") => {
+                    if let Some(Value::Array(list)) = o.remove("capabilities") {
+                        caps.extend(list.into_iter().map(|c| (name.clone(), c)));
+                    }
+                }
+                Ok(v) => caps.push((name, v)),
+                Err(e) => problems.push(format!("{name}: {e}")),
+            }
+        }
+    }
+    caps.sort_by(|a, b| a.0.cmp(&b.0));
+    (caps, problems)
 }
-
-// ----- verificador -----
-
-const FORBIDDEN_PREFIXES: [&str; 4] = ["fs:", "shell:", "http:", "opener:"];
-const FORBIDDEN_PLUGINS: [&str; 4] = ["fs", "shell", "http", "opener"];
 
 /// Identificadores de permissão de uma capability (string ou objeto `{identifier, allow, deny}`).
 fn permission_ids(cap: &Value) -> Vec<String> {
@@ -69,14 +110,19 @@ fn permission_ids(cap: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Todas as violações encontradas na configuração (vazio = ok).
+fn forbidden_permission(id: &str) -> bool {
+    FORBIDDEN_PREFIXES.iter().any(|p| id.starts_with(p)) || FORBIDDEN_EXACT.contains(&id)
+}
+
+// ----- verificadores -----
+
+/// Violações na configuração e nas capabilities (vazio = ok).
 fn violations(conf: &Value, caps: &[(String, Value)]) -> Vec<String> {
     let mut v = Vec::new();
     let security = &conf["app"]["security"];
 
     for key in ["csp", "devCsp"] {
-        let csp = &security[key];
-        let text = match csp {
+        let text = match &security[key] {
             Value::Null => continue,
             Value::String(s) => s.clone(),
             other => other.to_string(),
@@ -90,6 +136,9 @@ fn violations(conf: &Value, caps: &[(String, Value)]) -> Vec<String> {
     }
     if !security["dangerousDisableAssetCspModification"].is_null() {
         v.push("dangerousDisableAssetCspModification definido".into());
+    }
+    if security["assetProtocol"]["enable"].as_bool() == Some(true) {
+        v.push("assetProtocol ligado (UI leria arquivos por asset://)".into());
     }
     if conf["app"]["withGlobalTauri"].as_bool() == Some(true) {
         v.push("withGlobalTauri ligado".into());
@@ -129,7 +178,7 @@ fn violations(conf: &Value, caps: &[(String, Value)]) -> Vec<String> {
             v.push(format!("{name}: capability com acesso remoto"));
         }
         for id in permission_ids(cap) {
-            if FORBIDDEN_PREFIXES.iter().any(|p| id.starts_with(p)) {
+            if forbidden_permission(&id) {
                 v.push(format!("{name}: permissão proibida {id}"));
             }
         }
@@ -137,7 +186,37 @@ fn violations(conf: &Value, caps: &[(String, Value)]) -> Vec<String> {
     v
 }
 
-// ----- testes do verificador (casos sintéticos) -----
+/// Plugins registrados no código (`tauri_plugin_<nome>`) ou dependências diretas `tauri-plugin-*` fora da lista.
+fn plugin_violations(lib_rs: &str, cargo_toml: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    for (i, _) in lib_rs.match_indices("tauri_plugin_") {
+        let name: String = lib_rs[i + "tauri_plugin_".len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !ALLOWED_PLUGINS.contains(&name.as_str()) {
+            v.push(format!("lib.rs: plugin fora da lista: tauri_plugin_{name}"));
+        }
+    }
+    let manifest: toml::Table = toml::from_str(cargo_toml).expect("Cargo.toml inválido");
+    for section in ["dependencies", "build-dependencies"] {
+        let Some(deps) = manifest.get(section).and_then(|d| d.as_table()) else {
+            continue;
+        };
+        for dep in deps.keys() {
+            if let Some(name) = dep.strip_prefix("tauri-plugin-") {
+                if !ALLOWED_PLUGINS.contains(&name.replace('-', "_").as_str()) {
+                    v.push(format!(
+                        "Cargo.toml [{section}]: plugin fora da lista: {dep}"
+                    ));
+                }
+            }
+        }
+    }
+    v
+}
+
+// ----- testes do verificador (casos sintéticos e fixtures temporárias) -----
 
 fn good_conf() -> Value {
     serde_json::json!({
@@ -155,10 +234,11 @@ fn cap(perms: Value) -> Vec<(String, Value)> {
 
 #[test]
 fn verificador_aceita_configuracao_minima() {
-    assert_eq!(
-        violations(&good_conf(), &cap(serde_json::json!(["core:default"]))),
-        Vec::<String>::new()
-    );
+    let caps = cap(serde_json::json!([
+        "core:event:allow-listen",
+        "allow-app-version"
+    ]));
+    assert_eq!(violations(&good_conf(), &caps), Vec::<String>::new());
 }
 
 #[test]
@@ -169,8 +249,18 @@ fn verificador_pega_permissoes_proibidas() {
         "http:default",
         "opener:allow-open-url",
         "fs:allow-read-file",
+        "core:default",
+        "core:image:default",
+        "core:image:allow-from-path",
+        "core:tray:allow-new",
+        "core:menu:default",
+        "core:event:default",
+        "core:event:allow-emit",
+        "core:event:allow-emit-to",
+        "core:webview:default",
+        "core:webview:allow-internal-toggle-devtools",
     ] {
-        let caps = cap(serde_json::json!(["core:default", p]));
+        let caps = cap(serde_json::json!(["core:event:allow-listen", p]));
         assert_eq!(violations(&good_conf(), &caps).len(), 1, "{p}");
         let caps = cap(serde_json::json!([{ "identifier": p, "allow": [{ "path": "**" }] }]));
         assert_eq!(violations(&good_conf(), &caps).len(), 1, "{p} em objeto");
@@ -201,6 +291,18 @@ fn verificador_pega_csp_frouxa() {
 }
 
 #[test]
+fn verificador_pega_asset_protocol_ligado() {
+    let mut c = good_conf();
+    c["app"]["security"]["assetProtocol"] = serde_json::json!({ "enable": false, "scope": [] });
+    assert_eq!(violations(&c, &[]), Vec::<String>::new());
+    c["app"]["security"]["assetProtocol"] =
+        serde_json::json!({ "enable": true, "scope": ["$APPDATA/**"] });
+    let v = violations(&c, &[]);
+    assert_eq!(v.len(), 1);
+    assert!(v[0].contains("assetProtocol"));
+}
+
+#[test]
 fn verificador_pega_capability_inline_remota_e_plugins() {
     let mut c = good_conf();
     c["app"]["security"]["capabilities"] =
@@ -222,18 +324,101 @@ fn verificador_pega_capability_inline_remota_e_plugins() {
     assert_eq!(violations(&c, &[]).len(), 1);
 }
 
+#[test]
+fn fixture_capability_em_subpasta_toml_e_vista() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("default.json"),
+        r#"{ "identifier": "default", "permissions": ["allow-app-version"] }"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("extra/fundo")).unwrap();
+    std::fs::write(
+        dir.path().join("extra/fundo/fs.toml"),
+        "identifier = \"esc\"\npermissions = [\"fs:default\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("extra/lista.json"),
+        r#"[{ "identifier": "a", "permissions": ["core:tray:default"] }]"#,
+    )
+    .unwrap();
+    let (caps, problems) = load_capabilities(dir.path());
+    assert!(problems.is_empty(), "{problems:?}");
+    assert_eq!(caps.len(), 3);
+    let v = violations(&good_conf(), &caps);
+    assert!(
+        v.iter()
+            .any(|e| e.contains("extra/fundo/fs.toml") && e.contains("fs:default")),
+        "{v:?}"
+    );
+    assert!(
+        v.iter()
+            .any(|e| e.contains("extra/lista.json") && e.contains("core:tray")),
+        "{v:?}"
+    );
+}
+
+#[test]
+fn fixture_capability_em_formato_nao_verificado_falha() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(
+        dir.path().join("sub/x.json5"),
+        "{ identifier: 'x', permissions: ['fs:default'] }",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("quebrado.json"), "{ nao json").unwrap();
+    let (caps, problems) = load_capabilities(dir.path());
+    assert!(caps.is_empty());
+    assert_eq!(problems.len(), 2, "{problems:?}");
+}
+
+#[test]
+fn fixture_plugin_fora_da_lista_no_codigo_e_no_cargo() {
+    let lib_ok = "tauri::Builder::default().plugin(tauri_plugin_dialog::init())\
+                  .plugin(tauri_plugin_single_instance::init(|_, _, _| {}))";
+    let cargo_ok = "[package]\nname = \"x\"\n[dependencies]\ntauri = \"2\"\ntauri-plugin-dialog = \"2\"\ntauri-plugin-deep-link = \"2\"\n";
+    assert_eq!(plugin_violations(lib_ok, cargo_ok), Vec::<String>::new());
+
+    let lib_bad = format!("{lib_ok}.plugin(tauri_plugin_shell::init())");
+    let v = plugin_violations(&lib_bad, cargo_ok);
+    assert_eq!(v.len(), 1);
+    assert!(v[0].contains("tauri_plugin_shell"));
+
+    let cargo_bad = format!("{cargo_ok}tauri-plugin-opener = \"2\"\n");
+    let v = plugin_violations(lib_ok, &cargo_bad);
+    assert_eq!(v.len(), 1);
+    assert!(v[0].contains("tauri-plugin-opener"));
+}
+
 // ----- os arquivos reais -----
+
+fn real_capabilities() -> Vec<(String, Value)> {
+    let (caps, problems) = load_capabilities(&root().join("capabilities"));
+    assert!(problems.is_empty(), "{problems:?}");
+    assert!(!caps.is_empty(), "nenhuma capability encontrada");
+    caps
+}
 
 #[test]
 fn configuracao_real_passa_no_guarda() {
-    let caps = capability_files();
-    assert!(!caps.is_empty(), "nenhuma capability encontrada");
-    assert_eq!(violations(&conf(), &caps), Vec::<String>::new());
+    assert_eq!(
+        violations(&conf(), &real_capabilities()),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn plugins_reais_estao_na_lista() {
+    let lib_rs = read(&root().join("src/lib.rs"));
+    let cargo = read(&root().join("Cargo.toml"));
+    assert_eq!(plugin_violations(&lib_rs, &cargo), Vec::<String>::new());
 }
 
 #[test]
 fn capability_real_so_tem_o_permitido() {
-    let caps = capability_files();
+    let caps = real_capabilities();
     assert_eq!(caps.len(), 1, "capability nova precisa ser revisada aqui");
     let (_, c) = &caps[0];
     assert_eq!(c["windows"], serde_json::json!(["main"]));
@@ -245,7 +430,8 @@ fn capability_real_so_tem_o_permitido() {
             "allow-app-version",
             "allow-get-settings",
             "allow-set-settings",
-            "core:default"
+            "core:event:allow-listen",
+            "core:event:allow-unlisten",
         ]
     );
 }
@@ -276,7 +462,7 @@ fn tauri_conf_tem_os_valores_exigidos() {
     );
 
     let up = &c["plugins"]["updater"];
-    let pubkey = std::fs::read_to_string(root().join("keys/update.pub")).unwrap();
+    let pubkey = read(&root().join("keys/update.pub"));
     assert_eq!(
         up["pubkey"].as_str(),
         Some(pubkey.trim()),
@@ -298,8 +484,8 @@ fn tauri_conf_tem_os_valores_exigidos() {
 
 #[test]
 fn comandos_do_build_rs_batem_com_a_capability() {
-    let build = std::fs::read_to_string(root().join("build.rs")).unwrap();
-    let caps = capability_files();
+    let build = read(&root().join("build.rs"));
+    let caps = real_capabilities();
     let perms = permission_ids(&caps[0].1);
     for cmd in ["get_settings", "set_settings", "app_version"] {
         assert!(

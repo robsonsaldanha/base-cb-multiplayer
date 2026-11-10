@@ -9,11 +9,13 @@ const s: Settings = {
   hubUrl: "https://hub.example",
   favorites: ["a"],
   recent: [],
-  gameDir: null,
+  gameDir: "C:\\Jogos\\Hogwarts Legacy",
   cacheLimitMB: 10240,
   maxServerContentMB: 2048,
   simulateLaunch: true,
 };
+
+const editable = { favorites: ["a"], recent: [], cacheLimitMB: 10240, maxServerContentMB: 2048, simulateLaunch: true };
 
 describe("api", () => {
   beforeEach(() => invoke.mockReset());
@@ -25,9 +27,18 @@ describe("api", () => {
     expect(await appVersion()).toBe("1.2.3");
     expect(invoke.mock.calls).toEqual([
       ["get_settings", undefined],
-      ["set_settings", { settings: s }],
+      ["set_settings", { settings: editable }],
       ["app_version", undefined],
     ]);
+  });
+
+  it("set_settings nunca envia hubUrl nem gameDir", async () => {
+    invoke.mockResolvedValueOnce(s);
+    await setSettings({ ...s, hubUrl: "https://evil.example", gameDir: "C:\\Startup" } as Settings);
+    const sent = invoke.mock.calls[0]?.[1] as { settings: Record<string, unknown> };
+    expect(Object.keys(sent.settings).sort()).toEqual(
+      ["cacheLimitMB", "favorites", "maxServerContentMB", "recent", "simulateLaunch"],
+    );
   });
 
   it("converte o erro do Rust em ApiError com código estável", async () => {

@@ -8,6 +8,7 @@
     "build": "vite build",
     "test": "vitest run",
     "typecheck": "svelte-check --tsconfig ./tsconfig.json --fail-on-warnings",
+    "check:dist": "node scripts/check-dist.mjs",
     "tauri": "node tauri.mjs"
   },
   "dependencies": {

@@ -8,12 +8,10 @@ pub mod settings;
 pub mod update;
 
 use commands::AppState;
-use settings::Settings;
 use tauri::Manager;
 
 pub fn run() {
-    let settings_path = paths::settings_file();
-    let settings = Settings::load(&settings_path);
+    let state = AppState::load(paths::settings_file());
 
     tauri::Builder::default()
         // Precisa ser o primeiro plugin: a 2ª instância repassa os argumentos (deep link) à 1ª e sai.
@@ -32,7 +30,7 @@ pub fn run() {
         )
         // Só o seletor de pasta do jogo, chamado pelo Rust; nenhuma permissão `dialog:` é dada à UI.
         .plugin(tauri_plugin_dialog::init())
-        .manage(AppState::new(settings_path, settings))
+        .manage(state)
         .invoke_handler(tauri::generate_handler![
             commands::get_settings,
             commands::set_settings,

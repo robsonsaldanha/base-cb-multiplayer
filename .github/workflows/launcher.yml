@@ -22,8 +22,11 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # Ações de terceiros fixadas por commit (o instalador é gerado sob elas).
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: launcher/src-tauri -> target
       - run: npm ci
@@ -31,11 +34,13 @@ jobs:
       - run: npm run typecheck -w launcher/ui
       # O `generate_context!` exige a UI compilada antes de compilar o Rust.
       - run: npm run build -w launcher/ui
+      # CSP: nada inline nem remoto na UI compilada (o `tauri dev` não aplica a CSP).
+      - run: npm run check:dist -w launcher/ui
       - run: cargo test --locked
         working-directory: launcher/src-tauri
       # Build comum sem chave de updater: só o workflow de release liga createUpdaterArtifacts e assina.
       # bash (Git Bash do runner): passa o JSON intacto até a CLI, como no build local.
-      - run: npm run tauri -w launcher/ui -- build --ci --config '{"bundle":{"createUpdaterArtifacts":false}}'
+      - run: npm run tauri -w launcher/ui -- build --ci --config '{"bundle":{"createUpdaterArtifacts":false}}' -- --locked
         shell: bash
       - uses: actions/upload-artifact@v4
         with:
