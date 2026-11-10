@@ -145,7 +145,23 @@ void ScriptBridge::addPriority(cbscript::ScriptToSim c) {
   prioBacklog_.push_back(std::move(c));
 }
 
+bool ScriptBridge::postAdmin(cbscript::ScriptToSim c) {
+  if (std::holds_alternative<cbscript::CmdEmit>(c)) return false;
+  std::lock_guard<std::mutex> lk(adminMu_);
+  if (adminInbox_.size() >= kMaxAdminInbox) return false;
+  adminInbox_.push_back(std::move(c));
+  return true;
+}
+
 void ScriptBridge::applyCommands(double now) {
+  // 0) Ações do painel admin (outra thread): troca O(1) sob o mutex; entram no canal prioritário antes dos scripts.
+  {
+    std::lock_guard<std::mutex> lk(adminMu_);
+    adminTaken_.swap(adminInbox_);
+  }
+  for (auto& c : adminTaken_) addPriority(std::move(c));
+  adminTaken_.clear();
+
   // 1) Drena o host todo tick: prioritários (já coalescidos no host) e emits, cada emit na fila da sua origem.
   drained_.clear();
   host_.drainCommands(drained_);

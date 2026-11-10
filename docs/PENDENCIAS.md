@@ -109,10 +109,29 @@ Itens levantados nas revisões que não bloquearam o merge, com o momento em que
   - Auditoria em logger filho com nível `info` fixo: aparece mesmo com `HUB_LOG_LEVEL=warn/error`; some só com
     `silent`.
   - O Hub não sonda o painel admin (não confere que responde em `/auth/callback`).
-  - **Para a Task 8 (painel no cb-server):** gerar `state` (`[A-Za-z0-9_-]{16,64}`) em cookie `SameSite=Strict`,
-    mandar em `server-admin?…&state=`, conferir `#…&state=` no `/auth/callback` antes de enviar o ticket (evita login
-    CSRF no painel); `admin.port`/`bind`/`admins` no `ServerConfig` (hoje só `publicUrl`; outras chaves de `admin`
-    ignoradas sem aviso); jti de admin com cache próprio; logar `adminUrlIgnored` já é feito pelo heartbeat.
+  - ~~**Para a Task 8 (painel no cb-server):** `state` em cookie `SameSite=Strict`, conferido no login; `admin.port`/
+    `bind`/`admins` no `ServerConfig`; jti de admin com cache próprio.~~ Resolvido na Task 8 (state de 32 bytes em
+    cookie HttpOnly Path=/auth 10 min, comparado em tempo constante com o do corpo e de uso único também no servidor;
+    jti guardado até exp + 60 s, teto de 10 000; config validada).
+- Painel admin (Task 8), resíduos e decisões:
+  - Sessões, states, jti e limites de taxa só em memória do processo: restart do cb-server desloga todo mundo.
+  - `X-Forwarded-*` nunca é usado: atrás de um proxy reverso o limite de login por IP vira um limite do proxy inteiro
+    (o global continua valendo). Opção `trustProxy` fica para quando houver demanda.
+  - O proxy precisa repassar o `Host` original (`proxy_set_header Host $host`): o painel recusa (421) Host fora da
+    lista (origem da `publicUrl`; nomes de loopback só com bind loopback). Bind curinga sem `publicUrl` = 421 em tudo
+    (aviso no log).
+  - CSRF: Origin do painel + `X-CB-Admin: 1` + JSON (sem token por sessão). O JS manda `referrerPolicy:
+    'same-origin'` nos fetch (com `no-referrer` o navegador poderia mandar `Origin: null`). No Chromium o Origin veio
+    certo nos dois casos (verificação manual).
+  - Filtro de linhas de log com a senha do banco é por substring: senha curta (ex. "1") esconde muitas linhas. Só
+    `audit` e `anticheat` (o `server.log` não é exposto).
+  - Comando de console de resource que não devolve texto (ou demora > 2 s) responde `pending`; a resposta tardia se
+    perde (fica só no log/auditoria do resource).
+  - Ban pelo painel vai pela thread de scripts (`BanStore` tem um escritor): com o host de scripts parado
+    (supervisor) o ban responde 503; o kick por did sai mesmo assim pelo canal prioritário da ponte.
+  - Console aceita também comandos de resource registrados sem `admin = true` (a API não distingue origem console).
+  - Sem teste automatizado com navegador real (Playwright etc.); o fluxo completo foi verificado à mão no Chromium do
+    app (relatório da Task 8).
   - Sem `/metrics` para o HTTP (`HttpOutPool::metrics()` existe; falta expor).
   - Redirecionamento para outro host/porta descarta os cabeçalhos do script e recusa 307/308 com corpo; 301/302 de
     POST e 303 viram GET sem corpo. `Expect: 100-continue` automático do httplib para corpos ≥ 1 KiB.
@@ -137,8 +156,8 @@ Itens levantados nas revisões que não bloquearam o merge, com o momento em que
 
 - Limite de taxa de **novas conexões por IP** (hoje só há limite de pendentes).
 - Teto de saída por cliente (`net.maxOutKbpsPerClient` é lido mas não aplicado).
-- Limites explícitos do HTTP do servidor (`/metrics`, painel: `set_payload_max_length`, timeouts, pool). O HTTP de
-  saída dos scripts (`cb.http`) já tem os seus (Task 6).
+- Limites explícitos do HTTP do jogo (`/info`, `/cb/*`, `/metrics`: `set_payload_max_length`, timeouts, pool). O
+  painel admin (Task 8) e o HTTP de saída dos scripts (`cb.http`, Task 6) já têm os seus.
 - Teste manual de **512 bots em 4 vCPUs** (`docs/LOAD-TEST.md`).
 - Hub: migrar para zod 4; purge e observabilidade já feitos; revisar erros em inglês do Fastify.
 - Domínio, hospedagem do Hub e repositório/releases públicos.

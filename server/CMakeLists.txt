@@ -16,8 +16,10 @@ endif()
 add_library(cbserver_script STATIC src/script_bridge.cpp)
 target_link_libraries(cbserver_script PUBLIC cbserver_core cbscript)
 
+add_subdirectory(admin)
+
 add_executable(cb-server src/main.cpp)
-target_link_libraries(cb-server PRIVATE cbserver_core cbserver_script)
+target_link_libraries(cb-server PRIVATE cbserver_core cbserver_script cbadmin)
 cbmp_copy_mariadb_plugins(cb-server)
 
 add_executable(cbserver_tests tests/test_config.cpp tests/test_metrics.cpp tests/test_manifest.cpp tests/test_http.cpp

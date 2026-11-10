@@ -29,12 +29,22 @@ struct DbSettings {
   std::string tls = "auto";  // auto | off | required | verify
 };
 
-// admin: painel admin do servidor. Por enquanto só publicUrl (Task 7: anunciada no heartbeat como `adminUrl`);
-// porta, bind e lista de admins entram com o painel (Task 8). publicUrl é normalizada para uma ORIGEM
+// admin: painel admin do servidor. publicUrl (anunciada no heartbeat como `adminUrl`) é normalizada para uma ORIGEM
 // (scheme://host[:porta]): https obrigatório, exceto loopback (127.0.0.0/8, ::1, localhost) em dev.
+// O painel só sobe se houver quem possa entrar: `admins` (ids Discord, 17 a 20 dígitos) ou `devToken` (só em modo
+// dev: auth.devPublicKey sem hub; ≥ 32 caracteres).
 struct AdminSettings {
   std::optional<std::string> publicUrl;
+  int port = 30510;
+  std::string bind = "127.0.0.1";  // IP literal
+  std::vector<std::string> admins;
+  std::optional<std::string> devToken;
+  bool enabled() const { return !admins.empty() || devToken.has_value(); }
 };
+
+// Bind loopback (127.0.0.0/8, ::1) e curinga (0.0.0.0, ::).
+bool isLoopbackBind(std::string_view ip);
+bool isWildcardBind(std::string_view ip);
 
 // Normaliza a origem do painel admin (mesmas regras de normalizeAdminOrigin em @cbmp/contracts): sem caminho
 // (exceto "/"), query, fragmento, credenciais, espaços/controles ou não-ASCII; ≤ 256 chars; esquema/host em

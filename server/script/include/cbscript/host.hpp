@@ -153,6 +153,7 @@ class ScriptHost {
   std::future<bool> stopResource(std::string name);
   std::future<bool> restartResource(std::string name);
   std::vector<ResourceStatus> status() const;  // ordenado por nome
+  PlayersSnapshot players() const;             // última foto publicada (nunca nula); thread-safe
   HostMetrics metrics() const;
 
   // Roda fn na thread de scripts (respostas de banco/HTTP etc.). Nunca descartado, exceto com o host parado.

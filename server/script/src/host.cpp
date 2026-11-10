@@ -1185,6 +1185,8 @@ std::vector<ResourceStatus> ScriptHost::status() const {
   return impl_->statusSnap;
 }
 
+PlayersSnapshot ScriptHost::players() const { return impl_->players(); }
+
 HostMetrics ScriptHost::metrics() const {
   HostImpl& I = *impl_;
   HostMetrics m;

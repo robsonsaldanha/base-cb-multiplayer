@@ -22,6 +22,7 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -45,6 +46,12 @@ class ScriptBridge {
 
   void applyCommands(double now);
   void publishPlayers();
+
+  // Thread-safe (painel admin): CmdKick / CmdKickDid / CmdSetPosition entram no canal prioritário no próximo
+  // applyCommands, antes dos comandos dos scripts (não passa pela thread de scripts). A simulação só segura o mutex
+  // pela troca do vetor. false se for CmdEmit ou se a caixa estiver no teto (kMaxAdminInbox).
+  bool postAdmin(cbscript::ScriptToSim c);
+  static constexpr size_t kMaxAdminInbox = 4096;
 
   uint64_t eventsDropped() const { return eventsDropped_; }        // eventos de cliente recusados pelo host
   uint64_t joinLeaveDropped() const { return joinLeaveDropped_; }  // Join/Leave recusados (teto rígido/host parado)
@@ -71,6 +78,8 @@ class ScriptBridge {
   std::unordered_map<uint32_t, size_t> sourceBytes_;
   uint32_t rrLast_ = 0;
   std::vector<std::shared_ptr<std::vector<cbscript::PlayerView>>> snapPool_;
+  std::mutex adminMu_;
+  std::vector<cbscript::ScriptToSim> adminInbox_, adminTaken_;
   uint64_t eventsDropped_ = 0, joinLeaveDropped_ = 0, commandsRejected_ = 0, commandsDropped_ = 0;
 };
 

@@ -27,6 +27,7 @@
 
 #include <cbmp/messages.hpp>
 
+#include "cbadmin/admin_server.hpp"
 #include "cbscript/api.hpp"
 #include "cbscript/http_out.hpp"
 #include "cbscript/bans.hpp"
@@ -248,6 +249,48 @@ int run(const std::string& cfgPath) {
   }
   spdlog::info("ouvindo em UDP/TCP {} (serverId {}, {} threads de snapshot)", cfg.port, serverId, pool.workers());
 
+  // Painel admin: HTTP próprio (porta admin.port, bind admin.bind), threads próprias; só lê fotos/status publicados e
+  // age pelas filas (canal prioritário da ponte, ScriptHost). Sobe só se houver quem possa entrar.
+  std::unique_ptr<cbadmin::AdminServer> admin;
+  if (cfg.admin.enabled()) {
+    cbadmin::AdminOptions ao;
+    ao.bind = cfg.admin.bind;
+    ao.port = cfg.admin.port;
+    ao.publicUrl = cfg.admin.publicUrl;
+    ao.admins = cfg.admin.admins;
+    ao.devToken = cfg.admin.devToken;
+    ao.serverId = serverId;
+    ao.hubUrl = cfg.hub ? cfg.hub->url : std::string();
+    ao.logsDir = cfg.logsDir;
+    ao.dbPassword = cfg.db ? cfg.db->password : std::string();
+    auto adminMetrics = [&metrics, &scripts] {
+      auto j = metrics.snapshot();
+      const auto hm = scripts.metrics();
+      j["scripts"] = {{"eventQueueDepth", hm.eventQueueDepth}, {"eventsDropped", hm.eventsDropped},
+                      {"commandsDropped", hm.commandsDropped}, {"halted", hm.halted}};
+      return j;
+    };
+    admin = std::make_unique<cbadmin::AdminServer>(
+        std::move(ao), cbadmin::makeBackend(scripts, bridge, bans, *keys, std::move(adminMetrics),
+                                            [auditLog](const std::string& l) { auditLog->info("{}", l); }, unixNow));
+    try {
+      admin->start();
+    } catch (const std::exception& e) {
+      spdlog::error("{}", e.what());
+      http.stop();
+      net.stop();
+      return 1;
+    }
+    const bool v6 = cfg.admin.bind.find(':') != std::string::npos;
+    spdlog::info("painel admin em http://{}{}{}:{} ({} admin(s){})", v6 ? "[" : "", cfg.admin.bind, v6 ? "]" : "",
+                 admin->boundPort(), cfg.admin.admins.size(), cfg.admin.devToken ? ", devToken" : "");
+    if (cfg.admin.publicUrl) spdlog::info("painel admin: publicUrl {}", *cfg.admin.publicUrl);
+    if (cfg.hub && !cfg.admin.publicUrl)
+      spdlog::warn("painel admin: sem admin.publicUrl o login via Hub fica desabilitado");
+  } else {
+    spdlog::info("painel admin desligado (configure admin.admins com ids Discord para ligar)");
+  }
+
   std::unique_ptr<cbserver::Heartbeat> heartbeat;
   if (cfg.hub) {
     cbserver::HeartbeatInfo hi;
@@ -336,6 +379,7 @@ int run(const std::string& cfgPath) {
 
   spdlog::info("encerrando...");
   if (heartbeat) heartbeat->stop();
+  if (admin) admin->stop();
   http.stop();
   net.stop();
   spdlog::info("servidor parado");

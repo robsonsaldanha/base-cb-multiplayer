@@ -1,5 +1,7 @@
 #include "cbserver/config.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <fstream>
 #include <vector>
@@ -198,6 +200,89 @@ std::optional<std::string> normalizeAdminOrigin(std::string_view rawView) {
   return scheme + "://" + host + portOut;
 }
 
+namespace {
+
+// IPv4 decimal estrito (4 octetos 0..255, sem zeros à esquerda).
+bool parseIpv4(std::string_view s, std::array<int, 4>& o) {
+  size_t i = 0;
+  for (int k = 0; k < 4; ++k) {
+    if (k > 0) {
+      if (i >= s.size() || s[i] != '.') return false;
+      ++i;
+    }
+    size_t b = i;
+    int v = 0;
+    while (i < s.size() && s[i] >= '0' && s[i] <= '9' && i - b < 3) v = v * 10 + (s[i++] - '0');
+    if (i == b || v > 255 || (i - b > 1 && s[b] == '0')) return false;
+    o[static_cast<size_t>(k)] = v;
+  }
+  return i == s.size();
+}
+
+// IPv6 literal (sem colchetes/zona): até 8 grupos hex de 1..4 dígitos, no máximo um "::". Devolve os 8 grupos.
+bool parseIpv6(std::string_view s, std::array<uint32_t, 8>& g) {
+  if (s.empty() || s.size() > 45) return false;
+  const size_t dbl = s.find("::");
+  if (dbl != std::string_view::npos && s.find("::", dbl + 1) != std::string_view::npos) return false;
+  auto groups = [](std::string_view part, std::vector<uint32_t>& out) {
+    if (part.empty()) return true;
+    size_t b = 0;
+    while (true) {
+      size_t e = part.find(':', b);
+      std::string_view h = part.substr(b, e == std::string_view::npos ? std::string_view::npos : e - b);
+      if (h.empty() || h.size() > 4) return false;
+      uint32_t v = 0;
+      for (char c : h) {
+        int d = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+        if (d < 0) return false;
+        v = v * 16 + static_cast<uint32_t>(d);
+      }
+      out.push_back(v);
+      if (e == std::string_view::npos) return true;
+      b = e + 1;
+    }
+  };
+  std::vector<uint32_t> head, tail;
+  if (dbl == std::string_view::npos) {
+    if (!groups(s, head) || head.size() != 8) return false;
+  } else {
+    if (!groups(s.substr(0, dbl), head) || !groups(s.substr(dbl + 2), tail) || head.size() + tail.size() > 7)
+      return false;
+  }
+  g.fill(0);
+  for (size_t i = 0; i < head.size(); ++i) g[i] = head[i];
+  for (size_t i = 0; i < tail.size(); ++i) g[8 - tail.size() + i] = tail[i];
+  return true;
+}
+
+bool validBindIp(std::string_view s) {
+  std::array<int, 4> o{};
+  std::array<uint32_t, 8> g{};
+  return parseIpv4(s, o) || parseIpv6(s, g);
+}
+
+}  // namespace
+
+bool isLoopbackBind(std::string_view ip) {
+  std::array<int, 4> o{};
+  if (parseIpv4(ip, o)) return o[0] == 127;
+  std::array<uint32_t, 8> g{};
+  if (!parseIpv6(ip, g)) return false;
+  for (size_t i = 0; i < 7; ++i)
+    if (g[i] != 0) return false;
+  return g[7] == 1;
+}
+
+bool isWildcardBind(std::string_view ip) {
+  std::array<int, 4> o{};
+  if (parseIpv4(ip, o)) return o == std::array<int, 4>{0, 0, 0, 0};
+  std::array<uint32_t, 8> g{};
+  if (!parseIpv6(ip, g)) return false;
+  for (auto v : g)
+    if (v != 0) return false;
+  return true;
+}
+
 ServerConfig ServerConfig::fromJson(const json& j) {
   if (!j.is_object()) fail("(raiz)", "deve ser um objeto JSON");
   ServerConfig c;
@@ -342,8 +427,43 @@ ServerConfig ServerConfig::fromJson(const json& j) {
     c.db = std::move(db);
   }
   if (const json* a = sub(j, "admin", "")) {
-    // Só publicUrl por enquanto; port/bind/admins chegam com o painel (Task 8) e são ignorados aqui.
     if (!a->is_object()) fail("admin", "deve ser um objeto como {\"publicUrl\": \"https://painel.exemplo.com\"} ou null");
+    static const char* kAdminKeys[] = {"publicUrl", "port", "bind", "admins", "devToken"};
+    for (auto it = a->begin(); it != a->end(); ++it) {
+      bool known = false;
+      for (auto* k : kAdminKeys) known = known || it.key() == k;
+      if (!known) spdlog::warn("Configuração: chave desconhecida 'admin.{}' ignorada", it.key());
+    }
+    getInt(*a, "port", "admin.", 1, 65535, c.admin.port);
+    if (c.admin.port == c.port) fail("admin.port", "deve ser diferente de 'port' (a porta TCP do jogo)");
+    getStr(*a, "bind", "admin.", c.admin.bind);
+    if (!validBindIp(c.admin.bind))
+      fail("admin.bind", "deve ser um IP literal (ex. \"127.0.0.1\", \"0.0.0.0\", \"::1\"), sem porta");
+    if (const json* l = sub(*a, "admins", "admin.")) {
+      if (!l->is_array()) fail("admin.admins", "deve ser uma lista de ids Discord (texto com 17 a 20 dígitos)");
+      if (l->size() > 100) fail("admin.admins", "deve ter no máximo 100 itens");
+      for (const auto& e : *l) {
+        if (!e.is_string()) fail("admin.admins", "deve ser uma lista de ids Discord (texto com 17 a 20 dígitos)");
+        const auto& s = e.get_ref<const std::string&>();
+        if (s.size() < 17 || s.size() > 20 || !allOf(s, "0123456789"))
+          fail("admin.admins", "cada item deve ser um id Discord (17 a 20 dígitos)");
+        if (std::find(c.admin.admins.begin(), c.admin.admins.end(), s) == c.admin.admins.end())
+          c.admin.admins.push_back(s);
+      }
+    }
+    if (const json* t = sub(*a, "devToken", "admin.")) {
+      // Nunca repete o valor em mensagens.
+      if (!t->is_string()) fail("admin.devToken", "deve ser texto");
+      const auto& s = t->get_ref<const std::string&>();
+      if (s.size() < 32 || s.size() > 256) fail("admin.devToken", "deve ter entre 32 e 256 caracteres");
+      for (char ch : s)
+        if (static_cast<unsigned char>(ch) < 0x21 || static_cast<unsigned char>(ch) > 0x7e)
+          fail("admin.devToken", "só aceita ASCII visível (sem espaços)");
+      if (!c.devPublicKey || c.hub)
+        fail("admin.devToken", "só é permitido em modo dev (auth.devPublicKey definido e hub null); no modo Hub o "
+                               "login é pelo Discord via Hub");
+      c.admin.devToken = s;
+    }
     if (const json* u = sub(*a, "publicUrl", "admin.")) {
       if (!u->is_string()) fail("admin.publicUrl", "deve ser texto (origem https://host[:porta])");
       auto o = normalizeAdminOrigin(u->get<std::string>());

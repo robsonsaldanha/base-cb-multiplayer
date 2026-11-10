@@ -29,7 +29,13 @@ struct DevSigner {
 
   std::string sign(const std::string& sub, const std::string& jti, int64_t now, const std::string& aud = "srv_dev",
                    const std::string& kid = "dev", const std::string& name = "Jogador") const {
-    const std::string json = R"({"v":1,"kid":")" + kid + R"(","sub":")" + sub + R"(","did":"did-)" + sub +
+    return signDid(sub, "did-" + sub, jti, now, aud, kid, name);
+  }
+
+  // Igual a sign, com o did explícito (tickets de admin: did = id Discord).
+  std::string signDid(const std::string& sub, const std::string& did, const std::string& jti, int64_t now,
+                      const std::string& aud, const std::string& kid = "dev", const std::string& name = "Jogador") const {
+    const std::string json = R"({"v":1,"kid":")" + kid + R"(","sub":")" + sub + R"(","did":")" + did +
                              R"(","name":")" + name + R"(","aud":")" + aud + R"(","iat":)" + std::to_string(now) +
                              R"(,"exp":)" + std::to_string(now + 300) + R"(,"jti":")" + jti + R"("})";
     const std::vector<uint8_t> body(json.begin(), json.end());

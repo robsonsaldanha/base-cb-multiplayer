@@ -92,10 +92,62 @@ def dev_key(bots_bin: Path, seed: str) -> str:
     return out.stdout.strip()
 
 
+class AdminPanel:
+    """Cliente mínimo do painel admin (login por admin.devToken, só em modo dev) para exercitá-lo durante a carga."""
+
+    def __init__(self, port: int, token: str):
+        self.port = port
+        self.token = token
+        self.cookie: str | None = None
+        self.requests = 0
+        self.errors = 0
+        self.max_ms = 0.0
+        self.players_max = 0
+        self.last_error = ""
+
+    def _req(self, method: str, path: str, body: dict | None = None):
+        origin = f"http://127.0.0.1:{self.port}"
+        headers = {}
+        data = None
+        if method != "GET":
+            headers = {"Origin": origin, "X-CB-Admin": "1", "Content-Type": "application/json"}
+            data = json.dumps(body or {}).encode("utf-8")
+        if self.cookie:
+            headers["Cookie"] = self.cookie
+        req = urllib.request.Request(origin + path, data=data, method=method, headers=headers)
+        t0 = time.monotonic()
+        with urllib.request.urlopen(req, timeout=5) as r:
+            raw = r.read()
+            cookies = r.headers.get_all("Set-Cookie") or []
+        self.max_ms = max(self.max_ms, (time.monotonic() - t0) * 1000)
+        return json.loads(raw.decode("utf-8")), cookies
+
+    def poll(self) -> None:
+        try:
+            if not self.cookie:
+                _, cookies = self._req("POST", "/auth/login", {"devToken": self.token})
+                self.cookie = next(c.split(";", 1)[0] for c in cookies if c.startswith("cbadmin="))
+            self.requests += 1
+            players, _ = self._req("GET", "/api/players")
+            self.players_max = max(self.players_max, len(players))
+            self.requests += 1
+            self._req("GET", "/api/resources")
+            self.requests += 1
+            self._req("GET", "/api/metrics")
+        except Exception as e:  # conta e segue
+            self.errors += 1
+            self.last_error = str(e)
+
+    def summary(self) -> dict:
+        return {"requests": self.requests, "errors": self.errors, "maxMs": round(self.max_ms, 1),
+                "playersMax": self.players_max, "lastError": self.last_error}
+
+
 class Server:
-    def __init__(self, server_bin: Path, workdir: Path, pubkey: str, max_players: int):
+    def __init__(self, server_bin: Path, workdir: Path, pubkey: str, max_players: int, admin: bool = False):
         self.workdir = workdir
         self.port = free_port()
+        self.panel: AdminPanel | None = None
         workdir.mkdir(parents=True, exist_ok=True)
         (workdir / "resources").mkdir(exist_ok=True)
         # O eco dos bots é feito em Lua pelo resource de exemplo (não há mais eco em C++ no servidor).
@@ -115,6 +167,13 @@ class Server:
             "resourcesDir": str(workdir / "resources"),
             "logsDir": str(workdir / "logs"),
         }
+        if admin:
+            # Painel admin ligado (loopback, porta aleatória, login por devToken: só modo dev).
+            aport = free_port()
+            while aport == self.port:
+                aport = free_port()
+            self.panel = AdminPanel(aport, secrets.token_urlsafe(32))
+            cfg["admin"] = {"port": aport, "bind": "127.0.0.1", "devToken": self.panel.token}
         cfg_path = workdir / "server.cfg"
         cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
         self.out = open(workdir / "server.out.log", "wb")
@@ -147,6 +206,8 @@ class Server:
                     self.samples.append(m)
                 except Exception as e:  # amostra perdida não derruba o teste
                     log(f"falha ao ler /metrics: {e}")
+                if self.panel:
+                    self.panel.poll()
 
         self._poller = threading.Thread(target=loop, daemon=True)
         self._poller.start()
@@ -190,7 +251,7 @@ def load_round(args, server_bin: Path, bots_bin: Path, out_dir: Path, attempt: i
     seed = secrets.token_hex(32)
     work = out_dir / f"load-{attempt}"
     shutil.rmtree(work, ignore_errors=True)
-    srv = Server(server_bin, work, dev_key(bots_bin, seed), args.count + 16)
+    srv = Server(server_bin, work, dev_key(bots_bin, seed), args.count + 16, admin=not args.no_admin)
     try:
         info = srv.wait_ready()
         log(f"carga #{attempt}: servidor '{info.get('name')}' na porta {srv.port}; {args.count} bots por {args.duration} s")
@@ -221,6 +282,7 @@ def load_round(args, server_bin: Path, bots_bin: Path, out_dir: Path, attempt: i
         "serverKicks": last.get("kicks", 0),
         "serverCorrections": last.get("corrections", 0),
         "sendFailures": last.get("sendFailures", 0),
+        "adminPanel": srv.panel.summary() if srv.panel else None,
     }
     res["violations"] = load_violations(res, args.count)
     return res
@@ -252,6 +314,9 @@ def load_violations(r: dict, count: int) -> list[str]:
         v.append(f"cb-server saiu com código {r['serverExit']}")
     if b["maxSnapshotGapMs"] > LIMITS["maxSnapshotGapMs"]:
         v.append(f"bot sem snapshot por {b['maxSnapshotGapMs']:.0f} ms > {LIMITS['maxSnapshotGapMs']:.0f}")
+    ap = r.get("adminPanel")
+    if ap is not None and (ap["errors"] or ap["requests"] == 0):
+        v.append(f"painel admin: {ap['errors']} erro(s) em {ap['requests']} requisições ({ap['lastError']})")
     return v
 
 
@@ -269,6 +334,10 @@ def print_load(r: dict) -> None:
         ("banda recebida média por bot (kbps)", f"{b['avgKbpsInPerBot']:.1f}", "-"),
         ("correções / kicks no servidor", f"{r['serverCorrections']} / {r['serverKicks']}", "-"),
     ]
+    ap = r.get("adminPanel")
+    if ap is not None:
+        rows.append(("painel admin: requisições / erros / máx (ms)", f"{ap['requests']} / {ap['errors']} / {ap['maxMs']:.0f}",
+                     "0 erros"))
     w = max(len(x[0]) for x in rows)
     print()
     print(f"{'métrica'.ljust(w)}  {'valor':<28} limite")
@@ -369,6 +438,7 @@ def main() -> int:
     ap.add_argument("--out-dir", default=str(ROOT / "build-native" / "loadtest"))
     ap.add_argument("--skip-load", action="store_true")
     ap.add_argument("--skip-security", action="store_true")
+    ap.add_argument("--no-admin", action="store_true", help="não liga o painel admin na carga")
     args = ap.parse_args()
 
     server_bin = find_binary("cb-server", args.server_bin)

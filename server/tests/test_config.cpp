@@ -272,3 +272,64 @@ TEST_CASE("config admin origin matches the shared TS vectors") {
     REQUIRE_FALSE(cbserver::normalizeAdminOrigin(in.get<std::string>()).has_value());
   }
 }
+
+TEST_CASE("config admin port, bind and admins have defaults and are validated") {
+  auto c = ServerConfig::fromJson(json::object());
+  REQUIRE(c.admin.port == 30510);
+  REQUIRE(c.admin.bind == "127.0.0.1");
+  REQUIRE(c.admin.admins.empty());
+  REQUIRE(!c.admin.devToken);
+  REQUIRE(!c.admin.enabled());
+  REQUIRE(!ServerConfig::load(CBSERVER_CFG_EXAMPLE).admin.enabled());  // exemplo: painel desligado
+
+  auto a = ServerConfig::fromJson(json{{"admin",
+                                        {{"port", 31000},
+                                         {"bind", "0.0.0.0"},
+                                         {"admins", {"123456789012345678", "12345678901234567890", "123456789012345678"}}}}});
+  REQUIRE(a.admin.port == 31000);
+  REQUIRE(a.admin.bind == "0.0.0.0");
+  REQUIRE(a.admin.admins == std::vector<std::string>{"123456789012345678", "12345678901234567890"});  // sem repetidos
+  REQUIRE(a.admin.enabled());
+  REQUIRE(ServerConfig::fromJson(json{{"admin", {{"bind", "::1"}}}}).admin.bind == "::1");
+
+  requireRejects(json{{"admin", {{"port", 0}}}}, "admin.port");
+  requireRejects(json{{"admin", {{"port", 70000}}}}, "admin.port");
+  requireRejects(json{{"port", 30510}, {"admin", {{"port", 30510}}}}, "admin.port");  // mesma porta TCP do jogo
+  for (const char* b : {"localhost", "painel.example.com", "", "1.2.3", "300.1.1.1", "::g", "127.0.0.1:30510"}) {
+    INFO(b);
+    requireRejects(json{{"admin", {{"bind", b}}}}, "admin.bind");
+  }
+  for (const char* d : {"1234567890123456", "123456789012345678901", "12345678901234567a", " 123456789012345678", ""}) {
+    INFO(d);
+    requireRejects(json{{"admin", {{"admins", {d}}}}}, "admin.admins");
+  }
+  requireRejects(json{{"admin", {{"admins", "123456789012345678"}}}}, "admin.admins");
+  requireRejects(json{{"admin", {{"admins", {123456789012345678LL}}}}}, "admin.admins");
+  json many = json::array();
+  for (int i = 0; i < 101; ++i) many.push_back("1234567890123456" + std::to_string(10 + i));
+  requireRejects(json{{"admin", {{"admins", many}}}}, "admin.admins");
+}
+
+TEST_CASE("config admin devToken only in dev mode and long enough") {
+  json dev = base();
+  dev["auth"]["devPublicKey"] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  dev["admin"] = {{"devToken", std::string(32, 'a')}};
+  auto c = ServerConfig::fromJson(dev);
+  REQUIRE(c.admin.devToken == std::string(32, 'a'));
+  REQUIRE(c.admin.enabled());
+
+  dev["admin"]["devToken"] = std::string(31, 'a');
+  requireRejects(dev, "admin.devToken");
+  dev["admin"]["devToken"] = std::string(31, 'a') + "\n";
+  requireRejects(dev, "admin.devToken");
+  dev["admin"]["devToken"] = 5;
+  requireRejects(dev, "admin.devToken");
+
+  json hub = base();
+  hub["hub"] = {{"url", "https://hub.example.com"}, {"serverId", "srv_abcdefghijkl"}, {"key", "sk_x"}};
+  hub["admin"] = {{"devToken", std::string(40, 'a')}};
+  requireRejects(hub, "admin.devToken");  // modo Hub: erro de config
+  json none = base();
+  none["admin"] = {{"devToken", std::string(40, 'a')}};
+  requireRejects(none, "admin.devToken");  // sem devPublicKey
+}

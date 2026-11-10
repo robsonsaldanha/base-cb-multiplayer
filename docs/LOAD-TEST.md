@@ -50,6 +50,9 @@ python3 tools/loadtest.py --count 512 --duration 300 --cluster 0.3 --assert
 - `--assert` sai com código 1 se algum limite for violado (a carga é repetida 1x antes de falhar).
 - Outros: `--out-dir` (padrão `build-native/loadtest`), `--server-bin`, `--bots-bin`, `--skip-load`, `--skip-security`.
 - O servidor roda em modo dev (sem Hub), em porta aleatória de 127.0.0.1, com `maxPlayers = count + 16`.
+- O painel admin fica ligado na carga (porta aleatória de 127.0.0.1, login por `admin.devToken`): a cada amostra o
+  script lê `/api/players`, `/api/resources` e `/api/metrics` pelo painel; qualquer erro é violação. `--no-admin`
+  desliga.
   Nada é exposto na internet.
 
 O script faz (1) a carga, lendo `/metrics` a cada 5 s, e (2) três cenários de segurança, cada um com servidor próprio

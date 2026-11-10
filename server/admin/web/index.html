@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Painel admin</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="logo" aria-hidden="true"></span>
+    <div>
+      <h1>Painel admin</h1>
+      <p class="sub" id="server-id"></p>
+    </div>
+  </div>
+  <div class="who" id="who" hidden>
+    <span id="who-name"></span>
+    <button type="button" id="logout" class="ghost">Sair</button>
+  </div>
+</header>
+
+<main>
+  <section id="view-loading" class="card center">
+    <p>Carregando…</p>
+  </section>
+
+  <section id="view-login" class="card center" hidden>
+    <h2>Entrar</h2>
+    <p id="login-msg" class="muted"></p>
+    <p id="login-error" class="error" hidden></p>
+    <div id="login-hub" hidden>
+      <a class="button primary" id="login-hub-link" href="/auth/start">Entrar com Discord (via Hub)</a>
+    </div>
+    <form id="login-dev" class="row" hidden>
+      <label for="dev-token">Token dev</label>
+      <input id="dev-token" type="password" autocomplete="off" minlength="32" required>
+      <button type="submit" class="primary">Entrar</button>
+    </form>
+  </section>
+
+  <section id="view-app" hidden>
+    <nav class="tabs" role="tablist">
+      <button type="button" role="tab" data-tab="players" class="active">Jogadores</button>
+      <button type="button" role="tab" data-tab="resources">Resources</button>
+      <button type="button" role="tab" data-tab="console">Console</button>
+      <button type="button" role="tab" data-tab="logs">Logs</button>
+      <button type="button" role="tab" data-tab="metrics">Métricas</button>
+    </nav>
+    <p id="flash" class="flash" hidden></p>
+
+    <section class="card tab" id="tab-players">
+      <div class="head"><h2>Jogadores <span class="count" id="players-count"></span></h2></div>
+      <table>
+        <thead><tr><th>Id</th><th>Nome</th><th>Discord</th><th>Posição (cm)</th><th></th></tr></thead>
+        <tbody id="players-body"></tbody>
+      </table>
+      <p class="muted empty" id="players-empty" hidden>Nenhum jogador conectado.</p>
+    </section>
+
+    <section class="card tab" id="tab-resources" hidden>
+      <div class="head"><h2>Resources</h2></div>
+      <table>
+        <thead><tr><th>Nome</th><th>Estado</th><th>CPU (ms/s)</th><th>Memória</th><th>Último erro</th><th></th></tr></thead>
+        <tbody id="resources-body"></tbody>
+      </table>
+    </section>
+
+    <section class="card tab" id="tab-console" hidden>
+      <div class="head"><h2>Console</h2><span class="muted">help mostra os comandos</span></div>
+      <pre id="console-out" class="log" aria-live="polite"></pre>
+      <form id="console-form" class="row">
+        <input id="console-line" type="text" maxlength="512" autocomplete="off" spellcheck="false" placeholder="status">
+        <button type="submit" class="primary">Enviar</button>
+      </form>
+    </section>
+
+    <section class="card tab" id="tab-logs" hidden>
+      <div class="head">
+        <h2>Logs</h2>
+        <div class="row">
+          <select id="logs-kind">
+            <option value="audit">Auditoria</option>
+            <option value="anticheat">Anti-cheat</option>
+          </select>
+          <select id="logs-tail">
+            <option value="100">100 linhas</option>
+            <option value="200" selected>200 linhas</option>
+            <option value="500">500 linhas</option>
+          </select>
+        </div>
+      </div>
+      <p class="muted" id="logs-file"></p>
+      <pre id="logs-out" class="log"></pre>
+    </section>
+
+    <section class="card tab" id="tab-metrics" hidden>
+      <div class="head"><h2>Métricas</h2></div>
+      <table class="kv"><tbody id="metrics-body"></tbody></table>
+    </section>
+  </section>
+</main>
+</body>
+</html>
