@@ -41,8 +41,8 @@ const published = (r: Release) => !r.draft && !r.prerelease;
 const SHA256_TEXT = /^([0-9a-fA-F]{64})(?:\s|$)/;
 /** 60 req/min por IP (IPv6 agrupado por /64, como nas outras rotas). */
 const RATE = { rateLimit: { max: 60, timeWindow: '1 minute', keyGenerator: (req: { ip: string }) => ipKey(req.ip) } };
-/** Downloads repassados ao mesmo tempo (todos os clientes); acima disso → 503 busy. */
-export const MAX_CONCURRENT_DOWNLOADS = 8;
+/** Downloads simultâneos por IP (IPv6 por /64); acima disso → 429 too_many_downloads. O teto global vem de config.dlMaxConcurrent. */
+export const MAX_DOWNLOADS_PER_IP = 2;
 /** RFC 5987 attr-char: encodeURIComponent deixa ' ( ) * passarem. */
 const rfc5987 = (v: string) => encodeURIComponent(v).replace(/['()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
 const validDate = (d: string) => d !== '' && !Number.isNaN(Date.parse(d));
@@ -50,6 +50,7 @@ const validDate = (d: string) => d !== '' && !Number.isNaN(Date.parse(d));
 export async function releaseRoutes(app: FastifyInstance) {
   const { config } = app.deps;
   let activeDownloads = 0;
+  const perIp = new Map<string, number>();
 
   /** Sem token (ou sem cliente) → 503 updates_disabled. */
   function client(): GitHubReleases {
@@ -124,15 +125,49 @@ export async function releaseRoutes(app: FastifyInstance) {
       const release = (await releases.list()).find((r) => r.tag === tag && published(r));
       const entry = release?.assets.find((a) => a.name === asset);
       if (!entry) throw notFound();
-      if (activeDownloads >= MAX_CONCURRENT_DOWNLOADS) throw new HttpError(503, 'busy', 'muitos downloads em andamento; tente em instantes');
+      const ip = ipKey(req.ip);
+      if ((perIp.get(ip) ?? 0) >= MAX_DOWNLOADS_PER_IP) {
+        throw new HttpError(429, 'too_many_downloads', `no máximo ${MAX_DOWNLOADS_PER_IP} downloads simultâneos por conexão; aguarde terminar`);
+      }
+      if (activeDownloads >= config.dlMaxConcurrent) throw new HttpError(503, 'busy', 'muitos downloads em andamento; tente em instantes');
+      // Vaga: ocupada aqui, devolvida uma única vez (fim, erro, aborto do cliente ou escrita parada).
       activeDownloads++;
-      let released = false;
-      const free = () => { if (!released) { released = true; activeDownloads--; } };
+      perIp.set(ip, (perIp.get(ip) ?? 0) + 1);
+      let freed = false;
+      let watchdog: ReturnType<typeof setInterval> | undefined;
+      const free = () => {
+        clearInterval(watchdog);
+        if (freed) return;
+        freed = true;
+        activeDownloads--;
+        const n = (perIp.get(ip) ?? 1) - 1;
+        if (n > 0) perIp.set(ip, n); else perIp.delete(ip);
+      };
       let stream;
       try { stream = await releases.download(entry.id); } catch (e) { free(); throw e; }
       const body = Readable.fromWeb(stream as import('node:stream/web').ReadableStream<Uint8Array>);
-      body.once('close', free);
+      // A vaga só volta quando a resposta fecha (terminou de entregar ao SO, ou o cliente caiu, ou foi derrubada):
+      // o fim do stream de origem não basta, os bytes ainda podem estar no buffer da resposta.
       reply.raw.once('close', free);
+      // Escrita parada: buffer da resposta acima do limite (esperando 'drain') sem diminuir por dlStallTimeoutMs →
+      // derruba a resposta (o pipe destrói a origem e cancela o GitHub). Cliente lento que drena não é afetado.
+      const stallMs = config.dlStallTimeoutMs;
+      let blockedSince: number | null = null;
+      let lastLen = Infinity;
+      watchdog = setInterval(() => {
+        const res = reply.raw;
+        const len = res.writableLength;
+        if (!res.writableNeedDrain || len < lastLen) blockedSince = null;
+        else if (blockedSince === null) blockedSince = Date.now();
+        lastLen = len;
+        if (blockedSince !== null && Date.now() - blockedSince >= stallMs) {
+          req.log.warn({ code: 'dl_stalled', tag, assetId: entry.id }, 'download parado: cliente não drena o socket');
+          free();
+          body.destroy();
+          res.destroy();
+        }
+      }, Math.max(10, Math.min(1000, Math.floor(stallMs / 4))));
+      watchdog.unref();
       return reply
         .header('content-type', 'application/octet-stream')
         .header('content-length', String(stream.size))

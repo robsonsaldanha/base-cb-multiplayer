@@ -16,6 +16,13 @@ function parseTrustProxy(raw: string | undefined): string | false {
   return items.join(',');
 }
 
+function parseDlMax(raw: string | undefined): number {
+  const v = (raw ?? '').trim();
+  if (v === '') return 32;
+  if (!/^[1-9]\d{0,4}$/.test(v)) throw new Error(`HUB_DL_MAX_CONCURRENT deve ser um inteiro entre 1 e 99999: "${v}"`);
+  return Number(v);
+}
+
 export interface HubConfig {
   port: number;
   host: string;
@@ -33,6 +40,10 @@ export interface HubConfig {
   githubToken: string;
   /** `dono/repo` dos Releases (`launcher-vX.Y.Z`, `mod-pN-vX.Y.Z`). */
   releasesRepo: string;
+  /** Downloads repassados ao mesmo tempo, todos os clientes (`HUB_DL_MAX_CONCURRENT`, padrão 32). */
+  dlMaxConcurrent: number;
+  /** Download cujo cliente não drena o socket por este tempo é derrubado (30 s; injetável nos testes). */
+  dlStallTimeoutMs: number;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
@@ -54,6 +65,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
     logLevel: env.HUB_LOG_LEVEL ?? 'info',
     githubToken: (env.HUB_GITHUB_TOKEN ?? '').trim(),
     releasesRepo: (env.HUB_RELEASES_REPO ?? '').trim(),
+    dlMaxConcurrent: parseDlMax(env.HUB_DL_MAX_CONCURRENT),
+    dlStallTimeoutMs: 30_000,
   };
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('HUB_PORT inválida');
   if (!devLogin && (!cfg.discordClientId || !cfg.discordClientSecret)) {

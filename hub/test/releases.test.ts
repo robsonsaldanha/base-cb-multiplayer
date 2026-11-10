@@ -1,11 +1,13 @@
 import { PassThrough } from 'node:stream';
+import { get as httpGet, type ClientRequest, type IncomingMessage } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { describe, expect, it } from 'vitest';
 import { ModInfo, UpdateInfo } from '@cbmp/contracts';
 import { makeTestApp } from './helpers';
 import { createGitHubReleases, type AssetStream, type GitHubReleases, type Release, type ReleaseAsset } from '../src/github';
 import { compareSemver, parseSemver } from '../src/routes/releases';
 import { HttpError } from '../src/errors';
-import { loadConfig } from '../src/config';
+import { loadConfig, type HubConfig } from '../src/config';
 
 const TOKEN = 'ghp_TESTTOKEN_nao_vazar';
 const PUB = '2026-11-10T12:00:00Z';
@@ -42,6 +44,14 @@ class FakeReleases implements GitHubReleases {
     const b = this.blobs.get(assetId);
     if (!b) throw new HttpError(502, 'github_error', 'falha');
     const hold = this.hold;
+    if (b.length > 1024 * 1024) {
+      // Grandes: pedaços de 64 KiB sob demanda, como o fetch entrega (um único write enorme o SO aceita de uma vez).
+      let off = 0;
+      const chunked = new ReadableStream<Uint8Array>({
+        pull(c) { c.enqueue(b.subarray(off, off + 65536)); off += 65536; if (off >= b.length) c.close(); },
+      });
+      return Object.assign(chunked, { size: b.length });
+    }
     if (!hold) return Object.assign(new Blob([b]).stream(), { size: b.length });
     const body = new ReadableStream<Uint8Array>({
       async pull(c) { await hold; c.enqueue(b); c.close(); },
@@ -50,10 +60,10 @@ class FakeReleases implements GitHubReleases {
   }
 }
 
-async function setup(opts: { token?: string; rateLimit?: boolean } = {}) {
+async function setup(opts: { token?: string; rateLimit?: boolean; config?: Partial<HubConfig> } = {}) {
   const fake = new FakeReleases();
   const t = await makeTestApp({
-    config: { githubToken: opts.token ?? TOKEN, releasesRepo: 'dono/repo', rateLimit: opts.rateLimit ?? false },
+    config: { githubToken: opts.token ?? TOKEN, releasesRepo: 'dono/repo', rateLimit: opts.rateLimit ?? false, ...opts.config },
     releases: fake,
   });
   const get = (url: string, ip = '203.0.113.9') => t.app.inject({ method: 'GET', url, remoteAddress: ip });
@@ -532,16 +542,40 @@ describe('I2: cota do token', () => {
   it('teto global de chamadas à API por minuto → 503 busy; libera no minuto seguinte', async () => {
     const clock = { ms: 1_000_000 };
     const f = fetchFake(() => new Response('x', { status: 500 }));
-    const c = createGitHubReleases({ token: TOKEN, repo: 'dono/repo', fetchImpl: f.impl, nowMs: () => clock.ms, apiCallsPerMinute: 2 });
-    for (const id of [1, 2]) expect((await errOf(c.download(id))).code).toBe('github_error');
-    const err = await errOf(c.download(3));
+    const c = createGitHubReleases({ token: TOKEN, repo: 'dono/repo', fetchImpl: f.impl, nowMs: () => clock.ms, apiCallsPerMinute: 2, logger: { warn: () => {} } });
+    expect((await errOf(c.download(1))).code).toBe('github_error'); // 1/2 (downloads: 1 de 1)
+    expect((await errOf(c.list())).code).toBe('github_error'); // 2/2
+    clock.ms += 15_000; // passa o cache de falha da lista
+    const err = await errOf(c.list());
     expect([err.status, err.code]).toEqual([503, 'busy']);
     expect(f.calls.length).toBe(2);
     clock.ms += 60_000;
     expect((await errOf(c.download(4))).code).toBe('github_error');
   });
 
-  it('/v1/dl: no máximo 8 downloads simultâneos; o 9º → 503 busy; depois libera', async () => {
+  it('/v1/dl: teto global (HUB_DL_MAX_CONCURRENT) → 503 busy; depois libera', async () => {
+    const t = await setup({ config: { dlMaxConcurrent: 3 } });
+    const r1 = launcher('0.2.0');
+    t.fake.releases = [r1];
+    const exe = r1.assets[0]!;
+    t.fake.blobs.set(exe.id, new Uint8Array(1000));
+    let open!: () => void;
+    t.fake.hold = new Promise<void>((r) => { open = r; });
+    const url = `/v1/dl/launcher-v0.2.0/${encodeURIComponent(exe.name)}`;
+    const running = [1, 2, 3].map((i) => t.get(url, `198.51.100.${i}`));
+    for (let i = 0; i < 200 && t.fake.downloads.length < 3; i++) await sleep(5);
+    expect(t.fake.downloads.length).toBe(3);
+    const fourth = await t.get(url, '198.51.100.4');
+    expect(fourth.statusCode).toBe(503);
+    expect(fourth.json().error).toBe('busy');
+    expect(t.fake.downloads.length).toBe(3);
+    open();
+    for (const r of await Promise.all(running)) expect(r.statusCode).toBe(200);
+    t.fake.hold = null;
+    expect((await t.get(url, '198.51.100.4')).statusCode).toBe(200);
+  });
+
+  it('/v1/dl: no máximo 2 por IP (/64 em IPv6) → 429 too_many_downloads; outros IPs seguem', async () => {
     const t = await setup();
     const r1 = launcher('0.2.0');
     t.fake.releases = [r1];
@@ -550,17 +584,18 @@ describe('I2: cota do token', () => {
     let open!: () => void;
     t.fake.hold = new Promise<void>((r) => { open = r; });
     const url = `/v1/dl/launcher-v0.2.0/${encodeURIComponent(exe.name)}`;
-    const running = Array.from({ length: 8 }, () => t.get(url));
-    for (let i = 0; i < 200 && t.fake.downloads.length < 8; i++) await sleep(5);
-    expect(t.fake.downloads.length).toBe(8);
-    const ninth = await t.get(url);
-    expect(ninth.statusCode).toBe(503);
-    expect(ninth.json().error).toBe('busy');
-    expect(t.fake.downloads.length).toBe(8);
+    const running = [t.get(url, '2001:db8:5:6::1'), t.get(url, '2001:db8:5:6::2')];
+    for (let i = 0; i < 200 && t.fake.downloads.length < 2; i++) await sleep(5);
+    const third = await t.get(url, '2001:db8:5:6::3');
+    expect(third.statusCode).toBe(429);
+    expect(third.json().error).toBe('too_many_downloads');
+    const other = t.get(url, '2001:db8:5:7::1');
+    for (let i = 0; i < 200 && t.fake.downloads.length < 3; i++) await sleep(5);
+    expect(t.fake.downloads.length).toBe(3);
     open();
-    for (const r of await Promise.all(running)) expect(r.statusCode).toBe(200);
+    for (const r of [...(await Promise.all(running)), await other]) expect(r.statusCode).toBe(200);
     t.fake.hold = null;
-    expect((await t.get(url)).statusCode).toBe(200);
+    expect((await t.get(url, '2001:db8:5:6::3')).statusCode).toBe(200);
   });
 
   it('/v1/dl: falha no download libera a vaga', async () => {
@@ -725,5 +760,135 @@ describe('cliente real: casos de borda (M1–M6)', () => {
     t.fake.blobs.set(a.id, new Uint8Array(3));
     const r = await t.get(`/v1/dl/launcher-v0.2.0/${encodeURIComponent(a.name)}`);
     expect(r.headers['content-disposition']).toBe("attachment; filename*=UTF-8''x%27%281%29%2A.exe");
+  });
+});
+
+// ---------------------------------------------------------------- fix round 2 (re-review R1–R4)
+
+type TApp = Awaited<ReturnType<typeof setup>>;
+async function listenOn(t: TApp): Promise<number> {
+  await t.app.listen({ port: 0, host: '127.0.0.1' });
+  return (t.app.server.address() as AddressInfo).port;
+}
+function openGet(port: number, path: string): Promise<{ req: ClientRequest; res: IncomingMessage }> {
+  return new Promise((resolve, reject) => {
+    const req = httpGet({ host: '127.0.0.1', port, path, agent: false }, (res) => { res.on('error', () => {}); resolve({ req, res }); });
+    req.on('error', reject);
+  });
+}
+const BIG = 32 * 1024 * 1024; // passa dos buffers do loopback: um leitor parado trava a escrita
+async function bigAndSmall(t: TApp) {
+  const big = asset('big-setup.exe', BIG);
+  const small = asset('small-setup.exe', 3);
+  t.fake.releases = [rel('launcher-v0.2.0', [big, small])];
+  t.fake.blobs.set(big.id, new Uint8Array(BIG));
+  t.fake.blobs.set(small.id, new Uint8Array(3));
+  return { bigUrl: `/v1/dl/launcher-v0.2.0/${big.name}`, smallUrl: `/v1/dl/launcher-v0.2.0/${small.name}` };
+}
+async function until(cond: () => Promise<boolean>, ms = 3000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) { if (await cond()) return true; await sleep(20); }
+  return false;
+}
+
+describe('R1: downloads presos não seguram vagas', () => {
+  it('leitor parado é derrubado após o prazo de escrita e a vaga do IP volta', async () => {
+    const t = await setup({ config: { dlStallTimeoutMs: 200 } });
+    const { bigUrl, smallUrl } = await bigAndSmall(t);
+    const port = await listenOn(t);
+    try {
+      // dois downloads do mesmo IP que nunca leem
+      const a = await openGet(port, bigUrl);
+      const b = await openGet(port, bigUrl);
+      expect(a.res.statusCode).toBe(200);
+      const third = await t.get(smallUrl, '127.0.0.1');
+      expect(third.statusCode).toBe(429);
+      expect(third.json().error).toBe('too_many_downloads');
+      // depois do prazo o Hub derruba as duas e devolve as vagas do IP
+      expect(await until(async () => (await Promise.all([t.get(smallUrl, '127.0.0.1'), t.get(smallUrl, '127.0.0.1')])).every((r) => r.statusCode === 200))).toBe(true);
+      // o cliente parado, ao voltar a ler, recebe menos que o arquivo e a conexão fechada
+      for (const { res } of [a, b]) {
+        let got = 0;
+        res.on('data', (c: Buffer) => { got += c.length; });
+        await new Promise<void>((r) => res.once('close', () => r()));
+        expect(got).toBeLessThan(BIG);
+      }
+    } finally {
+      await t.app.close();
+    }
+  });
+
+  it('cliente que desconecta no meio libera a vaga (sem vazamento após vários abortos)', async () => {
+    const t = await setup();
+    const { bigUrl, smallUrl } = await bigAndSmall(t);
+    const port = await listenOn(t);
+    try {
+      for (let i = 0; i < 4; i++) {
+        const { req, res } = await openGet(port, bigUrl);
+        await new Promise<void>((r) => res.once('data', () => r()));
+        const gone = new Promise<void>((r) => res.once('close', () => r()));
+        req.destroy();
+        await gone;
+      }
+      // o servidor percebe o reset logo depois do cliente: espera as duas vagas do IP voltarem
+      expect(await until(async () => (await Promise.all([t.get(smallUrl, '127.0.0.1'), t.get(smallUrl, '127.0.0.1')])).every((r) => r.statusCode === 200))).toBe(true);
+      // e não sobrou vaga presa: com duas em andamento, a 3ª simultânea → 429
+      let open!: () => void;
+      t.fake.hold = new Promise<void>((r) => { open = r; });
+      const before = t.fake.downloads.length;
+      const two = [t.get(smallUrl, '127.0.0.1'), t.get(smallUrl, '127.0.0.1')];
+      expect(await until(async () => t.fake.downloads.length === before + 2)).toBe(true);
+      expect((await t.get(smallUrl, '127.0.0.1')).statusCode).toBe(429);
+      open();
+      for (const r of await Promise.all(two)) expect(r.statusCode).toBe(200);
+    } finally {
+      await t.app.close();
+    }
+  });
+
+  it('config: HUB_DL_MAX_CONCURRENT padrão 32, valida inteiro ≥ 1', () => {
+    const base = { DISCORD_CLIENT_ID: 'cid', DISCORD_CLIENT_SECRET: 'secret' };
+    expect(loadConfig({ ...base }).dlMaxConcurrent).toBe(32);
+    expect(loadConfig({ ...base, HUB_DL_MAX_CONCURRENT: '5' }).dlMaxConcurrent).toBe(5);
+    for (const v of ['0', '-1', 'abc', '1.5']) expect(() => loadConfig({ ...base, HUB_DL_MAX_CONCURRENT: v }), v).toThrow(/HUB_DL_MAX_CONCURRENT/);
+    expect(loadConfig({ ...base }).dlStallTimeoutMs).toBe(30_000);
+  });
+});
+
+describe('R2: downloads não esgotam a cota da lista', () => {
+  it('downloads usam no máximo 60% do teto por minuto; a lista ainda tem chamadas', async () => {
+    const clock = { ms: 1_000_000 };
+    const f = fetchFake(() => new Response('x', { status: 500 }));
+    const c = createGitHubReleases({ token: TOKEN, repo: 'dono/repo', fetchImpl: f.impl, nowMs: () => clock.ms, apiCallsPerMinute: 5, logger: { warn: () => {} } });
+    for (const id of [1, 2, 3]) expect((await errOf(c.download(id))).code).toBe('github_error');
+    expect((await errOf(c.download(4))).code).toBe('busy');
+    expect((await errOf(c.list())).code).toBe('github_error'); // chamou o GitHub (não busy)
+    expect(f.calls.length).toBe(4);
+  });
+});
+
+describe('R3: asset sempre ilegível', () => {
+  it('após 3 falhas seguidas o release é excluído (com aviso) e a lista volta a atualizar', async () => {
+    const clock = { ms: 1_000_000 };
+    const f = fetchFake((url) => {
+      if (url.includes('/releases?')) {
+        return Response.json([
+          gh('mod-p1-v0.2.0', [{ id: 21, name: 'cbmp-mod-p1-v0.2.0.zip', size: 9 }, { id: 22, name: 'cbmp-mod-p1-v0.2.0.zip.sig', size: 4 }]),
+          gh('launcher-v0.3.0', [{ id: 31, name: 'a-setup.exe', size: 9 }, { id: 32, name: 'a-setup.exe.sig', size: 4 }]),
+        ]);
+      }
+      if (url.endsWith('/assets/22')) return new Response('x', { status: 500 });
+      return new Response('SIG');
+    });
+    const warns: string[] = [];
+    const c = createGitHubReleases({ token: TOKEN, repo: 'dono/repo', fetchImpl: f.impl, nowMs: () => clock.ms, logger: { warn: (o, m) => warns.push(JSON.stringify(o) + m) } });
+    await expect(c.list()).rejects.toBeInstanceOf(HttpError);
+    clock.ms += 15_000;
+    await expect(c.list()).rejects.toBeInstanceOf(HttpError);
+    clock.ms += 15_000;
+    const l = await c.list();
+    expect(l.map((r) => r.tag)).toEqual(['launcher-v0.3.0']);
+    expect(warns.some((w) => w.includes('mod-p1-v0.2.0') && w.includes('excluded'))).toBe(true);
+    expect(warns.join('')).not.toContain(TOKEN);
   });
 });

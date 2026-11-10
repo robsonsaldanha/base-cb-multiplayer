@@ -24,8 +24,9 @@ Veja `.env.example` para a lista completa. Updates do launcher, mod e downloads 
 |---|---|
 | `HUB_GITHUB_TOKEN` | token do GitHub com leitura de Releases (fine-grained, só *Contents: read* no repo privado). Vazio → as três rotas respondem `503 updates_disabled`. Nunca vai para log nem para o cliente. |
 | `HUB_RELEASES_REPO` | `dono/repo` dos Releases; obrigatório quando há token. Tags `launcher-vX.Y.Z` (instalador `*-setup.exe` + `.sig`) e `mod-pN-vX.Y.Z` (`cbmp-mod-pN-vX.Y.Z.zip` + `.sig` + `.sha256`). |
+| `HUB_DL_MAX_CONCURRENT` | downloads de `/v1/dl` repassados ao mesmo tempo, somando todos os clientes (padrão 32; inteiro ≥ 1). Cada IP tem no máximo 2. |
 
-A lista de releases fica 60 s em cache (falha: 15 s, servindo a anterior). Drafts e prereleases são ignorados. No máximo 8 downloads simultâneos e 80 chamadas/min à API do GitHub (acima → `503 busy`). O Hub não confere assinaturas: o launcher confere.
+A lista de releases fica 60 s em cache (falha: 15 s, servindo a anterior). Drafts e prereleases são ignorados. Downloads simultâneos: 2 por IP (`429 too_many_downloads`) e `HUB_DL_MAX_CONCURRENT` no total (`503 busy`); cliente parado por 30 s é derrubado. Até 80 chamadas/min à API do GitHub (`503 busy`). O Hub não confere assinaturas: o launcher confere.
 
 ## Chaves de assinatura
 

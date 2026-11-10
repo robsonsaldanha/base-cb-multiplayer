@@ -37,6 +37,10 @@ const TEXT_MAX = 8 * 1024;
 const TEXT_CONCURRENCY = 8;
 const PER_PAGE = 100;
 const MAX_PAGES = 10;
+/** Falhas seguidas ao ler o mesmo `.sig`/`.sha256` até o release ser excluído da lista (em vez de travar a lista toda). */
+const EXCLUDE_AFTER_FAILS = 3;
+/** Fração do teto de chamadas/min que downloads podem usar; o resto fica para a lista e os textos. */
+const DOWNLOAD_BUDGET_SHARE = 0.6;
 
 const GhAsset = z.object({ id: z.number().int(), name: z.string(), size: z.number().int().min(0) });
 const GhRelease = z.object({
@@ -131,13 +135,21 @@ export function createGitHubReleases(opts: GitHubReleasesOptions): GitHubRelease
   const texts = new Map<number, string>();
   /** URL assinada do storage por asset (nunca logada). */
   const locations = new Map<number, { url: string; at: number }>();
-  let apiWindow = { start: nowMs(), count: 0 };
+  /** Falhas seguidas por asset de texto (zera ao ler com sucesso). */
+  const textFails = new Map<number, number>();
+  let apiWindow = { start: nowMs(), count: 0, downloads: 0 };
+  const downloadCap = Math.max(1, Math.floor(apiCap * DOWNLOAD_BUDGET_SHARE));
 
-  function spendApiCall(): void {
+  type CallKind = 'meta' | 'download';
+  /** Teto global por minuto; downloads só podem usar parte dele, para não sufocar a lista e os textos. */
+  function spendApiCall(kind: CallKind): void {
     const n = nowMs();
-    if (n - apiWindow.start >= 60_000) apiWindow = { start: n, count: 0 };
-    if (apiWindow.count >= apiCap) throw new HttpError(503, 'busy', 'muitas requisições ao GitHub agora; tente em instantes');
+    if (n - apiWindow.start >= 60_000) apiWindow = { start: n, count: 0, downloads: 0 };
+    if (apiWindow.count >= apiCap || (kind === 'download' && apiWindow.downloads >= downloadCap)) {
+      throw new HttpError(503, 'busy', 'muitas requisições ao GitHub agora; tente em instantes');
+    }
     apiWindow.count++;
+    if (kind === 'download') apiWindow.downloads++;
   }
 
   /**
@@ -171,8 +183,8 @@ export function createGitHubReleases(opts: GitHubReleasesOptions): GitHubRelease
     }
   }
 
-  async function apiGet(endpoint: string, init: RequestInit, msg: string) {
-    spendApiCall();
+  async function apiGet(endpoint: string, init: RequestInit, msg: string, kind: CallKind) {
+    spendApiCall(kind);
     return timedFetch(`${API}/repos/${repo}/${endpoint}`, init, endpoint.replace(/\?.*$/, ''), msg);
   }
 
@@ -186,14 +198,14 @@ export function createGitHubReleases(opts: GitHubReleasesOptions): GitHubRelease
   }
 
   /** GET do asset: URL assinada guardada, ou API (Bearer, octet-stream, redirect manual) → storage sem o token. */
-  async function downloadResponse(assetId: number): Promise<{ res: Response; ac: AbortController }> {
+  async function downloadResponse(assetId: number, kind: CallKind): Promise<{ res: Response; ac: AbortController }> {
     const endpoint = `releases/assets/${assetId}`;
     const msg = 'falha ao baixar asset';
     const saved = locations.get(assetId);
     if (saved && nowMs() - saved.at < LOCATION_TTL_MS) {
       try { return await fetchStorage(saved.url, endpoint); } catch { locations.delete(assetId); /* vencida → pede outra à API */ }
     }
-    const { res, ac } = await apiGet(endpoint, { headers: { ...auth, accept: 'application/octet-stream' }, redirect: 'manual' }, msg);
+    const { res, ac } = await apiGet(endpoint, { headers: { ...auth, accept: 'application/octet-stream' }, redirect: 'manual' }, msg, kind);
     if (res.status >= 300 && res.status < 400) {
       discard(res);
       const location = res.headers.get('location');
@@ -213,7 +225,7 @@ export function createGitHubReleases(opts: GitHubReleasesOptions): GitHubRelease
   async function assetText(id: number): Promise<string> {
     const cached = texts.get(id);
     if (cached !== undefined) return cached;
-    const { res, ac } = await downloadResponse(id);
+    const { res, ac } = await downloadResponse(id, 'meta');
     const text = (await withDeadline(res.text(), ac, `releases/assets/${id}`, 'falha ao ler asset')).slice(0, TEXT_MAX);
     texts.set(id, text);
     return text;
@@ -224,7 +236,7 @@ export function createGitHubReleases(opts: GitHubReleasesOptions): GitHubRelease
     const raw: unknown[] = [];
     for (let page = 1; page <= MAX_PAGES; page++) {
       const endpoint = page === 1 ? `releases?per_page=${PER_PAGE}` : `releases?per_page=${PER_PAGE}&page=${page}`;
-      const { res, ac } = await apiGet(endpoint, { headers: { ...auth, accept: 'application/vnd.github+json' } }, msg);
+      const { res, ac } = await apiGet(endpoint, { headers: { ...auth, accept: 'application/vnd.github+json' } }, msg, 'meta');
       if (!res.ok) { discard(res); throw fail(msg, 'releases', { status: res.status }); }
       const items = await withDeadline(res.json() as Promise<unknown>, ac, 'releases', msg);
       if (!Array.isArray(items)) throw fail('resposta inesperada do GitHub', 'releases', { error: 'bad_shape' });
@@ -233,7 +245,7 @@ export function createGitHubReleases(opts: GitHubReleasesOptions): GitHubRelease
       if (page === MAX_PAGES) logger?.warn({ service: 'github', pages: MAX_PAGES }, 'lista de releases truncada (mais páginas que o limite)');
     }
     const out: Release[] = [];
-    const wanted: ReleaseAsset[] = [];
+    const wanted: Array<{ asset: ReleaseAsset; tag: string }> = [];
     for (const item of raw) {
       const p = GhRelease.safeParse(item);
       if (!p.success) continue;
@@ -246,24 +258,36 @@ export function createGitHubReleases(opts: GitHubReleasesOptions): GitHubRelease
       // Só lê os textos dos releases que o Hub serve (economiza chamadas à API).
       if (!rel.draft && !rel.prerelease && isServedTag(rel.tag)) {
         for (const a of rel.assets) {
-          if ((a.name.endsWith('.sig') || a.name.endsWith('.sha256')) && a.size <= TEXT_MAX) wanted.push(a);
+          if ((a.name.endsWith('.sig') || a.name.endsWith('.sha256')) && a.size <= TEXT_MAX) wanted.push({ asset: a, tag: rel.tag });
         }
       }
       out.push(rel);
     }
     // Falha ao ler um texto = falha da lista: nada de anunciar uma versão menor por um soluço do GitHub.
-    const failed: Array<{ assetId: number; error: string }> = [];
-    await pool(wanted, TEXT_CONCURRENCY, async (a) => {
-      try { a.text = await assetText(a.id); } catch (e) {
-        failed.push({ assetId: a.id, error: e instanceof HttpError ? (e.upstream?.error ?? e.code) : errName(e) });
+    // Mas um asset que falha sempre (EXCLUDE_AFTER_FAILS seguidas) tira só o release dele, para não congelar a lista.
+    const failed: Array<{ assetId: number; tag: string; error: string; fails: number }> = [];
+    await pool(wanted, TEXT_CONCURRENCY, async ({ asset: a, tag }) => {
+      try {
+        a.text = await assetText(a.id);
+        textFails.delete(a.id);
+      } catch (e) {
+        const fails = (textFails.get(a.id) ?? 0) + 1;
+        textFails.set(a.id, fails);
+        failed.push({ assetId: a.id, tag, fails, error: e instanceof HttpError ? (e.upstream?.error ?? e.code) : errName(e) });
       }
     });
     if (failed.length) {
       logger?.warn({ service: 'github', failed }, 'falha ao ler .sig/.sha256 de releases');
-      throw fail('falha ao ler assinaturas dos releases', 'releases/assets', { error: 'asset_text' });
+      if (failed.some((f) => f.fails < EXCLUDE_AFTER_FAILS)) {
+        throw fail('falha ao ler assinaturas dos releases', 'releases/assets', { error: 'asset_text' });
+      }
+      const excluded = [...new Set(failed.map((f) => f.tag))];
+      logger?.warn({ service: 'github', excluded }, `releases excluídos: .sig/.sha256 ilegível após ${EXCLUDE_AFTER_FAILS} tentativas seguidas`);
+      out.splice(0, out.length, ...out.filter((r) => !excluded.includes(r.tag)));
     }
     const live = new Set(out.flatMap((r) => r.assets.map((a) => a.id)));
     for (const id of texts.keys()) if (!live.has(id)) texts.delete(id);
+    for (const id of textFails.keys()) if (!live.has(id)) textFails.delete(id);
     for (const id of locations.keys()) if (!live.has(id)) locations.delete(id);
     return out;
   }
@@ -293,7 +317,7 @@ export function createGitHubReleases(opts: GitHubReleasesOptions): GitHubRelease
       return inflight;
     },
     async download(assetId) {
-      const { res, ac } = await downloadResponse(assetId);
+      const { res, ac } = await downloadResponse(assetId, 'download');
       const header = res.headers.get('content-length');
       const len = header !== null && /^\d+$/.test(header) ? Number(header) : NaN;
       const size = Number.isSafeInteger(len) ? len
