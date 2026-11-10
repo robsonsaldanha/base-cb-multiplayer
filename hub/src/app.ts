@@ -17,7 +17,7 @@ import { banRoutes } from './routes/bans';
 import { panelRoutes } from './routes/panel';
 import { adminLoginRoutes } from './routes/admin-login';
 import { adminServerRoutes } from './routes/admin-servers';
-import { releaseRoutes } from './routes/releases';
+import { newDownloadSlots, releaseRoutes, type DownloadSlots } from './routes/releases';
 
 export interface HubDeps {
   config: HubConfig;
@@ -34,7 +34,7 @@ export interface HubDeps {
 }
 
 declare module 'fastify' {
-  interface FastifyInstance { deps: HubDeps }
+  interface FastifyInstance { deps: HubDeps; downloads: DownloadSlots }
   interface FastifyRequest { cachedUser?: UserRow | null }
 }
 
@@ -46,6 +46,7 @@ export async function buildApp(deps: HubDeps): Promise<FastifyInstance> {
     bodyLimit: 64 * 1024,
   });
   app.decorate('deps', deps);
+  app.decorate('downloads', newDownloadSlots());
   app.decorateRequest('cachedUser', undefined);
   await app.register(cookie);
   await app.register(rateLimit, {

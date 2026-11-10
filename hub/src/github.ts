@@ -282,8 +282,18 @@ export function createGitHubReleases(opts: GitHubReleasesOptions): GitHubRelease
         throw fail('falha ao ler assinaturas dos releases', 'releases/assets', { error: 'asset_text' });
       }
       const excluded = [...new Set(failed.map((f) => f.tag))];
-      logger?.warn({ service: 'github', excluded }, `releases excluídos: .sig/.sha256 ilegível após ${EXCLUDE_AFTER_FAILS} tentativas seguidas`);
-      out.splice(0, out.length, ...out.filter((r) => !excluded.includes(r.tag)));
+      // Se a lista anterior tinha o release (com os textos já lidos), mantém aquela entrada: nunca regride uma
+      // versão já anunciada por causa de um asset trocado que não se lê. Sem entrada anterior, o release sai.
+      const kept: string[] = [];
+      const next = out.flatMap((r) => {
+        if (!excluded.includes(r.tag)) return [r];
+        const prev = cache?.releases.find((p) => p.tag === r.tag);
+        if (prev) { kept.push(r.tag); return [prev]; }
+        return [];
+      });
+      out.splice(0, out.length, ...next);
+      logger?.warn({ service: 'github', excluded, keptPrevious: kept },
+        `releases excluídos: .sig/.sha256 ilegível após ${EXCLUDE_AFTER_FAILS} tentativas seguidas`);
     }
     const live = new Set(out.flatMap((r) => r.assets.map((a) => a.id)));
     for (const id of texts.keys()) if (!live.has(id)) texts.delete(id);

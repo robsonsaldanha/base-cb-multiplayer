@@ -3,7 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import type { ModInfo, UpdateInfo } from '@cbmp/contracts';
 import { HttpError } from '../errors';
 import { ipKey } from './admin-login';
-import { LAUNCHER_TAG, MOD_TAG, isServedTag, type GitHubReleases, type Release, type ReleaseAsset } from '../github';
+import { LAUNCHER_TAG, MOD_TAG, isServedTag, type AssetStream, type GitHubReleases, type Release, type ReleaseAsset } from '../github';
 
 // --- semver local (X.Y.Z[-pre][+build]; build ignorado na comparação) ---
 const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
@@ -41,6 +41,9 @@ const published = (r: Release) => !r.draft && !r.prerelease;
 const SHA256_TEXT = /^([0-9a-fA-F]{64})(?:\s|$)/;
 /** 60 req/min por IP (IPv6 agrupado por /64, como nas outras rotas). */
 const RATE = { rateLimit: { max: 60, timeWindow: '1 minute', keyGenerator: (req: { ip: string }) => ipKey(req.ip) } };
+/** Vagas de /v1/dl (estado do app; os testes leem). */
+export interface DownloadSlots { active: number; perIp: Map<string, number>; watchdogs: number }
+export const newDownloadSlots = (): DownloadSlots => ({ active: 0, perIp: new Map(), watchdogs: 0 });
 /** Downloads simultâneos por IP (IPv6 por /64); acima disso → 429 too_many_downloads. O teto global vem de config.dlMaxConcurrent. */
 export const MAX_DOWNLOADS_PER_IP = 2;
 /** RFC 5987 attr-char: encodeURIComponent deixa ' ( ) * passarem. */
@@ -49,8 +52,6 @@ const validDate = (d: string) => d !== '' && !Number.isNaN(Date.parse(d));
 
 export async function releaseRoutes(app: FastifyInstance) {
   const { config } = app.deps;
-  let activeDownloads = 0;
-  const perIp = new Map<string, number>();
 
   /** Sem token (ou sem cliente) → 503 updates_disabled. */
   function client(): GitHubReleases {
@@ -126,47 +127,78 @@ export async function releaseRoutes(app: FastifyInstance) {
       const entry = release?.assets.find((a) => a.name === asset);
       if (!entry) throw notFound();
       const ip = ipKey(req.ip);
-      if ((perIp.get(ip) ?? 0) >= MAX_DOWNLOADS_PER_IP) {
+      const slots = app.downloads;
+      if ((slots.perIp.get(ip) ?? 0) >= MAX_DOWNLOADS_PER_IP) {
         throw new HttpError(429, 'too_many_downloads', `no máximo ${MAX_DOWNLOADS_PER_IP} downloads simultâneos por conexão; aguarde terminar`);
       }
-      if (activeDownloads >= config.dlMaxConcurrent) throw new HttpError(503, 'busy', 'muitos downloads em andamento; tente em instantes');
-      // Vaga: ocupada aqui, devolvida uma única vez (fim, erro, aborto do cliente ou escrita parada).
-      activeDownloads++;
-      perIp.set(ip, (perIp.get(ip) ?? 0) + 1);
-      let freed = false;
+      if (slots.active >= config.dlMaxConcurrent) throw new HttpError(503, 'busy', 'muitos downloads em andamento; tente em instantes');
+      // Vaga: ocupada aqui e devolvida uma única vez por freeSlot() (fim, erro, cliente que caiu — inclusive antes do
+      // GitHub responder —, escrita parada ou taxa abaixo do mínimo). freeSlot() também limpa o cão de guarda.
+      slots.active++;
+      slots.perIp.set(ip, (slots.perIp.get(ip) ?? 0) + 1);
+      let released = false;
       let watchdog: ReturnType<typeof setInterval> | undefined;
-      const free = () => {
-        clearInterval(watchdog);
-        if (freed) return;
-        freed = true;
-        activeDownloads--;
-        const n = (perIp.get(ip) ?? 1) - 1;
-        if (n > 0) perIp.set(ip, n); else perIp.delete(ip);
+      const freeSlot = () => {
+        if (watchdog !== undefined) { clearInterval(watchdog); watchdog = undefined; slots.watchdogs--; }
+        if (released) return;
+        released = true;
+        slots.active--;
+        const n = (slots.perIp.get(ip) ?? 1) - 1;
+        if (n > 0) slots.perIp.set(ip, n); else slots.perIp.delete(ip);
       };
-      let stream;
-      try { stream = await releases.download(entry.id); } catch (e) { free(); throw e; }
+      // 'close' da resposta: terminou de entregar ao SO, o cliente caiu ou ela foi derrubada. Registrado ANTES de
+      // esperar o GitHub. (O 'close' do req dispara ao fim do corpo do pedido, não serve.)
+      reply.raw.once('close', freeSlot);
+      let stream: AssetStream;
+      try { stream = await releases.download(entry.id); } catch (e) { freeSlot(); throw e; }
+      if (released || reply.raw.destroyed || req.raw.socket?.destroyed) {
+        // Cliente sumiu enquanto o GitHub respondia: cancela o corpo (fecha a conexão com o GitHub) e não envia nada.
+        freeSlot();
+        await stream.cancel().catch(() => {});
+        return reply.hijack();
+      }
       const body = Readable.fromWeb(stream as import('node:stream/web').ReadableStream<Uint8Array>);
-      // A vaga só volta quando a resposta fecha (terminou de entregar ao SO, ou o cliente caiu, ou foi derrubada):
-      // o fim do stream de origem não basta, os bytes ainda podem estar no buffer da resposta.
-      reply.raw.once('close', free);
-      // Escrita parada: buffer da resposta acima do limite (esperando 'drain') sem diminuir por dlStallTimeoutMs →
-      // derruba a resposta (o pipe destrói a origem e cancela o GitHub). Cliente lento que drena não é afetado.
+      const drop = (code: string, msg: string) => {
+        req.log.warn({ code, tag, assetId: entry.id }, msg);
+        freeSlot();
+        body.destroy();
+        reply.raw.destroy();
+      };
+      // Cão de guarda:
+      // - escrita parada: buffer da resposta acima do limite (esperando 'drain') sem diminuir por dlStallTimeoutMs;
+      // - taxa mínima: depois de uma janela de carência, média da última janela (bytes entregues ao socket) abaixo de
+      //   dlMinKBps → derruba. Cobre o leitor em conta-gotas, que drena um pouco de cada vez e escapa da regra acima.
       const stallMs = config.dlStallTimeoutMs;
+      const windowMs = config.dlRateWindowMs;
+      const minBps = config.dlMinKBps * 1024;
+      const sock = reply.raw.socket;
+      const sent = () => (typeof sock?.bytesWritten === 'number' ? sock.bytesWritten : NaN);
+      const start = Date.now();
+      const base = sent();
+      const samples: Array<{ t: number; b: number }> = [{ t: start, b: 0 }];
       let blockedSince: number | null = null;
       let lastLen = Infinity;
+      slots.watchdogs++;
       watchdog = setInterval(() => {
         const res = reply.raw;
+        const now = Date.now();
         const len = res.writableLength;
         if (!res.writableNeedDrain || len < lastLen) blockedSince = null;
-        else if (blockedSince === null) blockedSince = Date.now();
+        else if (blockedSince === null) blockedSince = now;
         lastLen = len;
-        if (blockedSince !== null && Date.now() - blockedSince >= stallMs) {
-          req.log.warn({ code: 'dl_stalled', tag, assetId: entry.id }, 'download parado: cliente não drena o socket');
-          free();
-          body.destroy();
-          res.destroy();
+        if (blockedSince !== null && now - blockedSince >= stallMs) {
+          drop('dl_stalled', 'download parado: cliente não drena o socket');
+          return;
         }
-      }, Math.max(10, Math.min(1000, Math.floor(stallMs / 4))));
+        const b = sent() - base;
+        if (minBps <= 0 || Number.isNaN(b)) return;
+        samples.push({ t: now, b });
+        while (samples.length > 1 && samples[1]!.t <= now - windowMs) samples.shift();
+        const old = samples[0]!;
+        if (now - start >= windowMs && now - old.t >= windowMs && ((b - old.b) * 1000) / (now - old.t) < minBps) {
+          drop('dl_too_slow', 'download abaixo da taxa mínima');
+        }
+      }, Math.max(10, Math.min(1000, Math.floor(stallMs / 4), Math.floor(windowMs / 4))));
       watchdog.unref();
       return reply
         .header('content-type', 'application/octet-stream')

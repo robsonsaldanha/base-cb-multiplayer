@@ -1,6 +1,6 @@
 import { PassThrough } from 'node:stream';
 import { get as httpGet, type ClientRequest, type IncomingMessage } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { connect as netConnect, type AddressInfo } from 'node:net';
 import { describe, expect, it } from 'vitest';
 import { ModInfo, UpdateInfo } from '@cbmp/contracts';
 import { makeTestApp } from './helpers';
@@ -38,24 +38,29 @@ class FakeReleases implements GitHubReleases {
   downloads: number[] = [];
   /** Quando definido, o corpo só é entregue depois que a promessa resolve (downloads "em andamento"). */
   hold: Promise<void> | null = null;
+  /** Quando definido, o próprio download() só resolve depois dela (GitHub lento para responder). */
+  pending: Promise<void> | null = null;
+  /** Corpos cancelados pelo Hub (cliente sumiu, derrubado etc.). */
+  cancelled = 0;
   async list(): Promise<Release[]> { return this.releases; }
   async download(assetId: number): Promise<AssetStream> {
     this.downloads.push(assetId);
+    if (this.pending) await this.pending;
     const b = this.blobs.get(assetId);
     if (!b) throw new HttpError(502, 'github_error', 'falha');
     const hold = this.hold;
-    if (b.length > 1024 * 1024) {
-      // Grandes: pedaços de 64 KiB sob demanda, como o fetch entrega (um único write enorme o SO aceita de uma vez).
-      let off = 0;
-      const chunked = new ReadableStream<Uint8Array>({
-        pull(c) { c.enqueue(b.subarray(off, off + 65536)); off += 65536; if (off >= b.length) c.close(); },
-      });
-      return Object.assign(chunked, { size: b.length });
-    }
-    if (!hold) return Object.assign(new Blob([b]).stream(), { size: b.length });
+    const onCancel = () => { this.cancelled++; };
+    let off = 0;
+    // Pedaços de 64 KiB sob demanda, como o fetch entrega (um único write enorme o SO aceita de uma vez).
     const body = new ReadableStream<Uint8Array>({
-      async pull(c) { await hold; c.enqueue(b); c.close(); },
-    });
+      async pull(c) {
+        if (hold) await hold;
+        c.enqueue(b.subarray(off, off + 65536));
+        off += 65536;
+        if (off >= b.length) c.close();
+      },
+      cancel: onCancel,
+    }, { highWaterMark: 0 });
     return Object.assign(body, { size: b.length });
   }
 }
@@ -890,5 +895,163 @@ describe('R3: asset sempre ilegível', () => {
     expect(l.map((r) => r.tag)).toEqual(['launcher-v0.3.0']);
     expect(warns.some((w) => w.includes('mod-p1-v0.2.0') && w.includes('excluded'))).toBe(true);
     expect(warns.join('')).not.toContain(TOKEN);
+  });
+});
+
+// ---------------------------------------------------------------- fix round 3 (re-review 2: C1, I-R1b, M-R3a)
+
+describe('C1: cliente some enquanto download() ainda está pendente', () => {
+  it('a vaga volta na hora, o corpo que chega depois é cancelado e nenhum timer fica', async () => {
+    const t = await setup();
+    const { smallUrl } = await bigAndSmall(t);
+    let resolve!: () => void;
+    t.fake.pending = new Promise<void>((r) => { resolve = r; });
+    const port = await listenOn(t);
+    try {
+      for (let i = 0; i < 3; i++) {
+        const before = t.fake.downloads.length;
+        const sock = netConnect(port, '127.0.0.1');
+        sock.on('error', () => {});
+        await new Promise<void>((r) => sock.once('connect', () => r()));
+        sock.write(`GET ${smallUrl} HTTP/1.1\r\nHost: x\r\n\r\n`);
+        expect(await until(async () => t.fake.downloads.length === before + 1)).toBe(true);
+        expect(t.app.downloads.active).toBe(1);
+        sock.destroy();
+        expect(await until(async () => t.app.downloads.active === 0)).toBe(true); // antes de download() resolver
+      }
+      expect(t.app.downloads.perIp.size).toBe(0);
+      resolve();
+      expect(await until(async () => t.fake.cancelled === 3)).toBe(true);
+      expect(t.app.downloads.active).toBe(0);
+      expect(t.app.downloads.watchdogs).toBe(0);
+    } finally {
+      await t.app.close();
+    }
+  });
+
+  it('download() que falha depois do cliente sair não devolve a vaga duas vezes', async () => {
+    const t = await setup();
+    const a = asset('missing-setup.exe', 3); // sem blob → download() lança
+    t.fake.releases = [rel('launcher-v0.2.0', [a])];
+    let resolve!: () => void;
+    t.fake.pending = new Promise<void>((r) => { resolve = r; });
+    const port = await listenOn(t);
+    try {
+      const sock = netConnect(port, '127.0.0.1');
+      sock.on('error', () => {});
+      await new Promise<void>((r) => sock.once('connect', () => r()));
+      sock.write(`GET /v1/dl/launcher-v0.2.0/${a.name} HTTP/1.1\r\nHost: x\r\n\r\n`);
+      expect(await until(async () => t.fake.downloads.length === 1)).toBe(true);
+      sock.destroy();
+      expect(await until(async () => t.app.downloads.active === 0)).toBe(true);
+      resolve();
+      await sleep(50);
+      expect(t.app.downloads.active).toBe(0); // não ficou negativo
+      expect(t.app.downloads.watchdogs).toBe(0);
+    } finally {
+      await t.app.close();
+    }
+  });
+
+  it('downloads completos não deixam vaga nem timer', async () => {
+    const t = await setup();
+    const { smallUrl } = await bigAndSmall(t);
+    for (let i = 0; i < 5; i++) expect((await t.get(smallUrl)).statusCode).toBe(200);
+    expect(await until(async () => t.app.downloads.active === 0)).toBe(true);
+    expect(t.app.downloads.watchdogs).toBe(0);
+  });
+});
+
+describe('I-R1b: taxa mínima de transferência', () => {
+  const cfg = { dlStallTimeoutMs: 60_000, dlRateWindowMs: 300, dlMinKBps: 4096 };
+
+  it('leitor em conta-gotas (abaixo do mínimo) é derrubado após a carência e a vaga volta', async () => {
+    const t = await setup({ config: cfg });
+    const { bigUrl } = await bigAndSmall(t);
+    const port = await listenOn(t);
+    try {
+      const { res } = await openGet(port, bigUrl);
+      let got = 0;
+      // lê um pedaço a cada 100 ms: ~640 KiB/s, bem abaixo de 4 MiB/s; nunca para de vez (a regra de parada não pega)
+      res.pause();
+      res.on('data', (c: Buffer) => { got += c.length; res.pause(); setTimeout(() => res.resume(), 100); });
+      res.resume();
+      const closed = new Promise<void>((r) => res.once('close', () => r()));
+      expect(await until(async () => t.app.downloads.active === 0, 4000)).toBe(true);
+      expect(t.app.downloads.watchdogs).toBe(0);
+      await closed;
+      expect(got).toBeLessThan(BIG);
+    } finally {
+      await t.app.close();
+    }
+  });
+
+  it('leitor rápido termina normalmente', async () => {
+    const t = await setup({ config: cfg });
+    const { bigUrl } = await bigAndSmall(t);
+    const port = await listenOn(t);
+    try {
+      const { res } = await openGet(port, bigUrl);
+      let got = 0;
+      res.on('data', (c: Buffer) => { got += c.length; });
+      await new Promise<void>((r) => res.once('end', () => r()));
+      expect(got).toBe(BIG);
+      expect(await until(async () => t.app.downloads.active === 0)).toBe(true);
+    } finally {
+      await t.app.close();
+    }
+  });
+
+  it('HUB_DL_MIN_KBPS=0 desliga a regra', async () => {
+    const t = await setup({ config: { ...cfg, dlMinKBps: 0, dlStallTimeoutMs: 60_000 } });
+    const { bigUrl } = await bigAndSmall(t);
+    const port = await listenOn(t);
+    try {
+      const { req } = await openGet(port, bigUrl); // nunca lê
+      await sleep(900); // 3 janelas
+      expect(t.app.downloads.active).toBe(1);
+      req.destroy();
+      expect(await until(async () => t.app.downloads.active === 0)).toBe(true);
+    } finally {
+      await t.app.close();
+    }
+  });
+
+  it('config: HUB_DL_MIN_KBPS (padrão 32, 0 desliga) e HUB_DL_STALL_SECONDS (padrão 30)', () => {
+    const base = { DISCORD_CLIENT_ID: 'cid', DISCORD_CLIENT_SECRET: 'secret' };
+    const c = loadConfig({ ...base });
+    expect([c.dlMinKBps, c.dlStallTimeoutMs, c.dlRateWindowMs]).toEqual([32, 30_000, 30_000]);
+    const d = loadConfig({ ...base, HUB_DL_MIN_KBPS: '0', HUB_DL_STALL_SECONDS: '90' });
+    expect([d.dlMinKBps, d.dlStallTimeoutMs]).toEqual([0, 90_000]);
+    for (const v of ['-1', 'x', '1.5']) expect(() => loadConfig({ ...base, HUB_DL_MIN_KBPS: v }), v).toThrow(/HUB_DL_MIN_KBPS/);
+    for (const v of ['0', 'x', '99999']) expect(() => loadConfig({ ...base, HUB_DL_STALL_SECONDS: v }), v).toThrow(/HUB_DL_STALL_SECONDS/);
+  });
+});
+
+describe('M-R3a: exclusão não regride uma versão já anunciada', () => {
+  it('asset trocado que falha 3 vezes: mantém a entrada anterior do release', async () => {
+    const clock = { ms: 1_000_000 };
+    let sigId = 22;
+    const f = fetchFake((url) => {
+      if (url.includes('/releases?')) {
+        return Response.json([
+          gh('mod-p1-v0.2.0', [{ id: 21, name: 'cbmp-mod-p1-v0.2.0.zip', size: 9 }, { id: sigId, name: 'cbmp-mod-p1-v0.2.0.zip.sig', size: 4 }, { id: 23, name: 'cbmp-mod-p1-v0.2.0.zip.sha256', size: 64 }]),
+          gh('mod-p1-v0.1.0', [{ id: 11, name: 'cbmp-mod-p1-v0.1.0.zip', size: 9 }, { id: 12, name: 'cbmp-mod-p1-v0.1.0.zip.sig', size: 4 }, { id: 13, name: 'cbmp-mod-p1-v0.1.0.zip.sha256', size: 64 }]),
+        ]);
+      }
+      if (url.endsWith('/assets/99')) return new Response('x', { status: 500 }); // .sig novo, ilegível
+      if (url.endsWith('/assets/22') || url.endsWith('/assets/12')) return new Response('SIG');
+      return new Response(SHA);
+    });
+    const warns: string[] = [];
+    const releases = createGitHubReleases({ token: TOKEN, repo: 'dono/repo', fetchImpl: f.impl, nowMs: () => clock.ms, logger: { warn: (o, m) => warns.push(JSON.stringify(o) + m) } });
+    const t = await makeTestApp({ config: { githubToken: TOKEN, releasesRepo: 'dono/repo' }, releases });
+    const latest = async () => (await t.app.inject({ method: 'GET', url: '/v1/mod/latest?protocol=1' })).json().version as string;
+    expect(await latest()).toBe('0.2.0');
+    sigId = 99; // .sig trocado por um que não se lê
+    clock.ms += 61_000;
+    for (let i = 0; i < 3; i++) { expect(await latest()).toBe('0.2.0'); clock.ms += 15_000; }
+    expect(await latest()).toBe('0.2.0'); // excluído na 3ª falha, mas a entrada anterior foi mantida
+    expect(warns.some((w) => w.includes('excluded'))).toBe(true);
   });
 });

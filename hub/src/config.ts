@@ -16,6 +16,15 @@ function parseTrustProxy(raw: string | undefined): string | false {
   return items.join(',');
 }
 
+/** Inteiro decimal em [min, max]; vazio → padrão. */
+function parseIntEnv(raw: string | undefined, name: string, def: number, min: number, max: number): number {
+  const v = (raw ?? '').trim();
+  if (v === '') return def;
+  const n = /^\d{1,9}$/.test(v) ? Number(v) : NaN;
+  if (!(n >= min && n <= max)) throw new Error(`${name} deve ser um inteiro entre ${min} e ${max}: "${v}"`);
+  return n;
+}
+
 function parseDlMax(raw: string | undefined): number {
   const v = (raw ?? '').trim();
   if (v === '') return 32;
@@ -42,8 +51,12 @@ export interface HubConfig {
   releasesRepo: string;
   /** Downloads repassados ao mesmo tempo, todos os clientes (`HUB_DL_MAX_CONCURRENT`, padrão 32). */
   dlMaxConcurrent: number;
-  /** Download cujo cliente não drena o socket por este tempo é derrubado (30 s; injetável nos testes). */
+  /** Download cujo cliente não drena o socket por este tempo é derrubado (`HUB_DL_STALL_SECONDS`, padrão 30). */
   dlStallTimeoutMs: number;
+  /** Taxa mínima de entrega em KiB/s, média da última janela, depois de uma janela de carência (`HUB_DL_MIN_KBPS`, padrão 32; 0 desliga). */
+  dlMinKBps: number;
+  /** Janela (e carência) da taxa mínima, em ms (30 s; injetável nos testes). */
+  dlRateWindowMs: number;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
@@ -66,7 +79,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
     githubToken: (env.HUB_GITHUB_TOKEN ?? '').trim(),
     releasesRepo: (env.HUB_RELEASES_REPO ?? '').trim(),
     dlMaxConcurrent: parseDlMax(env.HUB_DL_MAX_CONCURRENT),
-    dlStallTimeoutMs: 30_000,
+    dlStallTimeoutMs: parseIntEnv(env.HUB_DL_STALL_SECONDS, 'HUB_DL_STALL_SECONDS', 30, 1, 3600) * 1000,
+    dlMinKBps: parseIntEnv(env.HUB_DL_MIN_KBPS, 'HUB_DL_MIN_KBPS', 32, 0, 1_000_000),
+    dlRateWindowMs: 30_000,
   };
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('HUB_PORT inválida');
   if (!devLogin && (!cfg.discordClientId || !cfg.discordClientSecret)) {
