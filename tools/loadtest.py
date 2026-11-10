@@ -265,7 +265,7 @@ def print_load(r: dict) -> None:
         ("CPU máx do servidor (%)", f"{r['cpuPercentMax']:.0f}", "-"),
         ("bots conectados / falhas / caíram / expulsos", f"{b['connected']} / {b['failedToConnect']} / {b['disconnected']} / {b['kicked']}", "todos / 0 / 0 / 0"),
         ("intervalo entre snapshots máx / p99 (ms)", f"{b['maxSnapshotGapMs']:.0f} / {b['p99SnapshotGapMs']:.0f}", f"máx <= {LIMITS['maxSnapshotGapMs']:.0f}"),
-        ("RTT médio do eco (ms) / respostas", f"{b['avgRttMs']:.1f} / {b.get('echoReplies', 0)}", "respostas > 0"),
+        ("RTT médio do eco (ms) / respostas / enviados", f"{b['avgRttMs']:.1f} / {b.get('echoReplies', 0)} / {b.get('echoSent', 0)}", "respostas ≥ 50%"),
         ("banda recebida média por bot (kbps)", f"{b['avgKbpsInPerBot']:.1f}", "-"),
         ("correções / kicks no servidor", f"{r['serverCorrections']} / {r['serverKicks']}", "-"),
     ]

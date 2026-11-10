@@ -148,6 +148,7 @@ struct ApiRes {
   HostedResource* h = nullptr;
   lua_State* L = nullptr;  // estado principal
   int nullRef = LUA_NOREF;
+  uint32_t source = 0;  // origem dos emits deste resource (justiça entre resources nas filas)
   int depth = 0;  // chamadas da API em andamento neste resource (cb.resource recusa reentrância)
   bool live = false;
   std::array<std::vector<Ref>, OnCount> on;
@@ -189,6 +190,7 @@ struct Shared {
   bool draining = false;
   double lastJsonWarn = -1e9;
   std::vector<uint64_t> dueScratch;
+  uint32_t nextSource = 1;
 
   int64_t unixNow() const {
     if (o.unixNow) return o.unixNow();
@@ -360,7 +362,9 @@ CBAPI_NOINLINE int doEmit(ApiRes* a, lua_State* L, lua_Integer target, const cha
       if (want != 0 && want != c->session) return 0;  // outra sessão ocupa o id
       session = c->session;
     }
-    return a->ctx->emit(CmdEmit{static_cast<int32_t>(target), std::string(name, len), a->scratch, session}) ? 1 : 0;
+    return a->ctx->emit(CmdEmit{static_cast<int32_t>(target), std::string(name, len), a->scratch, session, a->source})
+               ? 1
+               : 0;
   } catch (...) {
     setErr(e, "cb.events.emit: sem memória");
     return -1;
@@ -1296,7 +1300,7 @@ void reply(ScriptContext& ctx, EvCommand& ev, uint32_t session, const std::strin
   if (ev.reply) {
     ev.reply(text);
   } else if (ev.from) {
-    ctx.emit(CmdEmit{*ev.from, "cb:reply", replyJson(text), session});
+    ctx.emit(CmdEmit{*ev.from, "cb:reply", replyJson(text), session, 0});
   }
 }
 
@@ -1426,6 +1430,8 @@ void installApi(HostOptions& opt, ApiOptions api) {
     a->ctx = &ctx;
     a->h = &h;
     a->L = h.lua().lua().lua_state();
+    a->source = sh->nextSource++;
+    if (a->source == 0) a->source = sh->nextSource++;
     h.api = a;
     buildApi(a.get());
     if (prevSetup) prevSetup(ctx, h);

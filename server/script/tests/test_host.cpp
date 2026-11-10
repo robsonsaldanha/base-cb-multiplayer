@@ -67,7 +67,7 @@ int luaOnce(lua_State* L) {
   lua_pushboolean(L, n->fetch_add(1) == 0);
   return 1;
 }
-CBSCRIPT_TEST_NOINLINE void doEmit(ScriptContext* ctx, const char* name) { ctx->emit(CmdEmit{-1, name, "{}", 0}); }
+CBSCRIPT_TEST_NOINLINE void doEmit(ScriptContext* ctx, const char* name) { ctx->emit(CmdEmit{-1, name, "{}", 0, 0}); }
 int luaEmit(lua_State* L) {
   auto* ctx = static_cast<ScriptContext*>(lua_touserdata(L, lua_upvalueindex(1)));
   const char* s = luaL_checkstring(L, 1);
@@ -150,7 +150,7 @@ struct HostEnv {
             }
             if constexpr (std::is_same_v<T, EvClientEvent>) {
               if (e.name == "__players") {
-                ctx.emit(CmdEmit{-1, "players", std::to_string(ctx.players()->size()), 0});
+                ctx.emit(CmdEmit{-1, "players", std::to_string(ctx.players()->size()), 0, 0});
                 return;
               }
               for (HostedResource* h : ctx.running()) {
@@ -497,7 +497,7 @@ TEST_CASE("host: players snapshot, tasks, command replies and the command queue 
 
   // fila scripts → simulação limitada
   env.host->runOnScriptThread([](ScriptContext& ctx) {
-    for (int i = 0; i < 5; ++i) ctx.emit(CmdEmit{i, "e", "{}", 0});
+    for (int i = 0; i < 5; ++i) ctx.emit(CmdEmit{i, "e", "{}", 0, 0});
     // Fila de emits cheia: kick/teleporte vão pelo canal prioritário e não são descartados.
     ctx.emit(CmdKick{9, "k", 0});
     ctx.emit(CmdSetPosition{9, 1, 2, 3, 0});
@@ -868,7 +868,7 @@ TEST_CASE("host: the script to simulation command queue is bounded in bytes") {
   auto fut = p->get_future();
   env.host->runOnScriptThread([p](ScriptContext& ctx) {
     int ok = 0;
-    for (int i = 0; i < 40; ++i) ok += ctx.emit(CmdEmit{-1, "e", std::string(1000, 'x'), 0}) ? 1 : 0;
+    for (int i = 0; i < 40; ++i) ok += ctx.emit(CmdEmit{-1, "e", std::string(1000, 'x'), 0, 0}) ? 1 : 0;
     p->set_value(ok);
   });
   const int accepted = guarded("emit", [&fut] { return fut.get(); });
@@ -881,6 +881,40 @@ TEST_CASE("host: the script to simulation command queue is bounded in bytes") {
   // Drenou: cabe de novo.
   auto p2 = std::make_shared<std::promise<bool>>();
   auto f2 = p2->get_future();
-  env.host->runOnScriptThread([p2](ScriptContext& ctx) { p2->set_value(ctx.emit(CmdEmit{-1, "e", std::string(1000, 'x'), 0})); });
+  env.host->runOnScriptThread([p2](ScriptContext& ctx) { p2->set_value(ctx.emit(CmdEmit{-1, "e", std::string(1000, 'x'), 0, 0})); });
   REQUIRE(guarded("emit2", [&f2] { return f2.get(); }));
+}
+
+TEST_CASE("host: the priority channel coalesces teleports and kicks; emits are fair between sources") {
+  HostEnv env;
+  env.opt.commandQueueCapacity = 40;
+  env.addRes("a", {}, "return {}");
+  env.boot();
+  auto p = std::make_shared<std::promise<int>>();
+  auto fut = p->get_future();
+  env.host->runOnScriptThread([p](ScriptContext& ctx) {
+    for (int i = 0; i < 5000; ++i) ctx.emit(CmdSetPosition{1, i, 0, 0, 7});
+    ctx.emit(CmdSetPosition{1, 1, 1, 1, 8});  // outra sessão: entrada própria
+    ctx.emit(CmdKick{2, "primeiro", 9});
+    ctx.emit(CmdKick{2, "segundo", 9});
+    ctx.emit(CmdKickDid{"d", "a"});
+    ctx.emit(CmdKickDid{"d", "b"});
+    int ok = 0;
+    for (int i = 0; i < 40; ++i) ok += ctx.emit(CmdEmit{-1, "f", "0", 0, 1}) ? 1 : 0;  // origem 1: 1/4 da fila
+    ok += ctx.emit(CmdEmit{-1, "g", "0", 0, 2}) ? 100 : 0;                         // origem 2 ainda cabe
+    p->set_value(ok);
+  });
+  const int ok = guarded("emit", [&fut] { return fut.get(); });
+  REQUIRE(ok == 110);
+  std::vector<ScriptToSim> out;
+  env.host->drainPriority(out);
+  REQUIRE(out.size() == 4);
+  REQUIRE(std::get<CmdSetPosition>(out[0]).x == 4999);  // o último teleporte, na posição do primeiro
+  REQUIRE(std::get<CmdSetPosition>(out[1]).session == 8);
+  REQUIRE(std::get<CmdKick>(out[2]).reason == "primeiro");
+  REQUIRE(std::get<CmdKickDid>(out[3]).reason == "a");
+  REQUIRE(env.host->metrics().priorityDropped == 0);
+  out.clear();
+  env.host->drainCommands(out);
+  REQUIRE(out.size() == 11);
 }

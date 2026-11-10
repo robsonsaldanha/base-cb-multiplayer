@@ -59,6 +59,7 @@ struct CmdEmit {
   std::string name;     // ≤ 64 bytes
   std::string json;     // ≤ 4096 bytes (a simulação descarta e conta o que passar)
   uint32_t session = 0;
+  uint32_t source = 0;  // origem (resource) para a justiça entre resources nas filas; 0 = motor
 };
 struct CmdSetPosition {
   uint16_t id = 0;

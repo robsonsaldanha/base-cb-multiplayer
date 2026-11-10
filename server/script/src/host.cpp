@@ -16,7 +16,9 @@
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <type_traits>
 #include <variant>
@@ -142,7 +144,15 @@ struct HostImpl final : ScriptContext {
   // Canal prioritário (kick, kick por did, teleporte): fora da capacidade/bytes dos emits; só o teto de segurança
   // priorityQueueCapacity (com log CRÍTICO) ou o host parado o recusam.
   std::vector<ScriptToSim> prio;
+  size_t prioBytes = 0;
   std::atomic<uint64_t> prioDropped{0};
+  double prioLastCritical = -1e9;
+  // Coalescência do canal prioritário (sob cmdMu, zerada no dreno): teleporte = o último por (id, sessão) substitui o
+  // anterior no lugar; kick = o primeiro por (id, sessão); kick por did = o primeiro por did.
+  std::unordered_map<uint64_t, size_t> prioPos, prioKick;
+  std::unordered_map<std::string, size_t> prioKickDid;
+  // Cota por origem (resource) dos emits na fila atual: uma enxurrada de um resource não toma a fila dos outros.
+  std::unordered_map<uint32_t, std::pair<size_t, size_t>> emitBySource;  // origem → (itens, bytes)
 
   // ---- foto dos jogadores (playersMu: só a troca do ponteiro) ----
   mutable std::mutex playersMu;
@@ -199,27 +209,65 @@ struct HostImpl final : ScriptContext {
                                      c);
   }
   static bool isPriority(const ScriptToSim& c) { return !std::holds_alternative<CmdEmit>(c); }
+  static uint64_t keyOf(uint16_t id, uint32_t session) { return (uint64_t{id} << 32) | session; }
+  // true = já tratado (coalescido); false = precisa de uma posição nova na fila. Sob cmdMu.
+  bool coalesce(ScriptToSim& cmd) {
+    if (auto* t = std::get_if<CmdSetPosition>(&cmd)) {
+      auto [it, fresh] = prioPos.try_emplace(keyOf(t->id, t->session), prio.size());
+      if (!fresh) {
+        prio[it->second] = std::move(cmd);  // o último teleporte vale
+        return true;
+      }
+    } else if (auto* k = std::get_if<CmdKick>(&cmd)) {
+      if (!prioKick.try_emplace(keyOf(k->id, k->session), prio.size()).second) return true;  // o primeiro vale
+    } else if (auto* d = std::get_if<CmdKickDid>(&cmd)) {
+      if (!prioKickDid.try_emplace(d->did, prio.size()).second) return true;
+    }
+    return false;
+  }
   bool emit(ScriptToSim cmd) override {
+    const size_t n = bytesOf(cmd);
     if (isPriority(cmd)) {
       bool over = false;
       {
         std::lock_guard<std::mutex> lk(cmdMu);
-        if (!halted.load() && prio.size() < opt.priorityQueueCapacity) {
-          prio.push_back(std::move(cmd));
-          return true;
+        if (!halted.load()) {
+          if (coalesce(cmd)) return true;
+          if (prio.size() < opt.priorityQueueCapacity && prioBytes + n <= opt.priorityQueueBytes) {
+            prioBytes += n;
+            prio.push_back(std::move(cmd));
+            return true;
+          }
+          // Sem espaço: desfaz a reserva de índice feita por coalesce().
+          if (auto* t = std::get_if<CmdSetPosition>(&cmd)) prioPos.erase(keyOf(t->id, t->session));
+          else if (auto* k = std::get_if<CmdKick>(&cmd)) prioKick.erase(keyOf(k->id, k->session));
+          else if (auto* d = std::get_if<CmdKickDid>(&cmd)) prioKickDid.erase(d->did);
+          over = true;
         }
-        over = !halted.load();
       }
       prioDropped.fetch_add(1, std::memory_order_relaxed);
-      if (over) log(LogLevel::Critical, "fila prioritária de comandos (kick/teleporte) cheia: comando descartado");
+      if (over) {
+        const double t = clock();
+        if (t - prioLastCritical >= 1.0) {  // no máximo 1 CRÍTICO por segundo
+          prioLastCritical = t;
+          log(LogLevel::Critical, "fila prioritária de comandos (kick/teleporte) cheia: comando descartado");
+        }
+      }
       return false;
     }
-    const size_t n = bytesOf(cmd);
+    const auto* e = std::get_if<CmdEmit>(&cmd);
+    const uint32_t src = e ? e->source : 0;
     std::lock_guard<std::mutex> lk(cmdMu);
-    if (cmds.size() >= opt.commandQueueCapacity || cmdBytes + n > opt.commandQueueBytes) {
+    auto& [srcItems, srcBytes] = emitBySource[src];
+    const size_t srcCap = std::max<size_t>(1, opt.commandQueueCapacity / 4);
+    const size_t srcByteCap = std::max<size_t>(1, opt.commandQueueBytes / 4);
+    const bool overSource = src != 0 && (srcItems >= srcCap || srcBytes + n > srcByteCap);  // 0 = motor (cb:reply)
+    if (cmds.size() >= opt.commandQueueCapacity || cmdBytes + n > opt.commandQueueBytes || overSource) {
       cmdsDropped.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
+    ++srcItems;
+    srcBytes += n;
     cmdBytes += n;
     cmds.push_back(std::move(cmd));
     return true;
@@ -1092,6 +1140,10 @@ void ScriptHost::drainPriority(std::vector<ScriptToSim>& out) {
   {
     std::lock_guard<std::mutex> lk(I.cmdMu);
     got.swap(I.prio);
+    I.prioBytes = 0;
+    I.prioPos.clear();
+    I.prioKick.clear();
+    I.prioKickDid.clear();
   }
   out.insert(out.end(), std::make_move_iterator(got.begin()), std::make_move_iterator(got.end()));
 }
@@ -1102,8 +1154,13 @@ void ScriptHost::drainCommands(std::vector<ScriptToSim>& out) {
   {
     std::lock_guard<std::mutex> lk(I.cmdMu);
     pr.swap(I.prio);
+    I.prioBytes = 0;
+    I.prioPos.clear();
+    I.prioKick.clear();
+    I.prioKickDid.clear();
     got.swap(I.cmds);
     I.cmdBytes = 0;
+    I.emitBySource.clear();
   }
   out.insert(out.end(), std::make_move_iterator(pr.begin()), std::make_move_iterator(pr.end()));
   if (out.empty()) {

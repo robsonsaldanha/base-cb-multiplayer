@@ -145,6 +145,7 @@ class World {
 
   uint32_t currentTick() const { return tick_; }
   const std::vector<EntityId>& activeIds() const { return active_; }  // ordenados
+  size_t maxPlayers() const { return slots_.size() - 1; }
   size_t playerCount() const { return active_.size(); }
   const PlayerSlot* find(EntityId id) const;
 

@@ -1088,3 +1088,10 @@ TEST_CASE("api: callback error messages are escaped in the log") {
   REQUIRE_FALSE(env.hasLog("\n[2026-11-10]", LogLevel::Error));
   REQUIRE(env.hasLog("x\\n[2026-11-10] [info] forjado", LogLevel::Error));
 }
+
+TEST_CASE("api: escapeLogText also escapes LRM/RLM, ALM and BOM") {
+  REQUIRE(cbscript::escapeLogText("\xE2\x80\x8E" "a" "\xE2\x80\x8F") == "\\u{200e}a\\u{200f}");
+  REQUIRE(cbscript::escapeLogText("x\xD8\x9Cy") == "x\\u{061c}y");
+  REQUIRE(cbscript::escapeLogText("\xEF\xBB\xBF" "z") == "\\u{feff}z");
+  REQUIRE(cbscript::escapeLogText("\xD8\xA7") == "\xD8\xA7");  // letra árabe comum intacta
+}

@@ -276,7 +276,7 @@ int run(const std::string& cfgPath) {
     if (world.currentTick() % static_cast<uint32_t>(cfg.tickHz) == 0) {  // contadores dos scripts, 1×/s
       const auto hm = scripts.metrics();
       metrics.scriptEventsDropped = static_cast<int64_t>(hm.eventsDropped + bridge.eventsDropped());
-      metrics.scriptCommandsDropped = static_cast<int64_t>(hm.commandsDropped);
+      metrics.scriptCommandsDropped = static_cast<int64_t>(hm.commandsDropped + hm.priorityDropped + bridge.commandsDropped());
       metrics.scriptCommandsRejected = static_cast<int64_t>(bridge.commandsRejected());
       metrics.scriptEventsOutDropped = static_cast<int64_t>(world.eventsOutDropped());
       metrics.scriptLogDropped = static_cast<int64_t>(apiStats->logDropped.load());

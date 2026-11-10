@@ -1,6 +1,8 @@
 #include "cbserver/script_bridge.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <utility>
@@ -93,52 +95,151 @@ void ScriptBridge::applyOne(cbscript::ScriptToSim& c, double now) {
   }
 }
 
-void ScriptBridge::applyCommands(double now) {
-  // 1) Canal prioritário (kick/teleporte): sempre, todo tick, antes de qualquer emit e sem passar pelo atraso.
-  drained_.clear();
-  host_.drainPriority(drained_);
-  for (auto& c : drained_) applyOne(c, now);
-  drained_.clear();
-  // 2) Emits (e prioritários que vierem junto no dreno geral), com orçamento por tick.
-  if (backlog_.empty()) {
-    host_.drainCommands(drained_);
-    for (auto& c : drained_) {
-      if (std::holds_alternative<cbscript::CmdEmit>(c))
-        backlog_.push_back(std::move(c));
-      else
-        applyOne(c, now);
-    }
-    drained_.clear();
+bool ScriptBridge::validEmit(cbscript::CmdEmit& e) {
+  if (e.name.empty() || e.name.size() > cbmp::kMaxEventName || e.json.size() > cbmp::kMaxEventPayload) {
+    if (commandsRejected_++ % 1000 == 0)
+      spdlog::error("scripts: evento '{}' descartado (nome {} bytes, payload {} bytes; limites 64/4096)",
+                    e.name.substr(0, 64), e.name.size(), e.json.size());
+    return false;
   }
-  size_t n = 0, bytes = 0, recipients = 0;
-  const size_t players = world_.playerCount();
-  while (!backlog_.empty() && n < kMaxCommandsPerTick && bytes < kMaxBytesPerTick) {
-    // Orçamento de destinatários: um broadcast conta como N eventos de saída.
-    if (const auto* e = std::get_if<cbscript::CmdEmit>(&backlog_.front())) {
-      const size_t cost = e->target < 0 ? players : 1;
-      if (recipients > 0 && recipients + cost > kMaxEventOutPerTick) break;
-      recipients += cost;
+  return true;
+}
+
+namespace {
+uint64_t prioKey(const cbscript::ScriptToSim& c, int& kind, const std::string*& did) {
+  did = nullptr;
+  if (const auto* t = std::get_if<cbscript::CmdSetPosition>(&c)) {
+    kind = 0;
+    return (uint64_t{t->id} << 32) | t->session;
+  }
+  if (const auto* k = std::get_if<cbscript::CmdKick>(&c)) {
+    kind = 1;
+    return (uint64_t{k->id} << 32) | k->session;
+  }
+  if (const auto* d = std::get_if<cbscript::CmdKickDid>(&c)) {
+    kind = 2;
+    did = &d->did;
+    return 0;
+  }
+  kind = -1;
+  return 0;
+}
+}  // namespace
+
+void ScriptBridge::addPriority(cbscript::ScriptToSim c) {
+  // Coalescência também com o que sobrou de ticks anteriores: último teleporte por (id, sessão), primeiro kick.
+  int kind = -1;
+  const std::string* did = nullptr;
+  const uint64_t key = prioKey(c, kind, did);
+  if (kind == 0) {
+    auto [it, fresh] = prioPos_.try_emplace(key, prioBacklog_.size());
+    if (!fresh) {
+      prioBacklog_[it->second] = std::move(c);
+      return;
     }
-    cbscript::ScriptToSim c = std::move(backlog_.front());
-    backlog_.pop_front();
-    ++n;
-    bytes += payloadBytes(c);
+  } else if (kind == 1) {
+    if (!prioKick_.try_emplace(key, prioBacklog_.size()).second) return;
+  } else if (kind == 2) {
+    if (!prioKickDid_.try_emplace(*did, prioBacklog_.size()).second) return;
+  }
+  prioBacklog_.push_back(std::move(c));
+}
+
+void ScriptBridge::applyCommands(double now) {
+  // 1) Drena o host todo tick: prioritários (já coalescidos no host) e emits, cada emit na fila da sua origem.
+  drained_.clear();
+  host_.drainCommands(drained_);
+  for (auto& c : drained_) {
     if (auto* e = std::get_if<cbscript::CmdEmit>(&c)) {
-      if (e->name.empty() || e->name.size() > cbmp::kMaxEventName || e->json.size() > cbmp::kMaxEventPayload) {
-        if (commandsRejected_++ % 1000 == 0)
-          spdlog::error("scripts: evento '{}' descartado (nome {} bytes, payload {} bytes; limites 64/4096)",
-                        e->name.substr(0, 64), e->name.size(), e->json.size());
+      auto& q = bySource_[e->source];
+      auto& qb = sourceBytes_[e->source];
+      const size_t nb = e->name.size() + e->json.size();
+      if (q.size() >= kMaxBacklogPerSource || qb + nb > kMaxBacklogBytesPerSource) {
+        ++commandsDropped_;  // atraso desta origem no teto: descarta só dela
         continue;
       }
-      cbmp::Event ev{std::move(e->name), std::vector<uint8_t>(e->json.begin(), e->json.end())};
-      if (e->target < 0)
-        world_.broadcastEvent(std::move(ev), now);
-      else if (e->target <= 65535)
-        world_.queueEvent(static_cast<EntityId>(e->target), e->session, std::move(ev), now);
+      qb += nb;
+      q.push_back(std::move(*e));
     } else {
-      applyOne(c, now);
+      addPriority(std::move(c));
     }
   }
+  drained_.clear();
+
+  // 2) Prioritários: antes de qualquer emit, até o orçamento por tick (2 × maxPlayers); o resto fica para o próximo.
+  const size_t prioBudget = std::max<size_t>(64, world_.maxPlayers() * 2);
+  size_t applied = 0;
+  for (; applied < prioBacklog_.size() && applied < prioBudget; ++applied) applyOne(prioBacklog_[applied], now);
+  prioBacklog_.erase(prioBacklog_.begin(), prioBacklog_.begin() + static_cast<std::ptrdiff_t>(applied));
+  prioPos_.clear();
+  prioKick_.clear();
+  prioKickDid_.clear();
+  for (size_t i = 0; i < prioBacklog_.size(); ++i) {  // reindexa o que sobrou
+    int kind = -1;
+    const std::string* did = nullptr;
+    const uint64_t key = prioKey(prioBacklog_[i], kind, did);
+    if (kind == 0) prioPos_[key] = i;
+    else if (kind == 1) prioKick_[key] = i;
+    else if (kind == 2) prioKickDid_[*did] = i;
+  }
+
+  // 3) Emits: rodízio entre as origens, um de cada vez, dentro do orçamento (comandos, bytes, destinatários).
+  size_t n = 0, bytes = 0, recipients = 0;
+  const size_t players = world_.playerCount();
+  bool progress = true, full = false;
+  while (progress && !full) {
+    progress = false;
+    auto it = bySource_.upper_bound(rrLast_);
+    for (size_t visited = 0, total = bySource_.size(); visited < total; ++visited) {
+      if (it == bySource_.end()) it = bySource_.begin();
+      auto& q = it->second;
+      const uint32_t src = it->first;
+      if (!q.empty()) {
+        if (n >= kMaxCommandsPerTick || bytes >= kMaxBytesPerTick) {
+          full = true;
+          break;
+        }
+        cbscript::CmdEmit& e = q.front();
+        const size_t cost = e.target < 0 ? players : 1;
+        if (recipients > 0 && recipients + cost > kMaxEventOutPerTick) {
+          full = true;
+          break;
+        }
+        recipients += cost;
+        ++n;
+        const size_t nb = e.name.size() + e.json.size();
+        bytes += nb;
+        sourceBytes_[src] -= std::min(sourceBytes_[src], nb);
+        cbscript::CmdEmit cmd = std::move(e);
+        q.pop_front();
+        rrLast_ = src;
+        progress = true;
+        if (validEmit(cmd)) {
+          cbmp::Event ev{std::move(cmd.name), std::vector<uint8_t>(cmd.json.begin(), cmd.json.end())};
+          if (cmd.target < 0)
+            world_.broadcastEvent(std::move(ev), now);
+          else if (cmd.target <= 65535)
+            world_.queueEvent(static_cast<EntityId>(cmd.target), cmd.session, std::move(ev), now);
+        }
+      }
+      ++it;
+    }
+  }
+  // Origens sem nada pendente saem do mapa (resources parados não acumulam entradas).
+  for (auto it = bySource_.begin(); it != bySource_.end();) {
+    if (it->second.empty()) {
+      sourceBytes_.erase(it->first);
+      it = bySource_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+size_t ScriptBridge::backlog() const {
+  size_t n = prioBacklog_.size();
+  for (const auto& [src, q] : bySource_) n += q.size();
+  return n;
 }
 
 void ScriptBridge::publishPlayers() {

@@ -93,9 +93,14 @@ struct HostOptions {
   size_t eventQueueCapacity = 65536;
   size_t commandQueueCapacity = 65536;  // scripts → simulação
   size_t commandQueueBytes = size_t{16} << 20;  // teto de bytes (payloads) na fila scripts → simulação
-  // CmdKick/CmdKickDid/CmdSetPosition vão para um canal prioritário, fora dos dois limites acima (uma enxurrada de
-  // emits não os descarta). Teto de segurança; passar dele é log CRÍTICO.
+  // Cada origem (resource, CmdEmit::source ≠ 0) usa no máximo 1/4 dos dois limites acima: a enxurrada de um resource não
+  // descarta os emits dos outros.
+  // CmdKick/CmdKickDid/CmdSetPosition vão para um canal prioritário, fora dos limites acima (uma enxurrada de emits
+  // não os descarta). Na fila, teleportes são coalescidos (o último por id+sessão substitui o anterior) e kicks
+  // também (o primeiro por id+sessão / por did), então a fila fica do tamanho do número de alvos. Teto de segurança
+  // em itens e bytes; passar dele é log CRÍTICO (no máximo 1 por segundo).
   size_t priorityQueueCapacity = 65536;
+  size_t priorityQueueBytes = size_t{8} << 20;
   double supervisorGraceSec = 10.0;     // supervisor dispara em abortAfter + isto
   std::chrono::milliseconds supervisorPeriod{100};  // período real de checagem do supervisor
   std::chrono::milliseconds idleWait{10};  // espera máxima da thread de scripts sem trabalho (back-off, onTick)
