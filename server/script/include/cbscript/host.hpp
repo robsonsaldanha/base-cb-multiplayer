@@ -77,6 +77,13 @@ class ScriptContext {
                                       std::span<const sol::object> args = {}) = 0;
   virtual double now() const = 0;
   virtual void log(LogLevel lv, const std::string& msg) = 0;
+  // true depois que o ScriptHost foi destruído com uma chamada C presa (a thread foi desanexada). Contrato para os
+  // bindings da Task 4/5: a thread só estaciona em dois pontos (fim da chamada ao Lua e ctx.log/now chamados dela);
+  // entre a operação C presa voltar e esses pontos ainda pode rodar código do script. Todo binding que alcance algo
+  // fora do HostImpl/estado Lua (pools de banco/HTTP, callbacks do usuário, objetos do main.cpp) precisa checar
+  // abandoned() antes e, se true, não tocar em nada (devolver erro ao script ou chamar ctx.log, que estaciona).
+  // emit()/players()/find()/running() só tocam o HostImpl (mantido vivo pela própria thread) e são seguros.
+  virtual bool abandoned() const = 0;
 };
 
 struct HostOptions {

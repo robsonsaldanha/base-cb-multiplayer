@@ -10,10 +10,13 @@
 
 namespace {
 
-// Aborto (abortAfter = 200 ms) tem que chegar bem antes de qualquer travamento real (segundos ou para sempre, pego
-// pelo guard de 10 s). 1500 ms dá folga para máquina carregada (ctest -j16 já mediu 468 ms) e ainda separa
-// "abortou" de "travou".
-constexpr long long kMaxAbortMs = 1500;
+// O aborto (abortAfter = 200 ms de parede) é conferido pelo tempo de CPU da thread do Lua: carga na máquina
+// (ctest -j16) só reduz a CPU que a thread recebe, enquanto uma regressão (operação C cara sem checagem da vigia)
+// gasta segundos de CPU antes de voltar. 450 ms de CPU = 2× o prazo + folga. Cada carga abaixo custa ≥ 5 s (ou
+// infinito) sem os patches. O guard de parede de 10 s continua como detector de travamento; o limite de parede
+// solto (5 s) só pega uma regressão que de algum modo não apareça na CPU.
+constexpr double kMaxAbortCpuMs = 450;
+constexpr long long kMaxAbortWallMs = 5000;
 
 struct Case {
   const char* name;
@@ -23,11 +26,13 @@ struct Case {
 void expectAbort(const Case& c, Limits lim = shortLimits()) {
   Fixture f(lim);
   Timed t = guarded(c.name, [&] { return runRaw(*f.r, c.code); });
-  std::printf("TIMING %-28s %5lld ms timedOut=%d\n", c.name, t.ms, t.res.timedOut ? 1 : 0);
+  std::printf("TIMING %-28s %5lld ms wall %6.0f ms cpu timedOut=%d\n", c.name, t.ms, t.cpuMs,
+              t.res.timedOut ? 1 : 0);
   INFO(c.name << ": " << t.res.error);
   REQUIRE_FALSE(t.res.ok);
   REQUIRE(t.res.timedOut);
-  REQUIRE(t.ms <= kMaxAbortMs);
+  REQUIRE(t.cpuMs <= kMaxAbortCpuMs);
+  REQUIRE(t.ms <= kMaxAbortWallMs);
   // o estado continua usável
   Timed after = guarded(c.name, [&] { return runRaw(*f.r, "return 'vivo'"); });
   INFO(after.res.error);
@@ -72,7 +77,8 @@ TEST_CASE("escape C1: closing a stored aborted coroutine in a later call") {
   std::printf("TIMING %-28s %5lld ms timedOut=%d\n", "c1_close_later", t2.ms, t2.res.timedOut ? 1 : 0);
   INFO(t2.res.error);
   REQUIRE(t2.res.timedOut);
-  REQUIRE(t2.ms <= kMaxAbortMs);
+  REQUIRE(t2.cpuMs <= kMaxAbortCpuMs);
+  REQUIRE(t2.ms <= kMaxAbortWallMs);
 }
 
 TEST_CASE("escape C2: loops of long C calls are aborted at the call boundary") {
@@ -413,13 +419,13 @@ TEST_CASE("escape R4: remaining user-driven C loops are aborted") {
        "local t = setmetatable({}, {__len = function() return math.maxinteger end, __index = type}) "
        "return tostring(pcall(table.concat, t))"},
       {"r4_91_plainfind_small",
-       "local s = ('a'):rep(1 << 18) local p = ('a'):rep(1 << 17) .. 'b' s:find(p, 1, true) return 'done'"},
+       "local s = ('a'):rep(1 << 20) local p = ('a'):rep(1 << 19) .. 'b' s:find(p, 1, true) return 'done'"},
       // varredura: classe enorme repetida, %b quadrático, os.date com milhões de conversões
       {"r4_sweep_huge_class",
        "local cls = '[' .. ('b'):rep(1 << 20) .. ']' local s = ('a'):rep(1 << 20) "
        "for w in s:gmatch(cls) do end return 'done'"},
       {"r4_sweep_balance", "local s = ('('):rep(1 << 20) for w in s:gmatch('%b()') do end return 'done'"},
-      {"r4_sweep_osdate", "local f = ('%c'):rep(4e6) os.date(f) return 'done'"},
+      {"r4_sweep_osdate", "local f = ('%c'):rep(16e6) os.date(f) return 'done'"},
   };
   for (const auto& c : cases) expectAbort(c, big);
 }
@@ -431,7 +437,7 @@ TEST_CASE("escape R4: string.rep of empty pieces returns at once (repro 80)") {
   INFO(t.res.error);
   REQUIRE(t.res.ok);
   REQUIRE(t.res.value.as<std::string>().empty());
-  REQUIRE(t.ms < 500);  // regressão era ≥ 1 s ou travar; folga para ctest -j16
+  REQUIRE(t.cpuMs < 50);  // sem o patch: laço de 2^63 voltas (infinito)
 }
 
 TEST_CASE("R4 semantics: string.rep and plain find unchanged") {
@@ -471,7 +477,25 @@ TEST_CASE("R5: error tracebacks do not walk the script globals (repro 98)") {
   REQUIRE_FALSE(t.res.ok);
   REQUIRE(contains(t.res.error, "stack traceback"));
   REQUIRE(contains(t.res.error, "function 'error'"));  // nomes ainda vêm do retrato fixo em _LOADED._G
-  REQUIRE(t.ms < 500);  // regressão era ≥ 1 s ou travar; folga para ctest -j16
+  std::printf("TIMING %-28s %6.0f ms cpu\n", "r5_98_traceback_cpu", t.cpuMs);
+  REQUIRE(t.cpuMs < 50);  // sem a limpeza do _LOADED: ~1,05 s de CPU (medido no round 5 da Task 2)
   // erros de argumento continuam com o nome qualificado da biblioteca
   REQUIRE(f.isTrue("local ok, e = pcall(string.rep) return not ok and e:find('rep', 1, true) ~= nil"));
+}
+
+// Medição (oculta, rode com "[.unpatched]"): custo de CPU das cargas finitas acima num lua_State comum, onde o callback
+// de interrupção é NULL (os polls dos patches viram no-op), ou seja, o custo de uma regressão da vigia nesses laços C.
+TEST_CASE("unpatched cost of the finite escape workloads", "[.unpatched]") {
+  const Case cases[] = {
+      {"r4_sweep_osdate", "local f = ('%c'):rep(16e6) os.date(f) return 'done'"},
+      {"r4_91_plainfind_small",
+       "local s = ('a'):rep(1 << 20) local p = ('a'):rep(1 << 19) .. 'b' s:find(p, 1, true) return 'done'"},
+  };
+  for (const auto& c : cases) {
+    sol::state lua;
+    lua.open_libraries(sol::lib::base, sol::lib::string, sol::lib::os, sol::lib::table);
+    const double c0 = threadCpuMs();
+    auto r = lua.safe_script(c.code, sol::script_pass_on_error);
+    std::printf("UNPATCHED %-24s %8.0f ms cpu ok=%d\n", c.name, threadCpuMs() - c0, r.valid() ? 1 : 0);
+  }
 }

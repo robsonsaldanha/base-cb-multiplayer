@@ -148,7 +148,7 @@ struct HostImpl final : ScriptContext {
   std::vector<std::string> callStack;  // chamadas ao Lua abertas (resource de cada nível)
   double lastBeat = 0;                 // último início/fim de chamada, qualquer nível
   uint64_t beatSeq = 0;
-  std::atomic<bool> abandoned{false};  // escrito sob beatMu
+  std::atomic<bool> abandoned_{false};  // escrito sob beatMu
 
   // ---- threads ----
   std::thread scriptThread, supThread;
@@ -204,8 +204,9 @@ struct HostImpl final : ScriptContext {
     return guarded(r, [&](Resource& res) { return res.resume(co, args); });
   }
   double now() const override { return clock(); }
+  bool abandoned() const override { return abandoned_.load(); }
   void log(LogLevel lv, const std::string& msg) override {
-    if (abandoned.load()) {
+    if (abandoned_.load()) {
       // Host destruído: nada de log. A thread de scripts (voltando de uma chamada presa) estaciona aqui.
       if (std::this_thread::get_id() == scriptId.load()) parkForever();
       return;
@@ -251,7 +252,7 @@ struct HostImpl final : ScriptContext {
   void endCall() {
     --depth;
     std::unique_lock<std::mutex> lk(beatMu);
-    if (abandoned.load()) {
+    if (abandoned_.load()) {
       lk.unlock();
       parkForever();  // a chamada presa voltou depois de ~ScriptHost: não toca em mais nada
     }
@@ -679,6 +680,16 @@ struct HostImpl final : ScriptContext {
     if (s == nullptr) return false;
     const bool wasPending = s->restartAt.has_value();
     const std::set<std::string> deps = dependentsOf(name);
+    // Só ganham mensagem nova os dependentes afetados por esta parada: rodando, aguardando (em algum bringBack) ou
+    // com reinício próprio agendado. Os que já estavam parados mantêm o motivo anterior.
+    std::set<std::string> affected;
+    for (const auto& d : deps) {
+      const Slot& ds = *slots.at(d);
+      bool waiting = false;
+      for (auto& [n, sl] : slots)
+        if (std::find(sl->bringBack.begin(), sl->bringBack.end(), d) != sl->bringBack.end()) waiting = true;
+      if (ds.h.running_ || ds.restartAt || waiting) affected.insert(d);
+    }
     for (auto& [n, sl] : slots) {
       auto& bb = sl->bringBack;
       bb.erase(std::remove_if(bb.begin(), bb.end(),
@@ -694,7 +705,7 @@ struct HostImpl final : ScriptContext {
       Slot& ds = *slots.at(d);
       if (ds.h.running_) stopOne(ds);  // por segurança; stopOne(s) já parou os que rodavam
       ds.restartAt.reset();
-      if (ds.state == State::Failed) continue;
+      if (ds.state == State::Failed || !affected.count(d)) continue;
       ds.state = State::Stopped;
       ds.lastError = wasPending ? "a dependência '" + name + "' foi parada" : "parado junto com '" + name + "'";
     }
@@ -823,6 +834,9 @@ struct HostImpl final : ScriptContext {
                                " s (limite " + secs(abortSec + opt.supervisorGraceSec) +
                                " s; operação C não interrompível?). Host de scripts parado: nenhum resource roda "
                                "até reiniciar o servidor";
+    if (halted.load()) return;  // só o supervisor chama trip()
+    // CRÍTICO antes de `halted`: quem vê o host parado já encontra o log.
+    log(LogLevel::Critical, "[" + res + "] " + reason);
     {
       std::lock_guard<std::mutex> lk(statusMu);
       if (halted.exchange(true)) return;
@@ -832,7 +846,6 @@ struct HostImpl final : ScriptContext {
         s.lastError = s.name == res ? reason : "host de scripts parado pelo supervisor (chamada presa em '" + res + "')";
       }
     }
-    log(LogLevel::Critical, "[" + res + "] " + reason);
     std::deque<Task> ts;
     std::deque<SimToScript> evs;
     {
@@ -872,7 +885,7 @@ struct HostImpl final : ScriptContext {
         res = in ? callStack.back() : std::string();
         seq = beatSeq;
       }
-      if (in && !halted.load() && !abandoned.load()) {
+      if (in && !halted.load() && !abandoned_.load()) {
         const double el = clock() - last;
         if (el > abortSec + opt.supervisorGraceSec) {
           trip(res, el);
@@ -915,7 +928,7 @@ ScriptHost::~ScriptHost() {
       {
         std::lock_guard<std::mutex> lk(I.beatMu);
         if (I.halted.load() && !I.callStack.empty()) {
-          I.abandoned.store(true);  // sob beatMu: endCall verá a marca ou já terá fechado a chamada
+          I.abandoned_.store(true);  // sob beatMu: endCall verá a marca ou já terá fechado a chamada
           abandon = true;
         }
       }

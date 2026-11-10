@@ -521,8 +521,8 @@ TEST_CASE("host: supervisor halts the host when a C call never returns") {
   REQUIRE_FALSE(env.host->metrics().halted);
 
   env.clock.advance(0.5);
-  REQUIRE(waitFor([&] { return env.host->metrics().halted; }));
-  REQUIRE(env.hasLog(LogLevel::Critical, "s1"));
+  REQUIRE(waitFor([&] { return env.hasLog(LogLevel::Critical, "[s1]"); }));
+  REQUIRE(waitFor([&] { return env.host->metrics().halted; }));  // CRÍTICO é logado antes de `halted`
   REQUIRE(contains(env.host->metrics().haltReason, "s1"));
   for (auto& s : env.host->status()) {
     INFO(s.name);
@@ -756,6 +756,20 @@ TEST_CASE("host: admin stop of a waiting dependent is honored when the dependenc
   REQUIRE(env.is("a", State::Stopped));
   REQUIRE(env.st("b").lastError == "parado pelo admin");
   REQUIRE(env.get(env.started) == Strs{"c", "b", "a", "c"});
+}
+
+TEST_CASE("host: admin stop keeps the reason of dependents that were already stopped") {
+  HostEnv env;  // revisão round 3, M-1
+  env.addRes("a", {"b"}, "return {}");
+  env.addRes("b", {}, "return {}");
+  env.addRes("x", {"b"}, "return {}");
+  env.boot();
+  REQUIRE(env.call(env.host->stopResource("a")));
+  REQUIRE(env.st("a").lastError == "parado pelo admin");
+  REQUIRE(env.call(env.host->stopResource("b")));
+  REQUIRE(env.st("b").lastError == "parado pelo admin");
+  REQUIRE(env.st("a").lastError == "parado pelo admin");     // já estava parado: mantém o motivo
+  REQUIRE(env.st("x").lastError == "parado junto com 'b'");  // rodava: ganha o motivo novo
 }
 
 TEST_CASE("host: admin stop of a dependency with a pending restart cancels it and tells the waiting dependents") {

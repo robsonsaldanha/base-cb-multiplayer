@@ -107,9 +107,13 @@ auto guarded(const char* what, F f, std::chrono::seconds deadline = std::chrono:
   return fut.get();
 }
 
+// CPU (usuário + kernel) gasto pela thread atual, em ms (tests/test_cpu.cpp).
+double threadCpuMs();
+
 struct Timed {
   Resource::CallResult res;
-  long long ms = 0;
+  long long ms = 0;     // parede
+  double cpuMs = 0;     // CPU da thread que rodou o Lua (a de guarded())
 };
 
 // Compila e roda sem REQUIRE (para uso dentro de guarded()).
@@ -121,9 +125,11 @@ inline Timed runRaw(Resource& r, const std::string& code) {
     return t;
   }
   sol::protected_function fn = lr;
+  const double c0 = threadCpuMs();
   auto t0 = std::chrono::steady_clock::now();
   t.res = r.call(fn);
   t.ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+  t.cpuMs = threadCpuMs() - c0;
   return t;
 }
 
