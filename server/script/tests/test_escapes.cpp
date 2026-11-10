@@ -397,3 +397,46 @@ TEST_CASE("R3 semantics: native coroutine and table libraries (shape 76)") {
   REQUIRE(contains(v, "1,9,2,3,7/1/nil"));
   REQUIRE(contains(v, "position out of bounds"));
 }
+
+// ---- Fix round 4: laços C restantes (repros 80-83, 91) e varredura das bibliotecas ----
+
+TEST_CASE("escape R4: remaining user-driven C loops are aborted") {
+  Limits big = shortLimits(size_t{256} << 20);
+  const Case cases[] = {
+      {"r4_81_plainfind_nm",
+       "local s = ('a'):rep(1 << 22) local p = ('a'):rep(1 << 21) .. 'b' return tostring(s:find(p, 1, true))"},
+      {"r4_82_nospecials_nm",
+       "local s = ('a'):rep(1 << 22) local p = ('a'):rep(1 << 21) .. 'b' return tostring(s:find(p))"},
+      {"r4_83_concat_type",
+       "local t = setmetatable({}, {__len = function() return math.maxinteger end, __index = type}) "
+       "return tostring(pcall(table.concat, t))"},
+      {"r4_91_plainfind_small",
+       "local s = ('a'):rep(1 << 18) local p = ('a'):rep(1 << 17) .. 'b' s:find(p, 1, true) return 'done'"},
+      // varredura: classe enorme repetida, %b quadrático, os.date com milhões de conversões
+      {"r4_sweep_huge_class",
+       "local cls = '[' .. ('b'):rep(1 << 20) .. ']' local s = ('a'):rep(1 << 20) "
+       "for w in s:gmatch(cls) do end return 'done'"},
+      {"r4_sweep_balance", "local s = ('('):rep(1 << 20) for w in s:gmatch('%b()') do end return 'done'"},
+      {"r4_sweep_osdate", "local f = ('%c'):rep(4e6) os.date(f) return 'done'"},
+  };
+  for (const auto& c : cases) expectAbort(c, big);
+}
+
+TEST_CASE("escape R4: string.rep of empty pieces returns at once (repro 80)") {
+  Fixture f;
+  Timed t = guarded("r4_80_rep_empty", [&] { return runRaw(*f.r, "return string.rep('', math.maxinteger)"); });
+  std::printf("TIMING %-28s %5lld ms ok=%d\n", "r4_80_rep_empty", t.ms, t.res.ok ? 1 : 0);
+  INFO(t.res.error);
+  REQUIRE(t.res.ok);
+  REQUIRE(t.res.value.as<std::string>().empty());
+  REQUIRE(t.ms < 50);
+}
+
+TEST_CASE("R4 semantics: string.rep and plain find unchanged") {
+  Fixture f;
+  REQUIRE(f.isTrue("return string.rep('', 5) == '' and string.rep('', 0) == '' and string.rep('ab', 3, '-') == 'ab-ab-ab'"));
+  REQUIRE(f.isTrue("return string.rep('', math.maxinteger, '') == '' and string.rep('x', 2, '') == 'xx'"));
+  REQUIRE(f.isTrue("return ('hello world'):find('o w', 1, true) == 5 and ('abc'):find('d', 1, true) == nil"));
+  REQUIRE(f.isTrue("return ('aXbXc'):find('X') == 2 and select(2, ('(a(b))'):gsub('%b()', '')) == 1"));
+  REQUIRE(f.isTrue("return table.concat({1, 2, 3}, ',') == '1,2,3' and type(os.date('%c')) == 'string'"));
+}

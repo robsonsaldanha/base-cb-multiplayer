@@ -1,28 +1,106 @@
-cbmp: libraries poll the interrupt request in long C loops (Lua 5.4.7):
-lstrlib match() every 4096 steps; ltablib insert/remove/move loops and every sort
-comparison. Re-check on upgrade: MatchState/match/prepstate, tinsert/tremove/tmove/sort_comp.
+cbmp: libraries poll the interrupt request in long C loops (Lua 5.4.7).
+lstrlib: match() steps, singlematch (weighted by class length), %b scan and lmemfind
+(weighted by needle length) poll every 4096 work units; string.rep of empty pieces
+returns "" at once. ltablib: insert/remove/move/concat per iteration and every sort
+comparison. loslib: os.date per conversion. Re-check on upgrade: MatchState, match,
+singlematch, matchbalance, lmemfind, prepstate, str_rep; tinsert/tremove/tmove/tconcat/
+sort_comp; os_date.
+
 --- a/src/lstrlib.c
 +++ b/src/lstrlib.c
+@@ -152,8 +152,8 @@
+   const char *s = luaL_checklstring(L, 1, &l);
+   lua_Integer n = luaL_checkinteger(L, 2);
+   const char *sep = luaL_optlstring(L, 3, "", &lsep);
+-  if (n <= 0)
+-    lua_pushliteral(L, "");
++  if (n <= 0 || l + lsep == 0)  /* cbmp patch: 'n' empty copies would loop */
++    lua_pushliteral(L, "");          /* up to 2^63 times without allocating */
+   else if (l_unlikely(l + lsep < l || l + lsep > MAXSIZE / n))
+     return luaL_error(L, "resulting string too large");
+   else {
 @@ -361,6 +361,7 @@
    const char *p_end;  /* end ('\0') of pattern */
    lua_State *L;
    int matchdepth;  /* control for recursive depth (to avoid C stack overflow) */
-+  unsigned int cbmp_steps;  /* cbmp patch: steps since last interrupt poll */
++  unsigned int cbmp_steps;  /* cbmp patch: work since last interrupt poll */
    unsigned char level;  /* total number of captures (finished or unfinished) */
    struct {
      const char *init;
-@@ -571,6 +572,10 @@
+@@ -373,6 +374,25 @@
+ static const char *match (MatchState *ms, const char *s, const char *p);
+ 
+ 
++/*
++** cbmp patch: matching can run for minutes inside C (backtracking, long
++** classes, '%b', naive substring search). Count work (1 per step, plus 1 per
++** 4 KiB of pattern/needle scanned) and poll the host interrupt request every
++** CBMP_STEPS units.
++*/
++#define CBMP_STEPS	4096u
++
++static void cbmp_tick (lua_State *L, unsigned int *steps, size_t work) {
++  size_t w = 1 + (work >> 12);
++  if (w >= CBMP_STEPS - *steps) {
++    *steps = 0;
++    lua_cbmp_poll(L);
++  }
++  else
++    *steps += (unsigned int)w;
++}
++
++
+ /* maximum recursion depth for 'match' */
+ #if !defined(MAXCCALLS)
+ #define MAXCCALLS	200
+@@ -469,6 +489,7 @@
+ 
+ static int singlematch (MatchState *ms, const char *s, const char *p,
+                         const char *ep) {
++  cbmp_tick(ms->L, &ms->cbmp_steps, (size_t)(ep - p));  /* cbmp patch */
+   if (s >= ms->src_end)
+     return 0;
+   else {
+@@ -493,6 +514,7 @@
+     int e = *(p+1);
+     int cont = 1;
+     while (++s < ms->src_end) {
++      cbmp_tick(ms->L, &ms->cbmp_steps, 0);  /* cbmp patch */
+       if (*s == e) {
+         if (--cont == 0) return s+1;
+       }
+@@ -571,6 +593,7 @@
    if (l_unlikely(ms->matchdepth-- == 0))
      luaL_error(ms->L, "pattern too complex");
    init: /* using goto to optimize tail recursion */
-+  if (l_unlikely(++ms->cbmp_steps >= 4096u)) {  /* cbmp patch: backtracking */
-+    ms->cbmp_steps = 0;                         /* can run for minutes in C */
-+    lua_cbmp_poll(ms->L);
-+  }
++  cbmp_tick(ms->L, &ms->cbmp_steps, 0);  /* cbmp patch */
    if (p != ms->p_end) {  /* end of pattern? */
      switch (*p) {
        case '(': {  /* start capture */
-@@ -758,6 +763,7 @@
+@@ -670,12 +693,13 @@
+ 
+ 
+ 
+-static const char *lmemfind (const char *s1, size_t l1,
++static const char *lmemfind (lua_State *L, const char *s1, size_t l1,
+                                const char *s2, size_t l2) {
+   if (l2 == 0) return s1;  /* empty strings are everywhere */
+   else if (l2 > l1) return NULL;  /* avoids a negative 'l1' */
+   else {
+     const char *init;  /* to search for a '*s2' inside 's1' */
++    unsigned int steps = 0;  /* cbmp patch: O(l1 * l2) worst case */
+     l2--;  /* 1st char will be checked by 'memchr' */
+     l1 = l1-l2;  /* 's2' cannot be found after that */
+     while (l1 > 0 && (init = (const char *)memchr(s1, *s2, l1)) != NULL) {
+@@ -686,6 +710,7 @@
+         l1 -= init-s1;
+         s1 = init;
+       }
++      cbmp_tick(L, &steps, l2);  /* cbmp patch */
+     }
+     return NULL;  /* not found */
+   }
+@@ -758,6 +783,7 @@
                         const char *s, size_t ls, const char *p, size_t lp) {
    ms->L = L;
    ms->matchdepth = MAXCCALLS;
@@ -30,6 +108,15 @@ comparison. Re-check on upgrade: MatchState/match/prepstate, tinsert/tremove/tmo
    ms->src_init = s;
    ms->src_end = s + ls;
    ms->p_end = p + lp;
+@@ -782,7 +808,7 @@
+   /* explicit request or no special characters? */
+   if (find && (lua_toboolean(L, 4) || nospecials(p, lp))) {
+     /* do a plain search */
+-    const char *s2 = lmemfind(s + init, ls - init, p, lp);
++    const char *s2 = lmemfind(L, s + init, ls - init, p, lp);
+     if (s2) {
+       lua_pushinteger(L, (s2 - s) + 1);
+       lua_pushinteger(L, (s2 - s) + lp);
 --- a/src/ltablib.c
 +++ b/src/ltablib.c
 @@ -74,6 +74,7 @@
@@ -63,7 +150,15 @@ comparison. Re-check on upgrade: MatchState/match/prepstate, tinsert/tremove/tmo
          lua_geti(L, 1, f + i);
          lua_seti(L, tt, t + i);
        }
-@@ -273,6 +277,7 @@
+@@ -162,6 +166,7 @@
+   last = luaL_optinteger(L, 4, last);
+   luaL_buffinit(L, &b);
+   for (; i < last; i++) {
++    lua_cbmp_poll(L);  /* cbmp patch: '#t' may be huge, values may be empty */
+     addfield(L, &b, i);
+     luaL_addlstring(&b, sep, lsep);
+   }
+@@ -273,6 +278,7 @@
  ** index 'b' (according to the order of the sort).
  */
  static int sort_comp (lua_State *L, int a, int b) {
@@ -71,3 +166,16 @@ comparison. Re-check on upgrade: MatchState/match/prepstate, tinsert/tremove/tmo
    if (lua_isnil(L, 2))  /* no function? */
      return lua_compare(L, a, b, LUA_OPLT);  /* a < b */
    else {  /* function */
+--- a/src/loslib.c
++++ b/src/loslib.c
+@@ -339,7 +339,9 @@
+         luaL_addchar(&b, *s++);
+       else {
+         size_t reslen;
+-        char *buff = luaL_prepbuffsize(&b, SIZETIMEFMT);
++        char *buff;
++        lua_cbmp_poll(L);  /* cbmp patch: millions of conversions take seconds */
++        buff = luaL_prepbuffsize(&b, SIZETIMEFMT);
+         s++;  /* skip '%' */
+         s = checkoption(L, s, se - s, cc + 1);  /* copy specifier to 'cc' */
+         reslen = strftime(buff, SIZETIMEFMT, cc, stm);
