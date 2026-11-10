@@ -1,7 +1,13 @@
 <script lang="ts">
+  import type { UpdateStatus } from "../lib/api";
   import { VIEWS, type View } from "../lib/views";
 
-  let { current, version, onselect }: { current: View; version: string; onselect: (v: View) => void } = $props();
+  let {
+    current,
+    version,
+    update = null,
+    onselect,
+  }: { current: View; version: string; update?: UpdateStatus | null; onselect: (v: View) => void } = $props();
 </script>
 
 <aside class="sidebar">
@@ -16,7 +22,14 @@
       >
     {/each}
   </nav>
-  <div class="version">{version ? `v${version}` : ""}</div>
+  <div class="foot">
+    {#if update?.available}
+      <button type="button" class="update" onclick={() => onselect("settings")}
+        >Atualização {update.version ?? ""} disponível</button
+      >
+    {/if}
+    <div class="version">{version ? `v${version}` : ""}</div>
+  </div>
 </aside>
 
 <style>
@@ -25,7 +38,7 @@
     flex-direction: column;
     gap: 24px;
     padding: 20px 14px;
-    background: var(--panel);
+    background: var(--side);
     border-right: 1px solid var(--border);
   }
   .brand {
@@ -58,11 +71,21 @@
     color: var(--text);
   }
   button.active {
-    background: var(--accent-soft);
+    background: var(--panel-hover);
+    color: var(--title);
+  }
+  .foot {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: auto;
+  }
+  .update {
+    font-size: 12px;
     color: var(--accent);
+    background: var(--accent-soft);
   }
   .version {
-    margin-top: auto;
     font-size: 12px;
     color: var(--muted);
   }

@@ -29,6 +29,12 @@ for (const file of files(dist)) {
       problems.push(`${file}: recurso remoto (${m[0].trim()})`);
     }
   }
+  // Os modelos de HTML que o Svelte compila ficam em strings no JS: `style=`/`on*=` neles seriam inline também.
+  if (ext === ".js") {
+    if (/<[a-zA-Z][^<>`]{0,500}\sstyle\s*=/.test(text)) problems.push(`${file}: atributo style= em modelo HTML`);
+    if (/<[a-zA-Z][^<>`]{0,500}\son[a-z]+\s*=/.test(text)) problems.push(`${file}: handler on*= em modelo HTML`);
+    if (/setAttribute\(\s*["']style["']/.test(text)) problems.push(`${file}: setAttribute("style")`);
+  }
   if (ext === ".css" && /@import\s+url\(\s*["']?https?:/i.test(text)) {
     problems.push(`${file}: @import remoto`);
   }

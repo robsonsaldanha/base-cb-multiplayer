@@ -14,6 +14,9 @@ fn main() {
         "clear_cache",
         "check_update",
         "install_update",
+        "list_servers",
+        "cached_servers",
+        "ping_servers",
     ]);
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(manifest))
         .expect("falha no tauri-build");

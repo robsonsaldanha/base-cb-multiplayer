@@ -17,6 +17,9 @@
     "allow-cancel-play",
     "allow-clear-cache",
     "allow-check-update",
-    "allow-install-update"
+    "allow-install-update",
+    "allow-list-servers",
+    "allow-cached-servers",
+    "allow-ping-servers"
   ]
 }

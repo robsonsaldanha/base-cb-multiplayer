@@ -10,7 +10,9 @@ pub mod hub;
 pub mod launch;
 pub mod modpkg;
 pub mod paths;
+pub mod ping;
 pub mod play;
+pub mod server_cache;
 pub mod settings;
 pub mod update;
 
@@ -29,6 +31,10 @@ pub fn run() {
     ));
 
     let content = commands::content_store();
+    // Última lista do Hub (memória + `servers-cache.json`): modo offline e endereços do ping.
+    let servers = Arc::new(server_cache::ServerDirectory::new(
+        paths::servers_cache_file(),
+    ));
     let hub_url = state.get_settings().hub_url;
 
     tauri::Builder::default()
@@ -53,6 +59,7 @@ pub fn run() {
         // Uma loja de conteúdo só (índice e pastas de download coordenados por ela); usada pelo `play`.
         .manage(content.clone())
         .manage(auth.clone())
+        .manage(servers)
         // Um play por vez (também trava "limpar cache", a faxina da abertura e a instalação de update).
         .manage(play::PlayGate::default())
         .setup(move |app| {
@@ -108,7 +115,10 @@ pub fn run() {
             commands::cancel_play,
             commands::clear_cache,
             commands::check_update,
-            commands::install_update
+            commands::install_update,
+            commands::list_servers,
+            commands::cached_servers,
+            commands::ping_servers
         ])
         .run(tauri::generate_context!())
         .expect("falha ao iniciar o CB Multiplayer");

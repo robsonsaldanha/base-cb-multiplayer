@@ -41,6 +41,8 @@ describe("App (layout A)", () => {
         loggedIn = false;
         return undefined;
       }
+      if (cmd === "list_servers" || cmd === "ping_servers") return [];
+      if (cmd === "cached_servers") return null;
       throw new Error(`comando inesperado: ${cmd}`);
     });
     listen.mockReset();
@@ -94,6 +96,8 @@ describe("App (layout A)", () => {
     invoke.mockImplementation(async (cmd: string) => {
       if (cmd === "me") return { ...profile, avatar: "https://evil.example/x.png" };
       if (cmd === "app_version") return "0.1.0";
+      if (cmd === "list_servers" || cmd === "ping_servers") return [];
+      if (cmd === "cached_servers") return null;
       return settings;
     });
     render(App);
@@ -110,6 +114,8 @@ describe("App (layout A)", () => {
         return profile;
       }
       if (cmd === "app_version") return "0.1.0";
+      if (cmd === "list_servers" || cmd === "ping_servers") return [];
+      if (cmd === "cached_servers") return null;
       return settings;
     });
     render(App);

@@ -1,20 +1,11 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import Sidebar from "./components/Sidebar.svelte";
-  import DownloadBar from "./components/DownloadBar.svelte";
-  import Profile from "./components/Profile.svelte";
-  import Servers from "./routes/Servers.svelte";
-  import Favorites from "./routes/Favorites.svelte";
-  import Recent from "./routes/Recent.svelte";
-  import Settings from "./routes/Settings.svelte";
+  import Shell from "./components/Shell.svelte";
   import Login from "./routes/Login.svelte";
   import { appVersion } from "./lib/api";
-  import { auth, initAuth, refreshProfile, signOut } from "./lib/stores";
-  import { VIEWS, type View } from "./lib/views";
+  import { auth, initAuth, refreshProfile } from "./lib/stores";
 
-  let view = $state<View>("servers");
   let version = $state("");
-  const title = $derived(VIEWS.find((v) => v.id === view)?.label ?? "");
 
   onMount(() => {
     appVersion()
@@ -33,25 +24,7 @@
 </script>
 
 {#if $auth.status === "logged_in"}
-  <div class="shell">
-    <Sidebar current={view} {version} onselect={(v) => (view = v)} />
-    <main class="content">
-      <header class="top">
-        <h1>{title}</h1>
-        <Profile profile={$auth.profile} onlogout={signOut} />
-      </header>
-      {#if view === "servers"}
-        <Servers />
-      {:else if view === "favorites"}
-        <Favorites />
-      {:else if view === "recent"}
-        <Recent />
-      {:else}
-        <Settings />
-      {/if}
-    </main>
-    <DownloadBar />
-  </div>
+  <Shell profile={$auth.profile} {version} />
 {:else if $auth.status === "checking"}
   <p class="checking" role="status">Carregando…</p>
 {:else if $auth.status === "unavailable"}
@@ -64,31 +37,6 @@
 {/if}
 
 <style>
-  .shell {
-    display: grid;
-    grid-template-columns: 210px 1fr;
-    grid-template-rows: 1fr auto;
-    height: 100vh;
-  }
-  .content {
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
-    min-height: 0;
-    padding: 20px 24px;
-    overflow: hidden;
-  }
-  .top {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 16px;
-  }
-  h1 {
-    margin: 0;
-    font-size: 20px;
-    font-weight: 600;
-  }
   .checking {
     display: grid;
     place-content: center;

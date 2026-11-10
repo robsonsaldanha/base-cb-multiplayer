@@ -4,10 +4,13 @@ use crate::auth::{self, Auth};
 use crate::content::{ContentStore, Limits, Progress};
 use crate::error::{AppError, AppResult};
 use crate::game::{self, GameInstall};
+use crate::hub::ServerListing;
 use crate::launch::{LaunchOutcome, CONNECT_TTL};
 use crate::modpkg::ModInstaller;
 use crate::paths;
+use crate::ping::{self, PingResult};
 use crate::play::{PlayContext, PlayGate, Stage};
+use crate::server_cache::{CachedServers, ServerDirectory};
 use crate::settings::{validate_game_dir, Settings, SettingsUpdate};
 use crate::update::{self, UpdateStatus};
 use serde::Serialize;
@@ -334,6 +337,48 @@ pub async fn play(
 #[tauri::command]
 pub fn cancel_play(gate: State<'_, PlayGate>) -> bool {
     gate.cancel()
+}
+
+// ----- lista de servidores e ping -----
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// `GET /v1/servers`. Em sucesso a lista vira a conhecida (ping) e é gravada em `servers-cache.json`. Em erro a
+/// UI pede [`cached_servers`] e mostra a lista como "desatualizada".
+#[tauri::command]
+pub async fn list_servers(
+    auth: State<'_, Arc<Auth>>,
+    dir: State<'_, Arc<ServerDirectory>>,
+) -> AppResult<Vec<ServerListing>> {
+    let list = auth.hub().servers().await?;
+    let (d, copy) = (dir.inner().clone(), list.clone());
+    let _ = tokio::task::spawn_blocking(move || d.store_fresh(copy, unix_now())).await;
+    Ok(list)
+}
+
+/// Última lista gravada (`null` se não houver). Os endereços dela passam a valer para o ping.
+#[tauri::command]
+pub async fn cached_servers(
+    dir: State<'_, Arc<ServerDirectory>>,
+) -> AppResult<Option<CachedServers>> {
+    let d = dir.inner().clone();
+    tokio::task::spawn_blocking(move || d.cached())
+        .await
+        .map_err(|_| AppError::new("internal_error", "Falha interna ao ler a lista guardada."))
+}
+
+/// Ping por id (`GET /info`, 2 s, ≤ 16 simultâneos). Host/porta só da lista conhecida; id desconhecido → `ms: null`.
+#[tauri::command]
+pub async fn ping_servers(
+    ids: Vec<String>,
+    dir: State<'_, Arc<ServerDirectory>>,
+) -> AppResult<Vec<PingResult>> {
+    Ok(ping::ping_ids(&dir, ids).await)
 }
 
 // ----- atualização do launcher -----

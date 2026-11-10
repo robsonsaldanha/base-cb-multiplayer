@@ -87,3 +87,109 @@ const AVATAR_RE = /^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/]+={0,2}$
 export function safeAvatar(avatar: string | null): string | null {
   return avatar && AVATAR_RE.test(avatar) ? avatar : null;
 }
+
+// ----- servidores e ping -----
+
+/** Espelha `hub::ServerListing`. Todos os textos vêm do servidor: sempre exibidos como texto. */
+export interface ServerListing {
+  id: string;
+  name: string;
+  description: string;
+  tags: string[];
+  locale: string;
+  players: number;
+  maxPlayers: number;
+  host: string;
+  gamePort: number;
+  httpPort: number;
+  version: string;
+  protocol: number;
+  featured: boolean;
+}
+
+/** Espelha `server_cache::CachedServers` (`savedAt` em segundos Unix). */
+export interface CachedServers {
+  savedAt: number;
+  servers: ServerListing[];
+}
+
+/** Espelha `ping::PingResult`: `ms` nulo = sem resposta em 2 s. */
+export interface PingResult {
+  id: string;
+  ms: number | null;
+}
+
+/** `GET /v1/servers`; em sucesso o Rust grava `servers-cache.json`. */
+export const listServers = (): Promise<ServerListing[]> => call("list_servers");
+/** Última lista gravada (Hub fora), ou `null`. */
+export const cachedServers = (): Promise<CachedServers | null> => call("cached_servers");
+/** Ping por id: o Rust só usa host/porta da lista do Hub. */
+export const pingServers = (ids: string[]): Promise<PingResult[]> => call("ping_servers", { ids });
+
+// ----- jogar -----
+
+/** Espelha `play::Stage`, na ordem em que acontecem. */
+export type PlayStage = "ticket" | "manifest" | "download" | "mount" | "mod" | "connect" | "launch";
+
+/** Carga de `play://stage`. */
+export interface PlayStageEvent {
+  serverId: string;
+  stage: PlayStage;
+}
+
+/** Carga de `content://progress` (`content::Progress`). */
+export interface Progress {
+  doneBytes: number;
+  totalBytes: number;
+  bytesPerSec: number;
+  current: string;
+}
+
+/** Espelha `launch::ConnectPreview`: o arquivo de conexão sem o ticket. */
+export interface ConnectPreview {
+  host: string;
+  port: number;
+  serverId: string;
+  contentDir: string;
+  protocol: number;
+}
+
+/** Espelha `launch::LaunchOutcome`. */
+export type LaunchOutcome = { kind: "started" } | { kind: "simulated"; preview: ConnectPreview };
+
+export const PLAY_STAGE = "play://stage";
+export const CONTENT_PROGRESS = "content://progress";
+
+export const play = (serverId: string): Promise<LaunchOutcome> => call("play", { serverId });
+export const cancelPlay = (): Promise<boolean> => call("cancel_play");
+
+export function onPlayStage(cb: (p: PlayStageEvent) => void): Promise<UnlistenFn> {
+  return listen<PlayStageEvent>(PLAY_STAGE, (e) => cb(e.payload));
+}
+
+export function onProgress(cb: (p: Progress) => void): Promise<UnlistenFn> {
+  return listen<Progress>(CONTENT_PROGRESS, (e) => cb(e.payload));
+}
+
+// ----- configurações e atualização -----
+
+/** Seletor de pasta do Rust; valida que é o Hogwarts Legacy e grava `gameDir`. Cancelar devolve o atual. */
+export const pickGameDir = (): Promise<Settings> => call("pick_game_dir");
+export const clearCache = (): Promise<void> => call("clear_cache");
+
+/** Espelha `update::UpdateStatus`. */
+export interface UpdateStatus {
+  available: boolean;
+  version: string | null;
+  notes: string | null;
+}
+
+export const UPDATE_AVAILABLE = "update://available";
+
+export const checkUpdate = (): Promise<UpdateStatus> => call("check_update");
+/** Baixa, confere a assinatura e instala (o instalador fecha o launcher). */
+export const installUpdate = (): Promise<void> => call("install_update");
+
+export function onUpdateAvailable(cb: (s: UpdateStatus) => void): Promise<UnlistenFn> {
+  return listen<UpdateStatus>(UPDATE_AVAILABLE, (e) => cb(e.payload));
+}

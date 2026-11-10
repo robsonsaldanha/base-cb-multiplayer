@@ -428,15 +428,18 @@ fn capability_real_so_tem_o_permitido() {
         perms,
         [
             "allow-app-version",
+            "allow-cached-servers",
             "allow-cancel-play",
             "allow-check-update",
             "allow-clear-cache",
             "allow-get-settings",
             "allow-install-update",
+            "allow-list-servers",
             "allow-login",
             "allow-logout",
             "allow-me",
             "allow-pick-game-dir",
+            "allow-ping-servers",
             "allow-play",
             "allow-set-settings",
             "core:event:allow-listen",
@@ -512,6 +515,9 @@ fn comandos_do_build_rs_batem_com_a_capability() {
         "clear_cache",
         "check_update",
         "install_update",
+        "list_servers",
+        "cached_servers",
+        "ping_servers",
     ] {
         assert!(
             build.contains(&format!("\"{cmd}\"")),

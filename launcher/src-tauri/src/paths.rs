@@ -92,6 +92,11 @@ pub fn settings_file() -> PathBuf {
     data_dir().join("settings.json")
 }
 
+/// Última lista de servidores do Hub (modo offline).
+pub fn servers_cache_file() -> PathBuf {
+    data_dir().join("servers-cache.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,6 +113,7 @@ mod tests {
         assert_eq!(run_dir(), tmp.path().join("run"));
         assert_eq!(logs_dir(), tmp.path().join("logs"));
         assert_eq!(settings_file(), tmp.path().join("settings.json"));
+        assert_eq!(servers_cache_file(), tmp.path().join("servers-cache.json"));
         std::env::remove_var("CBMP_DATA_DIR");
         assert!(data_dir().ends_with(APP_DIR));
     }
