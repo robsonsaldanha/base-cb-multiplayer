@@ -37,6 +37,7 @@
 
 #include "cbscript/bans.hpp"
 #include "cbscript/db.hpp"
+#include "cbscript/http_out.hpp"
 #include "cbscript/json_lua.hpp"
 
 #if defined(_MSC_VER)
@@ -204,6 +205,12 @@ struct DbWaiting {
   std::function<void(Resource::CallResult&)> done;
 };
 
+// Resposta HTTP sendo entregue a uma corrotina (vive no quadro do host durante o resume; lida por k_http).
+struct HttpDelivery {
+  const char* fn = "cb.http";
+  HttpOutResult res;
+};
+
 struct DbTx {
   lua_State* co = nullptr;  // corrotina dona (mantida viva por `thread`)
   Ref thread;
@@ -244,6 +251,10 @@ struct ApiRes {
   std::unordered_map<lua_State*, uint64_t> txOf;      // corrotina → transação aberta
   uint64_t dbToken = 0;                // pedido sendo entregue agora (k_db confere)
   const DbDelivery* dbResult = nullptr;
+  // cb.http (a espera usa o mesmo `waiting`: uma corrotina espera um pedido por vez, de banco ou de HTTP)
+  size_t httpPending = 0;
+  uint64_t httpToken = 0;  // pedido sendo entregue agora (k_http confere)
+  const HttpDelivery* httpResult = nullptr;
 
   JsonOptions json(size_t maxBytes = kMaxPayload) const {
     JsonOptions o;
@@ -281,6 +292,30 @@ struct DbInbox {
   }
 };
 
+// Respostas do pool HTTP (threads do pool → thread de scripts, lidas no onTick).
+struct HttpInbox {
+  std::mutex mu;
+  std::vector<std::pair<uint64_t, HttpOutResult>> items;
+  void push(uint64_t id, HttpOutResult r) {
+    std::lock_guard<std::mutex> lk(mu);
+    items.emplace_back(id, std::move(r));
+  }
+  std::vector<std::pair<uint64_t, HttpOutResult>> take() {
+    std::lock_guard<std::mutex> lk(mu);
+    std::vector<std::pair<uint64_t, HttpOutResult>> v;
+    v.swap(items);
+    return v;
+  }
+};
+
+struct HttpPending {
+  ApiRes* a = nullptr;
+  lua_State* co = nullptr;
+  uint64_t poolId = 0;
+  double deadline = 0;  // relógio do host
+  const char* fn = "cb.http";
+};
+
 struct DbPending {
   ApiRes* a = nullptr;
   lua_State* co = nullptr;
@@ -306,7 +341,11 @@ struct Shared {
   std::shared_ptr<DbInbox> inbox = std::make_shared<DbInbox>();
   std::unordered_map<uint64_t, DbPending> reqs;  // id da API → pedido
   std::set<std::pair<double, uint64_t>> deadlines;
-  uint64_t nextReq = 1;
+  uint64_t nextReq = 1;  // ids da API (banco e HTTP)
+  // cb.http
+  std::shared_ptr<HttpInbox> httpInbox = std::make_shared<HttpInbox>();
+  std::unordered_map<uint64_t, HttpPending> httpReqs;
+  std::set<std::pair<double, uint64_t>> httpDeadlines;
 
   int64_t unixNow() const {
     if (o.unixNow) return o.unixNow();
@@ -333,6 +372,17 @@ ApiRes::~ApiRes() {
   }
   if (usePool)
     for (auto& [id, tx] : txs) sh->o.db->abortTx(id);
+  // cb.http: pedidos em andamento são cancelados (o pool fecha o socket) e o resultado, se vier, é descartado.
+  const bool useHttp = sh->o.http && !(ctx && ctx->abandoned());
+  for (auto it = sh->httpReqs.begin(); it != sh->httpReqs.end();) {
+    if (it->second.a != this) {
+      ++it;
+      continue;
+    }
+    if (useHttp) sh->o.http->cancel(it->second.poolId);
+    sh->httpDeadlines.erase({it->second.deadline, it->first});
+    it = sh->httpReqs.erase(it);
+  }
   std::erase(sh->live, this);
   for (auto it = sh->commands.begin(); it != sh->commands.end();)
     it = it->second.owner == this ? sh->commands.erase(it) : std::next(it);
@@ -1330,6 +1380,219 @@ return function(fn)
 end
 )lua";
 
+// ------------------------------------------------------------------------------------------------ cb.http
+//
+// Mesmo fluxo de cb.db: valida (quadro puro + ajudante), registra a corrotina, enfileira no HttpOutPool e cede com
+// lua_yieldk(..., k_http). A resposta chega pela HttpInbox e é entregue no onTick (deliverHttp). O resultado é
+// descartado se o resource parar (o pedido é cancelado no ApiRes; a próxima geração é outro ApiRes).
+
+// Empilha {status = n, headers = {nome = valor}, body = texto}. Quadro puro.
+int pushHttpResponse(lua_State* L, const HttpOutResult& res) {
+  if (!lua_checkstack(L, 6)) return luaL_error(L, "cb.http: pilha do Lua esgotada");
+  lua_createtable(L, 0, 3);
+  lua_pushinteger(L, static_cast<lua_Integer>(res.status));
+  lua_setfield(L, -2, "status");
+  lua_createtable(L, 0, static_cast<int>(std::min<size_t>(res.headers.size(), 128)));
+  for (size_t i = 0; i < res.headers.size(); ++i) {
+    const auto& h = res.headers[i];
+    lua_pushlstring(L, h.first.data(), h.first.size());
+    lua_pushlstring(L, h.second.data(), h.second.size());
+    lua_rawset(L, -3);
+  }
+  lua_setfield(L, -2, "headers");
+  lua_pushlstring(L, res.body.data(), res.body.size());
+  lua_setfield(L, -2, "body");
+  return 1;
+}
+
+// Continuação de toda espera de HTTP. Quadro puro.
+int k_http(lua_State* L, int status, lua_KContext kctx) {
+  (void)status;
+  ApiRes* a = self(L);
+  const uint64_t rid = static_cast<uint64_t>(kctx);
+  if (a->httpToken != rid || a->httpResult == nullptr) {
+    dbDropWaiting(a, L, rid);  // a resposta verdadeira, quando vier, não retoma mais esta corrotina
+    return luaL_error(L, "cb.http: a corrotina foi retomada por fora (coroutine.resume) enquanto esperava a resposta");
+  }
+  const HttpDelivery* d = a->httpResult;
+  a->httpResult = nullptr;
+  a->httpToken = 0;
+  lua_settop(L, 0);
+  if (!d->res.ok) return luaL_error(L, "%s: %s", d->fn, d->res.error.c_str());
+  return pushHttpResponse(L, d->res);
+}
+
+// Condições para esperar o HTTP. 0 = ok; -1 = erro em e.
+CBAPI_NOINLINE int httpCheck(ApiRes* a, lua_State* L, const char* fn, Err& e) {
+  try {
+    const std::string f = fn;
+    if (a->ctx->abandoned()) {
+      setErr(e, f + ": host de scripts encerrado");
+      return -1;
+    }
+    if (a->h->manifest().httpAllow.empty()) {
+      setErr(e, f + ": o resource não tem permissão de HTTP (liste os hosts em permissions.http no resource.json)");
+      return -1;
+    }
+    if (!a->sh->o.http) {
+      setErr(e, f + ": HTTP de saída não configurado neste servidor");
+      return -1;
+    }
+    if (!a->live) {
+      setErr(e, f + ": só pode ser usado depois que o resource subiu (no nível de cima do script use "
+                    "cb.on('resourceStart', function() ... end))");
+      return -1;
+    }
+    if (a->proxyDepth > 0) {
+      setErr(e, f + ": não pode ser usado dentro de uma chamada cb.resource (a chamada entre resources não espera)");
+      return -1;
+    }
+    if (!lua_isyieldable(L)) {
+      setErr(e, f + ": não dá para esperar a resposta aqui (metamétodo ou função chamada pelo C, como table.sort); "
+                    "chame direto do callback");
+      return -1;
+    }
+    if (a->txOf.count(L)) {
+      setErr(e, f + ": não pode ser usado dentro de cb.db.transaction (a transação seguraria a conexão do banco)");
+      return -1;
+    }
+    if (a->httpPending >= a->sh->o.maxHttpPending) {
+      setErr(e, f + ": pedidos HTTP pendentes demais neste resource (máximo " +
+                    std::to_string(a->sh->o.maxHttpPending) + ")");
+      return -1;
+    }
+    return 0;
+  } catch (...) {
+    setErr(e, "cb.http: sem memória");
+    return -1;
+  }
+}
+
+// Monta e enfileira o pedido. URL em 1; corpo em bodyIdx (0 = GET); tabela de cabeçalhos em hIdx (0 = nenhuma).
+// Só acesso cru (lua_next/lua_tolstring em valores que já são texto): nada aqui lança erro do Lua. Fica com `tref`
+// (ref da corrotina) se der certo. Devolve o id do pedido (> 0) ou 0 + erro.
+CBAPI_NOINLINE uint64_t httpSubmit(ApiRes* a, lua_State* L, HttpMethod m, const char* fn, int bodyIdx, int hIdx,
+                                   int tref, Err& e) {
+  uint64_t poolId = 0;
+  try {
+    Shared& sh = *a->sh;
+    HttpOutRequest r;
+    r.method = m;
+    size_t len = 0;
+    const char* u = lua_tolstring(L, 1, &len);  // já conferido: é texto
+    r.url.assign(u, len);
+    if (hIdx > 0) {
+      lua_pushnil(L);
+      while (lua_next(L, hIdx) != 0) {
+        if (lua_type(L, -2) != LUA_TSTRING || lua_type(L, -1) != LUA_TSTRING) {
+          lua_pop(L, 2);
+          setErr(e, std::string(fn) + ": cada cabeçalho deve ser nome (texto) = valor (texto)");
+          return 0;
+        }
+        size_t kl = 0, vl = 0;
+        const char* k = lua_tolstring(L, -2, &kl);
+        const char* v = lua_tolstring(L, -1, &vl);
+        r.headers.emplace_back(std::string(k, kl), std::string(v, vl));
+        lua_pop(L, 1);
+        if (r.headers.size() > 256) {
+          lua_pop(L, 1);
+          setErr(e, std::string(fn) + ": cabeçalhos demais (máximo 256)");
+          return 0;
+        }
+      }
+    }
+    if (bodyIdx > 0) {
+      const int t = lua_type(L, bodyIdx);
+      if (t == LUA_TSTRING) {
+        size_t bl = 0;
+        const char* b = lua_tolstring(L, bodyIdx, &bl);
+        r.body.assign(b, bl);
+      } else if (t == LUA_TTABLE) {
+        std::string jerr;
+        JsonOptions jo = a->json(sh.o.http->options().maxRequestBody);
+        if (!luaToJson(L, bodyIdx, r.body, jerr, jo)) {
+          setErr(e, std::string(fn) + ": corpo (tabela → JSON): " + jerr);
+          return 0;
+        }
+        r.contentType = "application/json";
+      }
+    }
+    r.allow = a->h->manifest().httpAllow;
+    r.owner = a->source;
+    const uint64_t rid = sh.nextReq++;
+    std::string err;
+    poolId = sh.o.http->submit(
+        std::move(r), [inbox = sh.httpInbox, rid](HttpOutResult res) { inbox->push(rid, std::move(res)); }, err);
+    if (poolId == 0) {
+      setErr(e, std::string(fn) + ": " + err);
+      return 0;
+    }
+    const auto& po = sh.o.http->options();
+    HttpPending p;
+    p.a = a;
+    p.co = L;
+    p.poolId = poolId;
+    p.deadline = a->ctx->now() + static_cast<double>(po.queueTimeout.count() + po.timeout.count()) / 1000.0 +
+                 sh.o.httpGraceSec;
+    p.fn = fn;
+    auto& w = a->waiting[L];
+    w.thread.release(L);
+    w.thread = Ref(a->L, tref);
+    w.req = rid;
+    sh.httpReqs[rid] = p;
+    sh.httpDeadlines.emplace(p.deadline, rid);
+    ++a->httpPending;
+    return rid;
+  } catch (...) {
+    if (poolId != 0) a->sh->o.http->cancel(poolId);
+    setErr(e, std::string(fn) + ": sem memória");
+    return 0;
+  }
+}
+
+// cb.http.get(url, opts?) / cb.http.post(url, corpo, opts?). Quadro puro.
+int httpCall(lua_State* L, HttpMethod m) {
+  ApiRes* a = self(L);
+  const char* fn = m == HttpMethod::Get ? "cb.http.get" : "cb.http.post";
+  const int optIdx = m == HttpMethod::Get ? 2 : 3;
+  const int bodyIdx = m == HttpMethod::Get ? 0 : 2;
+  if (lua_type(L, 1) != LUA_TSTRING) return luaL_error(L, "%s: a URL deve ser texto", fn);
+  if (bodyIdx > 0) {
+    const int t = lua_type(L, bodyIdx);
+    if (t != LUA_TSTRING && t != LUA_TTABLE && t != LUA_TNIL && t != LUA_TNONE)
+      return luaL_error(L, "%s: o corpo deve ser texto ou tabela (enviada como JSON)", fn);
+  }
+  const int ot = lua_type(L, optIdx);
+  if (ot != LUA_TNIL && ot != LUA_TNONE && ot != LUA_TTABLE)
+    return luaL_error(L, "%s: as opções devem ser uma tabela ({ headers = {...} })", fn);
+  lua_settop(L, optIdx);
+  if (!lua_checkstack(L, 8)) return luaL_error(L, "%s: pilha do Lua esgotada", fn);
+  int hIdx = 0;
+  if (ot == LUA_TTABLE) {
+    lua_pushliteral(L, "headers");
+    lua_rawget(L, optIdx);
+    const int ht = lua_type(L, -1);
+    if (ht == LUA_TTABLE)
+      hIdx = lua_gettop(L);
+    else if (ht != LUA_TNIL)
+      return luaL_error(L, "%s: opções.headers deve ser uma tabela", fn);
+  }
+  Err e;
+  if (httpCheck(a, L, fn, e) < 0) return luaL_error(L, "%s", e.msg);
+  lua_pushthread(L);
+  const int tref = luaL_ref(L, LUA_REGISTRYINDEX);
+  const uint64_t rid = httpSubmit(a, L, m, fn, bodyIdx, hIdx, tref, e);
+  if (rid == 0) {
+    luaL_unref(L, LUA_REGISTRYINDEX, tref);
+    return luaL_error(L, "%s", e.msg);
+  }
+  lua_settop(L, 0);
+  return lua_yieldk(L, 0, static_cast<lua_KContext>(rid), k_http);
+}
+
+int l_http_get(lua_State* L) { return httpCall(L, HttpMethod::Get); }
+int l_http_post(lua_State* L) { return httpCall(L, HttpMethod::Post); }
+
 // ---------------------------------------------------------------------------------------------- cb.resource
 
 // Chamada da API num resource, contando reentrância.
@@ -1707,6 +1970,8 @@ void buildApi(ApiRes* a) {
   lua_setfield(L, -2, "null");
   buildDb(L, a);
   lua_setfield(L, -2, "db");
+  pushModule(L, a, "cb.http", {{"get", l_http_get}, {"post", l_http_post}});
+  lua_setfield(L, -2, "http");
 
   // cb.config: cópia somente leitura do "config" do manifest.
   std::string err;
@@ -2052,6 +2317,70 @@ void deliverDb(Shared& sh, ScriptContext& ctx) {
   }
 }
 
+// ----------------------------------------------------------------------------------- cb.http: entrega (host)
+
+// Entrega a resposta do pedido `rid` à corrotina que a espera (fora de qualquer chamada ao Lua).
+void deliverHttpOne(Shared& sh, ScriptContext& ctx, uint64_t rid, HttpOutResult res) {
+  auto it = sh.httpReqs.find(rid);
+  if (it == sh.httpReqs.end()) return;  // cancelado (resource parado) ou já respondido (prazo)
+  const HttpPending p = it->second;
+  sh.httpReqs.erase(it);
+  sh.httpDeadlines.erase({p.deadline, rid});
+  ApiRes& a = *p.a;
+  if (a.httpPending > 0) --a.httpPending;
+  auto w = a.waiting.find(p.co);
+  if (w == a.waiting.end() || w->second.req != rid) return;  // corrotina retomada por fora
+  DbWaiting wait = std::move(w->second);
+  a.waiting.erase(w);
+  if (lua_status(p.co) != LUA_YIELD) return;  // a corrotina morreu
+
+  HttpDelivery d;
+  d.fn = p.fn;
+  d.res = std::move(res);
+  lua_rawgeti(a.L, LUA_REGISTRYINDEX, wait.thread.ref);
+  sol::thread th(a.L, -1);
+  lua_pop(a.L, 1);
+  a.httpResult = &d;
+  a.httpToken = rid;
+  ++a.depth;
+  auto r = ctx.resume(*a.h, th, {});
+  --a.depth;
+  a.httpResult = nullptr;
+  a.httpToken = 0;
+  auto again = a.waiting.find(p.co);
+  if (r.ok && r.yielded && again != a.waiting.end()) {
+    again->second.done = std::move(wait.done);  // esperando de novo (banco ou HTTP)
+  } else if (wait.done) {
+    wait.done(r);
+  }
+}
+
+// onTick: respostas do pool e prazos vencidos do lado do script.
+void deliverHttp(Shared& sh, ScriptContext& ctx) {
+  if (!sh.o.http) return;
+  for (auto& [rid, res] : sh.httpInbox->take()) {
+    deliverHttpOne(sh, ctx, rid, std::move(res));
+    drainLocal(sh);
+  }
+  const double now = ctx.now();
+  while (!sh.httpDeadlines.empty() && sh.httpDeadlines.begin()->first <= now) {
+    const uint64_t rid = sh.httpDeadlines.begin()->second;
+    auto it = sh.httpReqs.find(rid);
+    if (it == sh.httpReqs.end()) {
+      sh.httpDeadlines.erase(sh.httpDeadlines.begin());
+      continue;
+    }
+    sh.o.http->cancel(it->second.poolId);
+    const auto& po = sh.o.http->options();
+    deliverHttpOne(sh, ctx, rid,
+                   HttpOutResult::fail("tempo esgotado (" +
+                                           std::to_string(po.queueTimeout.count() + po.timeout.count()) +
+                                           " ms + folga)",
+                                       true));
+    drainLocal(sh);
+  }
+}
+
 void fireTimers(Shared& sh, ScriptContext& ctx) {
   if (sh.live.empty()) return;
   const double now = ctx.now();
@@ -2156,6 +2485,7 @@ void installApi(HostOptions& opt, ApiOptions api) {
   };
   opt.onTick = [sh, prevTick](ScriptContext& ctx) {
     deliverDb(*sh, ctx);
+    deliverHttp(*sh, ctx);
     fireTimers(*sh, ctx);
     drainLocal(*sh);
     if (prevTick) prevTick(ctx);

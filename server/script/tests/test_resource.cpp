@@ -265,14 +265,14 @@ TEST_CASE("runMain reports syntax errors and missing files") {
 TEST_CASE("loadManifest reads a full resource.json") {
   TmpDir t;
   put(t.p / "resource.json", R"({"name":"echo","version":"1.0.0","server":["server/main.lua","server/x/y.lua"],
-    "dependencies":["base-lib"],"config":{"k":[1,2]},"permissions":{"http":["api.example.com"],"db":true}})");
+    "dependencies":["base-lib"],"config":{"k":[1,2]},"permissions":{"http":["api.example.com","hooks.example.com:8443"],"db":true}})");
   auto m = cbscript::loadManifest(t.p);
   REQUIRE(m.name == "echo");
   REQUIRE(m.version == "1.0.0");
   REQUIRE(m.serverScripts == std::vector<std::string>{"server/main.lua", "server/x/y.lua"});
   REQUIRE(m.dependencies == std::vector<std::string>{"base-lib"});
   REQUIRE(m.config["k"][1] == 2);
-  REQUIRE(m.httpAllow == std::vector<std::string>{"api.example.com"});
+  REQUIRE(m.httpAllow == std::vector<std::string>{"api.example.com", "hooks.example.com:8443"});
   REQUIRE(m.db);
 
   put(t.p / "resource.json", R"({"name":"min","version":"0.1"})");
@@ -298,6 +298,11 @@ TEST_CASE("loadManifest rejects invalid names and unsafe paths") {
       R"({"name":"ok","version":"1","dependencies":["../x"]})",
       R"({"name":"ok","version":"1","permissions":{"db":"sim"}})",
       R"({"name":"ok","version":"1","permissions":{"http":["https://x.com"]}})",
+      R"({"name":"ok","version":"1","permissions":{"http":["*.x.com"]}})",
+      R"({"name":"ok","version":"1","permissions":{"http":["1.2.3.4"]}})",
+      R"({"name":"ok","version":"1","permissions":{"http":["Api.Example.com"]}})",
+      R"({"name":"ok","version":"1","permissions":{"http":["x.com:0"]}})",
+      R"({"name":"ok","version":"1","permissions":{"http":["bücher.example"]}})",
       R"([1,2])",
       "nao e json",
   };

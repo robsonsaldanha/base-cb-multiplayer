@@ -1,5 +1,5 @@
 #pragma once
-// API cb.* dos scripts (tabela "API cb.*" da spec), sem banco/HTTP (Tasks 5–6).
+// API cb.* dos scripts (tabela "API cb.*" da spec).
 //
 // installApi() preenche os ganchos do ScriptHost:
 // - onSetup: cria a tabela global `cb` no estado do resource (só funções C; acesso cru, nada de lua()["x"]).
@@ -29,6 +29,14 @@
 //   ceder (metamétodo/iterador chamado por C). Corrotina retomada por fora (coroutine.resume) enquanto espera o banco
 //   → erro nela. Resource parado → pedidos cancelados e resultados descartados.
 // - Comando (cb.commands) que espera o banco ainda responde com o texto que devolver no fim.
+//
+// cb.http (permissions.http com os hosts; ApiOptions::http; regras em http_out.hpp):
+// - cb.http.get(url, {headers = {...}}?) / cb.http.post(url, corpo, {headers = {...}}?) → {status, headers, body}
+//   (qualquer status HTTP; nomes de cabeçalho em minúsculas). Corpo: texto, ou tabela (vira JSON, Content-Type
+//   application/json). Recusa, tempo esgotado, resposta grande demais, TLS → erro Lua no callback.
+// - Mesmas regras de espera de cb.db (corrotina do callback, nada no nível de cima, nem em cb.resource, nem onde não
+//   dá para ceder) e também recusado dentro de cb.db.transaction. Até maxHttpPending pedidos por resource. Resource
+//   parado → pedidos cancelados (socket fechado) e resultados descartados.
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -42,6 +50,7 @@ namespace cbscript {
 
 class BanStore;
 class DbPool;
+class HttpOutPool;
 
 // Contadores da API (lidos de qualquer thread, para /metrics).
 struct ApiStats {
@@ -61,6 +70,11 @@ struct ApiOptions {
   size_t maxDbPending = 1024;  // pedidos cb.db em andamento por resource (acima disso: erro)
   size_t maxDbPendingBytes = size_t{16} << 20;  // bytes de SQL + parâmetros em andamento por resource
   double dbGraceSec = 1.0;     // prazo do lado do script = timeoutMs do pool + isto (relógio do host)
+  // HTTP de saída (cb.http.*). Nulo → cb.http.* dão erro "HTTP de saída não configurado". Resources precisam de
+  // permissions.http com o host.
+  std::shared_ptr<HttpOutPool> http;
+  size_t maxHttpPending = 64;  // pedidos cb.http em andamento por resource (acima disso: erro)
+  double httpGraceSec = 1.0;   // prazo do lado do script = fila + execução do pool + isto (relógio do host)
   // Jogador (por did) pode usar comandos admin=true pelo chat. Vazio = ninguém (só console/painel).
   std::function<bool(const std::string& did)> isAdmin;
   size_t maxTimersPerResource = 10000;

@@ -56,6 +56,31 @@ Itens levantados nas revisões que não bloquearam o merge, com o momento em que
   - `db.tls: "off"` só desliga a verificação; não impede o servidor de negociar TLS se exigir;
   - MySQL (não MariaDB): `max_execution_time` só vale para SELECT; o resto depende do timeout de leitura do cliente;
   - subida com o banco fora: bans do banco não valem até a carga (log CRÍTICO após 5 falhas; `/metrics.db.bansLoaded`).
+- HTTP de saída (Task 6, `cb.http`), resíduos e decisões:
+  - `getaddrinfo` não é cancelável: DNS lento segura uma thread do pool (4) até o resolvedor do SO desistir. O script
+    recebe "tempo esgotado" pelo prazo do lado do script (fila 10 s + execução 10 s + 1 s); no encerramento a thread
+    presa é desanexada (log) e termina sozinha.
+  - `httplib::Client::stop()` não interrompe um `connect` em andamento (o socket só existe depois): endereço que não
+    responde segura a thread até o connection timeout (restante do prazo; no máximo 3 s se houver outro endereço na
+    reserva). IPv4 é tentado antes do IPv6 (sem Happy Eyeballs).
+  - Cabeçalhos da resposta: o httplib lê até 100 linhas de 8 KiB (~800 KiB por pedido no pior caso) antes de o pool
+    conferir o teto de 64 KiB (recusa depois de ler). Baixar isso exigiria `CPPHTTPLIB_HEADER_MAX_*` globais (o resto
+    do servidor usa o mesmo header).
+  - Teto de 4 MiB por resource conta corpo do pedido + resposta recebida até a resposta sair do pool; a resposta já
+    entregue fica na caixa de entrada até o próximo onTick (limitada por `maxHttpPending` = 64 por resource).
+  - CAs: repositório do sistema (Windows ROOT+CA; Linux caminhos padrão do OpenSSL → a distribuição Linux precisa de
+    `ca-certificates`). `HttpOutOptions::caFile` existe, mas não há chave no `server.cfg`.
+  - Sem `/metrics` para o HTTP (`HttpOutPool::metrics()` existe; falta expor).
+  - Redirecionamento para outro host/porta descarta os cabeçalhos do script (credenciais); 301/302 de POST e 303 viram
+    GET sem corpo. `Expect: 100-continue` automático do httplib para corpos ≥ 1 KiB.
+  - `permissions.http`: maiúsculas, IP, curinga e não ASCII agora são recusados no `resource.json` (antes maiúsculas
+    eram convertidas). Porta diferente de 443 só com `"host:porta"`.
+  - `cb.http` dentro de `cb.db.transaction` é recusado (a transação seguraria a conexão do banco).
+  - Pool do banco (Task 5, M10): continua com fila FIFO única. Recomendação: quando valer a pena, usar o mesmo rodízio
+    por dono do `HttpOutPool` (fila por resource; a vez de outro dono vem antes do 2º pedido de quem acabou de ser
+    atendido). Prioridade baixa: cada resource já tem teto de 1024 pedidos / 16 MiB no banco.
+  - TLS só foi exercitado contra servidor local com certificado gerado no teste (`caFile`); o caminho das CAs do
+    sistema não tem teste automatizado (sem rede externa nos testes).
 - Eventos servidor → cliente de scripts: cota por jogador de `scripting.eventOutKBps` (padrão 8 KiB/s = 64 kbps) com
   rajada `eventOutBurstKB` (32 KiB) e 48 B de overhead por mensagem; teto de 8192 eventos de saída por tick. Um
   gamemode que precise de mais banda por jogador tem de subir a cota (e conferir o orçamento de 64 kbps da spec).
@@ -71,7 +96,8 @@ Itens levantados nas revisões que não bloquearam o merge, com o momento em que
 
 - Limite de taxa de **novas conexões por IP** (hoje só há limite de pendentes).
 - Teto de saída por cliente (`net.maxOutKbpsPerClient` é lido mas não aplicado).
-- Limites explícitos do HTTP (`set_payload_max_length`, timeouts, pool).
+- Limites explícitos do HTTP do servidor (`/metrics`, painel: `set_payload_max_length`, timeouts, pool). O HTTP de
+  saída dos scripts (`cb.http`) já tem os seus (Task 6).
 - Teste manual de **512 bots em 4 vCPUs** (`docs/LOAD-TEST.md`).
 - Hub: migrar para zod 4; purge e observabilidade já feitos; revisar erros em inglês do Fastify.
 - Domínio, hospedagem do Hub e repositório/releases públicos.

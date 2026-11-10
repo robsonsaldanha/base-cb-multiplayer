@@ -28,6 +28,7 @@
 #include <cbmp/messages.hpp>
 
 #include "cbscript/api.hpp"
+#include "cbscript/http_out.hpp"
 #include "cbscript/bans.hpp"
 #include "cbscript/db.hpp"
 #include "cbscript/host.hpp"
@@ -198,6 +199,9 @@ int run(const std::string& cfgPath) {
   cbscript::ApiOptions api;
   api.bans = bans;
   api.db = db;
+  // HTTP de saída dos scripts (cb.http): 4 threads próprias; https com verificação de certificado pelas CAs do
+  // sistema; só hosts de permissions.http de cada resource; nunca endereços privados/loopback.
+  api.http = std::make_shared<cbscript::HttpOutPool>();
   api.audit = [auditLog](const std::string& line) { auditLog->info("{}", line); };
   api.unixNow = unixNow;
   auto apiStats = std::make_shared<cbscript::ApiStats>();

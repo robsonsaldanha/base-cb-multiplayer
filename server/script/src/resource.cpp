@@ -1,4 +1,5 @@
 #include "cbscript/resource.hpp"
+#include "cbscript/http_out.hpp"
 
 #include <cbmp/log_text.hpp>
 #include <cbmp/safe_path.hpp>
@@ -749,15 +750,12 @@ ResourceManifest loadManifest(const fs::path& dir) {
       if (!p["http"].is_array()) throw fail("'permissions.http' deve ser uma lista de domínios");
       for (const auto& h : p["http"]) {
         if (!h.is_string()) throw fail("'permissions.http' deve ser uma lista de domínios");
-        std::string host = h.get<std::string>();
-        bool ok = !host.empty() && host.size() <= 253 && host.front() != '.' && host.back() != '.' &&
-                  host.front() != '-';
-        for (char& c : host) {
-          if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-          if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '-')) ok = false;
-        }
-        if (!ok) throw fail("domínio inválido em 'permissions.http': '" + h.get<std::string>() + "' (só o host)");
-        m.httpAllow.push_back(std::move(host));
+        std::string host, why;
+        if (!parseHttpAllowEntry(h.get<std::string>(), host, why))
+          throw fail("domínio inválido em 'permissions.http': '" + escapeLogText(h.get<std::string>()) + "' (" + why +
+                     "; use \"host\" ou \"host:porta\")");
+        if (std::find(m.httpAllow.begin(), m.httpAllow.end(), host) == m.httpAllow.end())
+          m.httpAllow.push_back(std::move(host));
       }
     }
   }
