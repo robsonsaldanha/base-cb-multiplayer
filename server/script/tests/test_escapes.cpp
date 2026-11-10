@@ -10,8 +10,10 @@
 
 namespace {
 
-// Aborto dentro do limite com folga de 2x (+ granularidade do relógio da vigia).
-constexpr long long kMaxAbortMs = 2 * 200 + 50;
+// Aborto (abortAfter = 200 ms) tem que chegar bem antes de qualquer travamento real (segundos ou para sempre, pego
+// pelo guard de 10 s). 1500 ms dá folga para máquina carregada (ctest -j16 já mediu 468 ms) e ainda separa
+// "abortou" de "travou".
+constexpr long long kMaxAbortMs = 1500;
 
 struct Case {
   const char* name;
@@ -429,7 +431,7 @@ TEST_CASE("escape R4: string.rep of empty pieces returns at once (repro 80)") {
   INFO(t.res.error);
   REQUIRE(t.res.ok);
   REQUIRE(t.res.value.as<std::string>().empty());
-  REQUIRE(t.ms < 50);
+  REQUIRE(t.ms < 500);  // regressão era ≥ 1 s ou travar; folga para ctest -j16
 }
 
 TEST_CASE("R4 semantics: string.rep and plain find unchanged") {
@@ -469,7 +471,7 @@ TEST_CASE("R5: error tracebacks do not walk the script globals (repro 98)") {
   REQUIRE_FALSE(t.res.ok);
   REQUIRE(contains(t.res.error, "stack traceback"));
   REQUIRE(contains(t.res.error, "function 'error'"));  // nomes ainda vêm do retrato fixo em _LOADED._G
-  REQUIRE(t.ms < 50);
+  REQUIRE(t.ms < 500);  // regressão era ≥ 1 s ou travar; folga para ctest -j16
   // erros de argumento continuam com o nome qualificado da biblioteca
   REQUIRE(f.isTrue("local ok, e = pcall(string.rep) return not ok and e:find('rep', 1, true) ~= nil"));
 }

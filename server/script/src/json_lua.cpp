@@ -8,6 +8,7 @@
 #include <limits>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -218,10 +219,16 @@ struct Enc {
   std::string& err;
   const JsonOptions& o;
   int nullIdx;  // índice absoluto do sentinela na pilha, ou 0
-  // Tabelas já visitadas nesta chamada. Cada tabela é varrida no máximo uma vez: uma tabela repetida (mesmo sem
-  // ciclo) faria lua_next percorrer de novo todas as posições vazias da parte de array (milhões por visita, numa
-  // única chamada C sem vigia). Recusar repetição limita o trabalho total ao tamanho do estado.
-  std::unordered_set<const void*> seen;
+  // Cada tabela é varrida no máximo uma vez por chamada: revarrer uma tabela compartilhada faria lua_next percorrer
+  // de novo todas as posições vazias da parte de array (milhões por visita, numa única chamada C sem vigia).
+  // Tabela já serializada → o trecho de `out` é copiado (memo); tabela ainda aberta na pilha → ciclo → erro.
+  struct Memo {
+    size_t off, len;
+    int height;  // níveis de contêiner do próprio valor (para o limite de profundidade no novo lugar)
+  };
+  std::unordered_map<const void*, Memo> done;
+  std::unordered_set<const void*> open;
+  int lastHeight = 0;  // altura do último valor escrito (0 = escalar)
 
   bool over() {
     if (out.size() <= o.maxBytes) return false;
@@ -289,6 +296,7 @@ struct Enc {
   }
 
   bool value(int idx, int depth) {
+    lastHeight = 0;
     switch (lua_type(L, idx)) {
       case LUA_TNIL:
         out += "null";
@@ -320,10 +328,35 @@ struct Enc {
       err = "profundidade máxima (" + std::to_string(o.maxDepth) + ") excedida";
       return false;
     }
-    if (!seen.insert(lua_topointer(L, idx)).second) {
-      err = "tabela repetida ou ciclo (cada tabela só pode aparecer uma vez no JSON)";
+    const void* self = lua_topointer(L, idx);
+    if (open.count(self)) {
+      err = "ciclo de tabelas (uma tabela contém a si mesma)";
       return false;
     }
+    if (auto m = done.find(self); m != done.end()) {
+      const Memo mm = m->second;
+      if (depth + mm.height - 1 > o.maxDepth) {
+        err = "profundidade máxima (" + std::to_string(o.maxDepth) + ") excedida";
+        return false;
+      }
+      if (mm.len > o.maxBytes - std::min(out.size(), o.maxBytes)) {
+        err = "JSON passa de " + std::to_string(o.maxBytes) + " bytes";
+        return false;
+      }
+      const std::string copy = out.substr(mm.off, mm.len);
+      out += copy;
+      lastHeight = mm.height;
+      return !over();
+    }
+    open.insert(self);
+    const size_t start = out.size();
+    int h = 0;
+    auto finish = [&] {
+      open.erase(self);
+      done[self] = Memo{start, out.size() - start, h + 1};
+      lastHeight = h + 1;
+      return !over();
+    };
     if (!lua_checkstack(L, 4)) {
       err = "pilha do Lua esgotada";
       return false;
@@ -362,11 +395,12 @@ struct Enc {
         if (k > 1) out.push_back(',');
         lua_rawgeti(L, idx, static_cast<lua_Integer>(k));
         bool ok = value(lua_gettop(L), depth);
+        h = std::max(h, lastHeight);
         lua_pop(L, 1);
         if (!ok) return false;
       }
       out.push_back(']');
-      return !over();
+      return finish();
     }
     out.push_back('{');
     bool first = true;
@@ -388,6 +422,7 @@ struct Enc {
       if (ok) {
         out.push_back(':');
         ok = value(lua_gettop(L), depth);
+        h = std::max(h, lastHeight);
       }
       lua_pop(L, 1);
       if (!ok) {
@@ -396,7 +431,7 @@ struct Enc {
       }
     }
     out.push_back('}');
-    return !over();
+    return finish();
   }
 };
 
@@ -466,7 +501,7 @@ bool luaToJson(lua_State* L, int idx, std::string& out, std::string& err, const 
       lua_rawgeti(L, LUA_REGISTRYINDEX, opt.nullRef);
       nullIdx = lua_gettop(L);
     }
-    Enc e{L, out, err, opt, nullIdx, {}};
+    Enc e{L, out, err, opt, nullIdx, {}, {}, 0};
     bool ok = e.value(idx, 0);
     lua_settop(L, base);
     return ok;

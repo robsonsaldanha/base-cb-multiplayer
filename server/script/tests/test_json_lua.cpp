@@ -280,35 +280,56 @@ TEST_CASE("json_lua: decode inside a script call under the memory cap fails clea
   REQUIRE(f.isTrue("collectgarbage('step', 0) ; return decode('[1]')[1] == 1"));
 }
 
-TEST_CASE("json_lua: a repeated table is rejected and big sparse tables are scanned at most once") {
+TEST_CASE("json_lua: shared tables are serialized in each place but scanned once; cycles are rejected") {
   Lua lua;
-  Rt rep = encode(lua, "local e = {} ; return {e, e}");
-  REQUIRE_FALSE(rep.ok);
-  REQUIRE(contains(rep.err, "repetida"));
-  REQUIRE(encode(lua, "return {{}, {}}").out == "[[],[]]");
-  // Revisão I-1: tabela com parte de array enorme e vazia, referenciada 1500 vezes. Antes: ~22 s numa chamada C.
+  // revisão ATK13: tabela compartilhada legítima
+  REQUIRE(encode(lua, "local e = {} ; return {e, e}").out == "[[],[]]");
+  REQUIRE(encode(lua, "local p = {x = 1} ; return {p, p}").out == R"([{"x":1},{"x":1}])");
+  REQUIRE(nlohmann::json::parse(encode(lua, "local p = {x = 1} ; return {a = p, b = p}").out) ==
+          nlohmann::json::parse(R"({"a":{"x":1},"b":{"x":1}})"));
+  Rt cyc = encode(lua, "local a = {} ; local b = {a} ; a[1] = b ; return {a}");
+  REQUIRE_FALSE(cyc.ok);
+  REQUIRE(contains(cyc.err, "ciclo"));
+  // o limite de profundidade vale no lugar onde a cópia memorizada entra
+  const char* deepShared = "local d = {{}} ; local t = {d, {}} ; local c = t[2] ; for i = 1, %d do c[1] = {} ; "
+                           "c = c[1] end ; c[1] = d ; return t";
+  char buf[256];
+  std::snprintf(buf, sizeof buf, deepShared, 28);
+  REQUIRE(encode(lua, buf).ok);
+  std::snprintf(buf, sizeof buf, deepShared, 29);
+  Rt deep = encode(lua, buf);
+  REQUIRE_FALSE(deep.ok);
+  REQUIRE(contains(deep.err, "profundidade"));
+  // Revisão I-1/ATK6: tabela com parte de array enorme e vazia, referenciada 1500 vezes. Antes: 4,7 s / 11,5 s numa
+  // chamada C. Agora é varrida uma vez e o resto vem da memória; 1500 × "[]" passa de 4096 bytes.
   for (int n : {1 << 20, 1 << 22}) {
     INFO(n);
     lua.s["N"] = n;
     lua.s.script("E = {} ; for i = 1, N do E[i] = true end ; for i = 1, N do E[i] = nil end ; "
-                 "L = {} ; for i = 1, 1500 do L[i] = E end");
+                 "L = {} ; for i = 1, 1500 do L[i] = E end ; S = {} ; for i = 1, 600 do S[i] = E end");
     struct R {
-      bool ok;
-      std::string err;
+      bool ok, okSmall;
+      std::string err, small;
       long long ms;
     };
     R r = guarded("luaToJson shared sparse table", [&] {
       lua_State* L = lua.L();
-      lua_getglobal(L, "L");
-      std::string out, err;
+      R x{};
       auto t0 = std::chrono::steady_clock::now();
-      bool ok = luaToJson(L, -1, out, err);
-      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+      lua_getglobal(L, "L");
+      std::string out;
+      x.ok = luaToJson(L, -1, out, x.err);
       lua_pop(L, 1);
-      return R{ok, err, ms};
+      lua_getglobal(L, "S");
+      x.okSmall = luaToJson(L, -1, x.small, out);
+      lua_pop(L, 1);
+      x.ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+      return x;
     });
     REQUIRE_FALSE(r.ok);
-    REQUIRE(contains(r.err, "repetida"));
+    REQUIRE(contains(r.err, "4096"));
+    REQUIRE(r.okSmall);
+    REQUIRE(r.small.size() == 1 + 600 * 3 - 1 + 1);
     REQUIRE(r.ms < 1000);
   }
 }

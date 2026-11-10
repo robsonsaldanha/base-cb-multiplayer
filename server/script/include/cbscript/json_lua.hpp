@@ -28,8 +28,8 @@ bool jsonToLua(lua_State* L, std::string_view json, std::string& err, const Json
 // Mapeamento: nil/sentinela → null; boolean; integer → inteiro; float finito → número com '.' ou expoente (1.0 fica
 // "1.0", então inteiro vs float sobrevive à ida e volta); NaN/inf → erro; string → texto (precisa ser UTF-8
 // válido); tabela com chaves exatamente 1..n → array; tabela vazia → []; outras tabelas → objeto (chaves texto, e
-// chaves inteiras viram texto decimal; outras chaves → erro); function/userdata/thread → erro. A mesma tabela
-// aparecendo duas vezes (ciclo ou compartilhada) → erro: cada tabela é varrida no máximo uma vez por chamada.
+// chaves inteiras viram texto decimal; outras chaves → erro); function/userdata/thread → erro. Tabela compartilhada
+// (mesma tabela em dois lugares) é serializada nos dois, mas varrida uma vez só (memo); ciclo → erro.
 bool luaToJson(lua_State* L, int idx, std::string& out, std::string& err, const JsonOptions& opt = {});
 
 }  // namespace cbscript

@@ -51,11 +51,14 @@ std::string secs(double s) {
   return b;
 }
 
+std::atomic<size_t> g_parked{0};
+
 // Estaciona a thread atual para sempre (cv nunca sinalizada; objetos vazados para não depender da saída do processo).
 [[noreturn]] void parkForever() {
   static auto* m = new std::mutex;
   static auto* cv = new std::condition_variable;
   std::unique_lock<std::mutex> lk(*m);
+  g_parked.fetch_add(1);
   for (;;) cv->wait(lk);
 }
 
@@ -116,7 +119,9 @@ struct HostImpl final : ScriptContext {
   std::deque<SimToScript> events;
   std::deque<Task> tasks;
   bool stopReq = false;
-  bool backstopLogged = false;
+  // Eventos aceitos e ainda não consumidos: na fila + no lote em processamento (a capacidade e o teto contam ambos).
+  std::atomic<size_t> pending{0};
+  std::atomic<bool> backstopLogged{false};
   std::atomic<uint64_t> eventsDropped{0}, backstopDropped{0};
 
   // ---- pedidos de controle em aberto (ctlMu) ----
@@ -649,14 +654,51 @@ struct HostImpl final : ScriptContext {
     s->restartAt.reset();
     return startFresh(name) == Start::Up;
   }
+  // Nomes de quem depende de `name`, direta ou transitivamente (pelos manifests conhecidos, rodando ou não).
+  std::set<std::string> dependentsOf(const std::string& name) {
+    std::set<std::string> out;
+    std::vector<std::string> todo{name};
+    while (!todo.empty()) {
+      const std::string cur = todo.back();
+      todo.pop_back();
+      for (auto& [n, sl] : slots) {
+        const auto& d = sl->h.manifest().dependencies;
+        if (n != name && !out.count(n) && std::find(d.begin(), d.end(), cur) != d.end()) {
+          out.insert(n);
+          todo.push_back(n);
+        }
+      }
+    }
+    return out;
+  }
+
+  // Parada pelo admin: cancela o reinício agendado e tira o resource e seus dependentes de toda lista bringBack, para
+  // que nada disso volte sozinho quando uma dependência subir.
   bool doStop(const std::string& name) {
     Slot* s = findOrDiscover(name);
     if (s == nullptr) return false;
+    const bool wasPending = s->restartAt.has_value();
+    const std::set<std::string> deps = dependentsOf(name);
+    for (auto& [n, sl] : slots) {
+      auto& bb = sl->bringBack;
+      bb.erase(std::remove_if(bb.begin(), bb.end(),
+                              [&](const std::string& x) { return x == name || deps.count(x) > 0; }),
+               bb.end());
+    }
     s->restartAt.reset();
     s->bringBack.clear();
     if (s->h.running_) stopOne(*s);
     s->state = State::Stopped;
-    log(LogLevel::Info, "[" + name + "] parado");
+    s->lastError = "parado pelo admin";
+    for (const auto& d : deps) {
+      Slot& ds = *slots.at(d);
+      if (ds.h.running_) stopOne(ds);  // por segurança; stopOne(s) já parou os que rodavam
+      ds.restartAt.reset();
+      if (ds.state == State::Failed) continue;
+      ds.state = State::Stopped;
+      ds.lastError = wasPending ? "a dependência '" + name + "' foi parada" : "parado junto com '" + name + "'";
+    }
+    log(LogLevel::Info, "[" + name + "] parado pelo admin");
     return true;
   }
   bool doRestart(const std::string& name) {
@@ -723,12 +765,12 @@ struct HostImpl final : ScriptContext {
         qCv.wait_for(lk, opt.idleWait, [&] { return !tasks.empty() || !events.empty() || stopReq; });
         ts.swap(tasks);
         evs.swap(events);
-        backstopLogged = false;
         stop = stopReq;
       }
       if (halted.load()) {
         cancelAll(ts);
         eventsDropped.fetch_add(evs.size());
+        pending.fetch_sub(evs.size());
         break;
       }
       for (size_t i = 0; i < ts.size(); ++i) {
@@ -743,9 +785,11 @@ struct HostImpl final : ScriptContext {
       for (size_t i = 0; i < evs.size(); ++i) {
         if (halted.load()) {
           eventsDropped.fetch_add(evs.size() - i);
+          pending.fetch_sub(evs.size() - i);
           break;
         }
         if (opt.onEvent) safely("despacho de evento", [&] { opt.onEvent(*this, evs[i]); });
+        if (pending.fetch_sub(1) - 1 < opt.eventQueueCapacity) backstopLogged.store(false);
         settle();
       }
       if (halted.load()) break;
@@ -797,6 +841,7 @@ struct HostImpl final : ScriptContext {
       ts.swap(tasks);
     }
     eventsDropped.fetch_add(evs.size());
+    pending.fetch_sub(evs.size());
     cancelAll(ts);
     // Pedidos de controle em aberto (inclusive o que está preso e os já retirados da fila pela thread de scripts).
     std::vector<std::weak_ptr<Ctl>> cs;
@@ -847,6 +892,8 @@ struct HostImpl final : ScriptContext {
 
 using detail::HostImpl;
 using detail::Task;
+
+size_t ScriptHost::parkedThreadCount() { return g_parked.load(); }
 
 ScriptHost::ScriptHost(fs::path resourcesDir, Limits limits, std::function<double()> now, HostOptions opt)
     : impl_(std::make_shared<HostImpl>(std::move(resourcesDir), limits, std::move(now), std::move(opt))) {}
@@ -935,7 +982,7 @@ bool ScriptHost::post(SimToScript ev) {
   bool critical = false, dropped = false;
   {
     std::lock_guard<std::mutex> lk(I.qMu);
-    const size_t n = I.events.size();
+    const size_t n = I.pending.load();
     if (I.halted.load() || (clientEvent && n >= cap)) {
       I.eventsDropped.fetch_add(1);
       return false;
@@ -944,10 +991,10 @@ bool ScriptHost::post(SimToScript ev) {
       dropped = true;
       I.eventsDropped.fetch_add(1);
       I.backstopDropped.fetch_add(1);
-      critical = !I.backstopLogged;
-      I.backstopLogged = true;
+      critical = !I.backstopLogged.exchange(true);
     } else {
       I.events.push_back(std::move(ev));
+      I.pending.fetch_add(1);
     }
   }
   if (critical)
@@ -1005,7 +1052,7 @@ HostMetrics ScriptHost::metrics() const {
   m.commandsDropped = I.cmdsDropped.load();
   {
     std::lock_guard<std::mutex> lk(I.qMu);
-    m.eventQueueDepth = I.events.size();
+    m.eventQueueDepth = I.pending.load();
   }
   {
     std::lock_guard<std::mutex> lk(I.statusMu);

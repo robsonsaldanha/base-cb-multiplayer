@@ -80,6 +80,7 @@ class ScriptContext {
 };
 
 struct HostOptions {
+  // Contagem = eventos aceitos e ainda não consumidos (na fila + no lote que a thread de scripts está processando).
   // Acima disto, eventos de cliente são descartados. Join/Leave e comandos (raros, de admin) passam do limite até o
   // teto rígido de 4× a capacidade: dali em diante tudo é descartado, com log CRÍTICO (1 por episódio) e métrica.
   size_t eventQueueCapacity = 65536;
@@ -103,7 +104,7 @@ struct HostMetrics {
   uint64_t eventsDropped = 0;          // total de eventos descartados (inclui os do teto rígido)
   uint64_t eventsBackstopDropped = 0;  // descartados pelo teto rígido (4× a capacidade), inclusive Join/Leave
   uint64_t commandsDropped = 0;
-  size_t eventQueueDepth = 0;
+  size_t eventQueueDepth = 0;  // aceitos e não consumidos (na fila + no lote em processamento)
   bool halted = false;  // supervisor disparou
   std::string haltReason;
   bool inLuaCall = false;  // batimento: há chamada ao Lua em andamento
@@ -138,6 +139,9 @@ class ScriptHost {
 
   // Roda fn na thread de scripts (respostas de banco/HTTP etc.). Nunca descartado, exceto com o host parado.
   void runOnScriptThread(std::function<void(ScriptContext&)> fn);
+
+  // Diagnóstico: threads de scripts estacionadas para sempre no processo (host destruído com chamada C presa).
+  static size_t parkedThreadCount();
 
  private:
   std::shared_ptr<detail::HostImpl> impl_;  // compartilhado com as threads (sobrevive a um detach)
