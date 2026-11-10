@@ -2,6 +2,7 @@ import { Readable } from 'node:stream';
 import type { FastifyInstance } from 'fastify';
 import type { ModInfo, UpdateInfo } from '@cbmp/contracts';
 import { HttpError } from '../errors';
+import { ipKey } from './admin-login';
 import { LAUNCHER_TAG, MOD_TAG, isServedTag, type GitHubReleases, type Release, type ReleaseAsset } from '../github';
 
 // --- semver local (X.Y.Z[-pre][+build]; build ignorado na comparação) ---
@@ -38,10 +39,17 @@ export function compareSemver(a: string, b: string): number {
 const byVersionDesc = <T extends { version: string }>(a: T, b: T) => compareSemver(b.version, a.version);
 const published = (r: Release) => !r.draft && !r.prerelease;
 const SHA256_TEXT = /^([0-9a-fA-F]{64})(?:\s|$)/;
-const RATE = { rateLimit: { max: 60, timeWindow: '1 minute' } };
+/** 60 req/min por IP (IPv6 agrupado por /64, como nas outras rotas). */
+const RATE = { rateLimit: { max: 60, timeWindow: '1 minute', keyGenerator: (req: { ip: string }) => ipKey(req.ip) } };
+/** Downloads repassados ao mesmo tempo (todos os clientes); acima disso → 503 busy. */
+export const MAX_CONCURRENT_DOWNLOADS = 8;
+/** RFC 5987 attr-char: encodeURIComponent deixa ' ( ) * passarem. */
+const rfc5987 = (v: string) => encodeURIComponent(v).replace(/['()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+const validDate = (d: string) => d !== '' && !Number.isNaN(Date.parse(d));
 
 export async function releaseRoutes(app: FastifyInstance) {
   const { config } = app.deps;
+  let activeDownloads = 0;
 
   /** Sem token (ou sem cliente) → 503 updates_disabled. */
   function client(): GitHubReleases {
@@ -62,7 +70,7 @@ export async function releaseRoutes(app: FastifyInstance) {
       const candidates: Array<{ version: string; release: Release; installer: ReleaseAsset; signature: string }> = [];
       for (const r of (await releases.list()).filter(published)) {
         const m = LAUNCHER_TAG.exec(r.tag);
-        if (!m) continue;
+        if (!m || !validDate(r.publishedAt)) continue;
         for (const a of r.assets) {
           if (!a.name.endsWith('-setup.exe')) continue;
           const signature = textOf(r, `${a.name}.sig`);
@@ -116,14 +124,22 @@ export async function releaseRoutes(app: FastifyInstance) {
       const release = (await releases.list()).find((r) => r.tag === tag && published(r));
       const entry = release?.assets.find((a) => a.name === asset);
       if (!entry) throw notFound();
-      const stream = await releases.download(entry.id);
+      if (activeDownloads >= MAX_CONCURRENT_DOWNLOADS) throw new HttpError(503, 'busy', 'muitos downloads em andamento; tente em instantes');
+      activeDownloads++;
+      let released = false;
+      const free = () => { if (!released) { released = true; activeDownloads--; } };
+      let stream;
+      try { stream = await releases.download(entry.id); } catch (e) { free(); throw e; }
+      const body = Readable.fromWeb(stream as import('node:stream/web').ReadableStream<Uint8Array>);
+      body.once('close', free);
+      reply.raw.once('close', free);
       return reply
         .header('content-type', 'application/octet-stream')
         .header('content-length', String(stream.size))
-        .header('content-disposition', `attachment; filename*=UTF-8''${encodeURIComponent(entry.name)}`)
+        .header('content-disposition', `attachment; filename*=UTF-8''${rfc5987(entry.name)}`)
         .header('x-content-type-options', 'nosniff')
         .header('cache-control', 'no-store')
-        .send(Readable.fromWeb(stream as import('node:stream/web').ReadableStream<Uint8Array>));
+        .send(body);
     },
   );
 }

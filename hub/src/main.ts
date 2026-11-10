@@ -15,8 +15,13 @@ const store = new Store(openDb(join(config.dataDir, 'hub.sqlite')));
 const keyring = loadOrCreateKeyRing(join(config.dataDir, 'keys'));
 const discord = createDiscordClient(config.discordClientId, config.discordClientSecret);
 const now = () => Math.floor(Date.now() / 1000);
-const releases = config.githubToken ? createGitHubReleases({ token: config.githubToken, repo: config.releasesRepo }) : undefined;
+// O logger do app só existe depois do buildApp; os avisos do cliente do GitHub (nunca com token) vão para ele.
+let releasesLog: { warn(obj: object, msg: string): void } | undefined;
+const releases = config.githubToken
+  ? createGitHubReleases({ token: config.githubToken, repo: config.releasesRepo, logger: { warn: (o, m) => releasesLog?.warn(o, m) } })
+  : undefined;
 const app = await buildApp({ config, store, keyring, discord, probe: httpProbe, now, releases });
+releasesLog = app.log;
 const PURGE_INTERVAL_MS = 10 * 60 * 1000;
 function purge(): void {
   try { store.purgeExpired(now()); } catch (err) { app.log.error(err); }
