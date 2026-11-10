@@ -6,6 +6,7 @@ Plataforma de multiplayer para Hogwarts Legacy no estilo FiveM: Hub, servidores 
 
 - `packages/contracts`: contratos compartilhados (tickets, mensagens) em TypeScript.
 - `hub/`: API e painel de donos de servidores (Node); veja `hub/README.md`.
+- `launcher/`: launcher Windows "CB Multiplayer" (Tauri 2 + Svelte 5); veja `launcher/README.md`.
 - `client/`: mod spike do cliente.
 - `proto/`: protocolo binário em C++ (`cbmp`), com vetores compartilhados com o TypeScript.
 - `server/`: `cb-server`, o servidor dedicado; veja `server/README.md`.

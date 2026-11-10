@@ -1,0 +1,36 @@
+/* Tema escuro do mockup aprovado (roxo/dourado). Sem fontes remotas: pilha de fontes do sistema. */
+:root {
+  --bg: #14121c;
+  --panel: #1d1a28;
+  --panel-hover: #262236;
+  --border: #2e2940;
+  --text: #ece8f4;
+  --muted: #9a93ad;
+  --accent: #d8b86a;
+  --accent-soft: rgba(216, 184, 106, 0.12);
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+  user-select: none;
+}
+
+.placeholder {
+  color: var(--muted);
+}
+
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

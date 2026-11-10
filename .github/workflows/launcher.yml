@@ -1,0 +1,44 @@
+name: launcher
+on:
+  push:
+    paths: ['launcher/**', 'packages/**', 'package.json', 'package-lock.json', '.github/workflows/launcher.yml']
+  pull_request:
+    paths: ['launcher/**', 'packages/**', 'package.json', 'package-lock.json', '.github/workflows/launcher.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: launcher-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  launcher:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: launcher/src-tauri -> target
+      - run: npm ci
+      - run: npm test -w launcher/ui
+      - run: npm run typecheck -w launcher/ui
+      # O `generate_context!` exige a UI compilada antes de compilar o Rust.
+      - run: npm run build -w launcher/ui
+      - run: cargo test --locked
+        working-directory: launcher/src-tauri
+      # Build comum sem chave de updater: só o workflow de release liga createUpdaterArtifacts e assina.
+      # bash (Git Bash do runner): passa o JSON intacto até a CLI, como no build local.
+      - run: npm run tauri -w launcher/ui -- build --ci --config '{"bundle":{"createUpdaterArtifacts":false}}'
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cb-multiplayer-nsis
+          path: launcher/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error

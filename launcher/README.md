@@ -1,0 +1,68 @@
+# CB Multiplayer — launcher
+
+Launcher Windows (x64) da plataforma: Tauri 2 (Rust) + UI Svelte 5 + Vite + TypeScript. Spec:
+`docs/superpowers/specs/2026-11-10-sub4-launcher-design.md`.
+
+```
+launcher/
+  ui/          Svelte 5 + TS — só chama comandos Tauri (src/lib/api.ts); sem fs/shell/http/opener
+  src-tauri/   backend Rust, tauri.conf.json, capabilities/, keys/update.pub
+```
+
+## Comandos
+
+Na raiz do repositório (a UI é o workspace npm `launcher/ui`):
+
+```bash
+npm ci
+npm test -w launcher/ui                 # Vitest (jsdom)
+npm run typecheck -w launcher/ui        # svelte-check
+npm run build -w launcher/ui            # gera launcher/ui/dist (exigido antes de compilar o Rust)
+(cd launcher/src-tauri && cargo test)   # inclui o guarda de capabilities/CSP (tests/config_guard.rs)
+npm run tauri -w launcher/ui -- dev     # janela de desenvolvimento
+npm run tauri -w launcher/ui -- build   # instalador NSIS em launcher/src-tauri/target/release/bundle/nsis/
+```
+
+Requisitos no Windows: Rust stable (MSVC), Visual Studio com C++ e Windows SDK, Node 24, WebView2 (já vem no
+Windows 11).
+
+## Dados
+
+`%LOCALAPPDATA%\CBMultiplayer` (`settings.json`, `cache\`, `servers\`, `mods\`, `run\`, `logs\`). Em builds de debug
+`CBMP_DATA_DIR` troca essa pasta (testes/dev); o release ignora a variável.
+
+`settings.json` é gravado de forma atômica (`.tmp` + rename). Arquivo corrompido ou inválido é renomeado para
+`settings.json.bad` e o launcher volta aos padrões.
+
+## Hub
+
+O endereço padrão é `https://hub.cbmp.invalid` — **placeholder**, precisa ser trocado pelo endereço real do Hub
+(`settings::DEFAULT_HUB_URL` e o endpoint do updater em `tauri.conf.json`) antes da primeira versão pública. Só
+`https://` é aceito; em builds de debug também `http://` de loopback (`localhost`, `127.0.0.1`, `[::1]`) e a variável
+`CBMP_HUB_URL` sobrepõe o endereço salvo. O release ignora `CBMP_HUB_URL`.
+
+## Auto-update e chave de assinatura
+
+O updater do Tauri consulta `{hub}/v1/launcher/update/{{target}}/{{arch}}/{{current_version}}` e só aceita pacotes
+assinados com a chave cuja parte pública está em `src-tauri/keys/update.pub` (embutida no binário e repetida em
+`plugins.updater.pubkey` do `tauri.conf.json`; o teste `config_guard` exige que as duas sejam iguais).
+
+> **A chave atual é de DESENVOLVIMENTO.** Foi gerada com `npx tauri signer generate` só para o esqueleto e deve ser
+> substituída por uma chave nova antes do primeiro release real. A chave privada correspondente **nunca** entra no
+> repositório: ela fica fora dele (na máquina de quem gerou) e, no CI, só no secret `CBMP_UPDATE_KEY` do workflow de
+> release.
+
+Para trocar a chave: `npx tauri signer generate -w <caminho fora do repo>`, copiar o `.pub` gerado para
+`src-tauri/keys/update.pub`, atualizar `plugins.updater.pubkey` com o mesmo conteúdo e cadastrar a privada (e a senha)
+no secret do workflow de release.
+
+`bundle.createUpdaterArtifacts` fica `false` no `tauri.conf.json`: o build comum (local e CI) não precisa da chave
+privada. Só o workflow de release liga essa opção e assina.
+
+## Segurança
+
+- A UI só tem `core:default` e os comandos do app (`capabilities/default.json`); cada comando novo precisa entrar em
+  `build.rs` e na capability. `tests/config_guard.rs` falha se aparecer permissão `fs:`/`shell:`/`http:`/`opener:`,
+  plugin desses configurado, capability remota ou CSP diferente da exigida ou com `unsafe-`.
+- CSP: `default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost`.
+- Sem fontes ou conteúdo remoto na UI; textos de servidores sempre como texto (nunca `{@html}`).

@@ -10,3 +10,8 @@ build-native/
 vcpkg_installed/
 vcpkg/
 CMakeUserPresets.json
+
+# launcher (Tauri)
+target/
+launcher/src-tauri/gen/
+*.key

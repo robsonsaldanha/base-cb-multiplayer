@@ -1,0 +1,55 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "CB Multiplayer",
+  "mainBinaryName": "CBMultiplayer",
+  "version": "0.1.0",
+  "identifier": "br.com.castelobruxo.cbmp",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "title": "CB Multiplayer",
+        "width": 1100,
+        "height": 700,
+        "minWidth": 900,
+        "minHeight": 600,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost",
+      "freezePrototype": true
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "createUpdaterArtifacts": false,
+    "publisher": "Castelo Bruxo",
+    "shortDescription": "CB Multiplayer",
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.ico"],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["PortugueseBR"]
+      }
+    }
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": { "schemes": ["cbmp"] }
+    },
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJEQ0I0NzgwOTFFOTE2MjkKUldRcEZ1bVJnRWZMdmJmTTJ1aXo5TVRyVldxa2RXUW5oMmNPWmp3eFR4Uml5YUoxMndOS3BQSlMK",
+      "endpoints": ["https://hub.cbmp.invalid/v1/launcher/update/{{target}}/{{arch}}/{{current_version}}"],
+      "windows": { "installMode": "passive" }
+    }
+  }
+}

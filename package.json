@@ -2,7 +2,7 @@
   "name": "base-cb-multiplayer",
   "private": true,
   "type": "module",
-  "workspaces": ["packages/*", "hub"],
+  "workspaces": ["packages/*", "hub", "launcher/ui"],
   "engines": { "node": ">=22" },
   "scripts": {
     "test": "npm test --workspaces --if-present",
