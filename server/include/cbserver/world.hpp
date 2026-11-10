@@ -41,12 +41,12 @@ struct PlayerSlot {
   std::deque<double> correctionTimes;  // um registro por incidente (não por Correction repetida)
   bool correcting = false;             // janela após Correction: inputs longe da posição corrigida são ignorados
   double correctionSince = 0;
-  int ignoredWindows = 0;
+  int ignoredWindows = 0;  // janelas de correção seguidas que venceram com o cliente ainda longe (≥ 5 → kick)
   // Janela aberta pelo servidor (spawn/setState): carência de carregamento, inputs longe ignorados em silêncio,
   // nunca conta para kick; após kServerGraceSec sem alcance, a Correction é reenviada uma vez.
   bool serverCorrection = false;
   bool serverCorrectionResent = false;
-  uint32_t correctionSeq = 0;  // janelas de correção seguidas que venceram com o cliente ainda longe (≥ 5 → kick)
+  uint32_t correctionSeq = 0;  // seq da Correction da janela aberta (reenviada igual após a carência do servidor)
   VisibleSet visible;
   std::unordered_map<std::string, TokenBucket> eventBuckets;
   std::deque<double> eventViolations;

@@ -5,7 +5,7 @@ e `/metrics`, simulação a 20 Hz com validação de movimento e anti-cheat. Spe
 
 ## Build
 
-Requer CMake, Ninja (Linux), vcpkg (`VCPKG_ROOT`) no commit fixado em `.github/workflows/native.yml` e compilador C++20.
+Requer CMake, Ninja (Linux), vcpkg (`VCPKG_ROOT`) no commit fixado em `.github/workflows/native.yml` e compilador C++23 (MSVC do VS 2026 ou GCC ≥ 13).
 
 Linux (Ubuntu 24.04; dependências em `docs/LOAD-TEST.md`):
 
@@ -31,7 +31,9 @@ Binário: `build-native/<preset>/server/cb-server` (em `Release/` no Windows).
 cb-server --config server.cfg
 ```
 
-Copie `server/server.cfg.example` como ponto de partida. A config é validada na subida; em erro o servidor mostra
+Copie `server/server.cfg.example` como ponto de partida. **Ele não sobe como está**: preencha `hub` (produção)
+**ou** `auth.devPublicKey` (desenvolvimento, nunca os dois). Para gerar uma chave dev: `cb-bots --dev-seed <hex de
+64 dígitos> --print-dev-key`. A config é validada na subida; em erro o servidor mostra
 o campo e o motivo (pt-BR) e não inicia (chaves desconhecidas só geram aviso). Ctrl+C / SIGTERM encerram com parada limpa.
 
 ## server.cfg
@@ -135,7 +137,10 @@ Correções emitidas pelo próprio servidor (spawn, teleporte) têm carência de
 - O teto de saída por cliente (`net.maxOutKbpsPerClient`) não é aplicado ainda.
 - Limite de taxa de novas conexões por IP: adiado (existe só o limite de pendentes).
 - Velocidades provisórias até o subprojeto 5.
-- Cliente que nunca alcança a correção do servidor só é expulso pelo teto de 60 a 120 s.
+- Cliente que nunca alcança uma correção feita pelo servidor (spawn/teleporte) **não é expulso**: a Correction é
+  reenviada uma vez após 30 s e os inputs dele seguem ignorados (fica parado no servidor). Um teto com kick fica
+  para o subprojeto 3.
+- HTTP escuta só em IPv4 (`0.0.0.0`); o jogo (GNS) escuta em IPv4 e IPv6. Corrigir antes do launcher (subprojeto 4).
 
 ## Teste de carga
 
