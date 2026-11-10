@@ -65,6 +65,21 @@ no secret do workflow de release.
 `bundle.createUpdaterArtifacts` fica `false` no `tauri.conf.json`: o build comum (local e CI) não precisa da chave
 privada. Só o workflow de release liga essa opção e assina.
 
+## Login
+
+- `login` gera PKCE (verifier de 64 chars, S256) e `state` (32 bytes), guarda o pendente por 10 min e abre o
+  navegador do sistema (ShellExecuteW no Rust; só `https://`, ou `http://` de loopback em debug) em
+  `{hub}/v1/auth/discord/login?client=launcher&code_challenge=…&code_challenge_method=S256&state=…`.
+- O Hub devolve `cbmp://auth?code=…&state=…` (ou `error=…&state=…`). A 2ª instância repassa o argv à 1ª
+  (single-instance com o recurso `deep-link`), que entrega a URL ao `on_open_url`. Só `cbmp://auth` com o `state`
+  pendente é aceito (uso único); o resto é ignorado e registrado só com o código do erro. Em debug, `register_all`
+  registra o esquema para o executável atual.
+- Refresh token só no Credential Manager (`keyring`, serviço `CBMultiplayer`, conta `refresh_token`); access token só
+  em memória, renovado quando faltam 60 s ou menos. Refresh recusado (401) limpa o cofre → `session_expired`.
+- A UI recebe `auth://changed` (`{loggedIn, error}`) e chama `me`; o avatar vem como `data:` URL baixada pelo Rust só
+  de `https://cdn.discordapp.com/` (a CSP não permite imagem remota).
+- Teste manual do cofre real: `cargo test --test auth -- --ignored cofre_real` (usa o serviço `CBMultiplayer-teste`).
+
 ## Segurança
 
 - A UI só tem `core:event:allow-listen`/`allow-unlisten` e os comandos do app (`capabilities/default.json`); cada

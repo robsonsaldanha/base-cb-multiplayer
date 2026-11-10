@@ -21,10 +21,27 @@ tauri-plugin-dialog = "=2.8.4"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 url = "=2.5.8"
+# Cliente do Hub: rustls com o provedor `ring` (o mesmo que o plugin updater já usa).
+reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
+tokio = { version = "=1.54.1", features = ["sync"] }
+sha2 = "=0.10.9"
+base64 = "=0.23.1"
+getrandom = "=0.3.4"
+log = "=0.4.35"
+# Cofre: Windows Credential Manager (serviço `CBMultiplayer`).
+keyring = { version = "=3.6.3", features = ["windows-native"] }
+
+[target.'cfg(windows)'.dependencies]
+# Abrir o navegador do sistema (ShellExecuteW) só a partir do Rust; nada de plugin opener/shell.
+windows-sys = { version = "=0.61.2", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 tempfile = "=3.27.0"
 toml = "=1.2.1"
+# Hub falso dos testes.
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "net", "sync"] }
 
 [profile.release]
 codegen-units = 1

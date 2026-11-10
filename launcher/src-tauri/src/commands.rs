@@ -1,10 +1,15 @@
 //! Superfície única exposta à UI. Cada comando aqui precisa constar em `build.rs` e na capability.
 
+use crate::auth::{self, Auth};
 use crate::error::{AppError, AppResult};
 use crate::settings::{validate_game_dir, Settings, SettingsUpdate};
+use serde::Serialize;
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard};
-use tauri::{AppHandle, State};
+use std::sync::{Arc, Mutex, MutexGuard};
+use tauri::{AppHandle, Emitter, Manager, State};
+
+/// Evento para a UI quando o login muda (deep link tratado, logout).
+pub const AUTH_CHANGED: &str = "auth://changed";
 
 pub struct AppState {
     settings_path: PathBuf,
@@ -78,6 +83,86 @@ pub fn app_version(app: AppHandle) -> String {
     app.package_info().version.to_string()
 }
 
+/// Carga de `auth://changed`: `error` só quando um login terminou mal (negado, recusado pelo Hub, cofre).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthChanged {
+    pub logged_in: bool,
+    pub error: Option<AppError>,
+}
+
+/// Perfil para o topo da UI. `avatar` é `data:` URL (baixada pelo Rust do CDN do Discord) ou `null`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Profile {
+    pub name: String,
+    pub discord_id: String,
+    pub avatar: Option<String>,
+}
+
+/// Evento a emitir depois de um deep link: link ignorado (não é nosso / state errado) não mexe na UI.
+pub fn auth_event_for(result: &AppResult<()>) -> Option<AuthChanged> {
+    match result {
+        Ok(()) => Some(AuthChanged {
+            logged_in: true,
+            error: None,
+        }),
+        Err(e) if matches!(e.code, "invalid_deep_link" | "login_state_invalid") => None,
+        Err(e) => Some(AuthChanged {
+            logged_in: false,
+            error: Some(e.clone()),
+        }),
+    }
+}
+
+/// Deep link vindo do plugin (1ª instância, ou repassado pela 2ª): trata fora da thread do evento.
+pub fn handle_deep_link(app: AppHandle, auth: Arc<Auth>, url: String) {
+    tauri::async_runtime::spawn(async move {
+        let r = auth.on_deep_link(&url).await;
+        if let Some(ev) = auth_event_for(&r) {
+            let _ = app.emit(AUTH_CHANGED, ev);
+        }
+        if r.is_ok() {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }
+    });
+}
+
+/// Abre o navegador do sistema na página de login do Hub. O resultado chega por `auth://changed`.
+#[tauri::command]
+pub fn login(auth: State<'_, Arc<Auth>>) -> AppResult<()> {
+    let url = auth.begin_login();
+    auth::open_in_browser(&url)
+}
+
+#[tauri::command]
+pub async fn logout(app: AppHandle, auth: State<'_, Arc<Auth>>) -> AppResult<()> {
+    let r = auth.logout().await;
+    let _ = app.emit(
+        AUTH_CHANGED,
+        AuthChanged {
+            logged_in: false,
+            error: None,
+        },
+    );
+    r
+}
+
+/// Perfil do usuário logado (`/v1/me`), renovando a sessão se preciso.
+#[tauri::command]
+pub async fn me(auth: State<'_, Arc<Auth>>) -> AppResult<Profile> {
+    let me = auth.me().await?;
+    let avatar = auth.hub().avatar_data_url(&me).await;
+    Ok(Profile {
+        name: me.name,
+        discord_id: me.discord_id,
+        avatar,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,6 +220,29 @@ mod tests {
         let err = state.set_game_dir(Some(PathBuf::from("jogo"))).unwrap_err();
         assert_eq!(err.code, "invalid_settings");
         assert_eq!(state.get_settings().game_dir, None);
+    }
+
+    #[test]
+    fn evento_de_auth_ignora_links_que_nao_sao_nossos() {
+        assert_eq!(
+            auth_event_for(&Ok(())),
+            Some(AuthChanged {
+                logged_in: true,
+                error: None
+            })
+        );
+        for code in ["invalid_deep_link", "login_state_invalid"] {
+            assert_eq!(auth_event_for(&Err(AppError::new(code, "x"))), None);
+        }
+        let denied = auth_event_for(&Err(AppError::new("login_denied", "x"))).unwrap();
+        assert!(!denied.logged_in);
+        assert_eq!(denied.error.unwrap().code, "login_denied");
+        let v = serde_json::to_value(AuthChanged {
+            logged_in: false,
+            error: None,
+        })
+        .unwrap();
+        assert_eq!(v, serde_json::json!({ "loggedIn": false, "error": null }));
     }
 
     #[test]

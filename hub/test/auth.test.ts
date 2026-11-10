@@ -135,6 +135,38 @@ describe('auth', () => {
     expect(again.json().error).toBe('bad_state');
   });
 
+  it('launcher: state próprio (43 chars base64url) volta no deep link, com code ou error', async () => {
+    const { app, discord } = await makeTestApp();
+    discord.users.set('c1', { id: '7', username: 'x', global_name: null, avatar: null });
+    const mine = randomBytes(32).toString('base64url');
+    const go = async (extra: Record<string, string>) => {
+      const q = new URLSearchParams({ client: 'launcher', code_challenge: pkce().challenge, code_challenge_method: 'S256', ...extra });
+      const res = await app.inject({ method: 'GET', url: `/v1/auth/discord/login?${q}` });
+      if (res.statusCode !== 302) return { status: res.statusCode };
+      const loc = new URL(res.headers.location as string);
+      return { status: 302, state: loc.searchParams.get('state')!, cookie: res.cookies.find((c) => c.name === 'cbmp_oauth')!.value };
+    };
+    const ok = await go({ state: mine });
+    expect(ok.state).not.toBe(mine); // o state OAuth do Hub é outro
+    const cb = await callback(app, 'c1', ok.state!, ok.cookie);
+    const deep = new URL(cb.headers.location as string);
+    expect(deep.searchParams.get('state')).toBe(mine);
+    expect(deep.searchParams.get('code')).toBeTruthy();
+
+    const denied = await go({ state: mine });
+    const rd = await app.inject({ method: 'GET', url: `/v1/auth/discord/callback?error=access_denied&state=${denied.state}`, cookies: { cbmp_oauth: denied.cookie! } });
+    expect(rd.headers.location).toBe(`cbmp://auth?error=access_denied&state=${mine}`);
+
+    for (const bad of ['curto', `${mine}x`, mine.slice(0, 42) + '+']) expect((await go({ state: bad })).status).toBe(400);
+  });
+
+  it('dev-login do launcher também devolve o state próprio', async () => {
+    const on = await makeTestApp({ config: { devLogin: true } });
+    const mine = randomBytes(32).toString('base64url');
+    const l = await on.app.inject({ method: 'GET', url: `/v1/auth/dev-login?client=launcher&discordId=42&name=Dev&code_challenge=${pkce().challenge}&code_challenge_method=S256&state=${mine}` });
+    expect(new URL(l.headers.location as string).searchParams.get('state')).toBe(mine);
+  });
+
   it('client inválido no login é 400', async () => {
     const { app } = await makeTestApp();
     const res = await app.inject({ method: 'GET', url: '/v1/auth/discord/login?client=outro' });

@@ -51,6 +51,10 @@ const MIGRATIONS: Migration[] = [
   (db) => {
     if (!hasColumn(db, 'servers', 'featured')) db.exec('ALTER TABLE servers ADD COLUMN featured INTEGER NOT NULL DEFAULT 0');
   },
+  // State do próprio launcher, devolvido no deep link cbmp://auth (o launcher confere e consome).
+  (db) => {
+    if (!hasColumn(db, 'oauth_states', 'client_state')) db.exec('ALTER TABLE oauth_states ADD COLUMN client_state TEXT');
+  },
 ];
 
 /** Aplica as migrações pendentes (pelo `user_version`), cada uma numa transação. */

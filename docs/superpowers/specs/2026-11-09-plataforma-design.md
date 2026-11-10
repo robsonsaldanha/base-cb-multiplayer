@@ -72,8 +72,8 @@ Fora do escopo: anti-cheat em nível de kernel; voz (decidir depois); loja/monet
 
 | Método | Rota | Auth | Uso |
 |---|---|---|---|
-| GET | `/v1/auth/discord/login?client=launcher\|panel` | — | inicia OAuth; launcher exige `code_challenge` + `code_challenge_method=S256` |
-| GET | `/v1/auth/discord/callback` | — | fim do OAuth; launcher recebe `cbmp://auth?code=…` ou `cbmp://auth?error=access_denied`; painel recebe cookie |
+| GET | `/v1/auth/discord/login?client=launcher\|panel` | — | inicia OAuth; launcher exige `code_challenge` + `code_challenge_method=S256` e pode mandar `state` próprio (`[A-Za-z0-9_-]{43}`), devolvido no deep link |
+| GET | `/v1/auth/discord/callback` | — | fim do OAuth; launcher recebe `cbmp://auth?code=…[&state=…]` ou `cbmp://auth?error=access_denied[&state=…]`; painel recebe cookie |
 | POST | `/v1/auth/exchange` `{code, codeVerifier}` | — | launcher troca o código (uso único, 60 s) por `{accessToken, accessExpiresAt, refreshToken, refreshExpiresAt}` |
 | POST | `/v1/auth/refresh` `{refreshToken}` | refresh token | renova sessão (gira os dois tokens) |
 | POST | `/v1/auth/logout` | sessão (Bearer ou cookie) | encerra sessão; aceita `{refreshToken}` |

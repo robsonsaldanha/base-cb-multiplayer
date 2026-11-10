@@ -110,20 +110,22 @@ export class Store {
 
   // ---- OAuth state e códigos de login (uso único)
   /** `returnTo` (só painel): volta para a confirmação de login de admin daquele servidor; morre com o state. */
-  createOauthState(client: ClientKind, now: number, codeChallenge?: string, returnTo?: ReturnTo): string {
+  /** `clientState` (só launcher): state do próprio launcher, devolvido no deep link. */
+  createOauthState(client: ClientKind, now: number, codeChallenge?: string, returnTo?: ReturnTo, clientState?: string): string {
     const state = randomBytes(24).toString('base64url');
-    this.db.prepare('INSERT INTO oauth_states (state, client, created_at, code_challenge, return_server_id, return_state) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(state, client, now, codeChallenge ?? null, returnTo?.serverId ?? null, returnTo?.state ?? null);
+    this.db.prepare('INSERT INTO oauth_states (state, client, created_at, code_challenge, return_server_id, return_state, client_state) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(state, client, now, codeChallenge ?? null, returnTo?.serverId ?? null, returnTo?.state ?? null, clientState ?? null);
     return state;
   }
 
-  consumeOauthState(state: string, now: number): { client: ClientKind; codeChallenge: string | null; returnTo: ReturnTo | null } | null {
-    const r = this.db.prepare('DELETE FROM oauth_states WHERE state = ? RETURNING client, created_at, code_challenge, return_server_id, return_state').get(state) as Raw | undefined;
+  consumeOauthState(state: string, now: number): { client: ClientKind; codeChallenge: string | null; returnTo: ReturnTo | null; clientState: string | null } | null {
+    const r = this.db.prepare('DELETE FROM oauth_states WHERE state = ? RETURNING client, created_at, code_challenge, return_server_id, return_state, client_state').get(state) as Raw | undefined;
     if (!r || now - (r.created_at as number) > OAUTH_STATE_TTL) return null;
     const sid = (r.return_server_id as string | null) ?? null;
     return {
       client: r.client as ClientKind, codeChallenge: (r.code_challenge as string | null) ?? null,
       returnTo: sid ? { serverId: sid, state: (r.return_state as string | null) ?? null } : null,
+      clientState: (r.client_state as string | null) ?? null,
     };
   }
 

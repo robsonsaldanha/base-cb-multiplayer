@@ -8,6 +8,9 @@
     "core:event:allow-unlisten",
     "allow-get-settings",
     "allow-set-settings",
-    "allow-app-version"
+    "allow-app-version",
+    "allow-login",
+    "allow-logout",
+    "allow-me"
   ]
 }

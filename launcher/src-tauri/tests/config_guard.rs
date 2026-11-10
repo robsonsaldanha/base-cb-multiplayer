@@ -429,6 +429,9 @@ fn capability_real_so_tem_o_permitido() {
         [
             "allow-app-version",
             "allow-get-settings",
+            "allow-login",
+            "allow-logout",
+            "allow-me",
             "allow-set-settings",
             "core:event:allow-listen",
             "core:event:allow-unlisten",
@@ -487,7 +490,14 @@ fn comandos_do_build_rs_batem_com_a_capability() {
     let build = read(&root().join("build.rs"));
     let caps = real_capabilities();
     let perms = permission_ids(&caps[0].1);
-    for cmd in ["get_settings", "set_settings", "app_version"] {
+    for cmd in [
+        "get_settings",
+        "set_settings",
+        "app_version",
+        "login",
+        "logout",
+        "me",
+    ] {
         assert!(
             build.contains(&format!("\"{cmd}\"")),
             "{cmd} fora do build.rs"
