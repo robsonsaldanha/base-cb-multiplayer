@@ -18,7 +18,9 @@
 #include <openssl/x509v3.h>
 
 #include "api_env.hpp"
+#include "cbscript/db.hpp"
 #include "cbscript/http_out.hpp"
+#include "fake_db.hpp"
 
 using namespace cbscript;
 
@@ -37,6 +39,9 @@ struct TestServer {
   std::vector<std::string> order;
   std::vector<std::string> seenHeaders;  // "nome: valor" do último pedido em /echo
   std::string lastBody, lastContentType, lastHost;
+  std::string redirTarget;
+  int redirStatus = 302;
+  std::atomic<int> anyRequest{0};
 
   explicit TestServer(std::unique_ptr<httplib::Server> s = std::make_unique<httplib::Server>()) : svr(std::move(s)) {
     auto hit = [this](const httplib::Request& rq) {
@@ -129,6 +134,21 @@ struct TestServer {
       else
         rs.set_redirect("/hop/" + std::to_string(n - 1));
     });
+    svr->Get(R"(/hook/(.+))", [this, hit](const httplib::Request& rq, httplib::Response& rs) {
+      hit(rq);
+      std::unique_lock<std::mutex> lk(mu);
+      cv.wait_for(lk, std::chrono::seconds(20), [this] { return released; });
+      rs.set_content("tarde", "text/plain");
+    });
+    svr->Post("/redir-post", [this, hit](const httplib::Request& rq, httplib::Response& rs) {
+      hit(rq);
+      std::lock_guard<std::mutex> lk(mu);
+      rs.set_redirect(redirTarget, redirStatus);
+    });
+    svr->set_pre_routing_handler([this](const httplib::Request&, httplib::Response&) {
+      ++anyRequest;
+      return httplib::Server::HandlerResponse::Unhandled;
+    });
     port = svr->bind_to_any_port("127.0.0.1");
     REQUIRE(port > 0);
     th = std::thread([this] { svr->listen_after_bind(); });
@@ -163,10 +183,24 @@ struct TestServer {
   std::string allow() const { return "localhost:" + std::to_string(port); }
 };
 
-// Certificado autoassinado (EC P-256) para `dnsName`, gravado em PEM.
-void makeCert(const fs::path& certPath, const fs::path& keyPath, const std::string& dnsName) {
+// Certificado (EC P-256) para `dnsName`, gravado em PEM. Sem emissor = autoassinado (e CA); com emissor = folha
+// assinada por ele, com as extensões extras (nid, valor no formato do openssl.cnf).
+void makeCert(const fs::path& certPath, const fs::path& keyPath, const std::string& dnsName,
+              const fs::path& issuerCert = {}, const fs::path& issuerKey = {},
+              std::vector<std::pair<int, std::string>> extra = {}) {
   EVP_PKEY* pkey = EVP_PKEY_Q_keygen(nullptr, nullptr, "EC", "P-256");
   REQUIRE(pkey != nullptr);
+  X509* issuer = nullptr;
+  EVP_PKEY* ikey = nullptr;
+  if (!issuerCert.empty()) {
+    BIO* ib = BIO_new_file(issuerCert.string().c_str(), "r");
+    issuer = PEM_read_bio_X509(ib, nullptr, nullptr, nullptr);
+    BIO_free(ib);
+    ib = BIO_new_file(issuerKey.string().c_str(), "r");
+    ikey = PEM_read_bio_PrivateKey(ib, nullptr, nullptr, nullptr);
+    BIO_free(ib);
+    REQUIRE((issuer && ikey));
+  }
   X509* x = X509_new();
   X509_set_version(x, 2);
   ASN1_INTEGER_set(X509_get_serialNumber(x), 1);
@@ -176,19 +210,22 @@ void makeCert(const fs::path& certPath, const fs::path& keyPath, const std::stri
   X509_NAME* name = X509_get_subject_name(x);
   X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char*>(dnsName.c_str()), -1,
                              -1, 0);
-  X509_set_issuer_name(x, name);
+  X509_set_issuer_name(x, issuer ? X509_get_subject_name(issuer) : name);
   X509V3_CTX ctx;
   X509V3_set_ctx_nodb(&ctx);
-  X509V3_set_ctx(&ctx, x, x, nullptr, nullptr, 0);
-  const std::string san = "DNS:" + dnsName;
-  for (auto [nid, val] : {std::pair<int, const char*>{NID_subject_alt_name, san.c_str()},
-                          std::pair<int, const char*>{NID_basic_constraints, "critical,CA:TRUE"}}) {
-    X509_EXTENSION* ext = X509V3_EXT_conf_nid(nullptr, &ctx, nid, val);
+  X509V3_set_ctx(&ctx, issuer ? issuer : x, x, nullptr, nullptr, 0);
+  std::vector<std::pair<int, std::string>> exts{{NID_subject_alt_name, "DNS:" + dnsName},
+                                                {NID_basic_constraints, issuer ? "critical,CA:FALSE" : "critical,CA:TRUE"}};
+  for (auto& e : extra) exts.push_back(e);
+  for (auto& [nid, val] : exts) {
+    X509_EXTENSION* ext = X509V3_EXT_conf_nid(nullptr, &ctx, nid, val.c_str());
     REQUIRE(ext != nullptr);
     X509_add_ext(x, ext, -1);
     X509_EXTENSION_free(ext);
   }
-  REQUIRE(X509_sign(x, pkey, EVP_sha256()) > 0);
+  REQUIRE(X509_sign(x, ikey ? ikey : pkey, EVP_sha256()) > 0);
+  if (issuer) X509_free(issuer);
+  if (ikey) EVP_PKEY_free(ikey);
   BIO* b = BIO_new_file(certPath.string().c_str(), "w");
   PEM_write_bio_X509(b, x);
   BIO_free(b);
@@ -305,7 +342,7 @@ TEST_CASE("http: URLs must be https with a hostname, a sane target and an allowe
   REQUIRE(u.port == 443);
   REQUIRE_FALSE(u.explicitPort);
   REQUIRE(u.target == "/v1/x?a=1");
-  REQUIRE(u.forLog() == "https://api.example.com/v1/x");
+  REQUIRE(u.forLog() == "https://api.example.com");
   REQUIRE(parseHttpUrl("https://api.example.com", u, err));
   REQUIRE(u.target == "/");
   REQUIRE(parseHttpUrl("https://api.example.com:8443/", u, err));
@@ -384,9 +421,17 @@ TEST_CASE("http: redirects resolve relative locations and never downgrade to htt
   REQUIRE_FALSE(resolveHttpRedirect(base, "javascript:alert(1)", out, err));
 }
 
-TEST_CASE("http: the log form of a URL drops the query string") {
-  REQUIRE(httpUrlForLog("https://api.example.com/p/x?token=segredo#f") == "https://api.example.com/p/x");
+TEST_CASE("http: the log form of a URL keeps only scheme, host and port") {
+  REQUIRE(httpUrlForLog("https://api.example.com/p/x?token=segredo#f") == "https://api.example.com");
   REQUIRE(httpUrlForLog("https://api.example.com#f") == "https://api.example.com");
+  REQUIRE(httpUrlForLog("https://discord.com:8443/api/webhooks/1/TOKEN") == "https://discord.com:8443");
+  REQUIRE(httpUrlForLog("https://api.example.com?x=1") == "https://api.example.com");
+  HttpUrl u;
+  std::string err;
+  REQUIRE(parseHttpUrl("https://api.telegram.org/botSEGREDO/sendMessage", u, err));
+  REQUIRE(u.forLog() == "https://api.telegram.org");
+  REQUIRE(parseHttpUrl("https://api.telegram.org:8443/botSEGREDO", u, err));
+  REQUIRE(u.forLog() == "https://api.telegram.org:8443");
 }
 
 // --------------------------------------------------------------------------- pool contra o servidor local
@@ -713,12 +758,14 @@ TEST_CASE("http pool: errors and logs never carry the query, headers or body") {
   o.timeout = std::chrono::milliseconds(300);
   o.log = logs.fn();
   HttpOutPool pool(o, HttpOutPool::InsecureLoopbackForTests{});
-  auto r = get(s.base() + "/slow?token=segredo1", {s.allow()});
+  auto r = get(s.base() + "/hook/segredo3/x?token=segredo1", {s.allow()});
   r.headers = {{"Authorization", "Bearer segredo2"}};
   auto res = run(pool, r);
   REQUIRE_FALSE(res.ok);
-  REQUIRE(contains(res.error, "/slow"));
-  for (const char* sec : {"segredo1", "segredo2"}) {
+  INFO(res.error);
+  REQUIRE(contains(res.error, s.allow()));
+  REQUIRE_FALSE(contains(res.error, "/hook"));
+  for (const char* sec : {"segredo1", "segredo2", "segredo3"}) {
     INFO(sec);
     REQUIRE_FALSE(contains(res.error, sec));
     REQUIRE_FALSE(logs.any(sec));
@@ -953,4 +1000,253 @@ TEST_CASE("api: resuming a coroutine that waits for HTTP from outside raises an 
   env.sync();
   env.sync();
   REQUIRE(env.countLog("voltou") == 1);
+}
+
+// ------------------------------------------------------------------------------------------------ fix round 1
+
+namespace {
+
+// Resolvedor injetado: "localhost" → 127.0.0.1; nomes em `map` → o endereço dado; "dns-lento.test" trava até
+// `release()`. Compartilhado com as threads de resolução (que podem viver mais que o teste).
+struct FakeDns {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool released = false;
+  std::atomic<int> blocked{0};
+  std::map<std::string, std::string> map;
+  bool resolve(const std::string& host, std::vector<std::string>& out, std::string& err) {
+    if (host == "dns-lento.test") {
+      ++blocked;
+      std::unique_lock<std::mutex> lk(mu);
+      cv.wait_for(lk, std::chrono::seconds(20), [this] { return released; });
+      --blocked;
+      err = "lento";
+      return false;
+    }
+    std::lock_guard<std::mutex> lk(mu);
+    if (auto it = map.find(host); it != map.end()) {
+      out = {it->second};
+      return true;
+    }
+    if (host == "localhost") {
+      out = {"127.0.0.1"};
+      return true;
+    }
+    err = "nome desconhecido";
+    return false;
+  }
+  void release() {
+    std::lock_guard<std::mutex> lk(mu);
+    released = true;
+    cv.notify_all();
+  }
+};
+
+HttpOutOptions withDns(const std::shared_ptr<FakeDns>& dns, HttpOutOptions o = fastOpt()) {
+  o.resolver = [dns](const std::string& h, std::vector<std::string>& out, std::string& err) {
+    return dns->resolve(h, out, err);
+  };
+  return o;
+}
+
+}  // namespace
+
+TEST_CASE("http pool: one owner cannot take every thread while others wait") {
+  TestServer s;
+  auto o = fastOpt();
+  o.timeout = std::chrono::milliseconds(8000);
+  HttpOutPool pool(o, HttpOutPool::InsecureLoopbackForTests{});
+  REQUIRE(pool.options().maxInFlightPerOwner == 2);
+  std::string err;
+  std::vector<Waiter> hung(4);
+  for (size_t i = 0; i < hung.size(); ++i)
+    REQUIRE(pool.submit(get(s.base() + "/slow", {s.allow()}, 1), hung[i].done(), err) != 0);
+  REQUIRE(waitUntil([&] { return s.hitCount("/slow") == 2; }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  REQUIRE(s.hitCount("/slow") == 2);  // o dono 1 fica com no máximo 2 threads
+  const auto t0 = std::chrono::steady_clock::now();
+  auto b = run(pool, get(s.base() + "/hello", {s.allow()}, 2));
+  REQUIRE(b.ok);
+  REQUIRE(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(2000));
+  s.release();
+  for (auto& w : hung) REQUIRE(w.get().ok);
+}
+
+TEST_CASE("http pool: a stuck DNS lookup is bounded by the deadline and does not hold a worker") {
+  auto dns = std::make_shared<FakeDns>();
+  TestServer s;
+  auto o = withDns(dns);
+  o.threads = 1;
+  o.timeout = std::chrono::milliseconds(400);
+  auto pool = std::make_unique<HttpOutPool>(o, HttpOutPool::InsecureLoopbackForTests{});
+  const std::vector<std::string> allow{"dns-lento.test:" + std::to_string(s.port), s.allow()};
+  const std::string slowUrl = "http://dns-lento.test:" + std::to_string(s.port) + "/hello";
+  const auto t0 = std::chrono::steady_clock::now();
+  auto r = run(*pool, get(slowUrl, allow, 1));
+  REQUIRE_FALSE(r.ok);
+  REQUIRE(r.timedOut);
+  REQUIRE(contains(r.error, "DNS"));
+  REQUIRE(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(2000));
+  // A única thread do pool já está livre, mesmo com a resolução ainda presa.
+  REQUIRE(dns->blocked.load() == 1);
+  auto ok = run(*pool, get(s.base() + "/hello", allow, 2));
+  INFO(ok.error);
+  REQUIRE(ok.ok);
+  // Cancelar durante o DNS solta a thread na hora.
+  std::string err;
+  std::atomic<int> calls{0};
+  auto o2 = withDns(dns);
+  o2.threads = 1;
+  o2.timeout = std::chrono::milliseconds(8000);
+  HttpOutPool pool2(o2, HttpOutPool::InsecureLoopbackForTests{});
+  const uint64_t id = pool2.submit(get(slowUrl, allow, 1), [&](HttpOutResult) { ++calls; }, err);
+  REQUIRE(id != 0);
+  REQUIRE(waitUntil([&] { return dns->blocked.load() == 2; }));
+  pool2.cancel(id);
+  const auto t1 = std::chrono::steady_clock::now();
+  auto ok2 = run(pool2, get(s.base() + "/hello", allow, 2));
+  REQUIRE(ok2.ok);
+  REQUIRE(std::chrono::steady_clock::now() - t1 < std::chrono::milliseconds(1500));
+  REQUIRE(calls.load() == 0);
+  // Teto de resoluções presas por dono: a terceira do mesmo dono falha na hora.
+  auto o3 = withDns(dns);
+  o3.timeout = std::chrono::milliseconds(300);
+  HttpOutPool pool3(o3, HttpOutPool::InsecureLoopbackForTests{});
+  REQUIRE(pool3.options().maxResolversPerOwner == 2);
+  for (int i = 0; i < 2; ++i) REQUIRE_FALSE(run(pool3, get(slowUrl, allow, 7)).ok);
+  REQUIRE(waitUntil([&] { return dns->blocked.load() == 4; }));
+  auto busy = run(pool3, get(slowUrl, allow, 7));
+  REQUIRE_FALSE(busy.ok);
+  REQUIRE(contains(busy.error, "DNS"));
+  REQUIRE(dns->blocked.load() == 4);  // nenhuma resolução nova foi iniciada
+  REQUIRE(run(pool3, get(s.base() + "/hello", allow, 8)).ok);  // outro dono segue
+  dns->release();
+  REQUIRE(waitUntil([&] { return dns->blocked.load() == 0; }));
+  pool.reset();
+}
+
+TEST_CASE("http pool: a redirect to a name that resolves to a private address is refused") {
+  auto dns = std::make_shared<FakeDns>();
+  dns->map["interno.test"] = "10.0.0.5";
+  TestServer s;
+  HttpOutPool pool(withDns(dns), HttpOutPool::InsecureLoopbackForTests{});
+  {
+    std::lock_guard<std::mutex> lk(s.mu);
+    s.redirTarget = "http://interno.test:" + std::to_string(s.port) + "/hello";
+  }
+  auto r = get(s.base() + "/redir-post", {s.allow(), "interno.test:" + std::to_string(s.port)});
+  r.method = HttpMethod::Post;
+  r.body = "x";
+  auto res = run(pool, r);
+  REQUIRE_FALSE(res.ok);
+  INFO(res.error);
+  REQUIRE(contains(res.error, "proibido"));
+  REQUIRE(contains(res.error, "rede privada"));
+  REQUIRE(s.hitCount("/hello") == 0);
+}
+
+TEST_CASE("http pool: redirects to another host drop the script headers, POST becomes GET, 307 with a body is refused") {
+  TestServer s, other;
+  HttpOutPool pool(fastOpt(), HttpOutPool::InsecureLoopbackForTests{});
+  const std::vector<std::string> allow{s.allow(), other.allow()};
+  {
+    std::lock_guard<std::mutex> lk(s.mu);
+    s.redirTarget = other.base() + "/echo";
+    s.redirStatus = 302;
+  }
+  auto r = get(s.base() + "/redir-post", allow);
+  r.method = HttpMethod::Post;
+  r.body = "corpo-secreto";
+  r.headers = {{"Authorization", "Bearer x"}};
+  auto res = run(pool, r);
+  INFO(res.error);
+  REQUIRE(res.ok);
+  REQUIRE(res.status == 201);
+  REQUIRE(res.body == "GET:");
+  {
+    std::lock_guard<std::mutex> lk(other.mu);
+    for (auto& h : other.seenHeaders) REQUIRE_FALSE(contains(h, "Authorization"));
+  }
+  for (int st : {307, 308}) {
+    INFO(st);
+    {
+      std::lock_guard<std::mutex> lk(s.mu);
+      s.redirStatus = st;
+    }
+    auto res2 = run(pool, r);
+    REQUIRE_FALSE(res2.ok);
+    REQUIRE(contains(res2.error, "corpo"));
+  }
+  REQUIRE(other.hitCount("/echo") == 1);
+  // Mesmo host e porta: 307 mantém POST, corpo e cabeçalhos.
+  {
+    std::lock_guard<std::mutex> lk(s.mu);
+    s.redirTarget = "/echo";
+    s.redirStatus = 307;
+  }
+  auto same = run(pool, r);
+  INFO(same.error);
+  REQUIRE(same.ok);
+  REQUIRE(same.body == "POST:corpo-secreto");
+}
+
+TEST_CASE("http pool: header names repeated with another case are refused") {
+  HttpOutPool pool(fastOpt(), HttpOutPool::InsecureLoopbackForTests{});
+  auto r = get("http://localhost:8080/", {"localhost:8080"});
+  r.headers = {{"Authorization", "a"}, {"authorization", "b"}};
+  std::string err;
+  REQUIRE(pool.submit(r, [](HttpOutResult) {}, err) == 0);
+  REQUIRE(contains(err, "repetido"));
+}
+
+TEST_CASE("http pool: certificate checks never fetch URLs named in the certificate (AIA, CRL, OCSP)") {
+  TmpDir t;
+  TestServer fetch;  // destino das URLs do certificado
+  const std::string base = fetch.base();
+  makeCert(t.p / "ca.pem", t.p / "ca.key", "ca.test");
+  makeCert(t.p / "leaf.pem", t.p / "leaf.key", "localhost", t.p / "ca.pem", t.p / "ca.key",
+           {{NID_info_access, "caIssuers;URI:" + base + "/aia.crt,OCSP;URI:" + base + "/ocsp"},
+            {NID_crl_distribution_points, "URI:" + base + "/crl"}});
+  TestServer s(std::make_unique<httplib::SSLServer>((t.p / "leaf.pem").string().c_str(),
+                                                    (t.p / "leaf.key").string().c_str()));
+  HttpOutPool pool(fastOpt(), HttpOutPool::InsecureLoopbackForTests{});  // sem caFile: CAs do sistema
+  auto r = run(pool, get("https://localhost:" + std::to_string(s.port) + "/hello", {s.allow()}));
+  REQUIRE_FALSE(r.ok);  // a CA do teste não é confiável
+  INFO(r.error);
+  REQUIRE(contains(r.error, "certificado"));
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  REQUIRE(fetch.anyRequest.load() == 0);
+  REQUIRE(s.hitCount("/hello") == 0);
+}
+
+TEST_CASE("api: cb.http is refused inside cb.db.transaction and a large body is refused before copying") {
+  HttpEnv env;
+  auto fdb = std::make_shared<FakeDb>();
+  fdb->handler = [](const DbRequest&) {
+    DbResult res;
+    res.ok = true;
+    return res;
+  };
+  env.api.db = std::make_shared<DbPool>(fakeCfg(2), fakeFactory(fdb), fastPoolOpt());
+  nlohmann::json perm = env.perm();
+  perm["db"] = true;
+  env.addRes("a", env.lua(R"(
+    cb.on('resourceStart', function()
+      local ok, e = pcall(cb.db.transaction, function(tx)
+        tx.exec('UPDATE t SET a = 1')
+        cb.http.get(BASE .. '/hello')
+      end)
+      cb.log.info('tx ' .. tostring(ok) .. ' ' .. tostring(e))
+      ok, e = pcall(cb.http.post, BASE .. '/echo', string.rep('x', 1024 * 1024 + 1))
+      cb.log.info('big ' .. tostring(ok) .. ' ' .. tostring(e))
+    end)
+  )"), {}, nlohmann::json::object(), perm);
+  env.boot();
+  REQUIRE(env.waitLog("[a] big false"));
+  INFO(env.allLogs());
+  REQUIRE(env.hasLog("[a] tx false"));
+  REQUIRE(env.hasLog("cb.db.transaction"));
+  REQUIRE(env.hasLog("corpo grande demais"));
+  REQUIRE(env.srv->totalHits() == 0);
+  REQUIRE(fdb->count("ROLLBACK") == 1);
 }

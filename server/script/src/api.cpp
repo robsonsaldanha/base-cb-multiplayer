@@ -1506,6 +1506,11 @@ CBAPI_NOINLINE uint64_t httpSubmit(ApiRes* a, lua_State* L, HttpMethod m, const 
       if (t == LUA_TSTRING) {
         size_t bl = 0;
         const char* b = lua_tolstring(L, bodyIdx, &bl);
+        if (bl > sh.o.http->options().maxRequestBody) {  // antes de copiar (o texto pode ter até o teto do Lua)
+          setErr(e, std::string(fn) + ": corpo grande demais (máximo " +
+                        std::to_string(sh.o.http->options().maxRequestBody >> 10) + " KiB)");
+          return 0;
+        }
         r.body.assign(b, bl);
       } else if (t == LUA_TTABLE) {
         std::string jerr;

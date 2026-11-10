@@ -180,13 +180,13 @@ std::string v6Refusal(const uint8_t b[16], bool allowLoopback) {
 std::string HttpUrl::forLog() const {
   std::string s = scheme + "://" + host;
   if (explicitPort) s += ":" + std::to_string(port);
-  const auto q = target.find('?');
-  s += target.substr(0, q);
-  return s;
+  return s;  // nunca o caminho: webhooks (Discord, Telegram...) levam o token nele
 }
 
 std::string httpUrlForLog(std::string_view url) {
-  const auto cut = url.find_first_of("?#");
+  const auto sep = url.find("://");
+  const size_t from = sep == std::string_view::npos ? 0 : sep + 3;
+  const auto cut = url.find_first_of("/?#", from);
   return std::string(url.substr(0, cut));
 }
 
@@ -368,9 +368,56 @@ struct HttpJob {
 struct HttpOwner {
   std::deque<HttpJob> q;
   size_t pending = 0;  // na fila + em execução
+  size_t running = 0;  // em execução (teto maxInFlightPerOwner)
   size_t bytes = 0;    // corpos de pedido + respostas recebidas
   bool inRr = false;
 };
+
+// Contadores das resoluções de nome em andamento. Compartilhado com as threads de resolução, que são desanexadas e
+// podem viver mais que o pool (getaddrinfo não é cancelável).
+struct DnsShared {
+  std::mutex mu;
+  size_t active = 0;
+  std::unordered_map<uint64_t, size_t> perOwner;
+};
+
+// Uma resolução: a thread de resolução preenche; a thread do pool espera com prazo (ou desiste).
+struct DnsCall {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool done = false, ok = false;
+  std::vector<std::string> addrs;
+  std::string err;
+};
+
+bool systemResolve(const std::string& host, std::vector<std::string>& out, std::string& err) {
+  addrinfo hints{};
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  addrinfo* res = nullptr;
+  const int rc = getaddrinfo(host.c_str(), nullptr, &hints, &res);
+  if (rc != 0 || res == nullptr) {
+    err = "não foi possível resolver " + host;
+    return false;
+  }
+  for (addrinfo* p = res; p; p = p->ai_next) {
+    char buf[INET6_ADDRSTRLEN] = {};
+    const void* src = nullptr;
+    if (p->ai_family == AF_INET)
+      src = &reinterpret_cast<const sockaddr_in*>(p->ai_addr)->sin_addr;
+    else if (p->ai_family == AF_INET6)
+      src = &reinterpret_cast<const sockaddr_in6*>(p->ai_addr)->sin6_addr;
+    if (!src || !inet_ntop(p->ai_family, src, buf, sizeof buf)) continue;
+    std::string ip(buf);
+    if (std::find(out.begin(), out.end(), ip) == out.end()) out.push_back(std::move(ip));
+  }
+  freeaddrinfo(res);
+  if (out.empty()) {
+    err = "não foi possível resolver " + host;
+    return false;
+  }
+  return true;
+}
 
 struct HttpSlot {
   uint64_t id = 0, owner = 0;
@@ -401,6 +448,7 @@ struct HttpPoolState {
   bool stop = false;
   uint64_t nextId = 1;
   size_t exited = 0;
+  std::shared_ptr<DnsShared> dns = std::make_shared<DnsShared>();
 
   std::atomic<uint64_t> requests{0}, errors{0}, timeouts{0}, refused{0};
   std::atomic<int> busy{0};
@@ -428,19 +476,36 @@ struct HttpPoolState {
     if (it->second.pending == 0 && it->second.q.empty()) owners.erase(it);
   }
 
-  // Sob mu: próximo pedido em rodízio entre os donos.
+  // Sob mu: há pedido de algum dono abaixo do teto de threads?
+  bool hasWork() const {
+    for (uint64_t owner : rr) {
+      auto it = owners.find(owner);
+      if (it != owners.end() && it->second.running < opt.maxInFlightPerOwner) return true;
+    }
+    return false;
+  }
+
+  // Sob mu: próximo pedido em rodízio entre os donos que estão abaixo do teto de threads.
   bool pick(HttpJob& out) {
     if (rr.empty()) return false;
     if (rr.size() > 1 && rr.front() == lastServed) {
       rr.push_back(rr.front());
       rr.pop_front();
     }
-    const uint64_t owner = rr.front();
-    rr.pop_front();
+    auto pos = rr.end();
+    for (auto it = rr.begin(); it != rr.end(); ++it)
+      if (owners[*it].running < opt.maxInFlightPerOwner) {
+        pos = it;
+        break;
+      }
+    if (pos == rr.end()) return false;
+    const uint64_t owner = *pos;
+    rr.erase(pos);
     auto& o = owners[owner];
     out = std::move(o.q.front());
     o.q.pop_front();
     --queued;
+    ++o.running;
     if (o.q.empty())
       o.inRr = false;
     else
@@ -473,30 +538,78 @@ struct HttpPoolState {
     slots[w].charged = 0;
   }
 
-  std::vector<std::string> resolve(const std::string& host, std::string& err) const {
-    std::vector<std::string> out;
-    addrinfo hints{};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    addrinfo* res = nullptr;
-    const int rc = getaddrinfo(host.c_str(), nullptr, &hints, &res);
-    if (rc != 0 || res == nullptr) {
-      err = "não foi possível resolver " + host;
-      return out;
+  // Resolve `host` numa thread de resolução própria (fora das threads do pool), esperando até `deadline` ou até o
+  // pedido ser cancelado/encerrado. Lista vazia + err (timedOut = prazo) se não deu.
+  std::vector<std::string> resolve(size_t w, uint64_t owner, const std::string& host, Clock::time_point deadline,
+                                   std::string& err, bool& timedOut) {
+    timedOut = false;
+    {
+      std::lock_guard<std::mutex> lk(dns->mu);
+      if (dns->active >= opt.maxResolvers || dns->perOwner[owner] >= opt.maxResolversPerOwner) {
+        if (dns->perOwner[owner] == 0) dns->perOwner.erase(owner);
+        err = "resolvedor DNS ocupado (resoluções presas demais; tente de novo depois)";
+        return {};
+      }
+      ++dns->active;
+      ++dns->perOwner[owner];
     }
-    for (addrinfo* p = res; p; p = p->ai_next) {
-      char buf[INET6_ADDRSTRLEN] = {};
-      const void* src = nullptr;
-      if (p->ai_family == AF_INET)
-        src = &reinterpret_cast<const sockaddr_in*>(p->ai_addr)->sin_addr;
-      else if (p->ai_family == AF_INET6)
-        src = &reinterpret_cast<const sockaddr_in6*>(p->ai_addr)->sin6_addr;
-      if (!src || !inet_ntop(p->ai_family, src, buf, sizeof buf)) continue;
-      std::string ip(buf);
-      if (std::find(out.begin(), out.end(), ip) == out.end()) out.push_back(std::move(ip));
+    auto call = std::make_shared<DnsCall>();
+    try {
+      std::thread([d = dns, call, fn = opt.resolver, host, owner] {
+        std::vector<std::string> addrs;
+        std::string e;
+        bool ok = false;
+        try {
+          ok = fn ? fn(host, addrs, e) : systemResolve(host, addrs, e);
+        } catch (...) {
+          ok = false;
+          e = "erro interno do resolvedor";
+        }
+        {
+          std::lock_guard<std::mutex> lk(d->mu);
+          if (d->active > 0) --d->active;
+          if (auto it = d->perOwner.find(owner); it != d->perOwner.end() && --it->second == 0) d->perOwner.erase(it);
+        }
+        std::lock_guard<std::mutex> lk(call->mu);
+        call->done = true;
+        call->ok = ok;
+        call->addrs = std::move(addrs);
+        call->err = std::move(e);
+        call->cv.notify_all();
+      }).detach();
+    } catch (...) {
+      std::lock_guard<std::mutex> lk(dns->mu);
+      if (dns->active > 0) --dns->active;
+      if (auto it = dns->perOwner.find(owner); it != dns->perOwner.end() && --it->second == 0) dns->perOwner.erase(it);
+      err = "resolvedor DNS indisponível";
+      return {};
     }
-    freeaddrinfo(res);
-    if (out.empty()) err = "não foi possível resolver " + host;
+    std::unique_lock<std::mutex> lk(call->mu);
+    while (!call->done) {
+      if (Clock::now() >= deadline) {
+        timedOut = true;
+        err = "tempo esgotado na resolução DNS de " + host;
+        return {};
+      }
+      call->cv.wait_for(lk, milliseconds(25));
+      if (call->done) break;
+      lk.unlock();
+      bool gone;
+      {
+        std::lock_guard<std::mutex> plk(mu);
+        gone = slots[w].cancelled || slots[w].stopping;
+      }
+      lk.lock();
+      if (gone) {
+        err = "pedido cancelado durante a resolução DNS de " + host;
+        return {};
+      }
+    }
+    if (!call->ok) {
+      err = call->err.empty() ? "não foi possível resolver " + host : call->err;
+      return {};
+    }
+    std::vector<std::string> out = std::move(call->addrs);
     // IPv4 primeiro: rota IPv6 quebrada (comum em VPS) ou porta fechada no Windows (~2 s por tentativa) não
     // consomem o prazo antes de tentar o IPv4. A ordem relativa de cada família é a do resolvedor.
     std::stable_partition(out.begin(), out.end(), [](const std::string& ip) { return ip.find(':') == std::string::npos; });
@@ -528,14 +641,22 @@ struct HttpPoolState {
     cli->set_compress(false);
     cli->set_path_encode(false);
     cli->set_payload_max_length(opt.maxResponseBody);
-    // Com outros endereços na reserva, um endereço que não responde não leva o prazo inteiro.
-    cli->set_connection_timeout(moreAddrs ? std::min(left, milliseconds(3000)) : left);
+    // connect() não é interrompido por stop() (o socket só existe depois): no máximo 3 s por endereço, para um
+    // endereço que não responde não segurar a thread (nem o encerramento) pelo prazo inteiro.
+    (void)moreAddrs;
+    cli->set_connection_timeout(std::min(left, milliseconds(3000)));
     cli->set_read_timeout(left);
     cli->set_write_timeout(left);
     cli->set_max_timeout(left);
     if (cur.scheme == "https") {
       cli->enable_server_certificate_verification(true);
       cli->enable_server_hostname_verification(true);
+#ifdef CPPHTTPLIB_WINDOWS_AUTOMATIC_ROOT_CERTIFICATES_UPDATE
+      // Sem a verificação do Schannel: o CryptoAPI buscaria na rede as URLs do próprio certificado (AIA, CRL, OCSP),
+      // por fora da checagem de endereços (SSRF). A cadeia é verificada pelo OpenSSL contra a cópia das lojas ROOT e
+      // CA do Windows (carregada pelo httplib). Servidor com cadeia incompleta (sem intermediário) falha.
+      cli->enable_windows_certificate_verification(false);
+#endif
       if (!opt.caFile.empty()) cli->set_ca_cert_path(opt.caFile);
     }
     {
@@ -665,8 +786,9 @@ struct HttpPoolState {
         return HttpOutResult::fail(cur.forLog() + ": host fora de permissions.http do resource");
       }
       std::string err;
-      const auto addrs = resolve(cur.host, err);
-      if (addrs.empty()) return HttpOutResult::fail(err);
+      bool dnsTimedOut = false;
+      const auto addrs = resolve(w, job.req.owner, cur.host, deadline, err, dnsTimedOut);
+      if (addrs.empty()) return HttpOutResult::fail(err, dnsTimedOut);
       for (const auto& ip : addrs) {
         const std::string why = httpAddressRefusal(ip, test);
         if (!why.empty()) {
@@ -711,7 +833,13 @@ struct HttpPoolState {
         body.clear();
         contentType.clear();
       }
-      if (next.host != cur.host || next.port != cur.port) headers.clear();  // credenciais não vão para outro host
+      if (next.host != cur.host || next.port != cur.port) {
+        // Credenciais não vão para outro host: cabeçalhos do script descartados; 307/308 manteriam o corpo → recusa.
+        if ((st == 307 || st == 308) && !body.empty())
+          return HttpOutResult::fail("redirecionamento " + std::to_string(st) + " com corpo para outro host (" +
+                                     next.forLog() + ") não é permitido");
+        headers.clear();
+      }
       cur = std::move(next);
     }
   }
@@ -721,9 +849,9 @@ struct HttpPoolState {
       HttpJob job;
       {
         std::unique_lock<std::mutex> lk(mu);
-        cv.wait(lk, [&] { return stop || queued > 0; });
+        cv.wait(lk, [&] { return stop || hasWork(); });
         if (stop) break;
-        pick(job);
+        if (!pick(job)) continue;
         slots[w] = HttpSlot{};
         slots[w].id = job.id;
         slots[w].owner = job.req.owner;
@@ -749,7 +877,9 @@ struct HttpPoolState {
         cancelled = slots[w].cancelled;
         uncharge(w, job.req.owner);
         slots[w] = HttpSlot{};
+        if (auto it = owners.find(job.req.owner); it != owners.end() && it->second.running > 0) --it->second.running;
         release(job.req.owner, job.reqBytes);
+        cv.notify_all();  // o dono pode ter voltado a ficar abaixo do teto
       }
       requests.fetch_add(1);
       if (!r.ok) errors.fetch_add(1);
@@ -801,6 +931,9 @@ void HttpOutPool::init(HttpOutOptions opt, bool test) {
   auto& s = *st_;
   opt.threads = std::clamp(opt.threads, 1, 64);
   opt.maxRedirects = std::clamp(opt.maxRedirects, 0, 10);
+  if (opt.maxInFlightPerOwner == 0) opt.maxInFlightPerOwner = std::max(1, opt.threads / 2);
+  opt.maxResolvers = std::max<size_t>(1, opt.maxResolvers);
+  opt.maxResolversPerOwner = std::max<size_t>(1, opt.maxResolversPerOwner);
   if (opt.timeout.count() < 1) opt.timeout = milliseconds(1);
   s.opt = std::move(opt);
   s.test = test;
@@ -877,6 +1010,7 @@ uint64_t HttpOutPool::submit(HttpOutRequest r, Done done, std::string& err) {
       "host",       "content-length",   "transfer-encoding", "connection", "accept-encoding", "te",
       "upgrade",    "keep-alive",       "proxy-connection",  "trailer",    "expect",          "proxy-authorization"};
   size_t hbytes = 0;
+  bool sawContentType = false;
   HttpHeaders hs;
   hs.reserve(r.headers.size());
   for (auto& [k, v] : r.headers) {
@@ -900,8 +1034,18 @@ uint64_t HttpOutPool::submit(HttpOutRequest r, Done done, std::string& err) {
         err = "cabeçalho '" + k + "' não pode ser definido pelo script";
         return 0;
       }
+    for (const auto& [k2, v2] : hs)
+      if (ieq(k, k2)) {
+        err = "cabeçalho '" + k + "' repetido";
+        return 0;
+      }
     hbytes += k.size() + v.size() + 4;
     if (ieq(k, "content-type")) {
+      if (sawContentType) {
+        err = "cabeçalho 'Content-Type' repetido";
+        return 0;
+      }
+      sawContentType = true;
       r.contentType = v;
       continue;
     }

@@ -57,30 +57,41 @@ Itens levantados nas revisões que não bloquearam o merge, com o momento em que
   - MySQL (não MariaDB): `max_execution_time` só vale para SELECT; o resto depende do timeout de leitura do cliente;
   - subida com o banco fora: bans do banco não valem até a carga (log CRÍTICO após 5 falhas; `/metrics.db.bansLoaded`).
 - HTTP de saída (Task 6, `cb.http`), resíduos e decisões:
-  - `getaddrinfo` não é cancelável: DNS lento segura uma thread do pool (4) até o resolvedor do SO desistir. O script
-    recebe "tempo esgotado" pelo prazo do lado do script (fila 10 s + execução 10 s + 1 s); no encerramento a thread
-    presa é desanexada (log) e termina sozinha.
-  - `httplib::Client::stop()` não interrompe um `connect` em andamento (o socket só existe depois): endereço que não
-    responde segura a thread até o connection timeout (restante do prazo; no máximo 3 s se houver outro endereço na
-    reserva). IPv4 é tentado antes do IPv6 (sem Happy Eyeballs).
-  - Cabeçalhos da resposta: o httplib lê até 100 linhas de 8 KiB (~800 KiB por pedido no pior caso) antes de o pool
-    conferir o teto de 64 KiB (recusa depois de ler). Baixar isso exigiria `CPPHTTPLIB_HEADER_MAX_*` globais (o resto
-    do servidor usa o mesmo header).
+  - DNS em threads de resolução próprias (desanexadas), com o prazo do pedido: a thread do pool não fica presa e
+    cancelar/parar o resource a solta na hora. Mas `getaddrinfo` não é cancelável: a resolução presa continua até o
+    resolvedor do SO desistir (glibc: até ~30 s) e conta num teto de 16 no pool e 2 por resource (geração); acima
+    disso o pedido falha na hora ("resolvedor DNS ocupado"). Um resource que se reinicia várias vezes com DNS travado
+    pode encher o teto global por esse tempo.
+  - `httplib::Client::stop()` não interrompe um `connect` em andamento (o socket só existe depois): cada endereço tem
+    no máximo 3 s de connect, então parar um resource devolve a thread em ≤ 3 s. IPv4 antes de IPv6 (sem Happy
+    Eyeballs).
+  - Um resource ocupa no máximo 2 das 4 threads ao mesmo tempo (`maxInFlightPerOwner`); a fila é em rodízio entre
+    resources.
+  - TLS no Windows: a verificação do Schannel (`CPPHTTPLIB_WINDOWS_AUTOMATIC_ROOT_CERTIFICATES_UPDATE`, ligada por
+    padrão no httplib 0.65) está DESLIGADA por pedido (`enable_windows_certificate_verification(false)`): ela fazia o
+    CryptoAPI buscar as URLs AIA/CRL/OCSP do certificado do servidor (SSRF por fora da checagem de endereços;
+    comprovado por teste). A cadeia é verificada pelo OpenSSL contra a cópia das lojas ROOT+CA do Windows feita a
+    cada pedido. Consequências: raízes que o Windows só baixaria sob demanda (não presentes na loja local) e
+    servidores que não mandam o intermediário falham; não há checagem de revogação (nem no Linux).
+  - Logs e erros devolvidos ao Lua só levam `scheme://host[:porta]` (nunca caminho/query: tokens de webhook).
+  - Cabeçalhos da resposta: o httplib lê até 100 linhas de 8 KiB (~800 KiB por pedido no pior caso; ≤ ~3,2 MiB com
+    4 threads) antes de o pool conferir o teto de 64 KiB (recusa depois de ler). Baixar isso exigiria
+    `CPPHTTPLIB_HEADER_MAX_*` globais (o resto do servidor usa o mesmo header).
   - Teto de 4 MiB por resource conta corpo do pedido + resposta recebida até a resposta sair do pool; a resposta já
     entregue fica na caixa de entrada até o próximo onTick (limitada por `maxHttpPending` = 64 por resource).
-  - CAs: repositório do sistema (Windows ROOT+CA; Linux caminhos padrão do OpenSSL → a distribuição Linux precisa de
-    `ca-certificates`). `HttpOutOptions::caFile` existe, mas não há chave no `server.cfg`.
+  - Cada pedido cria um `SSL_CTX` e reimporta a loja do Windows (CPU por pedido; sem cache).
+  - CAs: Linux usa os caminhos padrão do OpenSSL → a distribuição Linux precisa de `ca-certificates`.
+    `HttpOutOptions::caFile` existe, mas não há chave no `server.cfg`. O caminho das CAs do sistema só é exercitado
+    pelo teste de AIA (recusa); não há teste de sucesso contra uma CA do sistema (sem rede externa nos testes).
   - Sem `/metrics` para o HTTP (`HttpOutPool::metrics()` existe; falta expor).
-  - Redirecionamento para outro host/porta descarta os cabeçalhos do script (credenciais); 301/302 de POST e 303 viram
-    GET sem corpo. `Expect: 100-continue` automático do httplib para corpos ≥ 1 KiB.
-  - `permissions.http`: maiúsculas, IP, curinga e não ASCII agora são recusados no `resource.json` (antes maiúsculas
-    eram convertidas). Porta diferente de 443 só com `"host:porta"`.
+  - Redirecionamento para outro host/porta descarta os cabeçalhos do script e recusa 307/308 com corpo; 301/302 de
+    POST e 303 viram GET sem corpo. `Expect: 100-continue` automático do httplib para corpos ≥ 1 KiB.
+  - `permissions.http`: maiúsculas, IP, curinga e não ASCII recusados no `resource.json` (antes maiúsculas eram
+    convertidas). Porta diferente de 443 só com `"host:porta"`.
   - `cb.http` dentro de `cb.db.transaction` é recusado (a transação seguraria a conexão do banco).
-  - Pool do banco (Task 5, M10): continua com fila FIFO única. Recomendação: quando valer a pena, usar o mesmo rodízio
-    por dono do `HttpOutPool` (fila por resource; a vez de outro dono vem antes do 2º pedido de quem acabou de ser
-    atendido). Prioridade baixa: cada resource já tem teto de 1024 pedidos / 16 MiB no banco.
-  - TLS só foi exercitado contra servidor local com certificado gerado no teste (`caFile`); o caminho das CAs do
-    sistema não tem teste automatizado (sem rede externa nos testes).
+  - Pool do banco (Task 5, M10): continua com fila FIFO única. Recomendação: quando valer a pena, usar o mesmo desenho
+    do `HttpOutPool` (fila por resource em rodízio + teto de conexões por resource). Prioridade baixa: cada resource
+    já tem teto de 1024 pedidos / 16 MiB no banco.
 - Eventos servidor → cliente de scripts: cota por jogador de `scripting.eventOutKBps` (padrão 8 KiB/s = 64 kbps) com
   rajada `eventOutBurstKB` (32 KiB) e 48 B de overhead por mensagem; teto de 8192 eventos de saída por tick. Um
   gamemode que precise de mais banda por jogador tem de subir a cota (e conferir o orçamento de 64 kbps da spec).

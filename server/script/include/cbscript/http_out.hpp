@@ -5,8 +5,10 @@
 // submit() valida e enfileira; `done` é chamado depois, numa thread do pool.
 //
 // Regras (fora do modo de teste):
-// - só https; certificado e nome do host sempre verificados (CAs do sistema: repositório ROOT/CA do Windows, caminhos
-//   padrão do OpenSSL no Linux; HttpOutOptions::caFile troca por um arquivo PEM);
+// - só https; certificado e nome do host sempre verificados pelo OpenSSL (CAs do sistema: cópia das lojas ROOT/CA do
+//   Windows, caminhos padrão do OpenSSL no Linux; HttpOutOptions::caFile troca por um arquivo PEM). A verificação do
+//   Schannel (Windows) fica desligada: ela buscaria na rede as URLs AIA/CRL/OCSP do certificado do servidor, por fora
+//   da checagem de endereços. Nada é buscado durante a verificação; cadeia incompleta = falha;
 // - host exato da lista do resource (permissions.http): só nomes (nada de IP literal na URL nem na lista), minúsculas,
 //   sem curinga; porta 443, ou outra se a entrada da lista for "host:porta";
 // - DNS resolvido uma vez; TODOS os endereços precisam ser públicos (httpAddressRefusal) e a conexão vai para um
@@ -18,16 +20,18 @@
 //   TLS + envio + leitura); sem compressão (Accept-Encoding: identity);
 // - por dono (resource): até 64 pedidos no pool e 4 MiB de corpos (pedido + resposta recebida) em andamento; a fila é
 //   repartida em rodízio entre os donos (a vez de outro dono vem antes do 2º pedido de quem acabou de ser atendido);
-//   espera máxima na fila: queueTimeout.
-// - DNS: endereços IPv4 são tentados antes dos IPv6; com mais endereços na reserva, cada conexão tem no máximo 3 s.
-// - logs: nunca corpo nem cabeçalhos; a URL vai sem a query (httpUrlForLog).
+//   espera máxima na fila: queueTimeout. Um dono ocupa no máximo maxInFlightPerOwner (2) threads ao mesmo tempo.
+// - DNS: em threads de resolução próprias, com o prazo do pedido (a thread do pool não fica presa; cancelar solta na
+//   hora); resoluções presas contam num teto global e por dono. IPv4 antes de IPv6; connect ≤ 3 s por endereço.
+// - logs e erros: nunca corpo, cabeçalhos, caminho ou query; só scheme://host[:porta] (httpUrlForLog/forLog) — tokens
+//   de webhook (Discord, Telegram) ficam no caminho.
 //
 // Modo de teste (só pelo construtor com InsecureLoopbackForTests): aceita http:// e endereços de loopback
 // (127.0.0.0/8, ::1). Todo o resto (lista, IPs privados, limites) continua valendo.
 //
 // Encerramento: o destrutor falha os pedidos na fila, fecha os sockets dos que estão em andamento e espera as threads
-// por `shutdownWait`; uma thread presa onde não dá para cancelar (getaddrinfo) é desanexada e termina sozinha depois
-// (o estado é compartilhado), sem chamar `done` nem registrar log.
+// por `shutdownWait` (4 s > 3 s de connect). Threads de resolução presas em getaddrinfo são desanexadas desde o início
+// e terminam sozinhas (só tocam o próprio estado compartilhado).
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -48,7 +52,7 @@ struct HttpUrl {
   int port = 443;
   bool explicitPort = false;
   std::string target = "/";  // caminho + query (sem o fragmento)
-  std::string forLog() const;  // scheme://host[:porta]/caminho (sem a query)
+  std::string forLog() const;  // scheme://host[:porta] (nunca o caminho nem a query)
 };
 
 // Analisa a URL. `allowHttp` só no modo de teste. Recusa: esquema que não seja https, usuário/senha, IP literal
@@ -70,7 +74,7 @@ bool resolveHttpRedirect(const HttpUrl& base, std::string_view location, HttpUrl
 // documentação, IPv6 com IPv4 embutido proibido...). `allowLoopback` só no modo de teste. Texto que não é IP → motivo.
 std::string httpAddressRefusal(std::string_view ip, bool allowLoopback = false);
 
-// URL sem query nem fragmento (para logs e mensagens de erro).
+// Só scheme://host[:porta] da URL (para logs e mensagens de erro).
 std::string httpUrlForLog(std::string_view url);
 
 enum class HttpMethod : uint8_t { Get, Post };
@@ -112,8 +116,17 @@ struct HttpOutOptions {
   size_t maxResponseHeaderBytes = 64 * 1024;
   int maxRedirects = 3;
   size_t maxPendingPerOwner = 64;
+  size_t maxInFlightPerOwner = 2;  // threads ocupadas por um dono ao mesmo tempo (0 = threads/2, mínimo 1)
+  // Resolução de nomes: threads próprias (fora das threads do pool), com o prazo do pedido. Uma resolução presa
+  // (getaddrinfo não é cancelável) continua contando até voltar: no máximo maxResolvers no total e
+  // maxResolversPerOwner por dono; acima disso o pedido falha na hora.
+  size_t maxResolvers = 16;
+  size_t maxResolversPerOwner = 2;
+  // Resolvedor (chamado numa thread de resolução). Vazio = getaddrinfo. Os endereços devolvidos passam pela mesma
+  // checagem (httpAddressRefusal). Só C++ (testes); nenhum script ou config chega aqui.
+  std::function<bool(const std::string& host, std::vector<std::string>& addrs, std::string& err)> resolver;
   size_t maxBytesPerOwner = size_t{4} << 20;  // corpos de pedido + respostas recebidas, em andamento
-  std::chrono::milliseconds shutdownWait{2000};
+  std::chrono::milliseconds shutdownWait{4000};
   std::string caFile;  // PEM; vazio = CAs do sistema
   // Avisos do pool (thread presa no encerramento...). Chamado das threads do pool. Vazio = spdlog.
   std::function<void(bool error, const std::string&)> log;
