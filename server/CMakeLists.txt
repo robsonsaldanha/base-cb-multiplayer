@@ -21,3 +21,4 @@ add_executable(cbserver_tests tests/test_config.cpp tests/test_metrics.cpp tests
 target_link_libraries(cbserver_tests PRIVATE cbserver_core Catch2::Catch2WithMain)
 target_compile_definitions(cbserver_tests PRIVATE CBSERVER_CFG_EXAMPLE="${CMAKE_CURRENT_SOURCE_DIR}/server.cfg.example")
 catch_discover_tests(cbserver_tests)
+target_link_libraries(cb-server PRIVATE cbscript)

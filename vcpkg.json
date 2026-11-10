@@ -8,6 +8,10 @@
     { "name": "cpp-httplib", "features": ["openssl"] },
     "nlohmann-json",
     "spdlog",
-    "catch2"
-  ]
+    "catch2",
+    "lua",
+    "sol2",
+    "libmariadb"
+  ],
+  "overrides": [{ "name": "lua", "version": "5.4.7" }]
 }
