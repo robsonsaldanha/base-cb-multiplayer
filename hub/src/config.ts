@@ -29,6 +29,10 @@ export interface HubConfig {
   allowPrivateServers: boolean;
   rateLimit: boolean;
   logLevel: string;
+  /** Token do GitHub (só leitura de Releases do repo privado). Vazio → rotas de update/mod/dl respondem 503. Nunca logar. */
+  githubToken: string;
+  /** `dono/repo` dos Releases (`launcher-vX.Y.Z`, `mod-pN-vX.Y.Z`). */
+  releasesRepo: string;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
@@ -48,10 +52,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
     allowPrivateServers: env.HUB_ALLOW_PRIVATE_SERVERS === '1',
     rateLimit: env.HUB_RATE_LIMIT !== '0',
     logLevel: env.HUB_LOG_LEVEL ?? 'info',
+    githubToken: (env.HUB_GITHUB_TOKEN ?? '').trim(),
+    releasesRepo: (env.HUB_RELEASES_REPO ?? '').trim(),
   };
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('HUB_PORT inválida');
   if (!devLogin && (!cfg.discordClientId || !cfg.discordClientSecret)) {
     throw new Error('DISCORD_CLIENT_ID e DISCORD_CLIENT_SECRET são obrigatórios (ou HUB_DEV_LOGIN=1 para testes locais)');
+  }
+  const repoOk = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/.test(cfg.releasesRepo)
+    && cfg.releasesRepo.split('/').every((p) => p !== '.' && p !== '..');
+  if (cfg.githubToken && !repoOk) {
+    throw new Error('HUB_RELEASES_REPO (dono/repo) é obrigatório quando HUB_GITHUB_TOKEN está definido');
   }
   if (devLogin) assertDevLoginSafe(cfg);
   return cfg;

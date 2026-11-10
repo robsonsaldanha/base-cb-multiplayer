@@ -7,6 +7,7 @@ import { loadOrCreateKeyRing } from './keyring';
 import { createDiscordClient } from './discord';
 import { httpProbe } from './probe';
 import { buildApp } from './app';
+import { createGitHubReleases } from './github';
 
 const config = loadConfig();
 mkdirSync(config.dataDir, { recursive: true });
@@ -14,7 +15,8 @@ const store = new Store(openDb(join(config.dataDir, 'hub.sqlite')));
 const keyring = loadOrCreateKeyRing(join(config.dataDir, 'keys'));
 const discord = createDiscordClient(config.discordClientId, config.discordClientSecret);
 const now = () => Math.floor(Date.now() / 1000);
-const app = await buildApp({ config, store, keyring, discord, probe: httpProbe, now });
+const releases = config.githubToken ? createGitHubReleases({ token: config.githubToken, repo: config.releasesRepo }) : undefined;
+const app = await buildApp({ config, store, keyring, discord, probe: httpProbe, now, releases });
 const PURGE_INTERVAL_MS = 10 * 60 * 1000;
 function purge(): void {
   try { store.purgeExpired(now()); } catch (err) { app.log.error(err); }

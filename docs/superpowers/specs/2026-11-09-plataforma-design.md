@@ -89,6 +89,9 @@ Fora do escopo: anti-cheat em nível de kernel; voz (decidir depois); loja/monet
 | GET | `/v1/bans/global` | chave do servidor | `[{discordId, reason, createdAt}]`; só se o servidor tem `useGlobalBans` (senão 403 `not_opted_in`) |
 | POST/DELETE | `/v1/admin/bans/global` | sessão de admin da plataforma | gerenciar lista global |
 | PATCH | `/v1/admin/servers/:id` `{featured}` | sessão de admin da plataforma | liga/desliga o destaque (`{featured: boolean}`, nada mais); responde `{id, featured}`; 401 sem login, 403 não admin, 404 servidor inexistente; auditado no log (did, serverId, valor, resultado), mesmo com `HUB_LOG_LEVEL` alto; aparece na lista em até 5 s (cache) |
+| GET | `/v1/launcher/update/{target}/{arch}/{current_version}` | — | updater do launcher (Tauri v2 *dynamic update server*): `current_version` não-semver → 400 `invalid_version`; `target` ≠ `windows` ou `arch` ≠ `x86_64`, sem release ou versão já igual/maior → **204**; senão **200** `UpdateInfo {version, notes, pub_date, url, signature}` com o maior release `launcher-vX.Y.Z` (semver) que tem `*-setup.exe` + `*-setup.exe.sig`; `url` = `{HUB_PUBLIC_URL}/v1/dl/launcher-vX.Y.Z/<asset>`, `signature` = **conteúdo** do `.sig` (minisign; quem confere é o launcher) |
+| GET | `/v1/mod/latest?protocol=N` | — | `ModInfo {version, protocol, url, sha256, size, signature}` do maior `mod-pN-vX.Y.Z` com `cbmp-mod-pN-vX.Y.Z.zip` + `.zip.sig` + `.zip.sha256` (sha256 lido do asset); nenhum → 404 `no_mod`; `protocol` inválido → 400 `invalid_query` |
+| GET | `/v1/dl/{releaseTag}/{asset}` | — | repassa em stream o asset do GitHub (`Content-Type: application/octet-stream`, `Content-Length`); só tags `launcher-vX.Y.Z`/`mod-pN-vX.Y.Z` publicadas e assets listados nelas, senão 404 `not_found`; falha no GitHub → 502 `github_error` |
 
 Regras:
 - Chave do servidor: 32 bytes aleatórios, mostrada uma única vez; Hub guarda só `sha256`.
@@ -97,6 +100,7 @@ Regras:
 - Autenticação da API: `Authorization: Bearer at_…` em todas as rotas de sessão. O cookie `cbmp_session` (HttpOnly, SameSite=Lax) só vale no painel (`/panel`, com checagem de Origin/Sec-Fetch-Site), em `GET /v1/me` e em `POST /v1/auth/logout`. Formulários (`application/x-www-form-urlencoded`) só são aceitos no painel.
 - OAuth: `state` de uso único (10 min) amarrado ao navegador pelo cookie `cbmp_oauth`; callback com `state` diferente do cookie → `bad_state`. Launcher é cliente público: PKCE S256 obrigatório, `codeVerifier` com 43–128 chars `[A-Za-z0-9._~-]`.
 - Rate limit por IP e por chave/sessão. Erros com código estável (`{error: "codigo", message}`).
+- Releases (update/mod/dl): `HUB_GITHUB_TOKEN` (só leitura do repo privado; nunca logado, nunca repassado) + `HUB_RELEASES_REPO` (`dono/repo`). Sem token → as três rotas respondem `503 updates_disabled`. Lista de releases em cache por 60 s (inclui o texto dos `.sig`/`.sha256` ≤ 8 KiB); drafts e prereleases ignorados; release sem os assets exigidos é pulado. Download segue o redirect do GitHub sem o token. 60 req/min por IP nas três rotas. O Hub **não** confere assinaturas: o launcher confere com a chave pública embutida.
 - Banco interno do Hub: SQLite (não exposto). MySQL é o banco dos servidores de jogo.
 - Chave privada de assinatura só na VPS, com `kid` para rotação.
 
