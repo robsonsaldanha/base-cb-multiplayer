@@ -7,14 +7,14 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen }));
 
 import { baseSettings, fakeBackend, SERVERS } from "../test-utils";
-import { loadServers, pings, refreshPings, serverList, stopServers } from "./servers";
+import { byIds, loadServers, MAX_PING_IDS, pings, refreshPings, serverList, stopServers } from "./servers";
 import { loadSettings, pushRecent, settings, toggleFavorite } from "./settings";
 import { notice } from "./notice";
 
 describe("lista de servidores", () => {
   beforeEach(() => {
     stopServers();
-    pings.set({});
+    pings.set(new Map());
   });
   afterEach(() => {
     stopServers();
@@ -75,9 +75,65 @@ describe("lista de servidores", () => {
     });
     await refreshPings(["cb", "hl"]);
     expect(b.calls("ping_servers")).toEqual([{ ids: ["cb", "hl"] }]);
-    expect(get(pings)).toEqual({ cb: 24, hl: null });
+    expect(get(pings)).toEqual(new Map([["cb", 24], ["hl", null]]));
     await refreshPings([]);
     expect(b.calls("ping_servers")).toHaveLength(1);
+  });
+});
+
+describe("lista de servidores: dados hostis e corridas", () => {
+  beforeEach(() => stopServers());
+  afterEach(() => {
+    stopServers();
+    vi.useRealTimers();
+  });
+
+  it("id repetido (Hub ou cache antigo): fica a primeira ocorrência", async () => {
+    const dup = [SERVERS[0]!, { ...SERVERS[0]!, name: "Impostor" }, SERVERS[2]!, SERVERS[2]!];
+    fakeBackend(invoke, listen, { list_servers: () => dup });
+    await loadServers();
+    expect(get(serverList).servers.map((s) => s.name)).toEqual(["Castelo Bruxo RP", "Hogsmeade Life"]);
+
+    fakeBackend(invoke, listen, {
+      list_servers: () => {
+        throw { code: "hub_unreachable", message: "x" };
+      },
+      cached_servers: () => ({ savedAt: 1, servers: dup }),
+    });
+    await loadServers();
+    expect(get(serverList).servers).toHaveLength(2);
+    expect(byIds(["hl", "cb", "hl", "nada"], dup).map((s) => s.id)).toEqual(["hl", "cb"]);
+  });
+
+  it("ids com nome de propriedade de objeto não viram ping nem bloqueio falsos", async () => {
+    fakeBackend(invoke, listen, {
+      ping_servers: (a) => (a!.ids as string[]).map((id) => ({ id, ms: id === "__proto__" ? 5 : null })),
+    });
+    await refreshPings(["constructor", "__proto__", "toString"]);
+    const p = get(pings);
+    expect(p.get("constructor")).toBeNull();
+    expect(p.get("__proto__")).toBe(5);
+    expect(p.get("hasOwnProperty")).toBeUndefined();
+  });
+
+  it("ping corta nos mesmos 200 do Rust", async () => {
+    const b = fakeBackend(invoke, listen, { ping_servers: (a) => (a!.ids as string[]).map((id) => ({ id, ms: 1 })) });
+    await refreshPings(Array.from({ length: 300 }, (_, i) => `s${i}`));
+    expect((b.calls("ping_servers")[0] as { ids: string[] }).ids).toHaveLength(MAX_PING_IDS);
+  });
+
+  it("duas cargas ao mesmo tempo deixam um só timer de nova tentativa", async () => {
+    vi.useFakeTimers();
+    const b = fakeBackend(invoke, listen, {
+      list_servers: () => {
+        throw { code: "hub_unreachable", message: "x" };
+      },
+      cached_servers: () => null,
+    });
+    await Promise.all([loadServers(), loadServers()]);
+    expect(b.calls("list_servers")).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(b.calls("list_servers")).toHaveLength(3);
   });
 });
 

@@ -1,11 +1,11 @@
 <script lang="ts">
   import ListStatus from "../components/ListStatus.svelte";
   import ServerList from "../components/ServerList.svelte";
-  import { serverList } from "../lib/servers";
+  import { byIds, serverList } from "../lib/servers";
   import { settings } from "../lib/settings";
   import { pingVisible } from "../lib/visiblePings.svelte";
 
-  const shown = $derived(($settings?.recent ?? []).flatMap((id) => $serverList.servers.filter((s) => s.id === id)));
+  const shown = $derived(byIds($settings?.recent ?? [], $serverList.servers));
 
   pingVisible(
     () => shown.map((s) => s.id),

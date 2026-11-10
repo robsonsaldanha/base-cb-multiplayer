@@ -42,7 +42,7 @@
           </div>
           <Chips tags={s.tags} locale={s.locale} />
           <span class="players" class:full={s.players >= s.maxPlayers}>{s.players}/{s.maxPlayers}</span>
-          <span class="ping">{formatPing($pings[s.id])}</span>
+          <span class="ping">{formatPing($pings.get(s.id))}</span>
           <PlayButton server={s} nav="play" />
         </li>
       {/each}

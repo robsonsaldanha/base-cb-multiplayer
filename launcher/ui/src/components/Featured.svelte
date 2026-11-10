@@ -17,7 +17,7 @@
       <p class="desc">{s.description}</p>
       <div class="meta">
         <span class="players" title="Jogadores">{s.players}/{s.maxPlayers}</span>
-        <span class="ping" title="Ping">{formatPing($pings[s.id])}</span>
+        <span class="ping" title="Ping">{formatPing($pings.get(s.id))}</span>
         <Chips tags={s.tags} locale={s.locale} />
       </div>
       <PlayButton server={s} big />

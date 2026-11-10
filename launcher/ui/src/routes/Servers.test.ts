@@ -174,4 +174,24 @@ describe("Servidores", () => {
     await fireEvent.keyDown(plays.at(-2)!, { key: "Home" });
     expect(document.activeElement).toBe(plays[0]);
   });
+
+  it("id repetido do Hub e nos favoritos não quebra as telas", async () => {
+    setup({
+      list_servers: () => [SERVERS[0], { ...SERVERS[0], name: "Impostor" }, SERVERS[2], SERVERS[2]],
+      get_settings: () => ({ ...baseSettings, favorites: ["hl", "hl", "cb"], recent: ["cb", "cb"] }),
+    });
+    render(App);
+    const region = await list();
+    await within(region).findByText("Hogsmeade Life");
+    expect(rowNames(region)).toEqual(["Castelo Bruxo RP", "Hogsmeade Life"]);
+    const hero = screen.getByRole("region", { name: "Destaque" });
+    expect(within(hero).queryByText("Impostor")).toBeNull();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Favoritos" }));
+    const favs = await screen.findByRole("region", { name: "Servidores favoritos" });
+    expect(rowNames(favs)).toEqual(["Hogsmeade Life", "Castelo Bruxo RP"]);
+    await fireEvent.click(screen.getByRole("button", { name: "Recentes" }));
+    const rec = await screen.findByRole("region", { name: "Servidores recentes" });
+    expect(rowNames(rec)).toEqual(["Castelo Bruxo RP"]);
+  });
 });

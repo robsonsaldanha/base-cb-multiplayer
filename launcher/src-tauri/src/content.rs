@@ -19,6 +19,7 @@ use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -327,7 +328,15 @@ pub fn validate_manifest(
 
 /// `http://host:porta/` do servidor; IPv6 entre colchetes. O Hub só anuncia `host` + `httpPort` e o `cb-server` serve
 /// HTTP puro: o conteúdo é endereçado por hash e conferido aqui, então http basta.
+///
+/// O endereço vem do Hub (não confiável): IP literal passa por [`ip_allowed`] (regra do build atual); nome de domínio é
+/// conferido na resolução por [`ServerResolver`], que os clientes de conteúdo e de ping usam.
 pub fn server_base_url(host: &str, http_port: u16) -> AppResult<Url> {
+    server_base_url_with(host, http_port, cfg!(debug_assertions))
+}
+
+/// [`server_base_url`] com a regra explícita: `dev` libera loopback e redes privadas.
+pub fn server_base_url_with(host: &str, http_port: u16, dev: bool) -> AppResult<Url> {
     let bad = || {
         AppError::new(
             "server_unavailable",
@@ -352,9 +361,79 @@ pub fn server_base_url(host: &str, http_port: u16) -> AppResult<Url> {
         {
             return Err(bad());
         }
+        // O parser do WHATWG já transforma formas numéricas (`127.1`, `0x7f.1`) em IPv4.
         url::Host::parse(bare).map_err(|_| bad())?
     };
+    let literal = match &parsed {
+        url::Host::Ipv4(a) => Some(IpAddr::V4(*a)),
+        url::Host::Ipv6(a) => Some(IpAddr::V6(*a)),
+        url::Host::Domain(_) => None,
+    };
+    if literal.is_some_and(|ip| !ip_allowed(ip, dev)) {
+        return Err(bad());
+    }
     Url::parse(&format!("http://{parsed}:{http_port}/")).map_err(|_| bad())
+}
+
+/// Endereços que um servidor de jogo anunciado pelo Hub pode ter.
+/// - Sempre recusados: não especificado (`0.0.0.0/8`, `::`), multicast, broadcast/reservado (`240.0.0.0/4`) e
+///   link-local (`169.254.0.0/16`, `fe80::/10`) — inclusive na forma IPv4 mapeada em IPv6.
+/// - Só em `dev` (build de debug): loopback, redes privadas (RFC 1918), CGNAT (`100.64.0.0/10`) e ULA/site-local
+///   (`fc00::/7`, `fec0::/10`). Em produção o Hub já recusa servidores com esses endereços; aqui fica igual.
+pub fn ip_allowed(ip: IpAddr, dev: bool) -> bool {
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 => v4,
+    };
+    let local = match ip {
+        IpAddr::V4(a) => {
+            let o = a.octets();
+            if o[0] == 0 || o[0] >= 240 || a.is_multicast() || a.is_link_local() {
+                return false;
+            }
+            a.is_loopback() || a.is_private() || (o[0] == 100 && (o[1] & 0xc0) == 64)
+        }
+        IpAddr::V6(a) => {
+            let first = a.segments()[0];
+            if a.is_unspecified() || a.is_multicast() || (first & 0xffc0) == 0xfe80 {
+                return false;
+            }
+            a.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfec0
+        }
+    };
+    !local || dev
+}
+
+/// Resolve nomes de servidor e descarta os endereços que [`ip_allowed`] recusa (um nome que aponta para a rede
+/// local não escapa da regra dos IPs literais). Sem endereço permitido → erro de conexão.
+#[derive(Debug, Clone, Copy)]
+pub struct ServerResolver {
+    pub dev: bool,
+}
+
+impl Default for ServerResolver {
+    fn default() -> Self {
+        Self {
+            dev: cfg!(debug_assertions),
+        }
+    }
+}
+
+impl reqwest::dns::Resolve for ServerResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let dev = self.dev;
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await?
+                .filter(|a| ip_allowed(a.ip(), dev))
+                .collect();
+            if addrs.is_empty() {
+                return Err("endereço do servidor não permitido".into());
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
 }
 
 /// Cliente do conteúdo: sem redirecionamentos (nem para o mesmo host), conexão 10 s, ociosidade 30 s.
@@ -366,6 +445,9 @@ fn content_client() -> reqwest::Client {
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(IDLE_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
+        // Sem proxy do sistema: a resolução (e a regra de endereços) fica sempre aqui.
+        .no_proxy()
+        .dns_resolver(ServerResolver::default())
         .user_agent(concat!("CBMultiplayer/", env!("CARGO_PKG_VERSION")))
         .build()
         .expect("cliente HTTP")

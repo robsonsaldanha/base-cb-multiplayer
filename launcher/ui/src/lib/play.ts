@@ -38,11 +38,11 @@ export type PlayState =
 
 export const playState = writable<PlayState>({ status: "idle" });
 
-/** Jogar desativado: `"*"` (banimento) ou id do servidor → código do erro. */
-export const blocked = writable<Record<string, string>>({});
+/** Jogar desativado: `"*"` (banimento) ou id do servidor → código do erro. `Map`: id do Hub nunca é chave de objeto. */
+export const blocked = writable<ReadonlyMap<string, string>>(new Map());
 
-export function blockReason(map: Record<string, string>, id: string): string | null {
-  return map["*"] ?? map[id] ?? null;
+export function blockReason(map: ReadonlyMap<string, string>, id: string): string | null {
+  return map.get("*") ?? map.get(id) ?? null;
 }
 
 /** Escuta etapas e progresso do play em andamento (eventos de outro servidor são ignorados). */
@@ -73,7 +73,7 @@ export async function startPlay(server: PlayTarget): Promise<void> {
       return;
     }
     const scope = blocksPlay(error.code);
-    if (scope) blocked.update((b) => ({ ...b, [scope === "all" ? "*" : server.id]: error.code }));
+    if (scope) blocked.update((b) => new Map(b).set(scope === "all" ? "*" : server.id, error.code));
     playState.set({ status: "failed", server, error });
   }
 }
@@ -93,8 +93,8 @@ export function dismissPlay(): void {
 
 /** Lista recarregada: bloqueios por servidor (protocolo) podem ter mudado; o banimento continua. */
 export function clearServerBlocks(): void {
-  blocked.update((b): Record<string, string> => {
-    const all = b["*"];
-    return all ? { "*": all } : {};
+  blocked.update((b) => {
+    const all = b.get("*");
+    return new Map(all ? [["*", all]] : []);
   });
 }

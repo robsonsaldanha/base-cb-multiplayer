@@ -60,6 +60,8 @@ pub fn run() {
         .manage(content.clone())
         .manage(auth.clone())
         .manage(servers)
+        // Um pinger só: semáforo de 16 e intervalo mínimo valem para o launcher inteiro.
+        .manage(ping::Pinger::default())
         // Um play por vez (também trava "limpar cache", a faxina da abertura e a instalação de update).
         .manage(play::PlayGate::default())
         .setup(move |app| {

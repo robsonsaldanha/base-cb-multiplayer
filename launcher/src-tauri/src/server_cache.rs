@@ -23,47 +23,96 @@ pub struct CachedServers {
 
 pub struct ServerDirectory {
     path: PathBuf,
-    known: Mutex<Vec<ServerListing>>,
+    known: Mutex<Option<CachedServers>>,
+}
+
+/// Teto de servidores guardados/mostrados (a lista real é muito menor).
+pub const MAX_SERVERS: usize = 1000;
+const MAX_ID: usize = 64;
+const MAX_NAME: usize = 128;
+const MAX_DESCRIPTION: usize = 1024;
+const MAX_TAGS: usize = 16;
+const MAX_TAG: usize = 32;
+const MAX_LOCALE: usize = 16;
+
+fn cut(s: &mut String, max: usize) {
+    if let Some((i, _)) = s.char_indices().nth(max) {
+        s.truncate(i);
+    }
+}
+
+/// Lista do Hub (não confiável) pronta para a UI e o ping: id inválido (vazio, > 64, controle) sai; id repetido fica só
+/// a primeira ocorrência (a UI usa o id como chave); no máximo [`MAX_SERVERS`]; textos cortados num tamanho sensato.
+pub fn sanitize(servers: Vec<ServerListing>) -> Vec<ServerListing> {
+    let mut seen = std::collections::HashSet::new();
+    servers
+        .into_iter()
+        .filter(|s| !s.id.is_empty() && s.id.len() <= MAX_ID && !s.id.chars().any(char::is_control))
+        .filter(|s| seen.insert(s.id.clone()))
+        .take(MAX_SERVERS)
+        .map(|mut s| {
+            cut(&mut s.name, MAX_NAME);
+            cut(&mut s.description, MAX_DESCRIPTION);
+            cut(&mut s.locale, MAX_LOCALE);
+            s.tags.truncate(MAX_TAGS);
+            for t in &mut s.tags {
+                cut(t, MAX_TAG);
+            }
+            s
+        })
+        .collect()
 }
 
 impl ServerDirectory {
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
-            known: Mutex::new(Vec::new()),
+            known: Mutex::new(None),
         }
     }
 
-    fn known(&self) -> MutexGuard<'_, Vec<ServerListing>> {
+    fn known(&self) -> MutexGuard<'_, Option<CachedServers>> {
         self.known.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Lista recém-vinda do Hub: passa a valer para o ping e é gravada no disco. Falha ao gravar só é registrada
-    /// (a lista do Hub continua valendo).
-    pub fn store_fresh(&self, servers: Vec<ServerListing>, now: i64) {
+    /// Lista recém-vinda do Hub: passa por [`sanitize`], vale para o ping e é gravada no disco. Falha ao gravar só é
+    /// registrada (a lista do Hub continua valendo). Devolve a lista limpa (a que a UI recebe).
+    pub fn store_fresh(&self, servers: Vec<ServerListing>, now: i64) -> Vec<ServerListing> {
         let file = CachedServers {
             saved_at: now,
-            servers,
+            servers: sanitize(servers),
         };
         if let Err(e) = save(&self.path, &file) {
             log::warn!("lista de servidores não gravada em disco: {}", e.code);
         }
-        *self.known() = file.servers;
+        let out = file.servers.clone();
+        *self.known() = Some(file);
+        out
     }
 
-    /// Última lista gravada (Hub fora). Também passa a valer para o ping. `None` se não houver ou estiver ilegível.
+    /// Lista para o Hub fora: a mais nova entre a do disco e a da memória (se a gravação falhou, a da memória é mais
+    /// recente). Também passa a valer para o ping. `None` se não houver nenhuma.
     pub fn cached(&self) -> Option<CachedServers> {
-        let c = load(&self.path)?;
-        *self.known() = c.servers.clone();
-        Some(c)
+        let disk = load(&self.path).map(|c| CachedServers {
+            saved_at: c.saved_at,
+            servers: sanitize(c.servers),
+        });
+        let mut known = self.known();
+        let best = match (known.take(), disk) {
+            (Some(m), Some(d)) => Some(if d.saved_at > m.saved_at { d } else { m }),
+            (m, d) => m.or(d),
+        };
+        known.clone_from(&best);
+        best
     }
 
     /// Endereço de cada id (na ordem pedida); `None` para id que não está na lista conhecida.
     pub fn targets(&self, ids: &[String]) -> Vec<Option<PingTarget>> {
         let known = self.known();
+        let list = known.as_ref().map_or(&[][..], |c| &c.servers[..]);
         ids.iter()
             .map(|id| {
-                known.iter().find(|s| &s.id == id).map(|s| PingTarget {
+                list.iter().find(|s| &s.id == id).map(|s| PingTarget {
                     id: s.id.clone(),
                     host: s.host.clone(),
                     http_port: s.http_port,

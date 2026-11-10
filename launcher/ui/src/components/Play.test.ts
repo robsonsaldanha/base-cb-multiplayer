@@ -51,7 +51,7 @@ describe("Jogar", () => {
     stopServers();
     auth.set({ status: "checking" });
     playState.set({ status: "idle" });
-    blocked.set({});
+    blocked.set(new Map());
   });
   afterEach(() => stopServers());
 
@@ -132,6 +132,16 @@ describe("Jogar", () => {
     await vi.waitFor(() => expect(saved().recent).toEqual(["cb"]));
     await fireEvent.click(within(ready).getByRole("button", { name: "Fechar" }));
     expect(screen.queryByRole("region", { name: "Pronto para abrir" })).toBeNull();
+  });
+
+  it("servidor com id 'constructor' joga normalmente", async () => {
+    setup({
+      list_servers: () => [{ ...SERVERS[0]!, id: "constructor", name: "Objeto" }],
+      play: () => ({ kind: "started" }),
+    });
+    render(App);
+    await clickPlay("Objeto");
+    expect(await screen.findByText("Jogo aberto. Bom jogo!")).toBeInTheDocument();
   });
 
   it("jogo aberto de verdade", async () => {

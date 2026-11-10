@@ -112,4 +112,28 @@ describe("Configurações", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Instalar atualização" }));
     await vi.waitFor(() => expect(b.calls("install_update")).toHaveLength(1));
   });
+
+  it("modo simular volta ao valor salvo se a gravação falhar", async () => {
+    setup({
+      set_settings: () => {
+        throw { code: "settings_unreadable", message: "x" };
+      },
+    });
+    await loadSettings();
+    render(Settings);
+    const box = screen.getByRole("checkbox", { name: /Modo simular/ });
+    await fireEvent.click(box);
+    await vi.waitFor(() => expect(box).toBeChecked());
+  });
+
+  it("mudar o modo simular não apaga o limite que está sendo digitado", async () => {
+    const { saved } = setup();
+    await loadSettings();
+    render(Settings);
+    const cache = screen.getByRole("spinbutton", { name: "Limite do cache (MB)" });
+    await fireEvent.input(cache, { target: { value: "4096" } });
+    await fireEvent.click(screen.getByRole("checkbox", { name: /Modo simular/ }));
+    await vi.waitFor(() => expect(saved().simulateLaunch).toBe(false));
+    expect(cache).toHaveValue(4096);
+  });
 });

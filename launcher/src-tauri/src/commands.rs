@@ -8,7 +8,7 @@ use crate::hub::ServerListing;
 use crate::launch::{LaunchOutcome, CONNECT_TTL};
 use crate::modpkg::ModInstaller;
 use crate::paths;
-use crate::ping::{self, PingResult};
+use crate::ping::{PingResult, Pinger};
 use crate::play::{PlayContext, PlayGate, Stage};
 use crate::server_cache::{CachedServers, ServerDirectory};
 use crate::settings::{validate_game_dir, Settings, SettingsUpdate};
@@ -356,9 +356,17 @@ pub async fn list_servers(
     dir: State<'_, Arc<ServerDirectory>>,
 ) -> AppResult<Vec<ServerListing>> {
     let list = auth.hub().servers().await?;
-    let (d, copy) = (dir.inner().clone(), list.clone());
-    let _ = tokio::task::spawn_blocking(move || d.store_fresh(copy, unix_now())).await;
-    Ok(list)
+    let d = dir.inner().clone();
+    // Sem id repetido nem lixo (a UI usa o id como chave); gravar fora do executor assíncrono.
+    tokio::task::spawn_blocking(move || d.store_fresh(list, unix_now()))
+        .await
+        .map_err(|_| {
+            log::warn!("falha interna ao guardar a lista de servidores");
+            AppError::new(
+                "internal_error",
+                "Falha interna ao guardar a lista de servidores.",
+            )
+        })
 }
 
 /// Última lista gravada (`null` se não houver). Os endereços dela passam a valer para o ping.
@@ -372,13 +380,15 @@ pub async fn cached_servers(
         .map_err(|_| AppError::new("internal_error", "Falha interna ao ler a lista guardada."))
 }
 
-/// Ping por id (`GET /info`, 2 s, ≤ 16 simultâneos). Host/porta só da lista conhecida; id desconhecido → `ms: null`.
+/// Ping por id (`GET /info`, 2 s, ≤ 16 simultâneos no launcher, um pedido por endereço a cada 25 s). Host/porta só
+/// da lista conhecida; id desconhecido → `ms: null`.
 #[tauri::command]
 pub async fn ping_servers(
     ids: Vec<String>,
     dir: State<'_, Arc<ServerDirectory>>,
+    pinger: State<'_, Pinger>,
 ) -> AppResult<Vec<PingResult>> {
-    Ok(ping::ping_ids(&dir, ids).await)
+    Ok(pinger.ping_ids(&dir, ids).await)
 }
 
 // ----- atualização do launcher -----

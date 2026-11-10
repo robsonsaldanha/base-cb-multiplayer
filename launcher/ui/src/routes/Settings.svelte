@@ -22,13 +22,23 @@
       .catch(() => (version = ""));
   });
 
-  // Campos começam com o valor salvo (e voltam a ele quando o Rust devolve as configurações).
+  // Campos começam com o valor salvo e só são trocados quando os limites salvos mudam (mudar outra configuração,
+  // como o modo simular, não apaga o que está sendo digitado).
+  const savedCache = $derived($settings?.cacheLimitMB);
+  const savedContent = $derived($settings?.maxServerContentMB);
   $effect(() => {
-    if ($settings) {
-      cacheMB = $settings.cacheLimitMB;
-      contentMB = $settings.maxServerContentMB;
-    }
+    if (savedCache !== undefined) cacheMB = savedCache;
   });
+  $effect(() => {
+    if (savedContent !== undefined) contentMB = savedContent;
+  });
+
+  async function toggleSimulate(e: Event & { currentTarget: HTMLInputElement }) {
+    const box = e.currentTarget;
+    const ok = await updateSettings({ simulateLaunch: box.checked });
+    // Gravação recusada: a caixa volta ao valor salvo (o store não mudou, então o Svelte não redesenha sozinho).
+    if (!ok) box.checked = $settings?.simulateLaunch ?? true;
+  }
 
   async function run<T>(what: typeof busy, f: () => Promise<T>): Promise<T | undefined> {
     busy = what;
@@ -133,7 +143,7 @@
         type="checkbox"
         checked={$settings?.simulateLaunch ?? true}
         disabled={!$settings}
-        onchange={(e) => updateSettings({ simulateLaunch: e.currentTarget.checked })}
+        onchange={toggleSimulate}
       />
       Modo simular (baixa e confere tudo, mas não abre o jogo)
     </label>
