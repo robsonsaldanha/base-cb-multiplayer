@@ -1,78 +1,11 @@
 #include <catch2/catch_test_macros.hpp>
 
-#include <atomic>
 #include <chrono>
-#include <fstream>
-#include <random>
 #include <string>
 #include <vector>
 
-#include "cbscript/resource.hpp"
+#include "test_util.hpp"
 
-namespace fs = std::filesystem;
-using cbscript::Limits;
-using cbscript::Resource;
-using cbscript::ResourceManifest;
-using namespace std::chrono_literals;
-
-namespace {
-
-void put(const fs::path& p, const std::string& content) {
-  fs::create_directories(p.parent_path());
-  std::ofstream(p, std::ios::binary) << content;
-}
-
-struct TmpDir {
-  fs::path p;
-  TmpDir() {
-    static std::atomic<unsigned> n{0};
-    std::random_device rd;
-    p = fs::temp_directory_path() / ("cbscript_" + std::to_string(rd()) + "_" + std::to_string(n++));
-    fs::create_directories(p);
-  }
-  ~TmpDir() {
-    std::error_code ec;
-    fs::remove_all(p, ec);
-  }
-};
-
-Limits shortLimits(size_t mem = size_t{64} << 20) {
-  Limits l;
-  l.memoryBytes = mem;
-  l.warnAfter = 20ms;
-  l.abortAfter = 200ms;
-  return l;
-}
-
-struct Fixture {
-  TmpDir t;
-  std::vector<std::string> warns;
-  std::unique_ptr<Resource> r;
-  explicit Fixture(Limits lim = shortLimits(), std::string name = "teste") {
-    ResourceManifest m;
-    m.name = std::move(name);
-    m.version = "1.0.0";
-    r = std::make_unique<Resource>(m, t.p, lim, [this](std::string s) { warns.push_back(std::move(s)); });
-  }
-  ~Fixture() { r.reset(); }
-  // Compila `code` no ambiente sandbox (pelo host) e roda com call().
-  Resource::CallResult run(const std::string& code) {
-    sol::load_result lr = r->lua().load(code, "=teste", sol::load_mode::text);
-    REQUIRE(lr.valid());
-    sol::protected_function fn = lr;
-    return r->call(fn);
-  }
-  bool isTrue(const std::string& code) {
-    auto res = run(code);
-    INFO(res.error);
-    REQUIRE(res.ok);
-    return res.value.is<bool>() && res.value.as<bool>();
-  }
-};
-
-bool contains(const std::string& s, const std::string& sub) { return s.find(sub) != std::string::npos; }
-
-}  // namespace
 
 TEST_CASE("sandbox: forbidden functions are absent or fail") {
   Fixture f;
@@ -196,7 +129,7 @@ TEST_CASE("memory limit raises a memory error and the state stays usable") {
   REQUIRE_FALSE(big.ok);
   REQUIRE(contains(big.error, "mem\xC3\xB3ria"));
 
-  REQUIRE(f.isTrue("collectgarbage('collect'); return 1 + 1 == 2"));
+  REQUIRE(f.isTrue("collectgarbage('step'); return 1 + 1 == 2"));
   REQUIRE(f.r->memoryUsed() <= (size_t{16} << 20));
   // pcall dentro do script também recebe o erro de memória e continua.
   REQUIRE(f.isTrue("local ok = pcall(string.rep, 'x', 64 * 1024 * 1024); return ok == false"));

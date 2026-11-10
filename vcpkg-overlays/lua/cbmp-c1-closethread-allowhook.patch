@@ -1,0 +1,17 @@
+cbmp: re-enable hooks before running pending __close in luaE_resetthread
+(lua_closethread / coroutine.close / coroutine.wrap error path). Against Lua 5.4.7.
+Re-check on upgrade: luaE_resetthread in lstate.c.
+
+--- a/src/lstate.c
++++ b/src/lstate.c
+@@ -328,6 +328,10 @@
+   if (status == LUA_YIELD)
+     status = LUA_OK;
+   L->status = LUA_OK;  /* so it can run __close metamethods */
++  /* cbmp patch (Lua 5.4.7, C1): a thread that died from an error raised inside
++  ** a hook still has 'allowhook' == 0; its __close metamethods would then run
++  ** with no hooks (no watchdog). Re-enable hooks before closing. */
++  L->allowhook = 1;
+   status = luaD_closeprotected(L, 1, status);
+   if (status != LUA_OK)  /* errors? */
+     luaD_seterrorobj(L, status, L->stack.p + 1);

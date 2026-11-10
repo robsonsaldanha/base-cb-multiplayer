@@ -43,7 +43,9 @@ class Resource {
   Resource(const Resource&) = delete;
   Resource& operator=(const Resource&) = delete;
 
-  sol::state& lua();  // estado sandbox já preparado (globals = ambiente sandbox)
+  // Estado sandbox já preparado (globals = ambiente sandbox). Código do host deve usar acesso cru/refs no registro,
+  // não lua()["x"] (que passa por metamétodos de _G controláveis pelo script).
+  sol::state& lua();
   const ResourceManifest& manifest() const { return manifest_; }
 
   // Executa os serverScripts em ordem (cada um sob a vigia, como call()); o 1º valor retornado pelo último vira
@@ -51,6 +53,8 @@ class Resource {
   bool runMain(std::string& err);
   sol::object exports() const { return exports_; }
 
+  // Tempo de vida: `value` e `thread` são referências no registro deste estado Lua; precisam ser destruídos (ou
+  // reatribuídos) antes do Resource. Nunca guarde CallResult além da vida do Resource que o produziu.
   struct CallResult {
     bool ok = false;        // terminou (ou cedeu) sem erro
     bool timedOut = false;  // abortado pela vigia (ok=false)
