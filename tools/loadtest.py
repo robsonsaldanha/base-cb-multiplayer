@@ -126,15 +126,17 @@ class AdminPanel:
         try:
             if not self.cookie:
                 _, cookies = self._req("POST", "/auth/login", {"devToken": self.token})
+                self.requests += 1
                 self.cookie = next(c.split(";", 1)[0] for c in cookies if c.startswith("cbadmin="))
-            self.requests += 1
             players, _ = self._req("GET", "/api/players")
-            self.players_max = max(self.players_max, len(players))
             self.requests += 1
+            self.players_max = max(self.players_max, len(players))
             self._req("GET", "/api/resources")
             self.requests += 1
             self._req("GET", "/api/metrics")
-        except Exception as e:  # conta e segue
+            self.requests += 1
+        except Exception as e:  # conta (a requisição que falhou também) e segue
+            self.requests += 1
             self.errors += 1
             self.last_error = str(e)
 

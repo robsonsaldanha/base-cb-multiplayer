@@ -43,6 +43,7 @@ struct EvCommand {
   std::string adminDid;          // quem pediu, quando veio do painel
   std::string line;
   std::function<void(std::string)> reply;  // chamado na thread de scripts; precisa ser thread-safe do lado de quem pediu
+  bool adminOnly = false;  // painel admin: só comandos registrados com admin = true
 };
 using SimToScript = std::variant<EvPlayerJoin, EvPlayerLeave, EvClientEvent, EvCommand>;
 

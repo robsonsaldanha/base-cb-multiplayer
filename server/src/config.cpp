@@ -261,6 +261,20 @@ bool validBindIp(std::string_view s) {
   return parseIpv4(s, o) || parseIpv6(s, g);
 }
 
+// IP literal ou CIDR (ip/bits, bits ≤ 32 no IPv4 e ≤ 128 no IPv6).
+bool validCidr(std::string_view s) {
+  const size_t slash = s.find('/');
+  const std::string_view ip = s.substr(0, slash);
+  std::array<int, 4> o{};
+  std::array<uint32_t, 8> g{};
+  const bool v4 = parseIpv4(ip, o);
+  if (!v4 && !parseIpv6(ip, g)) return false;
+  if (slash == std::string_view::npos) return true;
+  const std::string_view b = s.substr(slash + 1);
+  if (b.empty() || b.size() > 3 || b.find_first_not_of("0123456789") != std::string_view::npos) return false;
+  return std::stoi(std::string(b)) <= (v4 ? 32 : 128);
+}
+
 }  // namespace
 
 bool isLoopbackBind(std::string_view ip) {
@@ -273,15 +287,7 @@ bool isLoopbackBind(std::string_view ip) {
   return g[7] == 1;
 }
 
-bool isWildcardBind(std::string_view ip) {
-  std::array<int, 4> o{};
-  if (parseIpv4(ip, o)) return o == std::array<int, 4>{0, 0, 0, 0};
-  std::array<uint32_t, 8> g{};
-  if (!parseIpv6(ip, g)) return false;
-  for (auto v : g)
-    if (v != 0) return false;
-  return true;
-}
+
 
 ServerConfig ServerConfig::fromJson(const json& j) {
   if (!j.is_object()) fail("(raiz)", "deve ser um objeto JSON");
@@ -428,7 +434,7 @@ ServerConfig ServerConfig::fromJson(const json& j) {
   }
   if (const json* a = sub(j, "admin", "")) {
     if (!a->is_object()) fail("admin", "deve ser um objeto como {\"publicUrl\": \"https://painel.exemplo.com\"} ou null");
-    static const char* kAdminKeys[] = {"publicUrl", "port", "bind", "admins", "devToken"};
+    static const char* kAdminKeys[] = {"publicUrl", "port", "bind", "admins", "devToken", "trustedProxies"};
     for (auto it = a->begin(); it != a->end(); ++it) {
       bool known = false;
       for (auto* k : kAdminKeys) known = known || it.key() == k;
@@ -449,6 +455,15 @@ ServerConfig ServerConfig::fromJson(const json& j) {
           fail("admin.admins", "cada item deve ser um id Discord (17 a 20 dígitos)");
         if (std::find(c.admin.admins.begin(), c.admin.admins.end(), s) == c.admin.admins.end())
           c.admin.admins.push_back(s);
+      }
+    }
+    if (const json* l = sub(*a, "trustedProxies", "admin.")) {
+      if (!l->is_array()) fail("admin.trustedProxies", "deve ser uma lista de IPs ou CIDRs (ex. [\"127.0.0.1\"])");
+      if (l->size() > 32) fail("admin.trustedProxies", "deve ter no máximo 32 itens");
+      for (const auto& e : *l) {
+        if (!e.is_string() || !validCidr(e.get_ref<const std::string&>()))
+          fail("admin.trustedProxies", "cada item deve ser um IP ou CIDR (ex. \"127.0.0.1\", \"10.0.0.0/8\", \"::1\")");
+        c.admin.trustedProxies.push_back(e.get<std::string>());
       }
     }
     if (const json* t = sub(*a, "devToken", "admin.")) {

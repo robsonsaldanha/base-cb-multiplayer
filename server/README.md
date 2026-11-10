@@ -67,6 +67,7 @@ JSON; todos os campos são opcionais. Valores abaixo são os padrões.
 | `admin.port` | `30510` | 1 a 65535, diferente de `port` |
 | `admin.bind` | `"127.0.0.1"` | IP literal sem porta (`127.0.0.1`, `::1`, `0.0.0.0`, `::`, IP da máquina) |
 | `admin.publicUrl` | `null` | origem `https://host[:porta]` (http só em loopback), sem caminho; anunciada ao Hub (`adminUrl`). Sem ela não há login via Hub |
+| `admin.trustedProxies` | `[]` | até 32 IPs ou CIDRs (`127.0.0.1`, `10.0.0.0/8`, `::1`) de proxies cujo `X-Forwarded-For` vale para achar o IP do cliente |
 | `admin.devToken` | `null` | só em modo dev (`auth.devPublicKey` e `hub` null); 32 a 256 caracteres ASCII visíveis. No modo Hub é erro de config |
 
 ### Modo dev vs modo Hub (mutuamente exclusivos)
@@ -105,7 +106,8 @@ em dev) não está vazio: `painel admin em http://127.0.0.1:30510` no log.
 
 Telas: jogadores (kick, ban, teleporte), resources (estado, último erro, iniciar/parar/reiniciar), console
 (`help`, `status`, `players`, `restart <resource>`, `kick <id> [motivo]`, `ban <id> [motivo]` e os comandos que os
-resources registram com `admin = true`, chamados com origem `0` = console e auditados com o did do admin), logs
+resources registram com `admin = true` — os demais são recusados no console —, chamados com origem `0` = console e
+auditados com o did do admin), logs
 (`audit-*.jsonl` e `anticheat-*.jsonl` do dia mais recente, últimas 100/200/500 linhas, até 1 MiB) e métricas.
 
 **Login (modo Hub):** "Entrar com Discord" → `GET /auth/start` (gera um `state` aleatório num cookie HttpOnly
@@ -113,14 +115,18 @@ resources registram com `admin = true`, chamados com origem `0` = console e audi
 → o JS manda o ticket em `POST /auth/login`. O servidor confere o `state`, a assinatura e a audiência
 `<serverId>#admin` do ticket, o `jti` (uso único) e se o Discord ID está em `admin.admins`. Sessão: cookie HttpOnly
 `SameSite=Strict` (`__Host-cbadmin` + `Secure` quando a `publicUrl` é https), 8 h no máximo e 1 h sem uso; até 5
-sessões por conta; "Sair" invalida no servidor. Tentativas de login: 10/min por IP (IPv6 por /64) e 60/min no total.
+sessões por conta; "Sair" invalida no servidor. Limites: só logins que **falham** contam (10/min por IP, IPv6 por
+/64, e 60/min no total); login com ticket e state válidos entra sempre; `/auth/start` aceita 60/min por IP.
 
 **Modo dev:** sem Hub, entre com `admin.devToken` (a conta aparece como `dev`). Nunca use em produção.
 
 **Segurança:** toda resposta leva CSP estrita (sem `unsafe-inline`), `X-Frame-Options: DENY`, `Referrer-Policy:
 no-referrer` e `Cache-Control: no-store`. Requisições com `Host` fora da lista (host da `publicUrl`; `127.0.0.1`/
 `localhost`/`[::1]` com a porta do painel quando o bind é loopback) recebem 421 (proteção contra DNS rebinding). Ações
-exigem `Origin` igual ao do painel, o cabeçalho `X-CB-Admin: 1` e JSON de até 64 KiB. `X-Forwarded-*` nunca é usado.
+exigem `Origin` igual ao do painel, o cabeçalho `X-CB-Admin: 1` e JSON de até 64 KiB. `X-Forwarded-For` só é
+lido quando a conexão vem de um IP de `admin.trustedProxies` (o IP do cliente é o primeiro endereço não confiável
+da direita para a esquerda); por padrão nunca. Uma ação do painel (teleporte, kick) pode ser sobrescrita no mesmo
+tick por um comando de script para o mesmo jogador (o último teleporte vence).
 Cada ação vai para `logs/audit-AAAA-MM-DD.jsonl` com o Discord ID do admin (`type` `admin_login`, `admin_logout` ou
 `admin` com `action` `kick`/`ban`/`teleport`/`resource`/`console`). O painel roda em threads próprias e nunca toca a
 simulação direto: lê a foto do tick e o status dos resources e age pelas filas da simulação e dos scripts.
@@ -138,14 +144,17 @@ server {
   ssl_certificate_key /etc/letsencrypt/live/admin.meuservidor.com/privkey.pem;
   location / {
     proxy_pass http://127.0.0.1:30510;
-    proxy_set_header Host $host;
+    proxy_set_header Host $http_host;   # $http_host mantém a porta (ex. :8443); $host a perde
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
   }
 }
 ```
 
 Com Caddy: `admin.meuservidor.com { reverse_proxy 127.0.0.1:30510 }` (Caddy já repassa o `Host` e cuida do
-certificado). Atrás do proxy todos os acessos vêm do IP do proxy, então o limite de login por IP vale para o proxy
-inteiro. `bind` fora do loopback sem `publicUrl` https gera aviso no log: o tráfego (inclusive o cookie de sessão)
+certificado). Atrás do proxy todos os acessos vêm do IP do proxy: configure `"trustedProxies": ["127.0.0.1"]`
+(o IP de onde o proxy conecta) para os limites e a auditoria usarem o IP real do cliente. Sem isso, os limites por
+IP valem para o proxy inteiro (logins válidos continuam entrando). O painel tem poucas threads (8) e segura uma por
+conexão aberta: exponha-o só atrás de um proxy que bufferiza as requisições (nginx/Caddy), nunca direto. `bind` fora do loopback sem `publicUrl` https gera aviso no log: o tráfego (inclusive o cookie de sessão)
 iria sem TLS.
 
 **Hub local de teste:** `publicUrl` `http://127.0.0.1:30510` só é aceita pelo Hub com `HUB_ALLOW_PRIVATE_SERVERS=1`.

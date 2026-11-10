@@ -39,12 +39,12 @@ struct AdminSettings {
   std::string bind = "127.0.0.1";  // IP literal
   std::vector<std::string> admins;
   std::optional<std::string> devToken;
+  std::vector<std::string> trustedProxies;  // IPs/CIDRs cujo X-Forwarded-For é aceito (padrão: nenhum)
   bool enabled() const { return !admins.empty() || devToken.has_value(); }
 };
 
-// Bind loopback (127.0.0.0/8, ::1) e curinga (0.0.0.0, ::).
+// Bind loopback (127.0.0.0/8, ::1).
 bool isLoopbackBind(std::string_view ip);
-bool isWildcardBind(std::string_view ip);
 
 // Normaliza a origem do painel admin (mesmas regras de normalizeAdminOrigin em @cbmp/contracts): sem caminho
 // (exceto "/"), query, fragmento, credenciais, espaços/controles ou não-ASCII; ≤ 256 chars; esquema/host em

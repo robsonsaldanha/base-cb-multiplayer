@@ -149,7 +149,10 @@ TEST_CASE("api: players come from the snapshot; kick and setPosition become comm
   env.host->publishPlayers(std::make_shared<const std::vector<PlayerView>>(std::vector<PlayerView>{
       PlayerView{1, "ana", "d1", "s1", 10, 20, 30, 2, 1001}, PlayerView{2, "bia", "d2", "s2", 0, 0, 0, 3, 1002}}));
   env.event(1, "go");
-  REQUIRE(env.waitLog("n=2 first=ana x=10 z=30"));
+  // Espera a ÚLTIMA linha do handler (as anteriores já foram gravadas); esperar a primeira deixava uma corrida com a
+  // thread de scripts ainda escrevendo as seguintes.
+  REQUIRE(env.waitLog("badget cb.players.get: id inválido"));
+  REQUIRE(env.hasLog("n=2 first=ana x=10 z=30"));
   REQUIRE(env.hasLog("get2=bia state=3 did=d2"));
   REQUIRE(env.hasLog("get9=nil"));
   REQUIRE(env.hasLog("kick=true"));
@@ -957,4 +960,34 @@ TEST_CASE("api: escapeLogText also escapes LRM/RLM, ALM and BOM") {
   REQUIRE(cbscript::escapeLogText("x\xD8\x9Cy") == "x\\u{061c}y");
   REQUIRE(cbscript::escapeLogText("\xEF\xBB\xBF" "z") == "\\u{feff}z");
   REQUIRE(cbscript::escapeLogText("\xD8\xA7") == "\xD8\xA7");  // letra árabe comum intacta
+}
+
+TEST_CASE("api: adminOnly console commands run only commands registered with admin = true") {
+  ApiEnv env;
+  env.addRes("a", R"(
+    cb.commands.register('pub', function() return 'publico' end)
+    cb.commands.register('adm', function() return 'admin ok' end, {admin = true})
+  )");
+  env.boot();
+  auto post = [&](const std::string& line) {
+    EvCommand c;
+    c.adminDid = "123456789012345678";
+    c.adminOnly = true;
+    c.line = line;
+    c.reply = [&env](std::string s) {
+      std::lock_guard<std::mutex> lk(env.mu);
+      env.replies.push_back(std::move(s));
+    };
+    REQUIRE(env.host->post(std::move(c)));
+  };
+  post("adm");
+  REQUIRE(waitUntil([&] { return env.hasReply("admin ok"); }));
+  post("pub");
+  REQUIRE(waitUntil([&] {
+    std::lock_guard<std::mutex> lk(env.mu);
+    for (auto& r : env.replies)
+      if (r.find("não é comando de admin") != std::string::npos) return true;
+    return false;
+  }));
+  REQUIRE_FALSE(env.hasReply("publico"));
 }

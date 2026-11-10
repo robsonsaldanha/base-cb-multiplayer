@@ -14,9 +14,14 @@
 // Modo dev: POST /auth/login {devToken} (só com auth.devPublicKey; tempo constante).
 //
 // Segurança em toda resposta: CSP estrita, X-Frame-Options DENY, Referrer-Policy no-referrer, Cache-Control
-// no-store, nosniff. Host fora da lista (origem de publicUrl; nomes de loopback quando o bind é loopback ou curinga)
-// → 421 em qualquer rota (DNS rebinding). Mutações: Origin igual a uma origem do painel (ausente/null → 403),
-// cabeçalho X-CB-Admin: 1, Content-Type application/json, corpo ≤ 64 KiB. X-Forwarded-* nunca é usado.
+// no-store, nosniff. Host fora da lista (origem de publicUrl; com bind loopback, também o IP do bind, 127.0.0.1,
+// localhost e [::1] na porta do painel) → 421 em qualquer rota (DNS rebinding). Mutações: Origin igual a uma origem
+// do painel (ausente/null → 403), cabeçalho X-CB-Admin: 1, Content-Type application/json, corpo ≤ 64 KiB (login
+// ≤ 8 KiB); a sessão é conferida antes de ler o JSON. X-Forwarded-For só vale quando o par TCP está em
+// trustedProxies (padrão: nunca).
+//
+// Limites de login: só tentativas que FALHAM gastam o orçamento (por IP do cliente e global); um par ticket + state
+// válido entra sempre; sem orçamento, devToken nem é comparado. /auth/start tem limite próprio só por IP.
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -53,15 +58,18 @@ struct AdminOptions {
   std::string hubUrl;                    // vazio = sem Hub (login só por devToken)
   std::filesystem::path logsDir = "logs";
   std::string dbPassword;  // linhas de log que a contenham nunca são devolvidas
-  int threads = 4;
+  int threads = 8;
 
   double sessionAbsoluteSec = 8 * 3600.0, sessionIdleSec = 3600.0;
   size_t maxSessionsPerDid = 5, maxSessions = 1024;
   double stateTtlSec = 600;
-  size_t maxPendingStates = 256;
+  size_t maxPendingStates = 4096;
   size_t maxJti = 10000;
-  // Login (POST /auth/login e GET /auth/start): por IP (IPv6 agrupado por /64) e global, por minuto.
+  // Falhas de login por minuto: por IP do cliente (IPv6 agrupado por /64) e global. Sucessos não contam.
   int loginPerIpPerMin = 10, loginGlobalPerMin = 60;
+  int startPerIpPerMin = 60;  // GET /auth/start por IP do cliente
+  // Proxies (IP ou CIDR) cujo X-Forwarded-For é aceito para descobrir o IP do cliente (limites e auditoria).
+  std::vector<std::string> trustedProxies;
   size_t maxRateKeys = 10000;
   // API por sessão (token bucket): requisições/s e rajada; console à parte.
   double apiPerSec = 20, apiBurst = 40, consolePerSec = 1, consoleBurst = 5;
@@ -82,8 +90,11 @@ struct AdminBackend {
   std::function<std::vector<cbscript::ResourceStatus>()> resources;
   std::function<std::future<bool>(ResourceOp, std::string)> resourceOp;
   std::function<bool(cbscript::EvCommand)> scriptCommand;  // console → comandos registrados dos resources
-  // Grava o ban (assíncrono, pela thread de scripts) e expulsa quem tiver o did. false = indisponível agora.
-  std::function<bool(const std::string& did, const std::string& reason, int64_t durationS, const std::string& by)> ban;
+  // Expulsa quem tiver o did e grava o ban (pela thread de scripts). O future diz se gravou (false ou promessa
+  // quebrada = não gravou); o painel espera até actionWait, depois responde 202.
+  std::function<std::future<bool>(const std::string& did, const std::string& reason, int64_t durationS,
+                                  const std::string& by)>
+      ban;
   std::function<nlohmann::json()> metrics;
   std::function<void(const std::string&)> audit;  // uma linha JSONL (sem '\n')
 };

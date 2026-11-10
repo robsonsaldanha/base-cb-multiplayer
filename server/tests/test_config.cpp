@@ -333,3 +333,17 @@ TEST_CASE("config admin devToken only in dev mode and long enough") {
   none["admin"] = {{"devToken", std::string(40, 'a')}};
   requireRejects(none, "admin.devToken");  // sem devPublicKey
 }
+
+TEST_CASE("config admin trustedProxies accepts IPs and CIDRs only") {
+  REQUIRE(ServerConfig::fromJson(json::object()).admin.trustedProxies.empty());
+  auto c = ServerConfig::fromJson(json{{"admin", {{"trustedProxies", {"127.0.0.1", "10.0.0.0/8", "::1", "fd00::/8"}}}}});
+  REQUIRE(c.admin.trustedProxies == std::vector<std::string>{"127.0.0.1", "10.0.0.0/8", "::1", "fd00::/8"});
+  for (const char* p : {"localhost", "10.0.0.0/33", "::1/129", "10.0.0.0/", "/8", "1.2.3.4/8/1", "*", ""}) {
+    INFO(p);
+    requireRejects(json{{"admin", {{"trustedProxies", {p}}}}}, "admin.trustedProxies");
+  }
+  requireRejects(json{{"admin", {{"trustedProxies", "127.0.0.1"}}}}, "admin.trustedProxies");
+  json many = json::array();
+  for (int i = 0; i < 33; ++i) many.push_back("10.0.0." + std::to_string(i));
+  requireRejects(json{{"admin", {{"trustedProxies", many}}}}, "admin.trustedProxies");
+}

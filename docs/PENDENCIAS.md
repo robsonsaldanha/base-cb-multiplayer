@@ -115,21 +115,33 @@ Itens levantados nas revisões que não bloquearam o merge, com o momento em que
     jti guardado até exp + 60 s, teto de 10 000; config validada).
 - Painel admin (Task 8), resíduos e decisões:
   - Sessões, states, jti e limites de taxa só em memória do processo: restart do cb-server desloga todo mundo.
-  - `X-Forwarded-*` nunca é usado: atrás de um proxy reverso o limite de login por IP vira um limite do proxy inteiro
-    (o global continua valendo). Opção `trustProxy` fica para quando houver demanda.
+  - Limites de login (fix 1 da revisão): só falhas gastam (por IP e global); ticket + state válidos entram sempre;
+    sem orçamento o devToken nem é comparado; `/auth/start` com limite próprio por IP (60/min) e até 4096 states
+    pendentes (o mais antigo sai). Atrás de proxy, sem `admin.trustedProxies`, os limites por IP valem para o proxy
+    inteiro.
+  - O state só prova que *algum* navegador começou o fluxo: um ticket roubado pode ser pareado com o state do próprio
+    atacante. Fechar isso exige o Hub amarrar o hash do state no ticket (claim `nonce`) — mudança no Hub/contrato.
+  - Ação do painel e comando de script para o mesmo jogador no mesmo tick: a coalescência do canal prioritário mantém
+    o último teleporte (o do script vence).
+  - Ban pelo painel: o kick por did sai na hora; a gravação vai pela thread de scripts e o painel espera até 3 s pelo
+    resultado (200 gravado / 503 falhou / 202 em andamento). Se o host parar no meio, o jogador já foi expulso mas o
+    ban não fica gravado (a auditoria registra `failed`).
+  - Pool do painel: 8 threads, fila de 32, keep-alive 2 s. O httplib segura uma thread por conexão: exposto direto,
+    poucas conexões lentas travam o painel (o jogo não é afetado). Documentado: só atrás de proxy que bufferiza.
+  - Filtro de logs: entre a checagem de symlink e a abertura do arquivo há uma janela (TOCTOU) que exige escrita
+    local em `logsDir`; aceito.
   - O proxy precisa repassar o `Host` original (`proxy_set_header Host $host`): o painel recusa (421) Host fora da
     lista (origem da `publicUrl`; nomes de loopback só com bind loopback). Bind curinga sem `publicUrl` = 421 em tudo
     (aviso no log).
   - CSRF: Origin do painel + `X-CB-Admin: 1` + JSON (sem token por sessão). O JS manda `referrerPolicy:
     'same-origin'` nos fetch (com `no-referrer` o navegador poderia mandar `Origin: null`). No Chromium o Origin veio
     certo nos dois casos (verificação manual).
-  - Filtro de linhas de log com a senha do banco é por substring: senha curta (ex. "1") esconde muitas linhas. Só
-    `audit` e `anticheat` (o `server.log` não é exposto).
+  - Filtro de linhas de log com a senha do banco: substring da senha crua e da forma escapada em JSON; senha com
+    menos de 4 caracteres desliga o filtro (aviso no log). Só `audit` e `anticheat` (o `server.log` não é exposto).
   - Comando de console de resource que não devolve texto (ou demora > 2 s) responde `pending`; a resposta tardia se
     perde (fica só no log/auditoria do resource).
-  - Ban pelo painel vai pela thread de scripts (`BanStore` tem um escritor): com o host de scripts parado
-    (supervisor) o ban responde 503; o kick por did sai mesmo assim pelo canal prioritário da ponte.
-  - Console aceita também comandos de resource registrados sem `admin = true` (a API não distingue origem console).
+  - ~~Console aceita comandos sem `admin = true`.~~ Resolvido no fix 1: o console do painel recusa comandos que não
+    são de admin.
   - Sem teste automatizado com navegador real (Playwright etc.); o fluxo completo foi verificado à mão no Chromium do
     app (relatório da Task 8).
   - Sem `/metrics` para o HTTP (`HttpOutPool::metrics()` existe; falta expor).

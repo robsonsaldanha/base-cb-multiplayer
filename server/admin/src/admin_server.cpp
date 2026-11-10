@@ -8,6 +8,7 @@
 #include <cctype>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <mutex>
@@ -40,6 +41,7 @@ using nlohmann::json;
 namespace fs = std::filesystem;
 
 constexpr size_t kMaxBody = 64 * 1024;
+constexpr size_t kMaxLoginBody = 8 * 1024;  // ticket ≤ 4 KiB + state
 constexpr size_t kMaxReason = 200;
 constexpr size_t kMaxConsoleLine = 512;
 constexpr size_t kMaxLogTail = 500;
@@ -98,6 +100,60 @@ std::string ipKey(const std::string& addr) {
   return "4:" + addr;
 }
 
+// IP literal (v4 ou v6; v4 mapeado em v6 vira v4) → 16 bytes + família.
+struct IpAddr {
+  bool v6 = false;
+  std::array<unsigned char, 16> b{};
+};
+std::optional<IpAddr> parseIp(const std::string& s) {
+  IpAddr a;
+  in_addr a4{};
+  if (inet_pton(AF_INET, s.c_str(), &a4) == 1) {
+    std::memcpy(a.b.data(), &a4, 4);
+    return a;
+  }
+  in6_addr a6{};
+  if (inet_pton(AF_INET6, s.c_str(), &a6) != 1) return std::nullopt;
+  const auto* p = reinterpret_cast<const unsigned char*>(&a6);
+  static const unsigned char kMapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+  if (std::equal(p, p + 12, kMapped)) {
+    std::memcpy(a.b.data(), p + 12, 4);
+    return a;
+  }
+  a.v6 = true;
+  std::memcpy(a.b.data(), p, 16);
+  return a;
+}
+
+// Rede de proxy confiável: IP ou CIDR (validado na config; aqui inválido = ignorado).
+struct IpNet {
+  IpAddr base;
+  int bits = 0;
+  bool contains(const IpAddr& a) const {
+    if (a.v6 != base.v6) return false;
+    int left = bits;
+    for (size_t i = 0; left > 0; ++i, left -= 8) {
+      const unsigned char mask = left >= 8 ? 0xff : static_cast<unsigned char>(0xff << (8 - left));
+      if ((a.b[i] & mask) != (base.b[i] & mask)) return false;
+    }
+    return true;
+  }
+};
+std::optional<IpNet> parseNet(const std::string& s) {
+  const size_t slash = s.find('/');
+  auto ip = parseIp(s.substr(0, slash));
+  if (!ip) return std::nullopt;
+  const int max = ip->v6 ? 128 : 32;
+  int bits = max;
+  if (slash != std::string::npos) {
+    const std::string b = s.substr(slash + 1);
+    if (b.empty() || b.size() > 3 || b.find_first_not_of("0123456789") != std::string::npos) return std::nullopt;
+    bits = std::stoi(b);
+    if (bits > max) return std::nullopt;
+  }
+  return IpNet{*ip, bits};
+}
+
 struct Bucket {
   double tokens = 0, last = 0;
   // Recarrega e tenta gastar 1 ficha.
@@ -109,7 +165,37 @@ struct Bucket {
     return true;
   }
   bool full(double now, double rate, double cap) const { return tokens + std::max(0.0, now - last) * rate >= cap; }
+  bool has(double now, double rate, double cap) const {
+    return std::min(cap, tokens + std::max(0.0, now - last) * rate) >= 1;
+  }
 };
+
+// Baldes por chave com teto de chaves (cheio: limpa os ociosos; se continuar cheio, nullptr = recusar).
+struct KeyedBuckets {
+  std::unordered_map<std::string, Bucket> m;
+  Bucket* get(const std::string& key, double now, double rate, double cap, size_t maxKeys) {
+    auto it = m.find(key);
+    if (it != m.end()) return &it->second;
+    if (m.size() >= maxKeys) {
+      for (auto i = m.begin(); i != m.end();) i = i->second.full(now, rate, cap) ? m.erase(i) : std::next(i);
+      if (m.size() >= maxKeys) return nullptr;
+    }
+    return &m.emplace(key, Bucket{cap, now}).first->second;
+  }
+};
+
+// Inteiro JSON dentro de [lo, hi] (sem deixar um sem-sinal enorme dar a volta para negativo).
+bool intIn(const nlohmann::json& v, int64_t lo, int64_t hi, int64_t& out) {
+  if (!v.is_number_integer()) return false;
+  if (v.is_number_unsigned()) {
+    const auto u = v.get<uint64_t>();
+    if (u > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) return false;
+    out = static_cast<int64_t>(u);
+  } else {
+    out = v.get<int64_t>();
+  }
+  return out >= lo && out <= hi;
+}
 
 struct Session {
   std::string did, name;
@@ -125,7 +211,9 @@ struct SessionView {
 std::optional<std::string> cookieOf(const httplib::Request& req, std::string_view name) {
   const size_t n = req.get_header_value_count("Cookie");
   for (size_t k = 0; k < n; ++k) {
-    std::string_view all = req.get_header_value("Cookie", "", k);
+    // get_header_value devolve std::string por valor: o texto precisa viver enquanto a view existir.
+    const std::string hdr = req.get_header_value("Cookie", "", k);
+    std::string_view all = hdr;
     while (!all.empty()) {
       size_t semi = all.find(';');
       std::string_view part = all.substr(0, semi);
@@ -211,10 +299,12 @@ struct AdminServer::Impl {
   std::unordered_map<std::string, Session> sessions;  // chave = sha256 do id
   std::unordered_map<std::string, double> states;      // sha256 do state → vence em
   std::unordered_map<std::string, int64_t> jtis;       // jti → vence em (Unix)
-  std::unordered_map<std::string, Bucket> loginByIp;
-  Bucket loginGlobal;
+  KeyedBuckets loginFailByIp, startByIp;  // falhas de login / inícios, por IP do cliente
+  Bucket loginFailGlobal;
   bool loginGlobalInit = false;
   uint64_t sessionSeq = 0;
+  std::vector<IpNet> proxies;          // admin.trustedProxies
+  std::vector<std::string> pwNeedles;  // senha do banco (crua e escapada em JSON) para o filtro de logs
 
   Impl(AdminOptions o, AdminBackend b) : opt(std::move(o)), be(std::move(b)) {
     if (sodium_init() < 0) throw std::runtime_error("painel admin: falha ao iniciar libsodium");
@@ -223,6 +313,19 @@ struct AdminServer::Impl {
     sessionCookie = https ? "__Host-cbadmin" : "cbadmin";
     stateCookie = https ? "__Secure-cbadmin_state" : "cbadmin_state";
     while (!opt.hubUrl.empty() && opt.hubUrl.back() == '/') opt.hubUrl.pop_back();
+    for (const auto& t : opt.trustedProxies) {
+      if (auto n = parseNet(t)) proxies.push_back(*n);
+      else spdlog::warn("painel admin: proxy confiável inválido ignorado: '{}'", t);
+    }
+    if (opt.dbPassword.size() >= 4) {
+      pwNeedles.push_back(opt.dbPassword);
+      std::string esc = json(opt.dbPassword).dump(-1, ' ', false, json::error_handler_t::replace);
+      esc = esc.substr(1, esc.size() - 2);
+      if (esc != opt.dbPassword) pwNeedles.push_back(esc);
+    } else if (!opt.dbPassword.empty()) {
+      spdlog::warn("painel admin: senha do banco com menos de 4 caracteres; o filtro de logs do painel fica "
+                   "desligado (use uma senha forte)");
+    }
     if (!be.unixNow)
       be.unixNow = [] {
         return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
@@ -239,9 +342,45 @@ struct AdminServer::Impl {
 
   double mono() const { return be.monoNow(); }
 
+  // IP do cliente: o do par TCP, ou, se o par for um proxy confiável (admin.trustedProxies), o primeiro endereço não
+  // confiável do X-Forwarded-For lido da direita para a esquerda. Entrada inválida → o par.
+  std::string clientIp(const httplib::Request& req) const {
+    if (proxies.empty()) return req.remote_addr;
+    auto trusted = [this](const std::string& ip) {
+      auto a = parseIp(ip);
+      if (!a) return false;
+      for (const auto& n : proxies)
+        if (n.contains(*a)) return true;
+      return false;
+    };
+    if (!trusted(req.remote_addr)) return req.remote_addr;
+    std::string all;
+    const size_t n = req.get_header_value_count("X-Forwarded-For");
+    for (size_t k = 0; k < n; ++k) {
+      if (!all.empty()) all += ',';
+      all += req.get_header_value("X-Forwarded-For", "", k);
+    }
+    if (all.size() > 4096) return req.remote_addr;
+    std::vector<std::string> hops;
+    for (size_t b = 0; b <= all.size();) {
+      size_t e = all.find(',', b);
+      if (e == std::string::npos) e = all.size();
+      std::string h = all.substr(b, e - b);
+      while (!h.empty() && (h.front() == ' ' || h.front() == '\t')) h.erase(h.begin());
+      while (!h.empty() && (h.back() == ' ' || h.back() == '\t')) h.pop_back();
+      hops.push_back(std::move(h));
+      b = e + 1;
+    }
+    for (auto it = hops.rbegin(); it != hops.rend(); ++it) {
+      if (!parseIp(*it)) return req.remote_addr;
+      if (!trusted(*it)) return *it;
+    }
+    return req.remote_addr;
+  }
+
   void audit(json j, const httplib::Request& req) {
     j["ts"] = be.unixNow();
-    j["ip"] = req.remote_addr;
+    j["ip"] = clientIp(req);
     if (be.audit) be.audit(dumpSafe(j));
   }
   void auditAction(const SessionView& s, const httplib::Request& req, const std::string& action, json extra) {
@@ -256,55 +395,86 @@ struct AdminServer::Impl {
     return a;
   }
 
-  // Limite de login: por IP (/64 no IPv6) e global. Memória limitada (maxRateKeys).
-  bool loginAllowed(const httplib::Request& req) {
-    const double now = mono();
-    const double perIp = std::max(1, opt.loginPerIpPerMin), global = std::max(1, opt.loginGlobalPerMin);
-    std::lock_guard<std::mutex> lk(mu);
+  // Login: só falhas gastam o orçamento (por IP do cliente, /64 no IPv6, e global). Sucessos nunca gastam, e um par
+  // ticket + state válido entra mesmo com o orçamento esgotado (tickets não se forjam e o state é de uso único: o que
+  // se pode adivinhar é só o devToken, que fica bloqueado sem orçamento).
+  double perIpRate() const { return std::max(1, opt.loginPerIpPerMin) / 60.0; }
+  double globalRate() const { return std::max(1, opt.loginGlobalPerMin) / 60.0; }
+  void initGlobalLocked(double now) {
     if (!loginGlobalInit) {
-      loginGlobal = {global, now};
+      loginFailGlobal = {static_cast<double>(std::max(1, opt.loginGlobalPerMin)), now};
       loginGlobalInit = true;
     }
-    const std::string key = ipKey(req.remote_addr);
-    auto it = loginByIp.find(key);
-    if (it == loginByIp.end()) {
-      if (loginByIp.size() >= opt.maxRateKeys) {
-        for (auto i = loginByIp.begin(); i != loginByIp.end();)
-          i = i->second.full(now, perIp / 60, perIp) ? loginByIp.erase(i) : std::next(i);
-        if (loginByIp.size() >= opt.maxRateKeys) return false;
-      }
-      it = loginByIp.emplace(key, Bucket{perIp, now}).first;
-    }
-    if (!it->second.take(now, perIp / 60, perIp)) return false;
-    return loginGlobal.take(now, global / 60, global);
+  }
+  // Ainda há orçamento de falhas para este IP e no global? (não gasta)
+  bool failureBudget(const std::string& ip) {
+    const double now = mono();
+    std::lock_guard<std::mutex> lk(mu);
+    initGlobalLocked(now);
+    const double cap = std::max(1, opt.loginPerIpPerMin);
+    auto it = loginFailByIp.m.find(ipKey(ip));
+    const bool ipOk = it == loginFailByIp.m.end() || it->second.has(now, perIpRate(), cap);
+    return ipOk && loginFailGlobal.has(now, globalRate(), std::max(1, opt.loginGlobalPerMin));
+  }
+  // Gasta uma falha; false = sem orçamento (responder 429).
+  bool chargeFailure(const std::string& ip) {
+    const double now = mono();
+    std::lock_guard<std::mutex> lk(mu);
+    initGlobalLocked(now);
+    const double cap = std::max(1, opt.loginPerIpPerMin);
+    Bucket* b = loginFailByIp.get(ipKey(ip), now, perIpRate(), cap, opt.maxRateKeys);
+    if (!b || !b->take(now, perIpRate(), cap)) return false;
+    return loginFailGlobal.take(now, globalRate(), std::max(1, opt.loginGlobalPerMin));
+  }
+  // /auth/start: barato, limite próprio só por IP (o teto de states pendentes segura a memória).
+  bool startAllowed(const std::string& ip) {
+    const double now = mono();
+    const double cap = std::max(1, opt.startPerIpPerMin);
+    std::lock_guard<std::mutex> lk(mu);
+    Bucket* b = startByIp.get(ipKey(ip), now, cap / 60, cap, opt.maxRateKeys);
+    return b && b->take(now, cap / 60, cap);
   }
 
-  // Mutação: Origin do painel, X-CB-Admin: 1, JSON (objeto). Devolve o corpo ou nullopt (resposta já escrita).
-  std::optional<json> guard(const httplib::Request& req, httplib::Response& res) {
+  // Mutação, só cabeçalhos (barato, antes de autenticar e de ler o JSON): Origin do painel, X-CB-Admin: 1,
+  // Content-Type JSON e tamanho. false = resposta já escrita.
+  bool guardHeaders(const httplib::Request& req, httplib::Response& res, size_t maxBody = kMaxBody) {
     const std::string origin = req.get_header_value("Origin");
     if (origin.empty() || !origins.count(lower(origin))) {
       sendError(res, 403, "origem não permitida");
-      return std::nullopt;
+      return false;
     }
     if (req.get_header_value("X-CB-Admin") != "1") {
       sendError(res, 403, "cabeçalho X-CB-Admin ausente");
-      return std::nullopt;
+      return false;
     }
     const std::string ct = lower(req.get_header_value("Content-Type"));
     if (!(ct == "application/json" || ct.rfind("application/json;", 0) == 0)) {
       sendError(res, 415, "use Content-Type: application/json");
-      return std::nullopt;
+      return false;
     }
-    if (req.body.size() > kMaxBody) {
+    if (req.body.size() > maxBody) {
       sendError(res, 413, "corpo grande demais");
-      return std::nullopt;
+      return false;
     }
+    return true;
+  }
+  static std::optional<json> parseBody(const httplib::Request& req) {
     auto j = json::parse(req.body, nullptr, false);
-    if (j.is_discarded() || !j.is_object()) {
+    if (j.is_discarded() || !j.is_object()) return std::nullopt;
+    return j;
+  }
+  // Mutação autenticada: cabeçalhos → sessão → corpo.
+  std::optional<std::pair<SessionView, json>> mutation(const httplib::Request& req, httplib::Response& res,
+                                                       bool console = false) {
+    if (!guardHeaders(req, res)) return std::nullopt;
+    auto s = auth(req, res, console);
+    if (!s) return std::nullopt;
+    auto j = parseBody(req);
+    if (!j) {
       sendError(res, 400, "corpo deve ser um objeto JSON");
       return std::nullopt;
     }
-    return j;
+    return std::make_pair(std::move(*s), std::move(*j));
   }
 
   void purgeSessionsLocked(double now) {
@@ -392,7 +562,7 @@ struct AdminServer::Impl {
   // ------------------------------------------------------------------ login
 
   void handleStart(const httplib::Request& req, httplib::Response& res) {
-    if (!loginAllowed(req)) return sendError(res, 429, "muitas tentativas; espere um minuto");
+    if (!startAllowed(clientIp(req))) return sendError(res, 429, "muitos inícios de login; espere um minuto");
     if (opt.hubUrl.empty()) return sendError(res, 409, "login via Hub indisponível: servidor sem 'hub' (modo dev)");
     if (opt.publicUrl && lower(req.get_header_value("Host")) != publicHost) {
       // O Hub volta para a publicUrl: o cookie de state precisa nascer nela.
@@ -418,17 +588,29 @@ struct AdminServer::Impl {
   }
 
   void handleLogin(const httplib::Request& req, httplib::Response& res) {
-    if (!loginAllowed(req)) return sendError(res, 429, "muitas tentativas; espere um minuto");
-    auto body = guard(req, res);
-    if (!body) return;
+    // Recusas do guard (cabeçalhos/tamanho) não gastam orçamento: não provam nada e não chegam a validar nada.
+    if (!guardHeaders(req, res, kMaxLoginBody)) return;
+    const std::string ip = clientIp(req);
     auto fail = [&](int status, const std::string& why, const std::string& msg, const std::string& did = "") {
       json a{{"type", "admin_login"}, {"result", why}};
       if (!did.empty()) a["did"] = did;
+      if (!chargeFailure(ip)) {
+        a["rateLimited"] = true;
+        audit(std::move(a), req);
+        return sendError(res, 429, "muitas tentativas de login falhas; espere um minuto");
+      }
       audit(std::move(a), req);
       sendError(res, status, msg);
     };
+    auto body = parseBody(req);
+    if (!body) return fail(400, "bad_request", "corpo deve ser um objeto JSON");
 
     if (body->contains("devToken")) {
+      // Único segredo adivinhável: sem orçamento de falhas, nem compara.
+      if (!failureBudget(ip)) {
+        audit({{"type", "admin_login"}, {"result", "bad_dev_token"}, {"rateLimited", true}}, req);
+        return sendError(res, 429, "muitas tentativas de login falhas; espere um minuto");
+      }
       const auto& t = (*body)["devToken"];
       if (!t.is_string()) return fail(400, "bad_request", "devToken deve ser texto");
       if (!opt.devToken || !ctEqual(t.get_ref<const std::string&>(), *opt.devToken))
@@ -438,9 +620,13 @@ struct AdminServer::Impl {
       return sendJson(res, {{"did", "dev"}, {"name", "dev"}});
     }
 
+    // Ticket só no modo Hub (em dev qualquer um com a seed dev cunharia tickets #admin).
+    if (opt.hubUrl.empty()) return fail(409, "no_hub", "login por ticket exige o Hub (servidor em modo dev)");
+
     // state: cookie == corpo (tempo constante), emitido por /auth/start, vivo e de uso único. O cookie sai sempre.
     res.set_header("Set-Cookie", stateCookie + "=" + cookieAttrs("/auth", 0));
-    const auto st = body->value("state", json()).is_string() ? (*body)["state"].get<std::string>() : std::string();
+    const auto stv = body->value("state", json());
+    const std::string st = stv.is_string() ? stv.get<std::string>() : std::string();
     const auto ck = cookieOf(req, stateCookie).value_or("");
     if (st.empty() || ck.empty() || st.size() > 128 || !ctEqual(st, ck))
       return fail(403, "bad_state", "login não iniciado neste navegador (state); comece de novo");
@@ -492,7 +678,7 @@ struct AdminServer::Impl {
   }
 
   void handleLogout(const httplib::Request& req, httplib::Response& res) {
-    if (!guard(req, res)) return;
+    if (!guardHeaders(req, res)) return;
     std::string did;
     if (auto id = cookieOf(req, sessionCookie); id && !id->empty() && id->size() <= 128) {
       std::lock_guard<std::mutex> lk(mu);
@@ -510,19 +696,25 @@ struct AdminServer::Impl {
   // ------------------------------------------------------------------ jogadores
 
   void handlePlayerAction(const httplib::Request& req, httplib::Response& res) {
-    auto body = guard(req, res);
-    if (!body) return;
-    auto s = auth(req, res);
-    if (!s) return;
-    uint16_t id = 0;
-    if (!parseId(req.matches[1].str(), id)) return sendError(res, 404, "jogador não encontrado");
+    auto m = mutation(req, res);
+    if (!m) return;
+    const SessionView& s = m->first;
+    const json& body = m->second;
     const std::string action = req.matches[2].str();
-    auto p = player(id);
-    if (!p) return sendError(res, 404, "jogador não encontrado");
+    // Toda recusa também vai para a auditoria.
+    auto reject = [&](int status, const std::string& result, const std::string& msg, json extra = json::object()) {
+      extra["result"] = result;
+      auditAction(s, req, action, std::move(extra));
+      sendError(res, status, msg);
+    };
+    uint16_t id = 0;
+    std::optional<cbscript::PlayerView> p;
+    if (parseId(req.matches[1].str(), id)) p = player(id);
+    if (!p) return reject(404, "not_found", "jogador não encontrado", {{"target", {{"id", req.matches[1].str()}}}});
     const json target{{"id", p->id}, {"did", p->did}, {"name", p->name}};
 
     auto reasonOf = [&](const char* def) -> std::optional<std::string> {
-      auto r = body->value("reason", json());
+      auto r = body.value("reason", json());
       if (r.is_null()) return std::string(def);
       if (!r.is_string() || r.get_ref<const std::string&>().size() > kMaxReason) return std::nullopt;
       auto v = r.get<std::string>();
@@ -531,42 +723,57 @@ struct AdminServer::Impl {
 
     if (action == "kick") {
       auto reason = reasonOf("expulso por um admin");
-      if (!reason) return sendError(res, 400, "reason deve ser texto de até 200 bytes");
+      if (!reason) return reject(400, "invalid", "reason deve ser texto de até 200 bytes", {{"target", target}});
       if (!be.simCommand || !be.simCommand(cbscript::CmdKick{p->id, *reason, p->session}))
-        return sendError(res, 503, "fila da simulação cheia");
-      auditAction(*s, req, "kick", {{"target", target}, {"reason", *reason}, {"result", "accepted"}});
+        return reject(503, "unavailable", "fila da simulação cheia", {{"target", target}});
+      auditAction(s, req, "kick", {{"target", target}, {"reason", *reason}, {"result", "accepted"}});
       return sendJson(res, {{"accepted", true}}, 202);
     }
     if (action == "ban") {
       auto reason = reasonOf("banido por um admin");
-      if (!reason) return sendError(res, 400, "reason deve ser texto de até 200 bytes");
+      if (!reason) return reject(400, "invalid", "reason deve ser texto de até 200 bytes", {{"target", target}});
       int64_t dur = 0;
-      if (auto d = body->value("durationS", json()); !d.is_null()) {
-        if (!d.is_number_integer() || d.get<int64_t>() < 0 || d.get<int64_t>() > kMaxBanSeconds)
-          return sendError(res, 400, "durationS deve ser inteiro de 0 (permanente) a 10 anos");
-        dur = d.get<int64_t>();
-      }
-      if (!be.ban || !be.ban(p->did, *reason, dur, "admin:" + s->did))
-        return sendError(res, 503, "bans indisponíveis agora (host de scripts parado?)");
-      auditAction(*s, req, "ban",
-                  {{"target", target}, {"reason", *reason}, {"durationS", dur}, {"result", "accepted"}});
-      return sendJson(res, {{"accepted", true}}, 202);
+      if (auto d = body.value("durationS", json()); !d.is_null() && !intIn(d, 0, kMaxBanSeconds, dur))
+        return reject(400, "invalid", "durationS deve ser inteiro de 0 (permanente) a 10 anos", {{"target", target}});
+      if (p->did.empty() || p->did.size() > 64)
+        return reject(400, "invalid", "jogador sem did válido", {{"target", target}});
+      const json info{{"target", target}, {"reason", *reason}, {"durationS", dur}};
+      auto out = runBan(p->did, *reason, dur, "admin:" + s.did);
+      json a = info;
+      a["result"] = !out ? "pending" : *out ? "ok" : "failed";
+      auditAction(s, req, "ban", std::move(a));
+      if (!out) return sendJson(res, {{"pending", true}}, 202);
+      if (!*out) return sendError(res, 503, "ban não gravado (host de scripts parado ou falha ao gravar; ver log)");
+      return sendJson(res, {{"ok", true}});
     }
     // teleport
     int32_t xyz[3] = {};
     const char* keys[3] = {"x", "y", "z"};
     for (int i = 0; i < 3; ++i) {
-      auto v = body->value(keys[i], json());
-      if (!v.is_number_integer() || v.get<int64_t>() < std::numeric_limits<int32_t>::min() ||
-          v.get<int64_t>() > std::numeric_limits<int32_t>::max())
-        return sendError(res, 400, "x, y e z devem ser inteiros (cm)");
-      xyz[i] = static_cast<int32_t>(v.get<int64_t>());
+      int64_t v = 0;
+      if (!intIn(body.value(keys[i], json()), std::numeric_limits<int32_t>::min(), std::numeric_limits<int32_t>::max(),
+                 v))
+        return reject(400, "invalid", "x, y e z devem ser inteiros (cm)", {{"target", target}});
+      xyz[i] = static_cast<int32_t>(v);
     }
     if (!be.simCommand || !be.simCommand(cbscript::CmdSetPosition{p->id, xyz[0], xyz[1], xyz[2], p->session}))
-      return sendError(res, 503, "fila da simulação cheia");
-    auditAction(*s, req, "teleport",
+      return reject(503, "unavailable", "fila da simulação cheia", {{"target", target}});
+    auditAction(s, req, "teleport",
                 {{"target", target}, {"pos", {xyz[0], xyz[1], xyz[2]}}, {"result", "accepted"}});
     sendJson(res, {{"accepted", true}}, 202);
+  }
+
+  // Ban: o backend grava pela thread de scripts e confirma pelo future. nullopt = ainda em andamento (202).
+  std::optional<bool> runBan(const std::string& did, const std::string& reason, int64_t dur, const std::string& by) {
+    if (!be.ban) return false;
+    auto f = be.ban(did, reason, dur, by);
+    if (!f.valid()) return false;
+    if (f.wait_for(opt.actionWait) != std::future_status::ready) return std::nullopt;
+    try {
+      return f.get();
+    } catch (const std::future_error&) {  // tarefa descartada (host parou): promessa quebrada
+      return false;
+    }
   }
 
   // ------------------------------------------------------------------ resources
@@ -581,7 +788,7 @@ struct AdminServer::Impl {
   }
 
   void handleResourceAction(const httplib::Request& req, httplib::Response& res) {
-    if (!guard(req, res)) return;
+    if (!guardHeaders(req, res)) return;
     auto s = auth(req, res);
     if (!s) return;
     const std::string name = req.matches[1].str(), op = req.matches[2].str();
@@ -654,19 +861,23 @@ struct AdminServer::Impl {
         return "expulsando " + p->name + " (" + std::to_string(p->id) + ")";
       }
       if (reason.empty()) reason = "banido por um admin";
-      if (!be.ban || !be.ban(p->did, reason, 0, "admin:" + s.did)) return std::string("bans indisponíveis agora");
-      auditAction(s, req, "ban", {{"target", target}, {"reason", reason}, {"durationS", 0}, {"result", "accepted"}});
-      return "banindo " + p->name + " (" + p->did + ")";
+      if (p->did.empty() || p->did.size() > 64) return std::string("jogador sem did válido");
+      auto out = runBan(p->did, reason, 0, "admin:" + s.did);
+      auditAction(s, req, "ban",
+                  {{"target", target}, {"reason", reason}, {"durationS", 0},
+                   {"result", !out ? "pending" : *out ? "ok" : "failed"}});
+      if (!out) return "ban de " + p->name + " em andamento";
+      if (!*out) return std::string("ban não gravado (host de scripts parado ou falha ao gravar; ver log)");
+      return "banido: " + p->name + " (" + p->did + ")";
     }
     return std::nullopt;
   }
 
   void handleConsole(const httplib::Request& req, httplib::Response& res) {
-    auto body = guard(req, res);
-    if (!body) return;
-    auto s = auth(req, res, true);
-    if (!s) return;
-    auto lv = body->value("line", json());
+    auto m = mutation(req, res, true);
+    if (!m) return;
+    auto s = std::optional<SessionView>(std::move(m->first));
+    auto lv = m->second.value("line", json());
     if (!lv.is_string()) return sendError(res, 400, "line deve ser texto");
     const std::string line = lv.get<std::string>();
     if (line.size() > kMaxConsoleLine) return sendError(res, 400, "linha grande demais (até 512 bytes)");
@@ -692,6 +903,7 @@ struct AdminServer::Impl {
     auto w = std::make_shared<Waiter>();
     cbscript::EvCommand ev;
     ev.adminDid = s->did;
+    ev.adminOnly = true;  // o console do painel só roda comandos de admin
     ev.line = line;
     ev.reply = [w](std::string t) {
       std::lock_guard<std::mutex> lk(w->m);
@@ -730,7 +942,13 @@ struct AdminServer::Impl {
     std::string best;
     std::error_code ec;
     for (fs::directory_iterator it(opt.logsDir, ec), end; !ec && it != end; it.increment(ec)) {
-      const std::string n = it->path().filename().string();
+      std::string n;
+      try {
+        const auto u8 = it->path().filename().u8string();
+        n.assign(u8.begin(), u8.end());
+      } catch (const std::exception&) {
+        continue;  // nome não representável: não é um dos nossos
+      }
       const std::string pre = kind + "-";
       if (n.size() != pre.size() + 16 || n.rfind(pre, 0) != 0 || n.substr(n.size() - 6) != ".jsonl") continue;
       const std::string d = n.substr(pre.size(), 10);
@@ -768,7 +986,9 @@ struct AdminServer::Impl {
     }
     const size_t start = all.size() > tail ? all.size() - tail : 0;
     for (size_t i = start; i < all.size(); ++i) {
-      if (!opt.dbPassword.empty() && all[i].find(opt.dbPassword) != std::string_view::npos) continue;
+      bool leak = false;
+      for (const auto& n : pwNeedles) leak = leak || all[i].find(n) != std::string_view::npos;
+      if (leak) continue;
       lines.push_back(std::string(all[i]));
     }
     sendJson(res, {{"file", best}, {"lines", lines}});
@@ -867,12 +1087,12 @@ struct AdminServer::Impl {
   void start() {
     if (th.joinable()) throw std::runtime_error("painel admin já iniciado");
     const size_t n = static_cast<size_t>(std::clamp(opt.threads, 1, 64));
-    svr.new_task_queue = [n] { return new httplib::ThreadPool(n, n, 64); };
+    svr.new_task_queue = [n] { return new httplib::ThreadPool(n, n, 32); };
     svr.set_payload_max_length(kMaxBody);
     svr.set_read_timeout(10, 0);
     svr.set_write_timeout(10, 0);
-    svr.set_keep_alive_timeout(5);
-    svr.set_keep_alive_max_count(100);
+    svr.set_keep_alive_timeout(2);  // conexões ociosas seguram um worker do httplib
+    svr.set_keep_alive_max_count(50);
     port = opt.port == 0 ? svr.bind_to_any_port(opt.bind) : (svr.bind_to_port(opt.bind, opt.port) ? opt.port : -1);
     if (port <= 0)
       throw std::runtime_error("painel admin: não foi possível abrir " + opt.bind + ":" + std::to_string(opt.port));
@@ -884,7 +1104,8 @@ struct AdminServer::Impl {
     }
     if (cbserver::isLoopbackBind(opt.bind)) {
       const std::string p = std::to_string(port);
-      for (const std::string& h : {"127.0.0.1:" + p, "localhost:" + p, "[::1]:" + p}) {
+      const std::string bindHost = opt.bind.find(':') != std::string::npos ? "[" + lower(opt.bind) + "]" : opt.bind;
+      for (const std::string& h : {bindHost + ":" + p, "127.0.0.1:" + p, "localhost:" + p, "[::1]:" + p}) {
         hosts.insert(h);
         origins.insert("http://" + h);
       }
@@ -943,8 +1164,13 @@ AdminBackend makeBackend(cbscript::ScriptHost& host, cbserver::ScriptBridge& bri
   };
   be.scriptCommand = [&host](cbscript::EvCommand c) { return host.post(std::move(c)); };
   be.ban = [&host, &bridge, bans, unixNow](const std::string& did, const std::string& reason, int64_t dur,
-                                           const std::string& by) {
-    if (!bans || host.metrics().halted) return false;
+                                           const std::string& by) -> std::future<bool> {
+    auto done = std::make_shared<std::promise<bool>>();
+    auto fut = done->get_future();
+    if (!bans || host.metrics().halted) {
+      done->set_value(false);
+      return fut;
+    }
     cbscript::Ban b;
     b.did = did;
     b.reason = reason;
@@ -954,16 +1180,20 @@ AdminBackend makeBackend(cbscript::ScriptHost& host, cbserver::ScriptBridge& bri
                                 std::chrono::system_clock::now().time_since_epoch())
                                 .count();
     b.expiresAt = dur > 0 ? b.createdAt + dur : 0;
-    // BanStore tem um escritor só: a thread de scripts.
-    host.runOnScriptThread([bans, b](cbscript::ScriptContext& ctx) mutable {
+    // BanStore tem um escritor só: a thread de scripts. O resultado volta pelo future; se a tarefa for descartada
+    // (host parou entre a checagem e a fila), a promessa é destruída sem valor e o painel lê isso como falha.
+    host.runOnScriptThread([bans, b, done](cbscript::ScriptContext& ctx) mutable {
       std::string err;
-      if (!bans->add(std::move(b), err)) ctx.log(cbscript::LogLevel::Error, "painel admin: ban não gravado: " + err);
+      const bool ok = bans->add(std::move(b), err);
+      if (!ok) ctx.log(cbscript::LogLevel::Error, "painel admin: ban não gravado no arquivo (vale em memória): " + err);
+      done->set_value(ok);
     });
-    // Kick por did direto pelo canal prioritário (pega também quem ainda não chegou aos scripts).
+    // Kick por did já, pelo canal prioritário da ponte (thread do painel; pega também quem ainda não chegou aos
+    // scripts). A ponte vive mais que o painel (o painel para antes).
     std::string why = "banido: " + reason;
     if (why.size() > 250) why = clip(why, 240);
     bridge.postAdmin(cbscript::CmdKickDid{did, std::move(why)});
-    return true;
+    return fut;
   };
   be.metrics = std::move(metrics);
   be.audit = std::move(audit);

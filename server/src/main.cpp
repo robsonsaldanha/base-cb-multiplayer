@@ -259,6 +259,7 @@ int run(const std::string& cfgPath) {
     ao.publicUrl = cfg.admin.publicUrl;
     ao.admins = cfg.admin.admins;
     ao.devToken = cfg.admin.devToken;
+    ao.trustedProxies = cfg.admin.trustedProxies;
     ao.serverId = serverId;
     ao.hubUrl = cfg.hub ? cfg.hub->url : std::string();
     ao.logsDir = cfg.logsDir;

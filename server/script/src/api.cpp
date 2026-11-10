@@ -2150,6 +2150,11 @@ void onCommand(Shared& sh, ScriptContext& ctx, EvCommand& ev) {
     reply(ctx, ev, session, "sem permissão para '/" + tok[0] + "'");
     return;
   }
+  // Console do painel admin (adminOnly): só comandos registrados com admin = true.
+  if (ev.adminOnly && !cmd.admin) {
+    reply(ctx, ev, session, "'/" + tok[0] + "' não é comando de admin (registre com {admin = true} para o console)");
+    return;
+  }
   ApiRes& a = *cmd.owner;
   if (!ev.from)
     auditLine(a, {{"type", "command"}, {"by", ev.adminDid.empty() ? "console" : ev.adminDid}, {"line", std::string(line)}});

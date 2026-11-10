@@ -16,6 +16,7 @@
 #include <mutex>
 #include <random>
 #include <regex>
+#include <thread>
 #include <string>
 #include <thread>
 #include <variant>
@@ -134,7 +135,9 @@ cbadmin::AdminBackend fakeBackend(Fake& f, cbserver::KeyProvider& keys) {
   be.ban = [&f](const std::string& did, const std::string& reason, int64_t dur, const std::string& by) {
     std::lock_guard<std::mutex> lk(f.mu);
     f.bans.push_back({did, reason, by, dur});
-    return true;
+    std::promise<bool> p;
+    p.set_value(true);
+    return p.get_future();
   };
   be.metrics = [] { return json{{"tickP99Ms", 1.5}, {"players", 1}}; };
   be.audit = [&f](const std::string& l) {
@@ -426,13 +429,105 @@ TEST_CASE("admin: https publicUrl gives __Host- session cookie and Secure state 
   REQUIRE(lo.header("Location") == "https://painel.example.com/auth/start");
 }
 
-TEST_CASE("admin: login attempts are rate limited per IP") {
+TEST_CASE("admin: only failed logins are charged and a valid ticket + state always gets in") {
   AdminEnv env([](cbadmin::AdminOptions& o) { o.loginPerIpPerMin = 3; });
+  // /auth/start não gasta o orçamento de falhas de login
+  std::vector<std::string> states;
+  for (int i = 0; i < 6; ++i) states.push_back(env.startState());
+  // sucessos não gastam
+  for (int i = 0; i < 2; ++i) REQUIRE(env.loginWith(env.ticket(kAdmin), states[i], states[i]).status == 200);
   for (int i = 0; i < 3; ++i) REQUIRE(env.post("/auth/login", {{"ticket", "x"}, {"state", "y"}}).status == 403);
-  REQUIRE(env.post("/auth/login", {{"ticket", "x"}, {"state", "y"}}).status == 429);
-  REQUIRE(env.get("/auth/start").status == 429);
-  env.fake.mono = env.fake.mono.load() + 61;  // janela passou
-  REQUIRE(env.get("/auth/start").status == 302);
+  REQUIRE(env.post("/auth/login", {{"ticket", "x"}, {"state", "y"}}).status == 429);  // orçamento de falhas do IP
+  REQUIRE(env.loginWith("x.y", states[2], states[2]).status == 429);                  // ticket ruim também
+  // par ticket + state válido entra mesmo com o orçamento esgotado
+  REQUIRE(env.loginWith(env.ticket(kAdmin), states[3], states[3]).status == 200);
+  REQUIRE(env.get("/auth/start").status == 302);  // início não é bloqueado pelas falhas
+  env.fake.mono = env.fake.mono.load() + 61;      // janela passou
+  REQUIRE(env.post("/auth/login", {{"ticket", "x"}, {"state", "y"}}).status == 403);
+  // requisição recusada pelo guard (sem Origin) não gasta nada
+  for (int i = 0; i < 10; ++i)
+    REQUIRE(env.send("POST", "/auth/login", {{"X-CB-Admin", "1"}}, R"({"ticket":"x","state":"y"})").status == 403);
+  REQUIRE(env.post("/auth/login", {{"ticket", "x"}, {"state", "y"}}).status == 403);
+}
+
+TEST_CASE("admin: the global failure budget never locks out a valid login (trusted proxy gives the client IP)") {
+  AdminEnv env([](cbadmin::AdminOptions& o) {
+    o.loginPerIpPerMin = 100;
+    o.loginGlobalPerMin = 5;
+    o.trustedProxies = {"127.0.0.1"};
+  });
+  auto from = [&](const std::string& ip, const json& body, const std::string& cookie = "") {
+    httplib::Headers h{{"Origin", env.origin()}, {"X-CB-Admin", "1"}, {"X-Forwarded-For", "203.0.113.9, " + ip}};
+    if (!cookie.empty()) h.emplace("Cookie", cookie);
+    return env.send("POST", "/auth/login", h, body.dump());
+  };
+  for (int i = 0; i < 5; ++i)
+    REQUIRE(from("10.0.0." + std::to_string(i + 1), {{"ticket", "x"}, {"state", "y"}}).status == 403);
+  REQUIRE(from("10.0.0.50", {{"ticket", "x"}, {"state", "y"}}).status == 429);  // global esgotado
+  auto st = env.startState();
+  REQUIRE(from("10.0.0.51", {{"ticket", env.ticket(kAdmin)}, {"state", st}}, "cbadmin_state=" + st).status == 200);
+  // a auditoria registra o IP do cliente (último salto não confiável do X-Forwarded-For)
+  REQUIRE(env.fake.hasAudit("\"ip\":\"10.0.0.51\"", "\"ok\""));
+  REQUIRE(env.fake.hasAudit("\"ip\":\"10.0.0.1\"", "bad_state"));
+}
+
+TEST_CASE("admin: /auth/start has its own per-IP limit and X-Forwarded-For is ignored unless the peer is trusted") {
+  AdminEnv env([](cbadmin::AdminOptions& o) { o.startPerIpPerMin = 3; });
+  for (int i = 0; i < 3; ++i)
+    REQUIRE(env.send("GET", "/auth/start", {{"X-Forwarded-For", "10.0.0." + std::to_string(i)}}).status == 302);
+  REQUIRE(env.send("GET", "/auth/start", {{"X-Forwarded-For", "10.0.0.99"}}).status == 429);  // mesmo IP real
+  REQUIRE(env.post("/auth/login", {{"ticket", "x"}, {"state", "y"}}).status == 403);  // login não é afetado
+
+  AdminEnv proxied([](cbadmin::AdminOptions& o) {
+    o.startPerIpPerMin = 3;
+    o.trustedProxies = {"127.0.0.0/8", "::1"};
+  });
+  for (int i = 0; i < 3; ++i)
+    REQUIRE(proxied.send("GET", "/auth/start", {{"X-Forwarded-For", "10.0.0.1"}}).status == 302);
+  REQUIRE(proxied.send("GET", "/auth/start", {{"X-Forwarded-For", "10.0.0.1"}}).status == 429);
+  REQUIRE(proxied.send("GET", "/auth/start", {{"X-Forwarded-For", "10.0.0.2"}}).status == 302);
+  // sem cabeçalho ou com lixo: vale o IP do par (o proxy)
+  REQUIRE(proxied.send("GET", "/auth/start", {{"X-Forwarded-For", "lixo"}}).status == 302);
+}
+
+TEST_CASE("admin: ticket login is refused when the server has no Hub (dev mode)") {
+  AdminEnv env([](cbadmin::AdminOptions& o) {
+    o.hubUrl.clear();
+    o.devToken = std::string(40, 'k');
+  });
+  REQUIRE(env.post("/auth/login", {{"ticket", env.ticket(kAdmin)}, {"state", "abc"}}).status == 409);
+}
+
+TEST_CASE("admin: oversized login bodies are refused before parsing") {
+  AdminEnv env;
+  REQUIRE(env.post("/auth/login", {{"ticket", std::string(9000, 'a')}, {"state", "y"}}).status == 413);
+}
+
+TEST_CASE("admin: cookie parsing survives long Cookie headers and concurrent sessions stay isolated") {
+  AdminEnv env([](cbadmin::AdminOptions& o) {
+    o.admins = {kAdmin, kOther};
+    o.apiBurst = 1e9;
+    o.loginPerIpPerMin = 1000;
+  });
+  const std::string a = env.login(kAdmin), b = env.login(kOther);
+  const std::string padA(3000, 'p'), padB(3000, 'q');
+  std::atomic<int> bad{0}, done{0};
+  std::vector<std::thread> ts;
+  for (int t = 0; t < 8; ++t)
+    ts.emplace_back([&, t] {
+      const bool isA = t % 2 == 0;
+      const std::string cookie =
+          "x1=" + (isA ? padA : padB) + "; " + (isA ? a : b) + "; x2=" + (isA ? padB : padA) + "; cbadmin_state=zz";
+      for (int i = 0; i < 40; ++i) {
+        auto r = env.get("/api/me", cookie);
+        auto j = r.j();
+        if (r.status != 200 || !j.is_object() || j.value("did", "") != (isA ? kAdmin : kOther)) ++bad;
+        ++done;
+      }
+    });
+  for (auto& t : ts) t.join();
+  REQUIRE(done == 320);
+  REQUIRE(bad == 0);
 }
 
 // ---------------------------------------------------------------- sessão
@@ -589,11 +684,18 @@ TEST_CASE("admin: players, kick, ban and teleport go to the queues and are audit
 
   REQUIRE(env.post("/api/players/1/kick", {{"reason", "tchau"}}, c).status == 202);
   REQUIRE(env.post("/api/players/9/kick", {{"reason", "tchau"}}, c).status == 404);
-  REQUIRE(env.post("/api/players/2/ban", {{"reason", "cheat"}, {"durationS", 3600}}, c).status == 202);
+  auto ban = env.post("/api/players/2/ban", {{"reason", "cheat"}, {"durationS", 3600}}, c);
+  REQUIRE(ban.status == 200);  // gravado (o backend confirmou)
+  REQUIRE(ban.j()["ok"] == true);
   REQUIRE(env.post("/api/players/2/ban", {{"reason", "cheat"}, {"durationS", -1}}, c).status == 400);
   REQUIRE(env.post("/api/players/1/teleport", {{"x", 100}, {"y", -5}, {"z", 7}}, c).status == 202);
   REQUIRE(env.post("/api/players/1/teleport", {{"x", 1.5}, {"y", 0}, {"z", 0}}, c).status == 400);
   REQUIRE(env.post("/api/players/1/teleport", {{"x", 5000000000LL}, {"y", 0}, {"z", 0}}, c).status == 400);
+  REQUIRE(env.send("POST", "/api/players/1/teleport", {{"Cookie", c}, {"Origin", env.origin()}, {"X-CB-Admin", "1"}},
+                   R"({"x":18446744073709551611,"y":0,"z":0})")
+              .status == 400);  // inteiro sem sinal enorme não pode virar -5
+  REQUIRE(env.post("/api/players/2/ban", {{"reason", "cheat"}, {"durationS", 18446744073709551615ULL}}, c).status ==
+          400);
   REQUIRE(env.post("/api/players/1/kick", {{"reason", std::string(300, 'a')}}, c).status == 400);
 
   std::lock_guard<std::mutex> lk(env.fake.mu);
@@ -621,6 +723,15 @@ TEST_CASE("admin: players, kick, ban and teleport go to the queues and are audit
   REQUIRE(kickAudit);
   REQUIRE(banAudit);
   REQUIRE(tpAudit);
+  // recusas também são auditadas
+  bool notFound = false, invalid = false;
+  for (auto& l : env.fake.audit) {
+    auto j = json::parse(l);
+    if (j.value("action", "") == "kick" && j.value("result", "") == "not_found") notFound = true;
+    if (j.value("action", "") == "teleport" && j.value("result", "") == "invalid") invalid = true;
+  }
+  REQUIRE(notFound);
+  REQUIRE(invalid);
 }
 
 TEST_CASE("admin: resources, metrics and resource actions") {
@@ -674,11 +785,11 @@ TEST_CASE("admin: console runs internal and script commands as the admin, bounde
 }
 
 TEST_CASE("admin: logs tail only fixed files, bounded, never lines with the DB password") {
-  AdminEnv env([](cbadmin::AdminOptions& o) { o.dbPassword = "s3nh4-secreta"; });
+  AdminEnv env([](cbadmin::AdminOptions& o) { o.dbPassword = R"(s3nh4"sec\reta)"; });
   put(env.logs.p / "audit-2026-11-09.jsonl", "{\"old\":1}\n");
   std::string today;
   for (int i = 0; i < 600; ++i) today += "{\"n\":" + std::to_string(i) + "}\n";
-  today += "{\"leak\":\"s3nh4-secreta\"}\n{\"n\":\"last\"}\n";
+  today += R"({"leak":"s3nh4\"sec\\reta"})" "\n" R"({"n":"last"})" "\n";  // senha escapada em JSON
   put(env.logs.p / "audit-2026-11-10.jsonl", today);
   put(env.logs.p / "anticheat-2026-11-10.jsonl", std::string(3 << 20, 'x') + "\n{\"ac\":1}\n");
   put(env.logs.p / "secret.txt", "nunca\n");
@@ -692,6 +803,9 @@ TEST_CASE("admin: logs tail only fixed files, bounded, never lines with the DB p
   REQUIRE(lines[1] == "{\"n\":\"last\"}");
   REQUIRE(a.j()["file"] == "audit-2026-11-10.jsonl");
   REQUIRE(a.body.find("s3nh4") == std::string::npos);
+  AdminEnv shortPw([](cbadmin::AdminOptions& o) { o.dbPassword = "ab"; });  // curta: filtro desligado (aviso no log)
+  put(shortPw.logs.p / "audit-2026-11-10.jsonl", "{\"tab\":1}\n");
+  REQUIRE(shortPw.get("/api/logs?kind=audit", shortPw.login()).j()["lines"].size() == 1);
 
   auto big = env.get("/api/logs?kind=audit&tail=100000", c);
   REQUIRE(big.j()["lines"].size() <= 500);
@@ -728,7 +842,8 @@ struct Live {
     put(dir.p / "probe" / "resource.json", R"({"name":"probe","version":"1.0.0","server":["server/main.lua"]})");
     put(dir.p / "probe" / "server" / "main.lua",
         "cb.on('resourceStart', function() cb.log.info('probe start') end)\n"
-        "cb.commands.register('quem', function(src, args) return 'src=' .. tostring(src) end, {admin = true})\n");
+        "cb.commands.register('quem', function(src, args) return 'src=' .. tostring(src) end, {admin = true})\n"
+        "cb.commands.register('publico', function(src, args) return 'nao devia' end)\n");
     cbscript::HostOptions ho;
     ho.idleWait = std::chrono::milliseconds(2);
     ho.log = [this](cbscript::LogLevel, const std::string& m) {
@@ -858,7 +973,8 @@ TEST_CASE("admin: ban via the API writes the ban and kicks by did") {
   auto a = env.h.add("ana", {100, 0, 0});
   REQUIRE(env.ticksUntil([&] { return env.host->players()->size() == 1; }));
   auto r = env.call("POST", "/api/players/" + std::to_string(a) + "/ban", c, {{"reason", "cheat"}});
-  REQUIRE(r->status == 202);
+  REQUIRE(r->status == 200);  // gravado pela thread de scripts antes da resposta
+  REQUIRE(json::parse(r->body)["ok"] == true);
   REQUIRE(env.ticksUntil([&] { return !env.h.kicks.empty(); }));
   const auto end = Clock::now() + std::chrono::seconds(5);
   while (Clock::now() < end && !env.bans->check("did-ana", 0)) std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -897,6 +1013,9 @@ TEST_CASE("admin: console reaches an admin=true command registered by a resource
   REQUIRE(r->status == 200);
   REQUIRE(json::parse(r->body)["reply"] == "src=0");
   REQUIRE(env.has(env.audit, "\"command\"", kAdmin));  // auditoria da API cb.* com o did do admin
+  auto pub = env.call("POST", "/api/console", c, {{"line", "publico"}});
+  REQUIRE(pub->status == 200);
+  REQUIRE_THAT(json::parse(pub->body)["reply"].get<std::string>(), ContainsSubstring("admin"));  // recusado
   auto rr = env.call("POST", "/api/console", c, {{"line", "restart probe"}});
   REQUIRE_THAT(json::parse(rr->body)["reply"].get<std::string>(), ContainsSubstring("probe"));
 }
