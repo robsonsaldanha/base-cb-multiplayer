@@ -1,0 +1,35 @@
+cmake_minimum_required(VERSION 3.25)
+project(cbmp_native LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+option(CBMP_BUILD_FUZZ "Alvo de fuzz (clang/libFuzzer)" OFF)
+
+if(MSVC)
+  add_compile_options(/W4 /permissive- /utf-8 /EHsc)
+else()
+  add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
+
+enable_testing()
+find_package(Catch2 3 CONFIG REQUIRED)
+include(Catch)
+# Aqui (e não em server/ e bots/): o config do GNS cria ALIAS globais e não pode ser carregado duas vezes.
+find_package(GameNetworkingSockets CONFIG REQUIRED)
+# Triplets dinâmicos (x64-windows) exportam GameNetworkingSockets::GameNetworkingSockets;
+# estáticos (x64-linux) exportam GameNetworkingSockets::GameNetworkingSockets_s.
+if(TARGET GameNetworkingSockets::GameNetworkingSockets)
+  set(CBMP_GNS_TARGET GameNetworkingSockets::GameNetworkingSockets)
+elseif(TARGET GameNetworkingSockets::GameNetworkingSockets_s)
+  set(CBMP_GNS_TARGET GameNetworkingSockets::GameNetworkingSockets_s)
+else()
+  message(FATAL_ERROR "GameNetworkingSockets: nenhum target conhecido exportado pelo pacote")
+endif()
+
+add_subdirectory(proto)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/server/CMakeLists.txt)
+  add_subdirectory(server)
+endif()
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bots/CMakeLists.txt)
+  add_subdirectory(bots)
+endif()

@@ -50,7 +50,7 @@ Cabeçalho: `u8 type`. Tudo little-endian / bitstream LSB-first.
 | Mensagem | Direção | Canal | Conteúdo |
 |---|---|---|---|
 | `Input` | C→S | não confiável, 20 Hz | `u32 seq`, posição (3×i32 cm), yaw u16, pitch u8, velocidade (3×i16 cm/s), estado u4 |
-| `Snapshot` | S→C | não confiável | `u32 tick`, `u32 ackInputSeq`, `u32 baselineTick`, lista de entidades `{u16 id, máscara de campos alterados, campos}` |
+| `Snapshot` | S→C | não confiável | `u32 tick`, `u32 ackInputSeq`, `u5 baselineAge` (0 = sem baseline), `u3 partIndex`, `u3 partCount`, `u8` quantidade, entidades `{id em gap, máscara u4, posição delta por eixo com classe de tamanho, velocidade 11 bits×3 (12,5 cm/s), yaw 10 bits, pitch 6 bits, estado u4}`; cada parte ≤ 1100 B; o cliente confirma o tick só com todas as partes |
 | `SnapshotAck` | C→S | não confiável | `u32 tick` recebido |
 | `EntityEnter` / `EntityLeave` | S→C | confiável | id, estado completo / id |
 | `Event` | ambos | confiável | `u16 nameLen`, nome, `u16 payloadLen`, payload (≤ 4 KiB) |
@@ -66,7 +66,9 @@ Estados de movimento (u4): 0 parado, 1 andando, 2 correndo, 3 vassoura, 4 nadand
 ## Autoridade e segurança
 
 - Velocidade máxima por estado no `server.cfg` (padrões folgados, calibrados no subprojeto 5) com tolerância
-  de 20%. Posição impossível → `Correction` + linha no log de anti-cheat; > 10 correções em 10 s → `Kick`.
+  de 20%. Posição impossível → `Correction` + linha no log de anti-cheat; > 10 correções em 10 s **ou** 5 janelas
+  de correção seguidas ignoradas → `Kick`.
+  Correções iniciadas pelo servidor (spawn/teleporte) têm carência de carregamento e não contam para kick.
 - Limite de eventos: token bucket por cliente e por nome de evento (padrão 20/s, rajada 40); excesso > 3x
   em 10 s → `Kick`.
 - Banda máxima de saída por cliente (padrão 256 kbps); se excedida, reduz frequência dos mais distantes.
@@ -76,7 +78,7 @@ Estados de movimento (u4): 0 parado, 1 andando, 2 correndo, 3 vassoura, 4 nadand
 
 Tick 20 Hz (50 ms):
 
-1. Drenar fila da rede; aplicar inputs válidos (mais recente por cliente); gerar correções.
+1. Drenar fila da rede; aplicar inputs válidos em ordem de `seq` (descartando seq antigo); gerar correções.
 2. Atualizar grade espacial (células de 64 m).
 3. Visibilidade por cliente: raio 300 m, sai em 330 m (histerese), teto 128 entidades mais próximas;
    frequência por distância: < 100 m 20 Hz, < 200 m 10 Hz, resto 5 Hz. Gera `EntityEnter/Leave`.
@@ -127,10 +129,13 @@ não derrubam o servidor; log com back-off. Sem `hub.url` configurado → não a
 
 Tick p50/p99/máximo (janela de 60 s), bytes enviados por cliente (média/máx), jogadores, conexões pendentes,
 correções, kicks, eventos descartados, RSS, CPU do processo.
+Banda por jogador (média/máx em kbps): bytes de payload das mensagens GNS enviadas à conexão (sem cabeçalhos
+IP/UDP/GNS) ÷ tempo conectado, média/máximo entre os jogadores conectados; a estimativa "no fio" do GNS
+(`m_flOutBytesPerSec`) é só informativa.
 
 ## Bots (`cb-bots`)
 
-`cb-bots --server 127.0.0.1:30500 --dev-key <seed hex> --count N --area 2000 --cluster 0.3 --duration 120
+`cb-bots --server 127.0.0.1:30500 --dev-seed <hex 64> --server-id <id> --count N --area 2000 --cluster 0.3 --duration 120
 --report report.json`
 
 Cada bot assina seu ticket com a chave dev, conecta, anda dentro da área (fração `cluster` concentrada em

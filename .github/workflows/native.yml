@@ -1,0 +1,142 @@
+name: native
+on:
+  push:
+    paths: ['proto/**', 'server/**', 'bots/**', 'CMakeLists.txt', 'CMakePresets.json', 'vcpkg.json', 'packages/contracts/test-vectors/**', '.github/workflows/native.yml']
+  pull_request:
+    paths: ['proto/**', 'server/**', 'bots/**', 'CMakeLists.txt', 'CMakePresets.json', 'vcpkg.json', 'packages/contracts/test-vectors/**', '.github/workflows/native.yml']
+concurrency:
+  group: native-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.vcpkg-cache,readwrite"
+  VCPKG_COMMIT: ec48c11eae9448c8c6e7739d93e06fa2433aa95f
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache/restore@v4
+        id: restore
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-linux-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-linux-${{ hashFiles('vcpkg.json') }}-
+            vcpkg-linux-
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build pkg-config autoconf autoconf-archive automake libtool
+      - run: |
+          mkdir -p .vcpkg-cache
+          git clone https://github.com/microsoft/vcpkg "$GITHUB_WORKSPACE/vcpkg"
+          git -C "$GITHUB_WORKSPACE/vcpkg" checkout "$VCPKG_COMMIT"
+          "$GITHUB_WORKSPACE/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$GITHUB_WORKSPACE/vcpkg" >> $GITHUB_ENV
+      - run: cmake --preset linux-asan && cmake --build --preset linux-asan -- -k 0
+      - run: ctest --test-dir build-native/linux-asan --output-on-failure
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-linux-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache/restore@v4
+        id: restore
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-win-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-win-${{ hashFiles('vcpkg.json') }}-
+            vcpkg-win-
+      - run: |
+          New-Item -ItemType Directory -Force .vcpkg-cache | Out-Null
+          git clone https://github.com/microsoft/vcpkg "$env:GITHUB_WORKSPACE/vcpkg"
+          git -C "$env:GITHUB_WORKSPACE/vcpkg" checkout $env:VCPKG_COMMIT
+          & "$env:GITHUB_WORKSPACE/vcpkg/bootstrap-vcpkg.bat" -disableMetrics
+          "VCPKG_ROOT=$env:GITHUB_WORKSPACE/vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append
+        shell: pwsh
+      - run: cmake --preset windows-ci && cmake --build --preset windows-ci
+        shell: pwsh
+      - run: ctest --test-dir build-native/windows-ci -C Release --output-on-failure
+        shell: pwsh
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-win-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache/restore@v4
+        id: restore
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-linux-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}-fuzz
+          restore-keys: |
+            vcpkg-linux-${{ hashFiles('vcpkg.json') }}-
+            vcpkg-linux-
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build pkg-config autoconf autoconf-archive automake libtool clang libclang-rt-18-dev
+      - run: |
+          mkdir -p .vcpkg-cache
+          git clone https://github.com/microsoft/vcpkg "$GITHUB_WORKSPACE/vcpkg"
+          git -C "$GITHUB_WORKSPACE/vcpkg" checkout "$VCPKG_COMMIT"
+          "$GITHUB_WORKSPACE/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$GITHUB_WORKSPACE/vcpkg" >> $GITHUB_ENV
+      - run: cmake --preset linux-fuzz && cmake --build --preset linux-fuzz --target proto_fuzz proto_fuzz_replay
+      - name: fuzz (120 s)
+        run: |
+          build-native/linux-fuzz/proto/proto_fuzz_replay --write-corpus fuzz-corpus
+          build-native/linux-fuzz/proto/proto_fuzz fuzz-corpus -max_total_time=120 -timeout=10 -max_len=4096 -print_final_stats=1
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-crash
+          path: |
+            crash-*
+            leak-*
+            timeout-*
+            oom-*
+          if-no-files-found: ignore
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-linux-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}-fuzz
+  load:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache/restore@v4
+        id: restore
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-linux-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}-load
+          restore-keys: |
+            vcpkg-linux-${{ hashFiles('vcpkg.json') }}-
+            vcpkg-linux-
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build pkg-config autoconf autoconf-archive automake libtool
+      - run: |
+          mkdir -p .vcpkg-cache
+          git clone https://github.com/microsoft/vcpkg "$GITHUB_WORKSPACE/vcpkg"
+          git -C "$GITHUB_WORKSPACE/vcpkg" checkout "$VCPKG_COMMIT"
+          "$GITHUB_WORKSPACE/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$GITHUB_WORKSPACE/vcpkg" >> $GITHUB_ENV
+      - run: cmake --preset linux-release && cmake --build --preset linux-release --target cb-server cb-bots -- -k 0
+      - run: python3 tools/loadtest.py --count 256 --duration 120 --cluster 0.3 --assert --out-dir loadtest-out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: loadtest-report
+          path: loadtest-out
+          if-no-files-found: warn
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-linux-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}-load

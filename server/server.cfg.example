@@ -1,0 +1,17 @@
+{
+  "name": "Meu servidor",
+  "description": "",
+  "tags": ["rp"],
+  "locale": "pt-BR",
+  "maxPlayers": 512,
+  "port": 30500,
+  "hub": null,
+  "auth": { "devPublicKey": null },
+  "net": { "pendingPerIp": 4, "pendingGlobal": 256, "maxOutKbpsPerClient": 256 },
+  "sim": { "tickHz": 20, "streamRadiusM": 300, "maxVisible": 128, "spawn": { "mode": "origin" } },
+  "movement": { "maxSpeedCmS": { "idle": 50, "walk": 400, "run": 900, "broom": 4000, "swim": 400, "fall": 6000, "apparate": 0 }, "tolerance": 0.2 },
+  "events": { "perSecond": 20, "burst": 40 },
+  "metrics": { "token": null },
+  "resourcesDir": "resources",
+  "logsDir": "logs"
+}
