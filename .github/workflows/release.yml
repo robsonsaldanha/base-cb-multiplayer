@@ -184,8 +184,20 @@ jobs:
           [[ "$status" == completed && "$conclusion" == success ]] || { echo "execução não concluída com sucesso: $status/$conclusion"; ok=0; }
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "head_sha inválido: '$sha'"; ok=0; }
           [[ $ok == 1 ]] || { echo "recusado: o artefato da execução $MOD_RUN_ID não é de origem confiável"; exit 1; }
+          # head_branch também vale para tags: uma tag chamada "main" passaria acima. Exige que o commit esteja na
+          # branch main (ancestral ou igual à ponta de refs/heads/main). Qualquer erro de API recusa.
+          tags=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/main" --jq '[.[] | select(.ref == "refs/tags/main")] | length') \
+            || { echo "falha ao consultar tags do repositório"; exit 1; }
+          [[ "$tags" == 0 ]] || { echo "recusado: existe uma tag 'main' no repositório (ambígua com a branch); apague-a"; exit 1; }
+          main_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha) \
+            || { echo "falha ao ler refs/heads/main"; exit 1; }
+          [[ "$main_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "sha inválido para refs/heads/main: '$main_sha'"; exit 1; }
+          cmp=$(gh api "repos/$GITHUB_REPOSITORY/compare/$sha...$main_sha" --jq .status) \
+            || { echo "recusado: não foi possível comparar $sha com a main"; exit 1; }
+          [[ "$cmp" == identical || "$cmp" == ahead ]] \
+            || { echo "recusado: o commit $sha da execução não está na branch main (compare: '$cmp')"; exit 1; }
           echo "MOD_HEAD_SHA=$sha" >> "$GITHUB_ENV"
-          echo "execução $MOD_RUN_ID confiável: $path, $event em main, commit $sha"
+          echo "execução $MOD_RUN_ID confiável: $path, $event em main, commit $sha (na main: $cmp de $main_sha)"
 
       - name: Baixar o zip do mod
         if: env.KIND == 'mod'

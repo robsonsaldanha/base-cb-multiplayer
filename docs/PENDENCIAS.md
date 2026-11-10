@@ -27,7 +27,9 @@ das tasks).
   do Hub (`mod-pN-vX.Y.Z`, assinado). Falta o mod em si e um build que publique o zip como artefato `cbmp-mod` (um
   único `.zip`) para o `release.yml` (`kind=mod`, `mod_run_id`) assinar e publicar. Esse build tem de ser
   `.github/workflows/mod.yml` e o artefato usado tem de vir de um `push`/`workflow_dispatch` na `main` concluído com
-  sucesso: o `release.yml` recusa qualquer outra execução (`MOD_WORKFLOW`, `launcher/README.md`). Enquanto não houver mod com
+  sucesso, com o commit na `main`: o `release.yml` recusa qualquer outra execução (`MOD_WORKFLOW`, `launcher/README.md`).
+  O `mod.yml` faz checkout exatamente de `GITHUB_SHA` (sem `ref:`), não tem entradas de ref, branch ou fonte e não usa
+  `pull_request_target`. Enquanto não houver mod com
   `protocol` compatível, o launcher fica em "Modo simular".
 - **Contrato do `connect.json` para o mod** (escrito pelo launcher em `<dados>\run\connect.json`, `launcher/README.md`):
   `{host, port, ticket, serverId, contentDir, protocol, contentReadOnly: true}`, UTF-8, DACL só do usuário. O mod lê,
