@@ -134,7 +134,29 @@ describe('GET /v1/auth/server-admin (confirmação)', () => {
     expect(res.headers['content-security-policy']).toBe(`default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self' ${ADMIN}; frame-ancestors 'none'`);
     expect(res.headers['x-frame-options']).toBe('DENY');
     expect(res.headers['cache-control']).toBe('no-store');
-    expect(res.headers['referrer-policy']).toBe('no-referrer');
+    // Regra do navegador (Fetch, "append a request Origin header"): POST vindo de documento com
+    // Referrer-Policy no-referrer leva `Origin: null` — e o POST exige Origin == Hub. Por isso a página de
+    // confirmação usa same-origin (o form é same-origin, então o Origin vai; nada vaza para fora).
+    expect(res.headers['referrer-policy']).toBe('same-origin');
+  });
+
+  it('respostas que levam a outra origem ou páginas de erro continuam sem referrer', async () => {
+    const t = await setup({ adminUrl: null });
+    expect((await view(t, t.server.id)).headers['referrer-policy']).toBe('no-referrer'); // 409
+    expect((await view(t, 'x')).headers['referrer-policy']).toBe('no-referrer'); // 400
+    expect((await view(t, t.server.id, { cookies: {} })).headers['referrer-policy']).toBe('no-referrer'); // 302 login
+  });
+
+  it('adminUrl IPv6 literal: CSP form-action usa o esquema (a gramática host-source da CSP não aceita [..])', async () => {
+    const t = await setup({ adminUrl: 'https://[2606:4700::1111]:8443' });
+    const res = await view(t, t.server.id);
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-security-policy']).toBe("default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self' https:; frame-ancestors 'none'");
+    expect(res.headers['content-security-policy']).not.toContain('[');
+    const dev = await setup({ adminUrl: 'http://[::1]:30510' });
+    expect((await view(dev, dev.server.id)).headers['content-security-policy']).toContain("form-action 'self' http:;");
+    const ok = await confirm(dev, { serverId: dev.server.id, csrf: csrfFrom((await view(dev, dev.server.id)).body) });
+    expect(ok.headers.location).toMatch(/^http:\/\/\[::1\]:30510\/auth\/callback#ticket=/);
   });
 
   it('nome do servidor e do usuário são escapados', async () => {

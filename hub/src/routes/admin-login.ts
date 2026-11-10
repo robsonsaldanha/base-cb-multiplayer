@@ -38,8 +38,13 @@ const CSRF_TTL = 600;
 
 const BASE_CSP = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 // O POST responde 303 para o painel: form-action precisa liberar a origem de destino (navegadores checam o redirect).
-const confirmCsp = (adminUrl: string) =>
-  `default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self' ${adminUrl}; frame-ancestors 'none'`;
+// A gramática host-source da CSP não aceita IPv6 literal ([..]): nesse caso libera só o esquema. A CSP aqui é defesa
+// extra — o destino real é fixado pelo Hub (origem normalizada + caminho fixo).
+const confirmCsp = (adminUrl: string) => {
+  const u = new URL(adminUrl);
+  const source = u.hostname.startsWith('[') ? u.protocol : adminUrl;
+  return `default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self' ${source}; frame-ancestors 'none'`;
+};
 
 const esc = (s: unknown) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
 
@@ -110,7 +115,9 @@ export async function adminLoginRoutes(app: FastifyInstance) {
     if (!reply.hasHeader('content-security-policy')) reply.header('content-security-policy', BASE_CSP);
     reply.header('x-frame-options', 'DENY');
     reply.header('x-content-type-options', 'nosniff');
-    reply.header('referrer-policy', 'no-referrer');
+    // no-referrer por padrão; a página de confirmação usa same-origin (com no-referrer o navegador manda
+    // `Origin: null` no POST do form e o Hub recusaria todo login real).
+    if (!reply.hasHeader('referrer-policy')) reply.header('referrer-policy', 'no-referrer');
     reply.header('cache-control', 'no-store');
   });
 
@@ -202,6 +209,7 @@ export async function adminLoginRoutes(app: FastifyInstance) {
       ? '<p class="warn">Atenção: o destino é um endereço IP, não um nome de domínio. Só continue se você reconhece esse endereço.</p>' : '';
     audit(s.user, serverId, 'confirm_shown');
     reply.header('content-security-policy', confirmCsp(status.adminUrl));
+    reply.header('referrer-policy', 'same-origin');
     return html(reply, 200, 'Entrar no painel admin', `<p>Você vai entrar no painel admin do servidor abaixo. O Hub vai enviar ao painel desse servidor a
 sua identidade Discord; quem decide se você é admin é o próprio servidor.</p>
 <dl><dt>Servidor</dt><dd><strong>${esc(server.name)}</strong> <small><code>${esc(server.id)}</code></small></dd>

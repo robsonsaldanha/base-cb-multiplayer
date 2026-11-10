@@ -84,8 +84,16 @@ Itens levantados nas revisões que não bloquearam o merge, com o momento em que
     `HttpOutOptions::caFile` existe, mas não há chave no `server.cfg`. O caminho das CAs do sistema só é exercitado
     pelo teste de AIA (recusa); não há teste de sucesso contra uma CA do sistema (sem rede externa nos testes).
 - Login de admin via Hub (Task 7 + fix 1), resíduos e decisões:
-  - GET `server-admin` só confirma; o ticket sai no POST com Origin = Hub e token CSRF (HMAC com chave do processo:
-    reiniciar o Hub invalida confirmações abertas; o usuário recarrega). Um clique a mais no fluxo legítimo.
+  - GET `server-admin` só confirma; o ticket sai no POST com Origin = Hub e token CSRF. Um clique a mais no fluxo
+    legítimo. A página de confirmação usa `Referrer-Policy: same-origin` (com `no-referrer` o navegador manda
+    `Origin: null` no POST e todo login falharia); o resto da rota, inclusive o 303, segue `no-referrer`. Não há
+    teste com navegador real no repo (só `inject`); o comportamento foi reproduzido no Chromium na revisão.
+  - Chave do HMAC do CSRF é aleatória por processo: restart do Hub, ou várias instâncias atrás de um balanceador,
+    fazem uma confirmação aberta falhar com 403 (o usuário refaz em 1 clique). Mesma premissa de instância única
+    dos limitadores; com várias instâncias, derivar a chave de um segredo de config.
+  - `adminUrl` IPv6 literal: a gramática `host-source` da CSP não aceita `[..]`, então a página de confirmação usa
+    `form-action 'self' https:` (ou `http:` em dev loopback) só nesse caso. O destino continua fixado pelo Hub; a
+    CSP é defesa extra.
   - Ticket de admin é emitido para qualquer usuário logado (inclusive quem não é dono): quem decide é o servidor
     (`admin.admins`). Ban global não bloqueia o login de admin.
   - `adminUrl` inválida, ou loopback/IP privado/`localhost`/`*.localhost` sem `HUB_ALLOW_PRIVATE_SERVERS=1`, é
