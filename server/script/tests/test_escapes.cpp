@@ -271,7 +271,7 @@ TEST_CASE("table.insert and table.remove keep standard semantics") {
   REQUIRE(f.isTrue("local ok, e = pcall(table.insert, {}, 1, 2, 3) "
                    "return not ok and e:find(\"wrong number of arguments to 'insert'\", 1, true) ~= nil"));
   REQUIRE(f.isTrue("local ok, e = pcall(table.insert, nil, 1) "
-                   "return not ok and e:find(\"bad argument #1 to 'insert' (table expected\", 1, true) ~= nil"));
+                   "return not ok and e:find('(table expected, got nil)', 1, true) ~= nil"));
   REQUIRE(f.isTrue("local t = {1, 2, 3} return table.remove(t) == 3 and #t == 2"));
   REQUIRE(f.isTrue("local t = {1, 2, 3} return table.remove(t, 1) == 1 and t[1] == 2 and t[2] == 3 and t[3] == nil"));
   REQUIRE(f.isTrue("local t = {} return table.remove(t) == nil and table.remove(t, 0) == nil"));
@@ -299,11 +299,11 @@ TEST_CASE("table.sort keeps standard behaviour") {
 TEST_CASE("table.move type-checks its table arguments like C") {
   Fixture f;
   REQUIRE(f.isTrue("local ok, e = pcall(table.move, 1, 1, 2, 1) "
-                   "return not ok and e:find(\"bad argument #1 to 'move' (table expected, got number)\", 1, true) ~= nil"));
+                   "return not ok and e:find('#1 to', 1, true) and e:find('(table expected, got number)', 1, true) ~= nil"));
   REQUIRE(f.isTrue("local ok, e = pcall(table.move, 1, 5, 1, 1) "
-                   "return not ok and e:find(\"bad argument #1 to 'move' (table expected, got number)\", 1, true) ~= nil"));
+                   "return not ok and e:find('#1 to', 1, true) and e:find('(table expected, got number)', 1, true) ~= nil"));
   REQUIRE(f.isTrue("local ok, e = pcall(table.move, {}, 1, 2, 1, 'x') "
-                   "return not ok and e:find(\"bad argument #5 to 'move' (table expected, got string)\", 1, true) ~= nil"));
+                   "return not ok and e:find('#5 to', 1, true) and e:find('(table expected, got string)', 1, true) ~= nil"));
   REQUIRE(f.isTrue("return table.move({1, 2}, '1', '2', 3)[4] == 2"));
 }
 
@@ -329,4 +329,71 @@ TEST_CASE("coroutine library keeps standard behaviour") {
                    "A = coroutine.create(function() return coroutine.resume(B) end) "
                    "local ok1, ok2, pok, perr = coroutine.resume(A) "
                    "return ok1 and ok2 and not pok and perr:find('normal') ~= nil"));
+}
+
+// ---- Fix round 3: formas 70-75 do revisor (troca de thread em volta de operador caro) ----
+
+TEST_CASE("escape R3: expensive operator after coroutine switches is aborted") {
+  Limits big = shortLimits(size_t{256} << 20);
+  const std::string pre = "local s = ('a'):rep(1 << 25) local t = ('a'):rep(1 << 25) ";
+  const std::string codes[] = {
+      // 70: A retoma B, B cede de volta, A entra no laço
+      pre + "local B = coroutine.create(function() coroutine.yield() end) "
+            "local A = coroutine.create(function() coroutine.resume(B) while true do local _ = s < t end end) "
+            "coroutine.resume(A)",
+      // 71: yield de dentro de metamétodo, laço no chamador
+      pre + "local mt = {__index = function() coroutine.yield(1) return 1 end} "
+            "local co = coroutine.wrap(function() local x = setmetatable({}, mt).foo return x end) "
+            "co() while true do local _ = s == t end",
+      // 72: erros saindo de resume/wrap/close antes do laço
+      pre + "for i = 1, 5 do pcall(coroutine.wrap(function() error('x') end)) end "
+            "local co = coroutine.create(function() local _ <close> = setmetatable({}, {__close = function() end}) "
+            "error('y') end) coroutine.resume(co) coroutine.close(co) while true do local _ = s < t end",
+      // 73: iterador gmatch numa corrotina, laço numa função carregada
+      pre + "local it = coroutine.wrap(function() for w in ('abc'):gmatch('.') do coroutine.yield(w) end end) "
+            "it() it() local f = load('local s, t = ... while true do local _ = s < t end') f(s, t)",
+      // 74: resume de si mesma / wrap morta / close da corrente
+      pre + "local co; co = coroutine.create(function() return coroutine.resume(co) end) "
+            "coroutine.resume(co) coroutine.resume(co) local w = coroutine.wrap(function() end) w() pcall(w) "
+            "pcall(coroutine.close, coroutine.running()) while true do local _ = s < t end",
+      // 75: wrap aninhado 1000 níveis com o laço no fundo
+      pre + "local function nest(n) if n == 0 then while true do local _ = s < t end end "
+            "return coroutine.wrap(nest)(n - 1) end pcall(nest, 1000) while true do local _ = s < t end",
+  };
+  int k = 70;
+  for (const auto& code : codes) {
+    std::string name = "r3_shape_" + std::to_string(k++);
+    expectAbort({name.c_str(), code.c_str()}, big);
+  }
+}
+
+TEST_CASE("R3 semantics: native coroutine and table libraries (shape 76)") {
+  Fixture f;
+  auto res = f.run(
+      "local r = {} "
+      "r[#r+1] = select(2, pcall(coroutine.resume, 1)) "
+      "r[#r+1] = tostring(coroutine.resume(coroutine.create(function(...) return select('#', ...) end), 1, nil, 3)) "
+      "local co = coroutine.create(function() coroutine.yield(coroutine.running()) end) "
+      "local _, inner = coroutine.resume(co) r[#r+1] = tostring(inner == co) .. coroutine.status(co) "
+      "r[#r+1] = select(2, pcall(coroutine.close, coroutine.running())) "
+      "r[#r+1] = select(2, pcall(coroutine.wrap(function() error('boom') end))) "
+      "r[#r+1] = tostring(coroutine.close(coroutine.create(print))) "
+      "local t = {3,1,2} table.sort(t) r[#r+1] = table.concat(t) "
+      "r[#r+1] = select(2, pcall(table.sort, {1,'a'})) "
+      "t = {1,2,3} table.insert(t, 2, 9) table.insert(t, 7) "
+      "r[#r+1] = table.concat(t, ',') .. '/' .. table.remove(t, 1) .. '/' .. tostring(table.remove({})) "
+      "r[#r+1] = select(2, pcall(table.insert, {}, 5, 1)) "
+      "return table.concat(r, ' | ')");
+  INFO(res.error);
+  REQUIRE(res.ok);
+  std::string v = res.value.as<std::string>();
+  INFO(v);
+  REQUIRE(contains(v, "thread expected"));
+  REQUIRE(contains(v, "true | truesuspended"));
+  REQUIRE(contains(v, "cannot close a running coroutine"));
+  REQUIRE(contains(v, "boom"));
+  REQUIRE(contains(v, "| true | 123 |"));
+  REQUIRE(contains(v, "attempt to compare"));
+  REQUIRE(contains(v, "1,9,2,3,7/1/nil"));
+  REQUIRE(contains(v, "position out of bounds"));
 }

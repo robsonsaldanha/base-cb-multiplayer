@@ -6,20 +6,21 @@ Ports locais que substituem os do registro do vcpkg. Ativados por `VCPKG_OVERLAY
 ## lua (5.4.7 + patches do sandbox)
 
 Cópia do port oficial `lua` 5.4.7 (árvore `97783a4c337df419c0a6a75e9599545c54259d86` do microsoft/vcpkg, a mesma da
-baseline `ec48c11e…`) com dois patches pequenos usados pela vigia dos scripts (`server/script/src/resource.cpp`):
+baseline `ec48c11e…`) com três patches pequenos usados pela vigia dos scripts (`server/script/src/resource.cpp`):
 
 | Patch | Arquivo | O quê |
 |---|---|---|
-| `cbmp-c1-closethread-allowhook.patch` | `lstate.c` (`luaE_resetthread`) | Religa hooks (`allowhook = 1`) antes de rodar `__close` pendentes de uma thread fechada (`coroutine.close`, erro em `coroutine.wrap`). Sem isso, uma corrotina morta por erro lançado no hook roda `__close` sem vigia. |
-| `cbmp-i1-match-interrupt.patch` | `lstrlib.c` (`match`) | A cada 4096 passos do casamento de padrões chama `check(L)` de um `struct cbmp_interrupt*` guardado no extra space da thread (ou nada, se NULL). O host lança erro ali quando o prazo passou. Também zera o extra space da thread principal em `lua_newstate` (`lstate.c`), para estados que não são do sandbox lerem NULL. |
+| `cbmp-c1-closethread-allowhook.patch` | `lstate.c` (`luaE_resetthread`) | Religa hooks (`allowhook = 1`) antes de rodar `__close` pendentes de uma thread fechada. Desde o round 3 o sandbox não usa hooks; mantido por segurança caso hooks voltem. |
+| `cbmp-c2-vm-interrupt.patch` | `lstate.h`, `lstate.c`, `lapi.c`, `lua.h`, `lvm.c`, `ldebug.c` | Pedido de interrupção vindo de outra thread do SO: `global_State.cbmp_interrupt` (`volatile sig_atomic_t`), gravado só por `lua_cbmp_setinterrupt(L, on)`. A VM junta a flag ao `trap` (`updatetrap` e entrada de função), então qualquer laço Lua a vê no próximo salto; em `luaG_traceexec` chama o callback do host guardado no extra space da thread (`luaE_cbmpinterrupt`), que lança o erro de tempo ou desliga a flag. `lua_cbmp_poll(L)` deixa bibliotecas C conferirem a flag. Zera o extra space da thread principal em `lua_newstate`. |
+| `cbmp-i1-lib-interrupt.patch` | `lstrlib.c`, `ltablib.c` | `lua_cbmp_poll` nos laços C longos: `match()` a cada 4096 passos; `table.insert/remove/move` por iteração; cada comparação do `table.sort`. |
 
 `port-version` 100 só marca que é o port local.
 
 ### Ao atualizar o Lua
 
-1. Copie o port novo do vcpkg para cá (mantendo a linha `PATCHES` com os dois `cbmp-*.patch`).
+1. Copie o port novo do vcpkg para cá (mantendo a linha `PATCHES` com os três `cbmp-*.patch`).
 2. Reaplique/ajuste os patches (os trechos tocados estão citados no cabeçalho de cada `.patch`).
-3. Rode `cbscript_tests` (casos `escape C1`/`escape I1` falham se um patch não estiver ativo).
+3. Rode `cbscript_tests` (os casos `escape *` falham — por prazo rígido, sem travar — se um patch não estiver ativo).
 
 ### Reinstalar localmente (Windows)
 
@@ -30,4 +31,4 @@ $env:VCPKG_ROOT = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\vcpk
 cmake --preset windows-release -DVCPKG_INSTALLED_DIR=C:/cbmp-vi
 ```
 
-Para conferir: `C:/cbmp-vi/vcpkg/blds/lua/` mostra os logs `patch-x64-windows-2/3-*.log` dos dois patches.
+Para conferir: `C:/cbmp-vi/vcpkg/blds/lua/` mostra os logs `patch-x64-windows-2/3/4-*.log` dos três patches.

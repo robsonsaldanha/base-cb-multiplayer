@@ -22,7 +22,7 @@ for w in str:gmatch("%d+") do n = n + 1 end
 return s
 )lua";
 
-// Biblioteca table (insert/remove em Lua e sort com comparador Lua no sandbox).
+// Biblioteca table (no round 2 insert/remove eram Lua e o sort usava comparador Lua; no round 3, C nativo).
 constexpr const char* kTable = R"lua(
 local u = {}
 for i = 1, 2e5 do table.insert(u, i) end

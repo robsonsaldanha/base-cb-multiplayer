@@ -11,7 +11,8 @@ vcpkg_extract_source_archive(
         fix-ios-system.patch
         # cbmp (Castelo Bruxo MP): patches do sandbox de scripts; ver vcpkg-overlays/README.md
         cbmp-c1-closethread-allowhook.patch
-        cbmp-i1-match-interrupt.patch
+        cbmp-c2-vm-interrupt.patch
+        cbmp-i1-lib-interrupt.patch
 )
 
 file(COPY "${CMAKE_CURRENT_LIST_DIR}/CMakeLists.txt" DESTINATION "${SOURCE_PATH}")

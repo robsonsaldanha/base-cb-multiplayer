@@ -1,0 +1,73 @@
+cbmp: libraries poll the interrupt request in long C loops (Lua 5.4.7):
+lstrlib match() every 4096 steps; ltablib insert/remove/move loops and every sort
+comparison. Re-check on upgrade: MatchState/match/prepstate, tinsert/tremove/tmove/sort_comp.
+--- a/src/lstrlib.c
++++ b/src/lstrlib.c
+@@ -361,6 +361,7 @@
+   const char *p_end;  /* end ('\0') of pattern */
+   lua_State *L;
+   int matchdepth;  /* control for recursive depth (to avoid C stack overflow) */
++  unsigned int cbmp_steps;  /* cbmp patch: steps since last interrupt poll */
+   unsigned char level;  /* total number of captures (finished or unfinished) */
+   struct {
+     const char *init;
+@@ -571,6 +572,10 @@
+   if (l_unlikely(ms->matchdepth-- == 0))
+     luaL_error(ms->L, "pattern too complex");
+   init: /* using goto to optimize tail recursion */
++  if (l_unlikely(++ms->cbmp_steps >= 4096u)) {  /* cbmp patch: backtracking */
++    ms->cbmp_steps = 0;                         /* can run for minutes in C */
++    lua_cbmp_poll(ms->L);
++  }
+   if (p != ms->p_end) {  /* end of pattern? */
+     switch (*p) {
+       case '(': {  /* start capture */
+@@ -758,6 +763,7 @@
+                        const char *s, size_t ls, const char *p, size_t lp) {
+   ms->L = L;
+   ms->matchdepth = MAXCCALLS;
++  ms->cbmp_steps = 0;  /* cbmp patch */
+   ms->src_init = s;
+   ms->src_end = s + ls;
+   ms->p_end = p + lp;
+--- a/src/ltablib.c
++++ b/src/ltablib.c
+@@ -74,6 +74,7 @@
+       luaL_argcheck(L, (lua_Unsigned)pos - 1u < (lua_Unsigned)e, 2,
+                        "position out of bounds");
+       for (i = e; i > pos; i--) {  /* move up elements */
++        lua_cbmp_poll(L);  /* cbmp patch: '#t' may be huge */
+         lua_geti(L, 1, i - 1);
+         lua_seti(L, 1, i);  /* t[i] = t[i - 1] */
+       }
+@@ -97,6 +98,7 @@
+                      "position out of bounds");
+   lua_geti(L, 1, pos);  /* result = t[pos] */
+   for ( ; pos < size; pos++) {
++    lua_cbmp_poll(L);  /* cbmp patch: '#t' may be huge */
+     lua_geti(L, 1, pos + 1);
+     lua_seti(L, 1, pos);  /* t[pos] = t[pos + 1] */
+   }
+@@ -128,12 +130,14 @@
+                   "destination wrap around");
+     if (t > e || t <= f || (tt != 1 && !lua_compare(L, 1, tt, LUA_OPEQ))) {
+       for (i = 0; i < n; i++) {
++        lua_cbmp_poll(L);  /* cbmp patch: range may be huge */
+         lua_geti(L, 1, f + i);
+         lua_seti(L, tt, t + i);
+       }
+     }
+     else {
+       for (i = n - 1; i >= 0; i--) {
++        lua_cbmp_poll(L);  /* cbmp patch */
+         lua_geti(L, 1, f + i);
+         lua_seti(L, tt, t + i);
+       }
+@@ -273,6 +277,7 @@
+ ** index 'b' (according to the order of the sort).
+ */
+ static int sort_comp (lua_State *L, int a, int b) {
++  lua_cbmp_poll(L);  /* cbmp patch: one comparison may be slow (long strings) */
+   if (lua_isnil(L, 2))  /* no function? */
+     return lua_compare(L, a, b, LUA_OPLT);  /* a < b */
+   else {  /* function */
