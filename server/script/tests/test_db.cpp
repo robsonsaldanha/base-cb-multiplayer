@@ -872,6 +872,7 @@ TEST_CASE("api: a coroutine resumed from outside that yields again is not resume
 
 TEST_CASE("api: cb.players.ban refuses a did that is not UTF-8 and cleans the reason") {
   ApiEnv env;
+  env.roomyWatchdog();  // o ban grava bans.json (fsync) dentro do resourceStart; este teste não é sobre a vigia
   env.addRes("a", R"(
     cb.on('resourceStart', function()
       local ok, e = pcall(cb.players.ban, 'd\255x', 'r')
@@ -881,7 +882,9 @@ TEST_CASE("api: cb.players.ban refuses a did that is not UTF-8 and cleans the re
     end)
   )");
   env.boot();
-  REQUIRE(env.waitLog("[a] feito"));
+  const bool done = env.waitLog("[a] feito", LogLevel::Info, ApiEnv::kDiskWait);
+  INFO(env.allLogs());
+  REQUIRE(done);
   REQUIRE(env.hasLog("[a] did false"));
   REQUIRE(env.hasLog("UTF-8"));
   auto b = env.bans->check("d7", env.unixTime.load());
