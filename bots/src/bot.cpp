@@ -153,7 +153,7 @@ struct Swarm {
       jti += kHex[c & 15];
     }
     cbmp::Hello h;
-    h.ticket = makeTicket(opt.seed, b.idx, opt.serverId, iat, jti);
+    h.ticket = makeTicket(opt.seed, b.idx, opt.serverId, iat, jti, opt.kid);
     send(b, h);
     b.phase = Phase::Handshake;
   }
@@ -471,13 +471,13 @@ struct Swarm {
 }  // namespace
 
 std::string makeTicket(const std::array<uint8_t, 32>& seed, int index, const std::string& aud, int64_t iat,
-                       const std::string& jti) {
+                       const std::string& jti, const std::string& kid) {
   if (sodium_init() < 0) throw std::runtime_error("sodium_init falhou");
   std::array<uint8_t, crypto_sign_PUBLICKEYBYTES> pk{};
   std::array<uint8_t, crypto_sign_SECRETKEYBYTES> sk{};
   crypto_sign_seed_keypair(pk.data(), sk.data(), seed.data());
   const std::string i = std::to_string(index);
-  const std::string json = R"({"v":1,"kid":"dev","sub":"bot_)" + i + R"(","did":"9000000000000000)" + i +
+  const std::string json = R"({"v":1,"kid":")" + kid + R"(","sub":"bot_)" + i + R"(","did":"9000000000000000)" + i +
                            R"(","name":"Bot )" + i + R"(","aud":")" + aud + R"(","iat":)" + std::to_string(iat) +
                            R"(,"exp":)" + std::to_string(iat + 300) + R"(,"jti":")" + jti + R"("})";
   const std::vector<uint8_t> body(json.begin(), json.end());
