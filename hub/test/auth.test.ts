@@ -179,6 +179,32 @@ describe('auth', () => {
     expect(new URL(l.headers.location as string).searchParams.get('state')).toBe(mine);
   });
 
+  it('só dev-login (sem app Discord): /discord/login mostra o formulário de dev com o PKCE e o state do launcher', async () => {
+    const on = await makeTestApp({ config: { devLogin: true, discordClientId: '', discordClientSecret: '' } });
+    const { verifier, challenge } = pkce();
+    const mine = randomBytes(32).toString('base64url');
+    const page = await on.app.inject({ method: 'GET', url: `/v1/auth/discord/login?client=launcher&code_challenge=${challenge}&code_challenge_method=S256&state=${mine}` });
+    expect(page.statusCode).toBe(200);
+    expect(page.headers['content-type']).toMatch(/text\/html/);
+    expect(page.headers['content-security-policy']).toContain("form-action 'self'");
+    expect(page.headers['x-frame-options']).toBe('DENY');
+    expect(page.body).toContain('action="/v1/auth/dev-login"');
+    for (const v of ['launcher', challenge, 'S256', mine]) expect(page.body).toContain(`value="${v}"`);
+    // O formulário (GET) leva ao dev-login, que fecha o login do launcher normalmente.
+    const l = await on.app.inject({ method: 'GET', url: `/v1/auth/dev-login?client=launcher&code_challenge=${challenge}&code_challenge_method=S256&state=${mine}&discordId=111111111111111111&name=Dev` });
+    const loc = new URL(l.headers.location as string);
+    expect(loc.protocol).toBe('cbmp:');
+    expect(loc.searchParams.get('state')).toBe(mine);
+    const ex = await on.app.inject({ method: 'POST', url: '/v1/auth/exchange', payload: { code: loc.searchParams.get('code'), codeVerifier: verifier } });
+    expect(ex.statusCode).toBe(200);
+    // Parâmetros inválidos continuam 400; com app Discord configurado continua indo ao Discord.
+    expect((await on.app.inject({ method: 'GET', url: '/v1/auth/discord/login?client=launcher' })).statusCode).toBe(400);
+    const both = await makeTestApp({ config: { devLogin: true } });
+    const d = await both.app.inject({ method: 'GET', url: `/v1/auth/discord/login?client=launcher&code_challenge=${challenge}&code_challenge_method=S256` });
+    expect(d.statusCode).toBe(302);
+    expect(d.headers.location).toMatch(/^https:\/\/discord\.com\//);
+  });
+
   it('client inválido no login é 400', async () => {
     const { app } = await makeTestApp();
     const res = await app.inject({ method: 'GET', url: '/v1/auth/discord/login?client=outro' });

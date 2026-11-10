@@ -53,10 +53,10 @@ const validDate = (d: string) => d !== '' && !Number.isNaN(Date.parse(d));
 export async function releaseRoutes(app: FastifyInstance) {
   const { config } = app.deps;
 
-  /** Sem token (ou sem cliente) → 503 updates_disabled. */
+  /** Sem fonte (token do GitHub ou pasta local de dev) ou sem cliente → 503 updates_disabled. */
   function client(): GitHubReleases {
     const r = app.deps.releases;
-    if (!config.githubToken || !r) throw new HttpError(503, 'updates_disabled', 'atualizações desativadas neste Hub');
+    if ((!config.githubToken && !config.releasesDir) || !r) throw new HttpError(503, 'updates_disabled', 'atualizações desativadas neste Hub');
     return r;
   }
   const dlUrl = (tag: string, asset: string) => `${config.publicUrl}/v1/dl/${encodeURIComponent(tag)}/${encodeURIComponent(asset)}`;

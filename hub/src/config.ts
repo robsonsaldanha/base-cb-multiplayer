@@ -1,4 +1,5 @@
 import { isIP } from 'node:net';
+import { resolve } from 'node:path';
 
 /** Lista de proxies confiáveis (IPs/CIDRs); vazio ou 0 → desligado. Nunca aceita booleano. */
 function parseTrustProxy(raw: string | undefined): string | false {
@@ -49,6 +50,11 @@ export interface HubConfig {
   githubToken: string;
   /** `dono/repo` dos Releases (`launcher-vX.Y.Z`, `mod-pN-vX.Y.Z`). */
   releasesRepo: string;
+  /**
+   * Só desenvolvimento: pasta local de releases (`<pasta>/<tag>/<asset>`) no lugar do GitHub (`HUB_RELEASES_DIR`,
+   * caminho absoluto; '' = desligado). Mutuamente exclusivo com `githubToken`; recusado com `NODE_ENV=production`.
+   */
+  releasesDir: string;
   /** Downloads repassados ao mesmo tempo, todos os clientes (`HUB_DL_MAX_CONCURRENT`, padrão 32). */
   dlMaxConcurrent: number;
   /** Download cujo cliente não drena o socket por este tempo é derrubado (`HUB_DL_STALL_SECONDS`, padrão 30). */
@@ -78,6 +84,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
     logLevel: env.HUB_LOG_LEVEL ?? 'info',
     githubToken: (env.HUB_GITHUB_TOKEN ?? '').trim(),
     releasesRepo: (env.HUB_RELEASES_REPO ?? '').trim(),
+    releasesDir: (env.HUB_RELEASES_DIR ?? '').trim() === '' ? '' : resolve((env.HUB_RELEASES_DIR ?? '').trim()),
     dlMaxConcurrent: parseDlMax(env.HUB_DL_MAX_CONCURRENT),
     dlStallTimeoutMs: parseIntEnv(env.HUB_DL_STALL_SECONDS, 'HUB_DL_STALL_SECONDS', 30, 1, 3600) * 1000,
     dlMinKBps: parseIntEnv(env.HUB_DL_MIN_KBPS, 'HUB_DL_MIN_KBPS', 32, 0, 1_000_000),
@@ -91,6 +98,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
     && cfg.releasesRepo.split('/').every((p) => p !== '.' && p !== '..');
   if (cfg.githubToken && !repoOk) {
     throw new Error('HUB_RELEASES_REPO (dono/repo) é obrigatório quando HUB_GITHUB_TOKEN está definido');
+  }
+  if (cfg.releasesDir) {
+    if (cfg.githubToken) throw new Error('HUB_RELEASES_DIR e HUB_GITHUB_TOKEN são mutuamente exclusivos (pasta local de releases é só para testes)');
+    if ((env.NODE_ENV ?? '').trim() === 'production') throw new Error('HUB_RELEASES_DIR (releases locais, só para testes) é recusado com NODE_ENV=production');
   }
   if (devLogin) assertDevLoginSafe(cfg);
   return cfg;

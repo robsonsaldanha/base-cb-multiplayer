@@ -49,6 +49,24 @@ const escapeHtml = (v: string) => v.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', 
 const deniedPage = (reason: string) => `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><title>Login cancelado</title></head>
 <body><h1>Login cancelado no Discord</h1><p>Não foi possível concluir o login (${escapeHtml(reason)}).</p><p><a href="/panel">Tentar de novo</a></p></body></html>`;
 
+/**
+ * Hub de teste só com dev-login (sem app Discord): o "Entrar" do launcher/painel cai aqui em vez do Discord. Formulário
+ * GET para /v1/auth/dev-login que repete os parâmetros do cliente (PKCE e state do launcher; retorno do painel) e pede
+ * um Discord ID e nome fictícios. Os valores já passaram pelo zod (regex), e mesmo assim são escapados.
+ */
+function devLoginPage(q: Record<string, string | undefined>): string {
+  const hidden = Object.entries(q)
+    .filter((e): e is [string, string] => typeof e[1] === 'string')
+    .map(([k, v]) => `<input type="hidden" name="${escapeHtml(k)}" value="${escapeHtml(v)}">`).join('');
+  return `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><title>Entrar (Hub de teste)</title></head>
+<body><h1>Hub de teste: entrar sem Discord</h1>
+<p>Este Hub roda com <code>HUB_DEV_LOGIN=1</code> e sem app Discord. Escolha uma conta fictícia.</p>
+<form method="get" action="/v1/auth/dev-login">${hidden}
+<p><label>Discord ID (fictício) <input name="discordId" value="111111111111111111" pattern="[0-9]{1,20}" required></label></p>
+<p><label>Nome <input name="name" value="Dev Local" maxlength="32" required></label></p>
+<p><button type="submit">Entrar como dev</button></p></form></body></html>`;
+}
+
 const tokenResponse = (s: SessionTokens): TokenResponse => ({
   accessToken: s.access, accessExpiresAt: s.accessExpiresAt, refreshToken: s.refresh, refreshExpiresAt: s.refreshExpiresAt,
 });
@@ -76,6 +94,16 @@ export async function authRoutes(app: FastifyInstance) {
   app.get('/v1/auth/discord/login', async (req, reply) => {
     const q = ClientQuery.parse(req.query);
     const challenge = checkPkce(q);
+    if (config.devLogin && !config.discordClientId) {
+      returnOf(q); // mesma validação do caminho normal
+      return reply
+        // form-action vale também para o redirecionamento depois do envio (Chrome): o do launcher vai para cbmp://.
+        .header('content-security-policy', "default-src 'none'; form-action 'self' cbmp:; base-uri 'none'; frame-ancestors 'none'")
+        .header('x-frame-options', 'DENY')
+        .header('cache-control', 'no-store')
+        .type('text/html; charset=utf-8')
+        .send(devLoginPage(q));
+    }
     const state = store.createOauthState(q.client, now(), challenge, returnOf(q), clientStateOf(q) ?? undefined);
     reply.setCookie(OAUTH_COOKIE, state, { path: OAUTH_COOKIE_PATH, httpOnly: true, sameSite: 'lax', secure, maxAge: 600 });
     const url = new URL('https://discord.com/oauth2/authorize');
