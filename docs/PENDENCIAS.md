@@ -119,6 +119,9 @@ Itens levantados nas revisões que não bloquearam o merge, com o momento em que
     sem orçamento o devToken nem é comparado; `/auth/start` com limite próprio por IP (60/min) e até 4096 states
     pendentes (o mais antigo sai). Atrás de proxy, sem `admin.trustedProxies`, os limites por IP valem para o proxy
     inteiro.
+  - Auditoria de caminhos sem login (fix 2): falhas de login só viram linha enquanto há orçamento (≤ 60/min no
+    total); recusas por limite viram um resumo por minuto (contagem + até 16 IPs). O resumo da janela em curso sai na
+    virada da janela (na próxima auditoria) ou no stop; se o processo morrer sem stop, ele se perde.
   - O state só prova que *algum* navegador começou o fluxo: um ticket roubado pode ser pareado com o state do próprio
     atacante. Fechar isso exige o Hub amarrar o hash do state no ticket (claim `nonce`) — mudança no Hub/contrato.
   - Ação do painel e comando de script para o mesmo jogador no mesmo tick: a coalescência do canal prioritário mantém

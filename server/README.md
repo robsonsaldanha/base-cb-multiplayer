@@ -125,7 +125,8 @@ no-referrer` e `Cache-Control: no-store`. Requisições com `Host` fora da lista
 `localhost`/`[::1]` com a porta do painel quando o bind é loopback) recebem 421 (proteção contra DNS rebinding). Ações
 exigem `Origin` igual ao do painel, o cabeçalho `X-CB-Admin: 1` e JSON de até 64 KiB. `X-Forwarded-For` só é
 lido quando a conexão vem de um IP de `admin.trustedProxies` (o IP do cliente é o primeiro endereço não confiável
-da direita para a esquerda); por padrão nunca. Uma ação do painel (teleporte, kick) pode ser sobrescrita no mesmo
+da direita para a esquerda; porta e zona IPv6 são ignoradas); por padrão nunca. Logins recusados por limite não
+geram uma linha cada: sai um resumo por minuto (`"result":"rate_limited"`, contagem e até 16 IPs). Uma ação do painel (teleporte, kick) pode ser sobrescrita no mesmo
 tick por um comando de script para o mesmo jogador (o último teleporte vence).
 Cada ação vai para `logs/audit-AAAA-MM-DD.jsonl` com o Discord ID do admin (`type` `admin_login`, `admin_logout` ou
 `admin` com `action` `kick`/`ban`/`teleport`/`resource`/`console`). O painel roda em threads próprias e nunca toca a
@@ -153,7 +154,8 @@ server {
 Com Caddy: `admin.meuservidor.com { reverse_proxy 127.0.0.1:30510 }` (Caddy já repassa o `Host` e cuida do
 certificado). Atrás do proxy todos os acessos vêm do IP do proxy: configure `"trustedProxies": ["127.0.0.1"]`
 (o IP de onde o proxy conecta) para os limites e a auditoria usarem o IP real do cliente. Sem isso, os limites por
-IP valem para o proxy inteiro (logins válidos continuam entrando). O painel tem poucas threads (8) e segura uma por
+IP valem para o proxy inteiro: um único cliente com 60 inícios por minuto impede qualquer um de *começar* um login
+(quem já tem ticket e state válidos ainda entra), e o servidor avisa no log ao subir. O painel tem poucas threads (8) e segura uma por
 conexão aberta: exponha-o só atrás de um proxy que bufferiza as requisições (nginx/Caddy), nunca direto. `bind` fora do loopback sem `publicUrl` https gera aviso no log: o tráfego (inclusive o cookie de sessão)
 iria sem TLS.
 

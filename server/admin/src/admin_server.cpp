@@ -12,6 +12,7 @@
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <string_view>
@@ -303,6 +304,12 @@ struct AdminServer::Impl {
   Bucket loginFailGlobal;
   bool loginGlobalInit = false;
   uint64_t sessionSeq = 0;
+  // Logins recusados por limite: nenhuma linha por requisição; um resumo por janela (sai na virada e no stop).
+  static constexpr double kRefusedWindowSec = 60;
+  static constexpr size_t kRefusedMaxIps = 16;
+  double refusedSince = 0;
+  uint64_t refusedCount = 0, refusedOtherIps = 0;
+  std::map<std::string, uint64_t> refusedByIp;
   std::vector<IpNet> proxies;          // admin.trustedProxies
   std::vector<std::string> pwNeedles;  // senha do banco (crua e escapada em JSON) para o filtro de logs
 
@@ -314,8 +321,15 @@ struct AdminServer::Impl {
     stateCookie = https ? "__Secure-cbadmin_state" : "cbadmin_state";
     while (!opt.hubUrl.empty() && opt.hubUrl.back() == '/') opt.hubUrl.pop_back();
     for (const auto& t : opt.trustedProxies) {
-      if (auto n = parseNet(t)) proxies.push_back(*n);
-      else spdlog::warn("painel admin: proxy confiável inválido ignorado: '{}'", t);
+      if (auto n = parseNet(t)) {
+        proxies.push_back(*n);
+        if (n->bits < (n->base.v6 ? 32 : 8))
+          spdlog::warn("painel admin: trustedProxies '{}' é larga demais (quase certamente um engano): qualquer "
+                       "conexão dessa faixa decide o IP do cliente pelo X-Forwarded-For",
+                       t);
+      } else {
+        spdlog::warn("painel admin: proxy confiável inválido ignorado: '{}'", t);
+      }
     }
     if (opt.dbPassword.size() >= 4) {
       pwNeedles.push_back(opt.dbPassword);
@@ -372,16 +386,70 @@ struct AdminServer::Impl {
       b = e + 1;
     }
     for (auto it = hops.rbegin(); it != hops.rend(); ++it) {
-      if (!parseIp(*it)) return req.remote_addr;
-      if (!trusted(*it)) return *it;
+      const std::string h = hopAddr(*it);
+      if (!parseIp(h)) return req.remote_addr;
+      if (!trusted(h)) return h;
     }
     return req.remote_addr;
   }
 
-  void audit(json j, const httplib::Request& req) {
+  // Salto do X-Forwarded-For sem porta ("1.2.3.4:5678", "[2001:db8::1]:443") e sem zona ("fe80::1%eth0").
+  static std::string hopAddr(std::string h) {
+    if (!h.empty() && h.front() == '[') {
+      const size_t close = h.find(']');
+      h = close == std::string::npos ? std::string() : h.substr(1, close - 1);
+    } else if (std::count(h.begin(), h.end(), ':') == 1) {
+      h = h.substr(0, h.find(':'));
+    }
+    if (const size_t pct = h.find('%'); pct != std::string::npos) h.resize(pct);
+    return h;
+  }
+
+  // ---- logins recusados por limite (agregados)
+  void noteRefused(const std::string& ip) {
+    std::optional<json> sum;
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      sum = takeRefusedLocked(mono(), false);
+      if (refusedCount == 0) refusedSince = mono();
+      ++refusedCount;
+      if (auto it = refusedByIp.find(ip); it != refusedByIp.end())
+        ++it->second;
+      else if (refusedByIp.size() < kRefusedMaxIps)
+        refusedByIp.emplace(ip, 1);
+      else
+        ++refusedOtherIps;
+    }
+    if (sum) writeAudit(std::move(*sum));
+  }
+  std::optional<json> takeRefusedLocked(double now, bool force) {
+    if (refusedCount == 0 || (!force && now - refusedSince < kRefusedWindowSec)) return std::nullopt;
+    json ips = json::object();
+    for (const auto& [ip, n] : refusedByIp) ips[ip] = n;
+    json j{{"type", "admin_login"}, {"result", "rate_limited"}, {"count", refusedCount},
+           {"windowS", static_cast<int>(kRefusedWindowSec)}, {"ips", std::move(ips)}};
+    if (refusedOtherIps) j["otherIps"] = refusedOtherIps;
+    refusedCount = refusedOtherIps = 0;
+    refusedByIp.clear();
+    return j;
+  }
+  void flushRefused(bool force) {
+    std::optional<json> sum;
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      sum = takeRefusedLocked(mono(), force);
+    }
+    if (sum) writeAudit(std::move(*sum));
+  }
+  void writeAudit(json j) {
     j["ts"] = be.unixNow();
-    j["ip"] = clientIp(req);
     if (be.audit) be.audit(dumpSafe(j));
+  }
+
+  void audit(json j, const httplib::Request& req) {
+    flushRefused(false);  // resumo de uma janela já vencida sai antes, na ordem
+    j["ip"] = clientIp(req);
+    writeAudit(std::move(j));
   }
   void auditAction(const SessionView& s, const httplib::Request& req, const std::string& action, json extra) {
     json j{{"type", "admin"}, {"action", action}, {"did", s.did}};
@@ -406,15 +474,13 @@ struct AdminServer::Impl {
       loginGlobalInit = true;
     }
   }
-  // Ainda há orçamento de falhas para este IP e no global? (não gasta)
-  bool failureBudget(const std::string& ip) {
-    const double now = mono();
+  // Devolve uma falha cobrada antes da hora (devToken certo).
+  void refundFailure(const std::string& ip) {
     std::lock_guard<std::mutex> lk(mu);
-    initGlobalLocked(now);
     const double cap = std::max(1, opt.loginPerIpPerMin);
-    auto it = loginFailByIp.m.find(ipKey(ip));
-    const bool ipOk = it == loginFailByIp.m.end() || it->second.has(now, perIpRate(), cap);
-    return ipOk && loginFailGlobal.has(now, globalRate(), std::max(1, opt.loginGlobalPerMin));
+    if (auto it = loginFailByIp.m.find(ipKey(ip)); it != loginFailByIp.m.end())
+      it->second.tokens = std::min(cap, it->second.tokens + 1);
+    loginFailGlobal.tokens = std::min<double>(std::max(1, opt.loginGlobalPerMin), loginFailGlobal.tokens + 1);
   }
   // Gasta uma falha; false = sem orçamento (responder 429).
   bool chargeFailure(const std::string& ip) {
@@ -595,8 +661,8 @@ struct AdminServer::Impl {
       json a{{"type", "admin_login"}, {"result", why}};
       if (!did.empty()) a["did"] = did;
       if (!chargeFailure(ip)) {
-        a["rateLimited"] = true;
-        audit(std::move(a), req);
+        // Sem orçamento: nada por requisição (senão qualquer um enche o disco); só o resumo da janela.
+        noteRefused(ip);
         return sendError(res, 429, "muitas tentativas de login falhas; espere um minuto");
       }
       audit(std::move(a), req);
@@ -606,15 +672,21 @@ struct AdminServer::Impl {
     if (!body) return fail(400, "bad_request", "corpo deve ser um objeto JSON");
 
     if (body->contains("devToken")) {
-      // Único segredo adivinhável: sem orçamento de falhas, nem compara.
-      if (!failureBudget(ip)) {
-        audit({{"type", "admin_login"}, {"result", "bad_dev_token"}, {"rateLimited", true}}, req);
+      // Único segredo adivinhável: a tentativa é cobrada ANTES de comparar (atômico; sem corrida entre checar e
+      // cobrar) e devolvida se o token estiver certo. Sem orçamento, nem compara.
+      if (!chargeFailure(ip)) {
+        noteRefused(ip);
         return sendError(res, 429, "muitas tentativas de login falhas; espere um minuto");
       }
       const auto& t = (*body)["devToken"];
-      if (!t.is_string()) return fail(400, "bad_request", "devToken deve ser texto");
+      auto charged = [&](int status, const std::string& why, const std::string& msg) {
+        audit({{"type", "admin_login"}, {"result", why}}, req);
+        sendError(res, status, msg);
+      };
+      if (!t.is_string()) return charged(400, "bad_request", "devToken deve ser texto");
       if (!opt.devToken || !ctEqual(t.get_ref<const std::string&>(), *opt.devToken))
-        return fail(401, "bad_dev_token", "token inválido");
+        return charged(401, "bad_dev_token", "token inválido");
+      refundFailure(ip);
       createSession(res, "dev", "dev");
       audit({{"type", "admin_login"}, {"result", "ok"}, {"did", "dev"}, {"method", "devToken"}}, req);
       return sendJson(res, {{"did", "dev"}, {"name", "dev"}});
@@ -740,11 +812,17 @@ struct AdminServer::Impl {
       const json info{{"target", target}, {"reason", *reason}, {"durationS", dur}};
       auto out = runBan(p->did, *reason, dur, "admin:" + s.did);
       json a = info;
-      a["result"] = !out ? "pending" : *out ? "ok" : "failed";
+      a["result"] = banResult(out);
       auditAction(s, req, "ban", std::move(a));
       if (!out) return sendJson(res, {{"pending", true}}, 202);
-      if (!*out) return sendError(res, 503, "ban não gravado (host de scripts parado ou falha ao gravar; ver log)");
-      return sendJson(res, {{"ok", true}});
+      if (*out == BanOutcome::Failed)
+        return sendError(res, 503, "ban não aplicado (host de scripts parado; ver log). O jogador foi expulso.");
+      if (*out == BanOutcome::MemoryOnly)
+        return sendJson(res, {{"ok", true},
+                              {"persisted", false},
+                              {"warning", "ban valendo, mas não gravado (falha no arquivo/banco; ver log): some no "
+                                          "próximo restart"}});
+      return sendJson(res, {{"ok", true}, {"persisted", true}});
     }
     // teleport
     int32_t xyz[3] = {};
@@ -764,15 +842,27 @@ struct AdminServer::Impl {
   }
 
   // Ban: o backend grava pela thread de scripts e confirma pelo future. nullopt = ainda em andamento (202).
-  std::optional<bool> runBan(const std::string& did, const std::string& reason, int64_t dur, const std::string& by) {
-    if (!be.ban) return false;
+  std::optional<BanOutcome> runBan(const std::string& did, const std::string& reason, int64_t dur,
+                                   const std::string& by) {
+    if (!be.ban) return BanOutcome::Failed;
     auto f = be.ban(did, reason, dur, by);
-    if (!f.valid()) return false;
+    if (!f.valid()) return BanOutcome::Failed;
     if (f.wait_for(opt.actionWait) != std::future_status::ready) return std::nullopt;
     try {
       return f.get();
     } catch (const std::future_error&) {  // tarefa descartada (host parou): promessa quebrada
-      return false;
+      return BanOutcome::Failed;
+    }
+  }
+  static const char* banResult(const std::optional<BanOutcome>& o) {
+    if (!o) return "pending";
+    switch (*o) {
+      case BanOutcome::Saved:
+        return "ok";
+      case BanOutcome::MemoryOnly:
+        return "memory_only";
+      default:
+        return "failed";
     }
   }
 
@@ -864,10 +954,11 @@ struct AdminServer::Impl {
       if (p->did.empty() || p->did.size() > 64) return std::string("jogador sem did válido");
       auto out = runBan(p->did, reason, 0, "admin:" + s.did);
       auditAction(s, req, "ban",
-                  {{"target", target}, {"reason", reason}, {"durationS", 0},
-                   {"result", !out ? "pending" : *out ? "ok" : "failed"}});
+                  {{"target", target}, {"reason", reason}, {"durationS", 0}, {"result", banResult(out)}});
       if (!out) return "ban de " + p->name + " em andamento";
-      if (!*out) return std::string("ban não gravado (host de scripts parado ou falha ao gravar; ver log)");
+      if (*out == BanOutcome::Failed) return std::string("ban não aplicado (host de scripts parado; ver log)");
+      if (*out == BanOutcome::MemoryOnly)
+        return "banido: " + p->name + " (" + p->did + "), mas NÃO gravado (some no restart; ver log)";
       return "banido: " + p->name + " (" + p->did + ")";
     }
     return std::nullopt;
@@ -1114,6 +1205,11 @@ struct AdminServer::Impl {
       spdlog::warn("painel admin: escutando em {} (fora do loopback) sem admin.publicUrl https: use um proxy reverso "
                    "com TLS (ver server/README.md)",
                    opt.bind);
+    if (https && cbserver::isLoopbackBind(opt.bind) && proxies.empty() && publicHost.rfind("127.", 0) != 0 &&
+        publicHost.rfind("localhost", 0) != 0 && publicHost.rfind("[::1]", 0) != 0)
+      spdlog::warn("painel admin: atrás de proxy (publicUrl {} com bind {}) sem admin.trustedProxies: todos os "
+                   "acessos têm o IP do proxy e os limites por IP (início de login, falhas) valem para todo mundo",
+                   *opt.publicUrl, opt.bind);
     if (hosts.empty())
       spdlog::warn("painel admin: nenhum Host aceito (bind fora do loopback sem admin.publicUrl): toda requisição "
                    "recebe 421");
@@ -1124,6 +1220,7 @@ struct AdminServer::Impl {
   void stop() {
     svr.stop();
     if (th.joinable()) th.join();
+    flushRefused(true);
   }
 };
 
@@ -1164,11 +1261,11 @@ AdminBackend makeBackend(cbscript::ScriptHost& host, cbserver::ScriptBridge& bri
   };
   be.scriptCommand = [&host](cbscript::EvCommand c) { return host.post(std::move(c)); };
   be.ban = [&host, &bridge, bans, unixNow](const std::string& did, const std::string& reason, int64_t dur,
-                                           const std::string& by) -> std::future<bool> {
-    auto done = std::make_shared<std::promise<bool>>();
+                                           const std::string& by) -> std::future<BanOutcome> {
+    auto done = std::make_shared<std::promise<BanOutcome>>();
     auto fut = done->get_future();
     if (!bans || host.metrics().halted) {
-      done->set_value(false);
+      done->set_value(BanOutcome::Failed);
       return fut;
     }
     cbscript::Ban b;
@@ -1186,7 +1283,7 @@ AdminBackend makeBackend(cbscript::ScriptHost& host, cbserver::ScriptBridge& bri
       std::string err;
       const bool ok = bans->add(std::move(b), err);
       if (!ok) ctx.log(cbscript::LogLevel::Error, "painel admin: ban não gravado no arquivo (vale em memória): " + err);
-      done->set_value(ok);
+      done->set_value(ok ? BanOutcome::Saved : BanOutcome::MemoryOnly);
     });
     // Kick por did já, pelo canal prioritário da ponte (thread do painel; pega também quem ainda não chegou aos
     // scripts). A ponte vive mais que o painel (o painel para antes).

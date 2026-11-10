@@ -75,6 +75,7 @@ struct Fake {
     int64_t dur;
   };
   std::vector<BanReq> bans;
+  cbadmin::BanOutcome banOutcome = cbadmin::BanOutcome::Saved;
   std::vector<std::pair<cbadmin::ResourceOp, std::string>> ops;
   std::shared_ptr<std::vector<cbscript::PlayerView>> players = std::make_shared<std::vector<cbscript::PlayerView>>();
   std::atomic<double> mono{1000};
@@ -135,8 +136,8 @@ cbadmin::AdminBackend fakeBackend(Fake& f, cbserver::KeyProvider& keys) {
   be.ban = [&f](const std::string& did, const std::string& reason, int64_t dur, const std::string& by) {
     std::lock_guard<std::mutex> lk(f.mu);
     f.bans.push_back({did, reason, by, dur});
-    std::promise<bool> p;
-    p.set_value(true);
+    std::promise<cbadmin::BanOutcome> p;
+    p.set_value(f.banOutcome);
     return p.get_future();
   };
   be.metrics = [] { return json{{"tickP99Ms", 1.5}, {"players", 1}}; };
@@ -161,6 +162,33 @@ struct Resp {
   std::string header(const std::string& k) const {
     auto it = headers.find(k);
     return it == headers.end() ? std::string() : it->second;
+  }
+};
+
+// Resposta "à moda de httplib::Result" que nunca é nula (status 0 = falha de conexão): os testes não podem
+// desreferenciar um resultado vazio quando a conexão falha.
+struct RespPtr {
+  Resp v;
+  const Resp* operator->() const { return &v; }
+  explicit operator bool() const { return v.status != 0; }
+};
+
+// Uma conexão nova por requisição (reaproveitar keep-alive corre contra o fechamento do servidor e o httplib não
+// repete POST em socket velho). Falha de conexão = status 0, nunca um ponteiro nulo.
+struct ClientPool {
+  int port = 0;
+  Resp run(const std::string& method, const std::string& path, const httplib::Headers& h, const std::string& body,
+           const std::string& ctype) const {
+    httplib::Client cli("127.0.0.1", port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(10);
+    httplib::Result r = method == "GET" ? cli.Get(path, h) : cli.Post(path, h, body, ctype);
+    Resp out;
+    if (!r) return out;
+    out.status = r->status;
+    out.body = r->body;
+    out.headers = r->headers;
+    return out;
   }
 };
 
@@ -189,6 +217,7 @@ struct AdminEnv {
   int port = 0;
   std::string host;  // cabeçalho Host usado por padrão
   int jti = 0;
+  ClientPool clients;
 
   explicit AdminEnv(std::function<void(cbadmin::AdminOptions&)> tweak = {}) {
     opt.port = 0;
@@ -203,6 +232,7 @@ struct AdminEnv {
     srv->start();
     port = srv->boundPort();
     host = "127.0.0.1:" + std::to_string(port);
+    clients.port = port;
   }
   ~AdminEnv() { srv->stop(); }
 
@@ -210,18 +240,9 @@ struct AdminEnv {
 
   Resp send(const std::string& method, const std::string& path, const httplib::Headers& extra,
             const std::string& body = "", const std::string& ctype = "application/json") {
-    httplib::Client cli("127.0.0.1", port);
-    cli.set_connection_timeout(5);
-    cli.set_read_timeout(10);
     httplib::Headers h = extra;
     if (h.find("Host") == h.end()) h.emplace("Host", host);
-    httplib::Result r = method == "GET" ? cli.Get(path, h) : cli.Post(path, h, body, ctype);
-    Resp out;
-    if (!r) return out;
-    out.status = r->status;
-    out.body = r->body;
-    out.headers = r->headers;
-    return out;
+    return clients.run(method, path, h, body, ctype);
   }
   Resp get(const std::string& path, const std::string& cookie = "") {
     httplib::Headers h;
@@ -448,6 +469,81 @@ TEST_CASE("admin: only failed logins are charged and a valid ticket + state alwa
   for (int i = 0; i < 10; ++i)
     REQUIRE(env.send("POST", "/auth/login", {{"X-CB-Admin", "1"}}, R"({"ticket":"x","state":"y"})").status == 403);
   REQUIRE(env.post("/auth/login", {{"ticket", "x"}, {"state", "y"}}).status == 403);
+}
+
+TEST_CASE("admin: a flood of failed logins writes O(1) audit lines per window and a valid login still gets in") {
+  AdminEnv env([](cbadmin::AdminOptions& o) {
+    o.loginPerIpPerMin = 3;
+    o.loginGlobalPerMin = 5;
+  });
+  auto countAudit = [&](const std::string& what) {
+    std::lock_guard<std::mutex> lk(env.fake.mu);
+    size_t n = 0;
+    for (auto& l : env.fake.audit) n += l.find(what) != std::string::npos;
+    return n;
+  };
+  // Sem state, sem corpo válido, devToken: todas falhas. Só as 3 primeiras (orçamento do IP) geram linha cada.
+  for (int i = 0; i < 300; ++i) {
+    const json body = i % 3 == 0   ? json{{"ticket", "x"}, {"state", "y"}}
+                      : i % 3 == 1 ? json{{"devToken", std::string(40, 'z')}}
+                                   : json{{"nada", 1}};
+    REQUIRE(env.post("/auth/login", body).status == (i < 3 ? (i == 1 ? 401 : 403) : 429));
+  }
+  REQUIRE(countAudit("admin_login") <= 3);
+  REQUIRE(countAudit("rate_limited") == 0);  // resumo só na virada da janela
+  // par válido continua entrando no meio da enxurrada
+  auto st = env.startState();
+  REQUIRE(env.loginWith(env.ticket(kAdmin), st, st).status == 200);
+  // janela virou: uma linha de resumo com a contagem, e só uma
+  env.fake.mono = env.fake.mono.load() + 61;
+  for (int i = 0; i < 4; ++i) env.post("/auth/login", {{"ticket", "x"}, {"state", "y"}});
+  REQUIRE(countAudit("rate_limited") == 1);
+  bool found = false;
+  {
+    std::lock_guard<std::mutex> lk(env.fake.mu);
+    for (auto& l : env.fake.audit) {
+      auto j = json::parse(l);
+      if (j.value("result", "") == "rate_limited") {
+        found = true;
+        REQUIRE(j["count"] == 297);
+        REQUIRE(j["windowS"] == 60);
+        REQUIRE(j["ips"]["127.0.0.1"] == 297);
+      }
+    }
+  }
+  REQUIRE(found);
+  // o resumo da janela em andamento sai no stop
+  env.srv->stop();
+  REQUIRE(countAudit("rate_limited") == 2);
+}
+
+TEST_CASE("admin: X-Forwarded-For hops with a port or an IPv6 zone are understood") {
+  AdminEnv env([](cbadmin::AdminOptions& o) { o.trustedProxies = {"127.0.0.1"}; });
+  for (const char* hop : {"10.0.0.7:5555", "[2001:db8::7]:443", "fe80::7%eth0"}) {
+    INFO(hop);
+    httplib::Headers h{{"Origin", env.origin()}, {"X-CB-Admin", "1"}, {"X-Forwarded-For", hop}};
+    REQUIRE(env.send("POST", "/auth/login", h, R"({"ticket":"x","state":"y"})").status == 403);
+  }
+  REQUIRE(env.fake.hasAudit("\"ip\":\"10.0.0.7\"", "bad_state"));
+  REQUIRE(env.fake.hasAudit("\"ip\":\"2001:db8::7\"", "bad_state"));
+  REQUIRE(env.fake.hasAudit("\"ip\":\"fe80::7\"", "bad_state"));
+}
+
+TEST_CASE("admin: a ban that is live but not persisted is reported as such") {
+  AdminEnv env;
+  env.fake.banOutcome = cbadmin::BanOutcome::MemoryOnly;
+  auto c = env.login();
+  {
+    std::lock_guard<std::mutex> lk(env.fake.mu);
+    env.fake.players->push_back(pv(1, "ana", "did-ana", 7));
+  }
+  auto r = env.post("/api/players/1/ban", {{"reason", "x"}}, c);
+  REQUIRE(r.status == 200);
+  REQUIRE(r.j()["ok"] == true);
+  REQUIRE(r.j()["persisted"] == false);
+  REQUIRE(env.fake.hasAudit("memory_only", "\"ban\""));
+  env.fake.banOutcome = cbadmin::BanOutcome::Failed;
+  REQUIRE(env.post("/api/players/1/ban", {{"reason", "x"}}, c).status == 503);
 }
 
 TEST_CASE("admin: the global failure budget never locks out a valid login (trusted proxy gives the client IP)") {
@@ -916,14 +1012,13 @@ struct Live {
     return n;
   }
   std::string origin() const { return "http://127.0.0.1:" + std::to_string(port); }
-  httplib::Result call(const std::string& method, const std::string& path, const std::string& cookie,
-                       const json& body = json::object()) {
-    httplib::Client cli("127.0.0.1", port);
-    cli.set_read_timeout(10);
+  ClientPool clients;
+  RespPtr call(const std::string& method, const std::string& path, const std::string& cookie,
+               const json& body = json::object()) {
     httplib::Headers hd{{"Origin", origin()}, {"X-CB-Admin", "1"}};
     if (!cookie.empty()) hd.emplace("Cookie", cookie);
-    if (method == "GET") return cli.Get(path, hd);
-    return cli.Post(path, hd, body.dump(), "application/json");
+    clients.port = port;
+    return RespPtr{clients.run(method, path, hd, method == "GET" ? "" : body.dump(), "application/json")};
   }
   std::string login() {
     auto s = call("GET", "/auth/start", "");
@@ -988,6 +1083,7 @@ TEST_CASE("admin: resource restart via the API is reflected in the status") {
   auto c = env.login();
   auto status = [&](const std::string& name) {
     auto r = env.call("GET", "/api/resources", c);
+    REQUIRE(r);
     for (auto& x : json::parse(r->body))
       if (x["name"] == name) return x["state"].get<std::string>();
     return std::string("?");

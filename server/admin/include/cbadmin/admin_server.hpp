@@ -21,7 +21,8 @@
 // trustedProxies (padrão: nunca).
 //
 // Limites de login: só tentativas que FALHAM gastam o orçamento (por IP do cliente e global); um par ticket + state
-// válido entra sempre; sem orçamento, devToken nem é comparado. /auth/start tem limite próprio só por IP.
+// válido entra sempre; sem orçamento, devToken nem é comparado. /auth/start tem limite próprio só por IP. Recusas por
+// limite não geram linha de auditoria cada: um resumo por janela de 60 s (contagem + até 16 IPs), também no stop.
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -78,6 +79,8 @@ struct AdminOptions {
 };
 
 enum class ResourceOp { Start, Stop, Restart };
+// Resultado da gravação de um ban: gravado; valendo só em memória (o arquivo/banco falhou; some no restart); falhou.
+enum class BanOutcome { Saved, MemoryOnly, Failed };
 
 // O que o painel consome do servidor. Todas as funções são chamadas das threads do painel e não podem bloquear a
 // simulação. Vazias = recurso indisponível (503).
@@ -90,10 +93,10 @@ struct AdminBackend {
   std::function<std::vector<cbscript::ResourceStatus>()> resources;
   std::function<std::future<bool>(ResourceOp, std::string)> resourceOp;
   std::function<bool(cbscript::EvCommand)> scriptCommand;  // console → comandos registrados dos resources
-  // Expulsa quem tiver o did e grava o ban (pela thread de scripts). O future diz se gravou (false ou promessa
-  // quebrada = não gravou); o painel espera até actionWait, depois responde 202.
-  std::function<std::future<bool>(const std::string& did, const std::string& reason, int64_t durationS,
-                                  const std::string& by)>
+  // Expulsa quem tiver o did e grava o ban (pela thread de scripts). O future traz o resultado (promessa quebrada =
+  // Failed); o painel espera até actionWait, depois responde 202.
+  std::function<std::future<BanOutcome>(const std::string& did, const std::string& reason, int64_t durationS,
+                                        const std::string& by)>
       ban;
   std::function<nlohmann::json()> metrics;
   std::function<void(const std::string&)> audit;  // uma linha JSONL (sem '\n')
