@@ -19,6 +19,7 @@
 #include <io.h>
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -173,6 +174,15 @@ bool BanStore::persist(std::string& err) {
     err = "não foi possível substituir '" + u8(file_) + "': " + ec.message();
     return false;
   }
+#if !defined(_WIN32)
+  // POSIX: o rename só é durável depois do fsync da pasta.
+  const fs::path dir = file_.has_parent_path() ? file_.parent_path() : fs::path(".");
+  const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+  if (dfd >= 0) {
+    (void)::fsync(dfd);
+    ::close(dfd);
+  }
+#endif
   return true;
 }
 

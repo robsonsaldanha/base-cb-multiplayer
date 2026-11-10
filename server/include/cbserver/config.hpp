@@ -42,7 +42,8 @@ struct ServerConfig {
   int scriptMemoryLimitMB = 256, scriptWarnMs = 50, scriptAbortMs = 5000;
   std::string bansFile = "bans.json";
   // Cota por jogador de eventos servidor → cliente vindos de scripts (bytes de nome + payload).
-  double scriptEventOutKBps = 64, scriptEventOutBurstKB = 128;
+  // Padrão 8 KiB/s = 64 kbps (alvo de banda por jogador da spec), rajada de 32 KiB.
+  double scriptEventOutKBps = 8, scriptEventOutBurstKB = 32;
 
   // Lançam std::runtime_error (pt-BR: campo + motivo).
   static ServerConfig load(const std::filesystem::path& path);

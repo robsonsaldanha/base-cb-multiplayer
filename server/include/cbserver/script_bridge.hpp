@@ -6,8 +6,9 @@
 //   cliente aceito pela cota (EvClientEvent), todos com a sessão do jogador. O evento de cliente `cb:command`
 //   (payload: texto JSON com a linha) vira EvCommand do jogador; qualquer outro nome `cb:*` vindo do cliente é
 //   descartado.
-// - applyCommands (antes de World::tick): no máximo kMaxCommandsPerTick comandos e kMaxBytesPerTick bytes de payload
-//   por tick (o resto fica para os próximos ticks; só drena o host de novo quando o atraso acabar, então a fila do
+// - applyCommands (antes de World::tick): primeiro o canal prioritário do host (kick, kick por did, teleporte), sempre
+//   e por inteiro; depois os emits, com no máximo kMaxCommandsPerTick comandos, kMaxBytesPerTick bytes de payload e
+//   kMaxEventOutPerTick destinatários (broadcast = número de jogadores) por tick (o resto fica para os próximos ticks; só drena o host de novo quando o atraso acabar, então a fila do
 //   host — limitada em itens e bytes — segura a pressão). CmdEmit → Event (broadcast com uma cópia só do payload;
 //   nome > 64 ou payload > 4096 bytes → descartado e contado), CmdKick → KickOrder, CmdKickDid → KickOrder de todos
 //   com o did, CmdSetPosition → setState (Correction com carência). Comando com sessão diferente da do jogador atual
@@ -29,6 +30,8 @@ class ScriptBridge {
  public:
   static constexpr size_t kMaxCommandsPerTick = 2048;
   static constexpr size_t kMaxBytesPerTick = size_t{2} << 20;
+  // Eventos de saída por tick (destinatários): um broadcast conta como o número de jogadores.
+  static constexpr size_t kMaxEventOutPerTick = 8192;
 
   ScriptBridge(World& world, cbscript::ScriptHost& host);
   ~ScriptBridge();  // remove os ganchos do World
@@ -44,6 +47,8 @@ class ScriptBridge {
   size_t backlog() const { return backlog_.size(); }               // comandos esperando o próximo tick
 
  private:
+  void applyOne(cbscript::ScriptToSim& c, double now);  // kick / kick por did / teleporte
+
   World& world_;
   cbscript::ScriptHost& host_;
   std::vector<cbscript::ScriptToSim> drained_;  // reaproveitado

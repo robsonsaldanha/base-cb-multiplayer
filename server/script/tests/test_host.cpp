@@ -497,12 +497,24 @@ TEST_CASE("host: players snapshot, tasks, command replies and the command queue 
 
   // fila scripts → simulação limitada
   env.host->runOnScriptThread([](ScriptContext& ctx) {
-    for (int i = 0; i < 5; ++i) ctx.emit(CmdKick{static_cast<uint16_t>(i), "", 0});
+    for (int i = 0; i < 5; ++i) ctx.emit(CmdEmit{i, "e", "{}", 0});
+    // Fila de emits cheia: kick/teleporte vão pelo canal prioritário e não são descartados.
+    ctx.emit(CmdKick{9, "k", 0});
+    ctx.emit(CmdSetPosition{9, 1, 2, 3, 0});
   });
   REQUIRE(waitFor([&] { return env.host->metrics().commandsDropped == 2; }));
   out.clear();
+  REQUIRE(waitFor([&] {
+    env.host->drainPriority(out);
+    return out.size() >= 2;
+  }));
+  REQUIRE(out.size() == 2);
+  REQUIRE(std::holds_alternative<CmdKick>(out[0]));
+  REQUIRE(std::holds_alternative<CmdSetPosition>(out[1]));
+  out.clear();
   env.host->drainCommands(out);
   REQUIRE(out.size() == 3);
+  REQUIRE(env.host->metrics().priorityDropped == 0);
 }
 
 TEST_CASE("host: supervisor halts the host when a C call never returns") {

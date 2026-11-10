@@ -65,17 +65,23 @@ struct PlayerSlot {
   bool awaitingSpawn = false;  // SpawnMode::DevTrustFirstInput: fora da grade até o primeiro Input
 };
 
+// Mensagem compartilhada por vários destinatários (broadcast): codificada uma vez só.
+struct SharedMessage {
+  cbmp::Message msg;
+  std::vector<uint8_t> bytes;  // cbmp::encode(msg)
+};
+
 // Mensagem para um jogador. `shared` (broadcast) aponta para uma mensagem imutável única para todos os
-// destinatários; use message() para ler.
+// destinatários, já codificada; use message() para ler.
 struct Outgoing {
   EntityId to = 0;
   cbmp::Message msg;
-  std::shared_ptr<const cbmp::Message> shared;
+  std::shared_ptr<const SharedMessage> shared;
 
   Outgoing() = default;
   Outgoing(EntityId t, cbmp::Message m) : to(t), msg(std::move(m)) {}
-  Outgoing(EntityId t, std::shared_ptr<const cbmp::Message> m) : to(t), shared(std::move(m)) {}
-  const cbmp::Message& message() const { return shared ? *shared : msg; }
+  Outgoing(EntityId t, std::shared_ptr<const SharedMessage> m) : to(t), shared(std::move(m)) {}
+  const cbmp::Message& message() const { return shared ? shared->msg : msg; }
 };
 struct KickOrder {
   EntityId who = 0;
@@ -127,8 +133,11 @@ class World {
   // tem outra sessão. Cada jogador tem cota de bytes (scripting.eventOutKBps/eventOutBurstKB): acima dela o evento
   // é descartado e contado em eventsOutDropped(). false = não enfileirado.
   bool queueEvent(EntityId to, uint32_t session, cbmp::Event ev, double now);
-  // Para todos os jogadores ativos (dentro da cota de cada um), com uma única cópia do payload.
-  void broadcastEvent(cbmp::Event ev, double now);
+  // Para todos os jogadores ativos (dentro da cota de cada um), com uma única cópia do payload, codificada uma vez.
+  // Devolve quantos destinatários receberam.
+  size_t broadcastEvent(cbmp::Event ev, double now);
+  // Cada evento custa nome + payload + este overhead na cota do jogador (cabeçalho/fila; evento vazio não é grátis).
+  static constexpr size_t kEventOverheadBytes = 48;
   // Expulsão pedida de fora (scripts): vira KickOrder no próximo tick (uma vez só). session ≠ 0 tem de bater.
   void kick(EntityId id, std::string reason, uint32_t session = 0);
   void kickDid(const std::string& did, const std::string& reason);  // todos os jogadores com esse did

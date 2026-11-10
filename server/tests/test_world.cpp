@@ -465,7 +465,8 @@ TEST_CASE("world outbound event budget per player drops and counts the excess; b
   Harness h(cfg);
   auto a = h.add("ana");
   auto b = h.add("bia", {100, 0, 0});
-  const std::vector<uint8_t> kb(1023, 'x');  // 1 KiB com o nome "e"
+  // 1 KiB na cota: nome "e" + 975 bytes + overhead fixo de 48 por mensagem.
+  const std::vector<uint8_t> kb(1024 - 1 - cbserver::World::kEventOverheadBytes, 'x');
   int accepted = 0;
   for (int i = 0; i < 40; ++i) accepted += h.world.queueEvent(a, 0, Event{"e", kb}, 0.0) ? 1 : 0;
   REQUIRE(accepted == 16);
@@ -477,7 +478,7 @@ TEST_CASE("world outbound event budget per player drops and counts the excess; b
   REQUIRE(ea == 17 + 7);  // a: 16 + 1 antes, depois 7 broadcasts (8 KiB − 1 KiB)
   REQUIRE(eb == 16);      // b: só o burst
   // Um broadcast = uma mensagem compartilhada entre os destinatários.
-  const cbmp::Message* first = nullptr;
+  const cbserver::SharedMessage* first = nullptr;
   for (const auto& o : h.out)
     if (o.shared) {
       if (!first) first = o.shared.get();

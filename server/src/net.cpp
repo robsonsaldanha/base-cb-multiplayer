@@ -10,6 +10,7 @@
 #include <span>
 #include <utility>
 
+#include <cbmp/log_text.hpp>
 #include <spdlog/spdlog.h>
 #include <steam/isteamnetworkingsockets.h>
 #include <steam/isteamnetworkingutils.h>
@@ -361,8 +362,11 @@ void NetServer::onHello(uint32_t conn, const cbmp::Hello& h) {
 
 int NetServer::sendTo(uint32_t conn, const cbmp::Message& m) {
   const auto bytes = cbmp::encode(m);
-  const int flags = cbmp::isReliable(cbmp::typeOf(m)) ? k_nSteamNetworkingSend_Reliable
-                                                       : k_nSteamNetworkingSend_UnreliableNoDelay;
+  return sendBytes(conn, bytes, cbmp::isReliable(cbmp::typeOf(m)));
+}
+
+int NetServer::sendBytes(uint32_t conn, const std::vector<uint8_t>& bytes, bool reliable) {
+  const int flags = reliable ? k_nSteamNetworkingSend_Reliable : k_nSteamNetworkingSend_UnreliableNoDelay;
   const EResult r = SteamNetworkingSockets()->SendMessageToConnection(
       conn, bytes.data(), static_cast<uint32_t>(bytes.size()), flags, nullptr);
   if (r == k_EResultOK) return static_cast<int>(bytes.size());
@@ -378,7 +382,10 @@ void NetServer::send(const std::vector<Outgoing>& out) {
     const cbmp::Message& m = o.message();
     int n = 0;
     try {
-      n = sendTo(it->second, m);
+      // Broadcast: já codificado uma vez pelo World, os mesmos bytes para todos.
+      n = o.shared && !o.shared->bytes.empty()
+              ? sendBytes(it->second, o.shared->bytes, cbmp::isReliable(cbmp::typeOf(m)))
+              : sendTo(it->second, m);
     } catch (const std::exception& e) {
       // Mensagem que não cabe no protocolo (ex.: payload > 4096): descarta só ela; o servidor segue.
       if (metrics_.encodeErrors.fetch_add(1) % 1000 == 0)
@@ -423,7 +430,7 @@ void NetServer::dropPending(uint32_t conn) {
 }
 
 void NetServer::reject(uint32_t conn, const std::string& reason) {
-  spdlog::info("conexão recusada: {}", reason);
+  spdlog::info("conexão recusada: {}", cbmp::escapeLogText(reason));
   sendTo(conn, cbmp::Reject{reason});
   SteamNetworkingSockets()->CloseConnection(conn, kEndRejected, reason.c_str(), true);
 }
@@ -439,7 +446,7 @@ void NetServer::endSession(uint32_t conn, const std::string& reason, bool sendKi
   SteamNetworkingSockets()->CloseConnection(conn, kEndKicked, reason.c_str(), sendKick);
   world_.removePlayer(s.id, reason);
   metrics_.removePlayer(s.id);
-  spdlog::info("jogador {} saiu: {}", s.id, reason);
+  spdlog::info("jogador {} saiu: {}", s.id, cbmp::escapeLogText(reason));
 }
 
 void NetServer::updateGauges() {

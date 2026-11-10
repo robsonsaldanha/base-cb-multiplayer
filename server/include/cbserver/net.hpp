@@ -99,6 +99,7 @@ class NetServer {
   void onHello(uint32_t conn, const cbmp::Hello& h);
   // Bytes enviados, -2 = LimitExceeded, -1 = outra falha (ambas contam em Metrics::sendFailures).
   int sendTo(uint32_t conn, const cbmp::Message& m);
+  int sendBytes(uint32_t conn, const std::vector<uint8_t>& bytes, bool reliable);
   void violation(const Session& s, const std::string& reason);
   void closeConn(uint32_t conn, const std::string& reason, bool linger);
   void dropPending(uint32_t conn);

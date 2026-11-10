@@ -8,6 +8,12 @@
 // - onTick: timers (cb.timers) pelo relógio do host (resolução = volta do laço da thread de scripts).
 // Ganchos que já estavam em `opt` continuam sendo chamados, depois dos da API.
 //
+// Sessões: tabelas de jogador têm `session` (único no processo; o id é reaproveitado, a sessão não).
+// cb.events.emit(alvo, nome, dados, sessão?), cb.players.kick(id, motivo?, sessão?) e
+// cb.players.setPosition(id, x, y, z, sessão?) aceitam a sessão opcional: sem ela, valem para o ocupante atual do id
+// (o conectado quando o script chama); com ela, devolvem false se o id agora é de outra sessão. Em todos os casos a
+// simulação ainda descarta o comando se o id mudar de dono antes de ele ser aplicado.
+//
 // Todo callback roda numa corrotina própria (ScriptContext::invoke). Eventos locais (cb.events.emitLocal) são
 // entregues na mesma thread logo depois do gancho/evento atual terminar (nunca reentrantes).
 #include <atomic>

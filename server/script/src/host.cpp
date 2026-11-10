@@ -1,5 +1,6 @@
 #include "cbscript/host.hpp"
 
+#include <cbmp/log_text.hpp>
 #include <cbmp/safe_path.hpp>
 #include <spdlog/spdlog.h>
 
@@ -138,6 +139,10 @@ struct HostImpl final : ScriptContext {
   std::vector<ScriptToSim> cmds;
   size_t cmdBytes = 0;  // bytes aproximados em `cmds` (teto commandQueueBytes)
   std::atomic<uint64_t> cmdsDropped{0};
+  // Canal prioritário (kick, kick por did, teleporte): fora da capacidade/bytes dos emits; só o teto de segurança
+  // priorityQueueCapacity (com log CRÍTICO) ou o host parado o recusam.
+  std::vector<ScriptToSim> prio;
+  std::atomic<uint64_t> prioDropped{0};
 
   // ---- foto dos jogadores (playersMu: só a troca do ponteiro) ----
   mutable std::mutex playersMu;
@@ -193,7 +198,22 @@ struct HostImpl final : ScriptContext {
                                      },
                                      c);
   }
+  static bool isPriority(const ScriptToSim& c) { return !std::holds_alternative<CmdEmit>(c); }
   bool emit(ScriptToSim cmd) override {
+    if (isPriority(cmd)) {
+      bool over = false;
+      {
+        std::lock_guard<std::mutex> lk(cmdMu);
+        if (!halted.load() && prio.size() < opt.priorityQueueCapacity) {
+          prio.push_back(std::move(cmd));
+          return true;
+        }
+        over = !halted.load();
+      }
+      prioDropped.fetch_add(1, std::memory_order_relaxed);
+      if (over) log(LogLevel::Critical, "fila prioritária de comandos (kick/teleporte) cheia: comando descartado");
+      return false;
+    }
     const size_t n = bytesOf(cmd);
     std::lock_guard<std::mutex> lk(cmdMu);
     if (cmds.size() >= opt.commandQueueCapacity || cmdBytes + n > opt.commandQueueBytes) {
@@ -325,7 +345,7 @@ struct HostImpl final : ScriptContext {
       return;
     }
     ++s.errLines;
-    log(LogLevel::Error, msg);
+    log(LogLevel::Error, cbmp::escapeLogText(msg));
   }
 
   // ================= status =================
@@ -1066,14 +1086,26 @@ void ScriptHost::publishPlayers(PlayersSnapshot players) {
   // a foto antiga (se for a última referência) é liberada aqui, fora do lock
 }
 
-void ScriptHost::drainCommands(std::vector<ScriptToSim>& out) {
+void ScriptHost::drainPriority(std::vector<ScriptToSim>& out) {
   HostImpl& I = *impl_;
   std::vector<ScriptToSim> got;
   {
     std::lock_guard<std::mutex> lk(I.cmdMu);
+    got.swap(I.prio);
+  }
+  out.insert(out.end(), std::make_move_iterator(got.begin()), std::make_move_iterator(got.end()));
+}
+
+void ScriptHost::drainCommands(std::vector<ScriptToSim>& out) {
+  HostImpl& I = *impl_;
+  std::vector<ScriptToSim> pr, got;
+  {
+    std::lock_guard<std::mutex> lk(I.cmdMu);
+    pr.swap(I.prio);
     got.swap(I.cmds);
     I.cmdBytes = 0;
   }
+  out.insert(out.end(), std::make_move_iterator(pr.begin()), std::make_move_iterator(pr.end()));
   if (out.empty()) {
     out.swap(got);
   } else {
@@ -1102,6 +1134,7 @@ HostMetrics ScriptHost::metrics() const {
   m.eventsDropped = I.eventsDropped.load();
   m.eventsBackstopDropped = I.backstopDropped.load();
   m.commandsDropped = I.cmdsDropped.load();
+  m.priorityDropped = I.prioDropped.load();
   {
     std::lock_guard<std::mutex> lk(I.qMu);
     m.eventQueueDepth = I.pending.load();

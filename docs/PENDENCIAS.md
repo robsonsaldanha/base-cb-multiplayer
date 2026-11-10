@@ -36,6 +36,11 @@ Itens levantados nas revisões que não bloquearam o merge, com o momento em que
 - Foto dos jogadores por tick: buffers reaproveitados quando a thread de scripts já soltou a foto antiga (até 4); ainda
   copia as strings de cada jogador por tick (`assign`, sem nova alocação no caso comum).
 - Comando de chat que cede (consulta assíncrona da Task 5) não responde: só retorno síncrono vira `cb:reply`.
+- Eventos servidor → cliente de scripts: cota por jogador de `scripting.eventOutKBps` (padrão 8 KiB/s = 64 kbps) com
+  rajada `eventOutBurstKB` (32 KiB) e 48 B de overhead por mensagem; teto de 8192 eventos de saída por tick. Um
+  gamemode que precise de mais banda por jogador tem de subir a cota (e conferir o orçamento de 64 kbps da spec).
+- `kick`/`setPosition`/kick por did dos scripts vão por um canal prioritário do host (nunca atrás dos emits); teto de
+  segurança de 65 536 com log CRÍTICO.
 - Política de teleporte (`setState` limpa `correctionTimes`; decidir se mantém o histórico).
 - Teto com kick para cliente que nunca alcança correção do servidor.
 - ~~Evento `echo` é de teste e fica ativo em produção: tornar só-dev.~~ Resolvido na Task 4: o eco C++ saiu; só existe

@@ -1004,3 +1004,87 @@ TEST_CASE("bans: expired bans are purged on load and save; out-of-range values a
   put(t.p / "huge.json", R"([{"did": "a", "createdAt": 1000000000000000}])");
   REQUIRE_THROWS(BanStore(t.p / "huge.json", clk));
 }
+
+// ============================================== regressões (Task 4, fix round 2)
+
+TEST_CASE("api: cb.audit is limited per resource and engine audit lines are never limited") {
+  ApiEnv env;
+  env.api.stats = std::make_shared<ApiStats>();
+  env.addRes("a", R"(
+    cb.events.on('flood', function() for i = 1, 1000 do cb.audit('flood', {i = i}) end cb.log.info('flooded') end)
+  )");
+  env.addRes("b", R"(
+    cb.events.on('both', function()
+      cb.audit('b-own', {x = 1})
+      for i = 1, 300 do cb.players.kick(3, 'k' .. i) end
+      cb.log.info('kicked')
+    end)
+  )");
+  env.boot();
+  env.join(3, "ana");
+  env.event(3, "flood");
+  REQUIRE(env.waitLog("flooded"));
+  env.event(3, "both");
+  REQUIRE(env.waitLog("kicked"));
+  int own = 0, kicks = 0, floods = 0;
+  for (auto& l : env.auditLines()) {
+    auto j = nlohmann::json::parse(l);
+    own += j["type"] == "b-own" ? 1 : 0;
+    kicks += j["type"] == "kick" ? 1 : 0;
+    floods += j["type"] == "flood" ? 1 : 0;
+  }
+  REQUIRE(floods == 200);  // a: limitado
+  REQUIRE(own == 1);       // b: não sofre com o limite de a
+  REQUIRE(kicks == 300);   // linhas do motor: nunca limitadas
+  REQUIRE(env.api.stats->auditDropped.load() == 800);
+}
+
+TEST_CASE("api: player tables expose the session and emit/kick/setPosition accept an optional session") {
+  ApiEnv env;
+  env.addRes("a", R"(
+    cb.events.on('go', function(p)
+      cb.log.info('sess ' .. p.session .. ' ' .. cb.players.get(p.id).session)
+      cb.log.info('emit-old ' .. tostring(cb.events.emit(p.id, 'x', {}, p.session + 1)))
+      cb.log.info('emit-cur ' .. tostring(cb.events.emit(p.id, 'x', {}, p.session)))
+      cb.log.info('tp-old ' .. tostring(cb.players.setPosition(p.id, 1, 2, 3, 99)))
+      cb.log.info('kick-old ' .. tostring(cb.players.kick(p.id, 'x', 99)))
+      cb.log.info('kick-cur ' .. tostring(cb.players.kick(p.id, 'x', p.session)))
+      local ok, e = pcall(cb.players.kick, p.id, 'x', -1)
+      cb.log.info('bad ' .. e)
+    end)
+  )");
+  env.boot();
+  env.join(3, "ana");
+  env.host->publishPlayers(std::make_shared<const std::vector<PlayerView>>(
+      std::vector<PlayerView>{PlayerView{3, "ana", "d3", "s3", 0, 0, 0, 1, ApiEnv::sessionOf(3)}}));
+  env.event(3, "go");
+  REQUIRE(env.waitLog("bad "));
+  INFO(env.allLogs());
+  REQUIRE(env.hasLog("sess 1003 1003"));
+  REQUIRE(env.hasLog("emit-old false"));
+  REQUIRE(env.hasLog("emit-cur true"));
+  REQUIRE(env.hasLog("tp-old false"));
+  REQUIRE(env.hasLog("kick-old false"));
+  REQUIRE(env.hasLog("kick-cur true"));
+  REQUIRE(env.hasLog("cb.players.kick: sessão inválida"));
+}
+
+TEST_CASE("api: escapeLogText escapes C0/C1 controls, line separators and bidi overrides") {
+  REQUIRE(cbscript::escapeLogText("a\nb\rc\x01\x7f\td") == "a\\nb\\rc\\x01\\x7f\td");
+  REQUIRE(cbscript::escapeLogText("x\xC2\x85y") == "x\\u{0085}y");                    // NEL (C1)
+  REQUIRE(cbscript::escapeLogText("\xE2\x80\xA8\xE2\x80\xA9") == "\\u{2028}\\u{2029}");  // separadores
+  REQUIRE(cbscript::escapeLogText("\xE2\x80\xAE" "abc") == "\\u{202e}abc");              // RLO
+  REQUIRE(cbscript::escapeLogText("\xE2\x81\xA6\xE2\x81\xA9") == "\\u{2066}\\u{2069}");  // isolates
+  REQUIRE(cbscript::escapeLogText("ção €") == "ção €");                                  // UTF-8 comum intacto
+}
+
+TEST_CASE("api: callback error messages are escaped in the log") {
+  ApiEnv env;
+  env.addRes("a", R"(cb.events.on('boom', function() error('x\n[2026-11-10] [info] forjado') end))");
+  env.boot();
+  env.join(3, "ana");
+  env.event(3, "boom");
+  REQUIRE(env.waitLog("forjado", LogLevel::Error));
+  REQUIRE_FALSE(env.hasLog("\n[2026-11-10]", LogLevel::Error));
+  REQUIRE(env.hasLog("x\\n[2026-11-10] [info] forjado", LogLevel::Error));
+}

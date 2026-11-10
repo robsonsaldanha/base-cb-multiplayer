@@ -78,15 +78,47 @@ ScriptBridge::ScriptBridge(World& world, cbscript::ScriptHost& host) : world_(wo
 
 ScriptBridge::~ScriptBridge() { world_.setHooks({}); }
 
+void ScriptBridge::applyOne(cbscript::ScriptToSim& c, double now) {
+  if (auto* k = std::get_if<cbscript::CmdKick>(&c)) {
+    world_.kick(k->id, std::move(k->reason), k->session);
+  } else if (auto* kd = std::get_if<cbscript::CmdKickDid>(&c)) {
+    world_.kickDid(kd->did, kd->reason);
+  } else if (auto* t = std::get_if<cbscript::CmdSetPosition>(&c)) {
+    const PlayerSlot* p = world_.find(t->id);
+    if (!p || (t->session != 0 && p->session != t->session) || p->kicked) return;
+    cbmp::PlayerState s = p->state;
+    s.pos = {t->x, t->y, t->z};
+    s.vel = {};
+    world_.setState(t->id, s, now);
+  }
+}
+
 void ScriptBridge::applyCommands(double now) {
+  // 1) Canal prioritário (kick/teleporte): sempre, todo tick, antes de qualquer emit e sem passar pelo atraso.
+  drained_.clear();
+  host_.drainPriority(drained_);
+  for (auto& c : drained_) applyOne(c, now);
+  drained_.clear();
+  // 2) Emits (e prioritários que vierem junto no dreno geral), com orçamento por tick.
   if (backlog_.empty()) {
-    drained_.clear();
     host_.drainCommands(drained_);
-    for (auto& c : drained_) backlog_.push_back(std::move(c));
+    for (auto& c : drained_) {
+      if (std::holds_alternative<cbscript::CmdEmit>(c))
+        backlog_.push_back(std::move(c));
+      else
+        applyOne(c, now);
+    }
     drained_.clear();
   }
-  size_t n = 0, bytes = 0;
+  size_t n = 0, bytes = 0, recipients = 0;
+  const size_t players = world_.playerCount();
   while (!backlog_.empty() && n < kMaxCommandsPerTick && bytes < kMaxBytesPerTick) {
+    // Orçamento de destinatários: um broadcast conta como N eventos de saída.
+    if (const auto* e = std::get_if<cbscript::CmdEmit>(&backlog_.front())) {
+      const size_t cost = e->target < 0 ? players : 1;
+      if (recipients > 0 && recipients + cost > kMaxEventOutPerTick) break;
+      recipients += cost;
+    }
     cbscript::ScriptToSim c = std::move(backlog_.front());
     backlog_.pop_front();
     ++n;
@@ -103,17 +135,8 @@ void ScriptBridge::applyCommands(double now) {
         world_.broadcastEvent(std::move(ev), now);
       else if (e->target <= 65535)
         world_.queueEvent(static_cast<EntityId>(e->target), e->session, std::move(ev), now);
-    } else if (auto* k = std::get_if<cbscript::CmdKick>(&c)) {
-      world_.kick(k->id, std::move(k->reason), k->session);
-    } else if (auto* kd = std::get_if<cbscript::CmdKickDid>(&c)) {
-      world_.kickDid(kd->did, kd->reason);
-    } else if (auto* t = std::get_if<cbscript::CmdSetPosition>(&c)) {
-      const PlayerSlot* p = world_.find(t->id);
-      if (!p || (t->session != 0 && p->session != t->session) || p->kicked) continue;
-      cbmp::PlayerState s = p->state;
-      s.pos = {t->x, t->y, t->z};
-      s.vel = {};
-      world_.setState(t->id, s, now);
+    } else {
+      applyOne(c, now);
     }
   }
 }

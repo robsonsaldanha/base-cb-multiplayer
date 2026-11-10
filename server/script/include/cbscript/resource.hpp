@@ -29,8 +29,8 @@ struct ResourceManifest {
 // dependência com nome inválido; "permissions" malformado.
 ResourceManifest loadManifest(const std::filesystem::path& dir);
 
-// Texto de script para uma linha de log: \n, \r e outros caracteres de controle (exceto tab) viram escapes
-// (\n, \r, \xHH), para um script não forjar linhas no log do servidor.
+// Texto de script para uma linha de log (ver cbmp::escapeLogText): controles, separadores de linha Unicode e
+// controles bidi viram escapes, para um script não forjar linhas no log do servidor.
 std::string escapeLogText(std::string_view s);
 
 struct Limits {

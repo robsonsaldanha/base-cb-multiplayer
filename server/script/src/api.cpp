@@ -159,6 +159,7 @@ struct ApiRes {
   PlayersSnapshot snap;   // foto em uso por players.list/get
   std::vector<const PlayerView*> view;  // entradas da foto cuja sessão bate com a dos conectados
   RateWindow logRate;
+  RateWindow auditRate;  // só cb.audit
 
   JsonOptions json(size_t maxBytes = kMaxPayload) const {
     JsonOptions o;
@@ -188,7 +189,6 @@ struct Shared {
   bool draining = false;
   double lastJsonWarn = -1e9;
   std::vector<uint64_t> dueScratch;
-  RateWindow auditRate;
 
   int64_t unixNow() const {
     if (o.unixNow) return o.unixNow();
@@ -214,16 +214,22 @@ const Conn* connOf(const Shared& sh, uint16_t id) {
 
 // ---------------------------------------------------------------------------------------------- auditoria
 
-CBAPI_NOINLINE void auditLine(ApiRes& a, nlohmann::json line) {
+// `limited` = linha pedida pelo script (cb.audit): 200/s por resource. Linhas do motor (kick, ban, unban, command)
+// nunca são limitadas.
+CBAPI_NOINLINE void auditLine(ApiRes& a, nlohmann::json line, bool limited = false) {
   if (a.ctx->abandoned() || !a.sh->o.audit) return;
   try {
-    uint64_t summary = 0;
-    const bool ok = a.sh->auditRate.take(summary);
-    if (summary > 0)
-      a.sh->o.audit(nlohmann::json{{"type", "audit_dropped"}, {"ts", a.sh->unixNow()}, {"count", summary}}.dump());
-    if (!ok) {
-      if (a.sh->o.stats) a.sh->o.stats->auditDropped.fetch_add(1);
-      return;
+    if (limited) {
+      uint64_t summary = 0;
+      const bool ok = a.auditRate.take(summary);
+      if (summary > 0)
+        a.sh->o.audit(nlohmann::json{{"type", "audit_dropped"}, {"ts", a.sh->unixNow()}, {"resource", a.h->name()},
+                                     {"count", summary}}
+                          .dump());
+      if (!ok) {
+        if (a.sh->o.stats) a.sh->o.stats->auditDropped.fetch_add(1);
+        return;
+      }
     }
     line["ts"] = a.sh->unixNow();
     line["resource"] = a.h->name();
@@ -262,6 +268,15 @@ const char* optText(lua_State* L, int idx, const char* fn, const char* what, con
   }
   if (lua_type(L, idx) != LUA_TSTRING) luaL_error(L, "%s: %s deve ser texto", fn, what);
   return lua_tolstring(L, idx, len);
+}
+
+// Sessão opcional (nil → 0 = ocupante atual do id).
+uint32_t optSession(lua_State* L, int idx, const char* fn) {
+  if (lua_isnoneornil(L, idx)) return 0;
+  int isnum = 0;
+  lua_Integer v = lua_type(L, idx) == LUA_TNUMBER ? lua_tointegerx(L, idx, &isnum) : 0;
+  if (!isnum || v < 1 || v > 0xFFFFFFFFll) luaL_error(L, "%s: sessão inválida", fn);
+  return static_cast<uint32_t>(v);
 }
 
 int pushRef(lua_State* L, int idx) {
@@ -330,7 +345,8 @@ int l_events_on(lua_State* L) { return registerNamed(L, false); }
 int l_events_onLocal(lua_State* L) { return registerNamed(L, true); }
 
 // 1 = enfileirado, 0 = fila cheia, -1 = erro.
-CBAPI_NOINLINE int doEmit(ApiRes* a, lua_State* L, lua_Integer target, const char* name, size_t len, Err& e) {
+CBAPI_NOINLINE int doEmit(ApiRes* a, lua_State* L, lua_Integer target, const char* name, size_t len,
+                          uint32_t want, Err& e) {
   try {
     std::string err;
     if (!luaToJson(L, 3, a->scratch, err, a->json())) {
@@ -341,6 +357,7 @@ CBAPI_NOINLINE int doEmit(ApiRes* a, lua_State* L, lua_Integer target, const cha
     if (target != -1) {
       const Conn* c = connOf(*a->sh, static_cast<uint16_t>(target));
       if (!c) return 0;  // jogador não conectado: ignorado (sem erro)
+      if (want != 0 && want != c->session) return 0;  // outra sessão ocupa o id
       session = c->session;
     }
     return a->ctx->emit(CmdEmit{static_cast<int32_t>(target), std::string(name, len), a->scratch, session}) ? 1 : 0;
@@ -358,9 +375,10 @@ int l_events_emit(lua_State* L) {
     return luaL_error(L, "cb.events.emit: alvo inválido (id do jogador ou -1 para todos)");
   size_t len = 0;
   const char* name = checkName(L, 2, "cb.events.emit", &len);
-  lua_settop(L, 3);
+  lua_settop(L, 4);
+  const uint32_t want = optSession(L, 4, "cb.events.emit");
   Err e;
-  int rc = doEmit(a, L, t, name, len, e);
+  int rc = doEmit(a, L, t, name, len, want, e);
   if (rc < 0) return luaL_error(L, "%s", e.msg);
   lua_pushboolean(L, rc);
   return 1;
@@ -412,7 +430,7 @@ CBAPI_NOINLINE void grabSnap(ApiRes* a) {
 }
 
 void pushPlayer(lua_State* L, const PlayerView& p) {
-  lua_createtable(L, 0, 8);
+  lua_createtable(L, 0, 9);
   lua_pushinteger(L, p.id);
   lua_setfield(L, -2, "id");
   lua_pushlstring(L, p.name.data(), p.name.size());
@@ -429,6 +447,8 @@ void pushPlayer(lua_State* L, const PlayerView& p) {
   lua_setfield(L, -2, "z");
   lua_pushinteger(L, p.state);
   lua_setfield(L, -2, "state");
+  lua_pushinteger(L, static_cast<lua_Integer>(p.session));
+  lua_setfield(L, -2, "session");
 }
 
 int l_players_list(lua_State* L) {
@@ -458,13 +478,16 @@ int l_players_get(lua_State* L) {
 }
 
 // 1 = feito, 0 = jogador não conectado.
-CBAPI_NOINLINE int doKick(ApiRes* a, uint16_t id, const char* reason, size_t len) {
+CBAPI_NOINLINE int doKick(ApiRes* a, uint16_t id, const char* reason, size_t len, uint32_t want) {
   if (a->ctx->abandoned()) return 0;
   try {
     const Conn* c = connOf(*a->sh, id);
-    if (!c) return 0;
+    if (!c || (want != 0 && want != c->session)) return 0;
     std::string why = clampUtf8(std::string_view(reason, len), kMaxReason);
-    a->ctx->emit(CmdKick{id, why, c->session});
+    if (!a->ctx->emit(CmdKick{id, why, c->session})) {
+      a->ctx->log(LogLevel::Critical, "[" + a->h->name() + "] cb.players.kick: comando não entregue à simulação");
+      return 0;
+    }
     auditLine(*a, {{"type", "kick"}, {"id", id}, {"did", c->did}, {"reason", why}});
     return 1;
   } catch (...) {
@@ -477,16 +500,20 @@ int l_players_kick(lua_State* L) {
   uint16_t id = checkId(L, 1, "cb.players.kick");
   size_t len = 0;
   const char* reason = optText(L, 2, "cb.players.kick", "o motivo", "expulso", &len);
-  lua_pushboolean(L, doKick(a, id, reason, len));
+  const uint32_t want = optSession(L, 3, "cb.players.kick");
+  lua_pushboolean(L, doKick(a, id, reason, len, want));
   return 1;
 }
 
-CBAPI_NOINLINE int doSetPosition(ApiRes* a, uint16_t id, lua_Integer x, lua_Integer y, lua_Integer z) {
+CBAPI_NOINLINE int doSetPosition(ApiRes* a, uint16_t id, lua_Integer x, lua_Integer y, lua_Integer z, uint32_t want) {
   try {
     const Conn* c = connOf(*a->sh, id);
-    if (!c) return 0;
-    a->ctx->emit(
-        CmdSetPosition{id, static_cast<int32_t>(x), static_cast<int32_t>(y), static_cast<int32_t>(z), c->session});
+    if (!c || (want != 0 && want != c->session)) return 0;
+    if (!a->ctx->emit(CmdSetPosition{id, static_cast<int32_t>(x), static_cast<int32_t>(y), static_cast<int32_t>(z),
+                                     c->session})) {
+      a->ctx->log(LogLevel::Critical, "[" + a->h->name() + "] cb.players.setPosition: comando não entregue à simulação");
+      return 0;
+    }
     return 1;
   } catch (...) {
     return 0;
@@ -503,7 +530,8 @@ int l_players_setPosition(lua_State* L) {
     if (!isnum || c[i] < INT32_MIN || c[i] > INT32_MAX)
       return luaL_error(L, "cb.players.setPosition: coordenadas inteiras (cm, int32) esperadas");
   }
-  lua_pushboolean(L, doSetPosition(a, id, c[0], c[1], c[2]));
+  const uint32_t want = optSession(L, 5, "cb.players.setPosition");
+  lua_pushboolean(L, doSetPosition(a, id, c[0], c[1], c[2], want));
   return 1;
 }
 
@@ -530,7 +558,8 @@ CBAPI_NOINLINE int doBan(ApiRes* a, const char* did, size_t didLen, const char* 
       a->ctx->log(LogLevel::Error, "[" + a->h->name() + "] cb.players.ban: " + err + " (o ban vale até reiniciar)");
     const std::string why = clampUtf8("banido: " + b.reason, kMaxReason);
     // Resolvido na simulação: pega também quem entrou e ainda não chegou aos scripts.
-    a->ctx->emit(CmdKickDid{b.did, why});
+    if (!a->ctx->emit(CmdKickDid{b.did, why}))
+      a->ctx->log(LogLevel::Critical, "[" + a->h->name() + "] cb.players.ban: expulsão não entregue à simulação");
     auditLine(*a, {{"type", "ban"}, {"did", b.did}, {"reason", b.reason}, {"expiresAt", b.expiresAt}});
     return 1;
   } catch (...) {
@@ -773,7 +802,7 @@ CBAPI_NOINLINE int doAudit(ApiRes* a, lua_State* L, const char* type, size_t len
         line["did"] = c->did;
         line["sub"] = c->sub;
       }
-    auditLine(*a, std::move(line));
+    auditLine(*a, std::move(line), true);
     return 0;
   } catch (...) {
     setErr(e, "cb.audit: falha ao montar a linha");
@@ -1245,12 +1274,22 @@ std::string replyJson(const std::string& text) {
   };
   std::string js = dump(text);
   if (js.size() <= kMaxPayload) return js;
-  size_t cut = std::min(text.size(), kMaxPayload);
-  while (true) {
-    js = dump(clampUtf8(text, cut) + "\u2026");
-    if (js.size() <= kMaxPayload || cut == 0) return js;
-    cut = cut > js.size() - kMaxPayload + 8 ? cut - (js.size() - kMaxPayload + 8) : 0;  // escapes ocupam mais
+  // Maior corte (em bytes do texto, sem quebrar UTF-8) cujo JSON com "\u2026" cabe: busca bin\u00e1ria. Escapes (\u0001 = 6
+  // bytes) e bytes inv\u00e1lidos (U+FFFD = 3 bytes) fazem o JSON crescer mais que o texto; um corte proporcional
+  // simples podia cair para s\u00f3 "\u2026".
+  size_t lo = 1, hi = std::min(text.size(), kMaxPayload);
+  std::string best = dump("\u2026");
+  while (lo <= hi) {
+    const size_t mid = lo + (hi - lo) / 2;
+    std::string cand = dump(clampUtf8(text, mid) + "\u2026");
+    if (cand.size() <= kMaxPayload) {
+      best = std::move(cand);
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
   }
+  return best;
 }
 
 void reply(ScriptContext& ctx, EvCommand& ev, uint32_t session, const std::string& text) {

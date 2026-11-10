@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <exception>
 #include <cmath>
 #include <utility>
 
@@ -223,7 +224,7 @@ bool World::takeOut(PlayerSlot& p, size_t bytes, double now) {
   else
     p.outTokens = std::min(burst, p.outTokens + std::max(0.0, now - p.outLast) * rate);
   p.outLast = now;
-  const double need = static_cast<double>(bytes);
+  const double need = static_cast<double>(bytes + kEventOverheadBytes);
   if (p.outTokens < need) {
     ++eventsOutDropped_;
     return false;
@@ -240,15 +241,28 @@ bool World::queueEvent(EntityId to, uint32_t session, cbmp::Event ev, double now
   return true;
 }
 
-void World::broadcastEvent(cbmp::Event ev, double now) {
+size_t World::broadcastEvent(cbmp::Event ev, double now) {
   const size_t bytes = ev.name.size() + ev.payload.size();
-  std::shared_ptr<const cbmp::Message> msg;
+  std::shared_ptr<const SharedMessage> msg;
+  size_t n = 0;
   for (EntityId id : active_) {
     PlayerSlot& p = *slots_[id];
     if (p.kicked || !takeOut(p, bytes, now)) continue;
-    if (!msg) msg = std::make_shared<const cbmp::Message>(std::move(ev));
+    if (!msg) {
+      auto m = std::make_shared<SharedMessage>();
+      m->msg = cbmp::Message{std::move(ev)};
+      try {
+        m->bytes = cbmp::encode(m->msg);
+      } catch (const std::exception&) {
+        ++eventsOutDropped_;  // não cabe no protocolo: ninguém recebe
+        return 0;
+      }
+      msg = std::move(m);
+    }
     pending_.push_back(Outgoing{id, msg});
+    ++n;
   }
+  return n;
 }
 
 void World::kick(EntityId id, std::string reason, uint32_t session) {

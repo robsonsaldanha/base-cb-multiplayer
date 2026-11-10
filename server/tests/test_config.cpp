@@ -144,8 +144,8 @@ TEST_CASE("config scripting section has defaults and validates its limits") {
   REQUIRE(c.scriptWarnMs == 20);
   REQUIRE(c.scriptAbortMs == 1000);
   REQUIRE(c.bansFile == "dados/bans.json");
-  REQUIRE(d.scriptEventOutKBps == 64);
-  REQUIRE(d.scriptEventOutBurstKB == 128);
+  REQUIRE(d.scriptEventOutKBps == 8);
+  REQUIRE(d.scriptEventOutBurstKB == 32);
   auto out = base();
   out["scripting"] = {{"eventOutKBps", 32}, {"eventOutBurstKB", 256}};
   auto o = ServerConfig::fromJson(out);

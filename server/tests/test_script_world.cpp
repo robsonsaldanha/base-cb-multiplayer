@@ -16,6 +16,8 @@
 #include <thread>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "cbscript/api.hpp"
 #include "cbscript/bans.hpp"
 #include "cbscript/host.hpp"
@@ -393,4 +395,154 @@ TEST_CASE("bridge: a script burst of broadcasts is spread over ticks with bounde
   REQUIRE(totalEvents <= 16 * 270);
   REQUIRE(env.h.world.eventsOutDropped() > 0);
   REQUIRE(env.bridge->backlog() <= cbserver::ScriptBridge::kMaxCommandsPerTick * 40);
+}
+
+// ============================================== regressões (Task 4, fix round 2)
+
+TEST_CASE("bridge: tiny broadcasts to 200 players are bounded per recipient; tick plus send p99 under 25 ms") {
+  Env env(R"(
+    cb.on('playerJoin', function(p) if p.id == 200 then cb.log.info('join ' .. p.id) end end)  -- cb.log: 200 linhas/s
+    cb.events.on('burst', function(p)
+      local n = 0
+      for i = 1, 65536 do if cb.events.emit(-1, 'b', 0) then n = n + 1 end end
+      cb.log.info('queued ' .. n)
+    end)
+  )", std::chrono::milliseconds(5000));
+  std::vector<cbserver::EntityId> ids;
+  // Jogadores a 500 m uns dos outros: o custo medido é o dos eventos, não o dos snapshots (200 aglomerados com
+  // 128 visíveis cada, numa thread só de snapshot, já custam ~15–20 ms aqui sem nenhum evento).
+  for (int i = 0; i < 200; ++i) ids.push_back(env.h.add("p" + std::to_string(i), {i * 50000, 0, 0}));
+  REQUIRE(env.ticksUntil([&] { return env.hasLog("join 200"); }));
+  REQUIRE(env.h.world.onEvent(ids[0], Event{"burst", bytes("{}")}, env.h.now));
+  for (int i = 0; i < 5000 && !env.hasLog("queued"); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  REQUIRE(env.hasLog("queued"));
+  std::vector<double> ms;
+  size_t maxEv = 0, total = 0;
+  for (int t = 0; t < 60; ++t) {
+    const auto t0 = Clock::now();
+    env.tick();
+    // Caminho de envio medível sem rede: o que o NetServer::send codifica (broadcast já vem codificado uma vez).
+    size_t evs = 0, sent = 0;
+    for (auto& o : env.h.out) {
+      if (std::holds_alternative<cbmp::Event>(o.message())) ++evs;
+      sent += o.shared && !o.shared->bytes.empty() ? o.shared->bytes.size() : cbmp::encode(o.message()).size();
+    }
+    ms.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+    REQUIRE(sent > 0);
+    maxEv = std::max(maxEv, evs);
+    total += evs;
+  }
+  std::sort(ms.begin(), ms.end());
+  const double p99 = ms[static_cast<size_t>(0.99 * static_cast<double>(ms.size() - 1))];
+  WARN("200 jogadores, rajada de broadcasts minúsculos: p99 " << p99 << " ms, pior " << ms.back() << " ms, máx "
+                                                              << maxEv << " eventos/tick, total " << total);
+  REQUIRE(maxEv <= cbserver::ScriptBridge::kMaxEventOutPerTick);
+  REQUIRE(p99 <= 25);
+  // Cota por jogador (padrão 8 KiB/s, rajada 32 KiB; 48 B de overhead + 1 + 1 por evento): ~655 + ~164/s cada;
+  // 60 ticks = 3 s de jogo → ≤ ~1150 por jogador.
+  REQUIRE(total <= 200 * 1200);
+}
+
+TEST_CASE("bridge: a flooding resource never delays another resource's kick") {
+  Tmp dir;
+  Harness h;
+  std::mutex mu;
+  std::vector<std::string> logs;
+  put(dir.p / "flood" / "resource.json", R"({"name":"flood","version":"1.0.0","server":["server/main.lua"]})");
+  put(dir.p / "flood" / "server" / "main.lua", R"(
+    cb.on('playerJoin', function(p)
+      if p.id == 1 then
+        cb.timers.every(10, function() for i = 1, 3000 do cb.events.emit(1, 'f', 0) end end)
+      end
+    end)
+  )");
+  put(dir.p / "mod" / "resource.json", R"({"name":"mod","version":"1.0.0","server":["server/main.lua"]})");
+  put(dir.p / "mod" / "server" / "main.lua", R"(
+    cb.on('playerJoin', function(p) cb.log.info('join ' .. p.id) end)
+    cb.events.on('kickbia', function() cb.log.info('kick returned ' .. tostring(cb.players.kick(2, 'x'))) end)
+  )");
+  cbscript::HostOptions opt;
+  opt.idleWait = std::chrono::milliseconds(2);
+  opt.log = [&](cbscript::LogLevel, const std::string& m) {
+    std::lock_guard<std::mutex> lk(mu);
+    logs.push_back(m);
+  };
+  cbscript::installApi(opt, {});
+  auto host = std::make_unique<cbscript::ScriptHost>(dir.p, cbscript::Limits{}, [] {
+    return std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
+  }, opt);
+  hard("start", [&] {
+    host->start();
+    return 0;
+  });
+  auto bridge = std::make_unique<cbserver::ScriptBridge>(h.world, *host);
+  auto has = [&](const std::string& s) {
+    std::lock_guard<std::mutex> lk(mu);
+    for (auto& l : logs)
+      if (l.find(s) != std::string::npos) return true;
+    return false;
+  };
+  auto tick = [&] {
+    bridge->applyCommands(h.now + 0.05);
+    h.step();
+    bridge->publishPlayers();
+  };
+  auto a = h.add("ana");
+  auto b = h.add("bia");
+  for (int i = 0; i < 300 && !has("join 2"); ++i) {
+    tick();
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  REQUIRE(has("join 2"));
+  for (int i = 0; i < 40; ++i) {  // fila de emits satura
+    tick();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  REQUIRE(h.world.onEvent(a, Event{"kickbia", bytes("{}")}, h.now));
+  for (int i = 0; i < 2500 && !has("kick returned"); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  REQUIRE(has("kick returned true"));
+  tick();  // o próximo tick já aplica o kick (canal prioritário, antes dos emits atrasados)
+  bool kicked = false;
+  for (auto& k : h.kicks) kicked = kicked || k.who == b;
+  WARN("backlog " << bridge->backlog() << "; host cmdsDropped " << host->metrics().commandsDropped
+                  << "; priorityDropped " << host->metrics().priorityDropped);
+  REQUIRE(kicked);
+  REQUIRE(host->metrics().priorityDropped == 0);
+  bridge.reset();
+  hard("destroy", [&] {
+    host.reset();
+    return 0;
+  });
+}
+
+TEST_CASE("bridge: cb:reply clamp keeps valid UTF-8 and real content for multibyte and escape-heavy output") {
+  Env env(R"(
+    cb.on('playerJoin', function(p) cb.log.info('join ' .. p.id) end)
+    cb.commands.register('acc', function() return string.rep('\195\169', 3000) end)
+    cb.commands.register('emo', function() return 'a' .. string.rep('\240\159\152\128', 2000) end)
+    cb.commands.register('ctl', function() return string.rep('\1', 5000) end)
+    cb.commands.register('mix', function() return string.rep('x\1\195\169"', 2000) end)
+    cb.commands.register('bad', function() return string.rep('\255', 5000) end)
+  )");
+  auto a = env.h.add("ana");
+  REQUIRE(env.ticksUntil([&] { return env.hasLog("join 1"); }));
+  for (const char* c : {"acc", "emo", "ctl", "mix", "bad"}) {
+    std::string cmd = std::string("\"/") + c + "\"";
+    REQUIRE(env.h.world.onEvent(a, Event{"cb:command", bytes(cmd)}, env.h.now + 1));
+    std::vector<Event> got;
+    REQUIRE(env.ticksUntil([&] {
+      auto ev = env.h.msgs<Event>(a);
+      got.insert(got.end(), ev.begin(), ev.end());
+      return !got.empty();
+    }));
+    const std::string js = text(got[0].payload);
+    auto j = nlohmann::json::parse(js, nullptr, false);
+    INFO(c << ": " << js.size() << " bytes");
+    REQUIRE(js.size() <= 4096);
+    REQUIRE(js.size() >= 3000);  // corte perto do limite, nunca só "…"
+    REQUIRE_FALSE(j.is_discarded());
+    REQUIRE(j.get<std::string>().size() > 100);
+    REQUIRE_NOTHROW(cbmp::encode(cbmp::Message{got[0]}));
+    for (int i = 0; i < 25; ++i) env.h.step(0.05);  // reabastece a cota de eventos do cliente
+  }
 }

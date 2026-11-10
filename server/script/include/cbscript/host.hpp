@@ -93,6 +93,9 @@ struct HostOptions {
   size_t eventQueueCapacity = 65536;
   size_t commandQueueCapacity = 65536;  // scripts → simulação
   size_t commandQueueBytes = size_t{16} << 20;  // teto de bytes (payloads) na fila scripts → simulação
+  // CmdKick/CmdKickDid/CmdSetPosition vão para um canal prioritário, fora dos dois limites acima (uma enxurrada de
+  // emits não os descarta). Teto de segurança; passar dele é log CRÍTICO.
+  size_t priorityQueueCapacity = 65536;
   double supervisorGraceSec = 10.0;     // supervisor dispara em abortAfter + isto
   std::chrono::milliseconds supervisorPeriod{100};  // período real de checagem do supervisor
   std::chrono::milliseconds idleWait{10};  // espera máxima da thread de scripts sem trabalho (back-off, onTick)
@@ -112,6 +115,7 @@ struct HostMetrics {
   uint64_t eventsDropped = 0;          // total de eventos descartados (inclui os do teto rígido)
   uint64_t eventsBackstopDropped = 0;  // descartados pelo teto rígido (4× a capacidade), inclusive Join/Leave
   uint64_t commandsDropped = 0;
+  uint64_t priorityDropped = 0;  // comandos prioritários recusados (teto de segurança; nunca com host rodando normal)
   size_t eventQueueDepth = 0;  // aceitos e não consumidos (na fila + no lote em processamento)
   bool halted = false;  // supervisor disparou
   std::string haltReason;
@@ -134,7 +138,8 @@ class ScriptHost {
   // ---- Chamados pela simulação (não bloqueiam) ----
   bool post(SimToScript ev);  // false se descartado (fila cheia para evento de cliente, teto rígido, host parado)
   void publishPlayers(PlayersSnapshot players);
-  void drainCommands(std::vector<ScriptToSim>& out);  // acrescenta ao fim de `out`
+  void drainCommands(std::vector<ScriptToSim>& out);  // prioritários e depois os demais, ao fim de `out`
+  void drainPriority(std::vector<ScriptToSim>& out);  // só os prioritários (kick/teleporte), ao fim de `out`
 
   // ---- Painel/console (thread-safe; executados na thread de scripts) ----
   // start sobe também as dependências; stop para os dependentes antes; restart religa os dependentes que parou.

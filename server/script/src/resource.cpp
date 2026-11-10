@@ -1,5 +1,6 @@
 #include "cbscript/resource.hpp"
 
+#include <cbmp/log_text.hpp>
 #include <cbmp/safe_path.hpp>
 
 #include <algorithm>
@@ -154,26 +155,7 @@ struct Resource::Shared {
   }
 };
 
-std::string escapeLogText(std::string_view s) {
-  static constexpr char kHex[] = "0123456789abcdef";
-  std::string out;
-  out.reserve(s.size());
-  for (char ch : s) {
-    const auto c = static_cast<unsigned char>(ch);
-    if (c == '\n') {
-      out += "\\n";
-    } else if (c == '\r') {
-      out += "\\r";
-    } else if ((c < 0x20 && c != '\t') || c == 0x7f) {
-      out += "\\x";
-      out += kHex[c >> 4];
-      out += kHex[c & 15];
-    } else {
-      out += ch;
-    }
-  }
-  return out;
-}
+std::string escapeLogText(std::string_view s) { return cbmp::escapeLogText(s); }
 
 namespace {
 

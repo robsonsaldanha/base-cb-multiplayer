@@ -66,6 +66,7 @@ struct Bot {
   uint64_t bytesIn = 0, snapshots = 0, corrections = 0, enters = 0;
   double rttSum = 0;
   uint64_t rttN = 0;
+  uint64_t echoSent = 0;
 };
 
 using Clock = std::chrono::steady_clock;
@@ -324,6 +325,7 @@ struct Swarm {
     }
     if (t >= b.nextEcho) {
       send(b, cbmp::Event{"echo", encodeEcho(t)});  // respondido pelo resource Lua de exemplo `echo`
+      ++b.echoSent;
       b.nextEcho = t + kEchoPeriod;
     }
   }
@@ -395,7 +397,7 @@ struct Swarm {
     int connected = 0, failed = 0, rejected = 0, disconnected = 0, kicked = 0;
     uint64_t bytesIn = 0, corrections = 0, snapshots = 0;
     double rttSum = 0, maxGap = 0, kbpsSum = 0;
-    uint64_t rttN = 0;
+    uint64_t rttN = 0, echoSent = 0;
     int kbpsN = 0, withoutSnapshots = 0;
     for (auto& b : bots) {
       if (!countsForStats(b)) continue;
@@ -430,6 +432,7 @@ struct Swarm {
       snapshots += b.snapshots;
       rttSum += b.rttSum;
       rttN += b.rttN;
+      echoSent += b.echoSent;
       maxGap = std::max(maxGap, b.maxGap);
     }
     nlohmann::json r{{"count", static_cast<int>(bots.size())},
@@ -443,6 +446,7 @@ struct Swarm {
                      {"botsWithoutSnapshots", withoutSnapshots},
                      {"avgRttMs", rttN ? rttSum / static_cast<double>(rttN) * 1000.0 : 0.0},
                      {"echoReplies", rttN},
+                     {"echoSent", echoSent},
                      {"bytesIn", bytesIn},
                      {"avgKbpsInPerBot", kbpsN ? kbpsSum / kbpsN : 0.0},
                      {"snapshotsReceived", snapshots},
