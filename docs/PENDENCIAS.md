@@ -24,13 +24,15 @@ Itens levantados nas revisões que não bloquearam o merge, com o momento em que
 
 ## Subprojeto 3 (Lua / MySQL / admin)
 
-- `World` sem gancho para rotear eventos para Lua e sem API para enviar `Event` servidor → cliente.
+- ~~`World` sem gancho para rotear eventos para Lua e sem API para enviar `Event` servidor → cliente.~~ Resolvido
+  na Task 4 (`WorldHooks`, `queueEvent`/`broadcastEvent`, `ScriptBridge`).
 - `addPlayer` sempre na origem fora do modo dev: spawn deve vir do gamemode.
 - Lua deve rodar na thread da simulação ou por fila (`World`/`Authenticator` não são thread-safe).
 - Exceção dentro de `world.tick` derruba o servidor (sem try/catch no loop).
 - Política de teleporte (`setState` limpa `correctionTimes`; decidir se mantém o histórico).
 - Teto com kick para cliente que nunca alcança correção do servidor.
-- Evento `echo` é de teste e fica ativo em produção: tornar só-dev.
+- ~~Evento `echo` é de teste e fica ativo em produção: tornar só-dev.~~ Resolvido na Task 4: o eco C++ saiu; só existe
+  no resource de exemplo `resources.example/echo` (fora da pasta de resources de produção).
 - `kid`/`name` vindos do Hub vão para o log sem remover caracteres de controle.
 
 ## Antes de abrir ao público

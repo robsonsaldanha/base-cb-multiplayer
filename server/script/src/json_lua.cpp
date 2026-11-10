@@ -297,6 +297,11 @@ struct Enc {
 
   bool value(int idx, int depth) {
     lastHeight = 0;
+    // Sentinela de null (cb.null é lightuserdata; qualquer tipo serve).
+    if (nullIdx != 0 && lua_type(L, idx) != LUA_TNIL && lua_rawequal(L, idx, nullIdx)) {
+      out += "null";
+      return !over();
+    }
     switch (lua_type(L, idx)) {
       case LUA_TNIL:
         out += "null";
@@ -312,10 +317,6 @@ struct Enc {
         return str(p, n);
       }
       case LUA_TTABLE:
-        if (nullIdx != 0 && lua_rawequal(L, idx, nullIdx)) {
-          out += "null";
-          return !over();
-        }
         return table(idx, depth + 1);
       default:
         err = std::string("tipo não suportado em JSON: ") + lua_typename(L, lua_type(L, idx));

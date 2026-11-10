@@ -7,6 +7,7 @@
 #include <exception>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -26,6 +27,9 @@
 
 #include <cbmp/messages.hpp>
 
+#include "cbscript/api.hpp"
+#include "cbscript/bans.hpp"
+#include "cbscript/host.hpp"
 #include "cbserver/auth.hpp"
 #include "cbserver/config.hpp"
 #include "cbserver/http.hpp"
@@ -34,6 +38,7 @@
 #include "cbserver/metrics.hpp"
 #include "cbserver/net.hpp"
 #include "cbserver/pool.hpp"
+#include "cbserver/script_bridge.hpp"
 #include "cbserver/snapshots.hpp"
 #include "cbserver/world.hpp"
 
@@ -98,6 +103,18 @@ std::shared_ptr<spdlog::logger> makeAnticheatLogger(const std::filesystem::path&
   return logger;
 }
 
+std::shared_ptr<spdlog::logger> makeAuditLogger(const std::filesystem::path& dir) {
+  auto sink = std::make_shared<spdlog::sinks::daily_file_format_sink_mt>((dir / "audit-%Y-%m-%d.jsonl").string(), 0, 0);
+  auto logger = std::make_shared<spdlog::logger>("audit", sink);
+  logger->set_pattern("%v");
+  logger->flush_on(spdlog::level::info);
+  return logger;
+}
+
+double steadySeconds() {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 void anticheat(spdlog::logger& log, const cbserver::World& world, cbserver::EntityId id, nlohmann::json line) {
   const auto* p = world.find(id);
   line["ts"] = unixNow();
@@ -142,6 +159,36 @@ int run(const std::string& cfgPath) {
     nlohmann::json line{{"type", "net_close"}, {"ts", unixNow()}, {"id", id},
                         {"sub", sub},          {"did", did},       {"reason", reason}};
     acLog->info("{}", line.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+  });
+
+  // Scripts Lua: thread própria; a simulação só conversa com ela por filas (ScriptBridge).
+  auto bans = std::make_shared<cbscript::BanStore>(cfg.bansFile);
+  auto auditLog = makeAuditLogger(cfg.logsDir);
+  cbscript::ApiOptions api;
+  api.bans = bans;
+  api.audit = [auditLog](const std::string& line) { auditLog->info("{}", line); };
+  api.unixNow = unixNow;
+  cbscript::HostOptions hostOpt;
+  cbscript::installApi(hostOpt, std::move(api));
+  cbscript::Limits limits;
+  limits.memoryBytes = static_cast<size_t>(cfg.scriptMemoryLimitMB) << 20;
+  limits.warnAfter = std::chrono::milliseconds(cfg.scriptWarnMs);
+  limits.abortAfter = std::chrono::milliseconds(cfg.scriptAbortMs);
+  cbscript::ScriptHost scripts(cfg.resourcesDir, limits, steadySeconds, std::move(hostOpt));
+  scripts.start();
+  for (const auto& st : scripts.status())
+    if (st.state != cbscript::ResourceStatus::State::Running)
+      spdlog::warn("resource '{}' não subiu: {}", st.name, st.lastError);
+  cbserver::ScriptBridge bridge(world, scripts);
+  net.setAdmission([bans](const std::string&, const std::string& did) -> std::optional<std::string> {
+    if (auto b = bans->check(did, unixNow())) {
+      std::string why = "banido: " + b->reason;
+      size_t n = std::min<size_t>(why.size(), 250);  // Reject aceita até 255 bytes; corta sem quebrar UTF-8
+      while (n < why.size() && n > 0 && (static_cast<unsigned char>(why[n]) & 0xC0) == 0x80) --n;
+      why.resize(n);
+      return why;
+    }
+    return std::nullopt;
   });
 
   std::string err;
@@ -205,7 +252,9 @@ int run(const std::string& cfgPath) {
         if (!world.onEvent(m.from, *e, now)) ++metrics.droppedEvents;
       }
     }
+    bridge.applyCommands(now);
     world.tick(now, builder, out, kicks);
+    bridge.publishPlayers();
     for (const auto& o : out)
       if (const auto* c = std::get_if<cbmp::Correction>(&o.msg); c && c->seq != 0) {
         ++metrics.corrections;

@@ -127,3 +127,31 @@ TEST_CASE("config hub and devPublicKey are mutually exclusive") {
   j["auth"]["devPublicKey"] = nullptr;
   REQUIRE(ServerConfig::fromJson(j).hub.has_value());
 }
+
+TEST_CASE("config scripting section has defaults and validates its limits") {
+  auto d = ServerConfig::fromJson(json::object());
+  REQUIRE(d.scriptMemoryLimitMB == 256);
+  REQUIRE(d.scriptWarnMs == 50);
+  REQUIRE(d.scriptAbortMs == 5000);
+  REQUIRE(d.bansFile == "bans.json");
+  auto ex = ServerConfig::load(CBSERVER_CFG_EXAMPLE);
+  REQUIRE(ex.scriptMemoryLimitMB == 256);
+
+  auto j = base();
+  j["scripting"] = {{"memoryLimitMB", 64}, {"warnMs", 20}, {"abortMs", 1000}, {"bansFile", "dados/bans.json"}};
+  auto c = ServerConfig::fromJson(j);
+  REQUIRE(c.scriptMemoryLimitMB == 64);
+  REQUIRE(c.scriptWarnMs == 20);
+  REQUIRE(c.scriptAbortMs == 1000);
+  REQUIRE(c.bansFile == "dados/bans.json");
+
+  auto bad = base();
+  bad["scripting"] = {{"memoryLimitMB", 0}};
+  requireRejects(bad, "scripting.memoryLimitMB");
+  bad["scripting"] = {{"warnMs", 0}};
+  requireRejects(bad, "scripting.warnMs");
+  bad["scripting"] = {{"warnMs", 500}, {"abortMs", 100}};
+  requireRejects(bad, "scripting.abortMs");
+  bad["scripting"] = 5;
+  requireRejects(bad, "scripting");
+}

@@ -233,6 +233,27 @@ TEST_CASE("json_lua: null sentinel maps both ways") {
   REQUIRE(lua.s.script("return u.a == nil and u.b == 1").get<bool>());
 }
 
+TEST_CASE("json_lua: a lightuserdata null sentinel maps both ways") {
+  Lua lua;
+  static char tag = 0;
+  lua_pushlightuserdata(lua.L(), &tag);
+  JsonOptions o;
+  o.nullRef = luaL_ref(lua.L(), LUA_REGISTRYINDEX);
+  Rt r = roundTrip(lua.L(), "[1,null,{\"a\":null},null]", o);
+  INFO(r.err);
+  REQUIRE(r.ok);
+  REQUIRE(r.out == "[1,null,{\"a\":null},null]");
+  // Outro lightuserdata não é o sentinela.
+  static char other = 0;
+  lua_pushlightuserdata(lua.L(), &other);
+  std::string out, err;
+  REQUIRE_FALSE(luaToJson(lua.L(), -1, out, err, o));
+  lua_pushlightuserdata(lua.L(), &tag);
+  REQUIRE(luaToJson(lua.L(), -1, out, err, o));
+  REQUIRE(out == "null");
+  lua_pop(lua.L(), 2);
+}
+
 namespace {
 char g_decodeErr[256];
 CBSCRIPT_TEST_NOINLINE int decodeInto(lua_State* L, const char* s, size_t n) {

@@ -43,9 +43,11 @@ struct EvCommand {
 using SimToScript = std::variant<EvPlayerJoin, EvPlayerLeave, EvClientEvent, EvCommand>;
 
 // ---- Scripts → simulação ----
+// `did` (opcional): só aplica se o jogador com esse id ainda tiver esse did (o id pode ter sido reaproveitado).
 struct CmdKick {
   uint16_t id = 0;
   std::string reason;
+  std::string did;
 };
 struct CmdEmit {
   int32_t target = -1;  // id do jogador ou -1 = todos
@@ -55,6 +57,7 @@ struct CmdEmit {
 struct CmdSetPosition {
   uint16_t id = 0;
   int32_t x = 0, y = 0, z = 0;
+  std::string did;
 };
 using ScriptToSim = std::variant<CmdKick, CmdEmit, CmdSetPosition>;
 

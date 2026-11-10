@@ -74,6 +74,7 @@ std::optional<EntityId> World::addPlayer(std::string sub, std::string did, std::
     }
     active_.insert(std::lower_bound(active_.begin(), active_.end(), p->id), p->id);
     slots_[i] = std::move(p);
+    if (hooks_.join) hooks_.join(*slots_[i]);
     return static_cast<EntityId>(i);
   }
   return std::nullopt;
@@ -84,8 +85,9 @@ void World::forget(PlayerSlot& viewer, EntityId gone) {
     std::erase_if(rec.ents, [gone](const SentEntity& e) { return e.id == gone; });
 }
 
-void World::removePlayer(EntityId id) {
+void World::removePlayer(EntityId id, std::string_view reason) {
   if (!slot(id)) return;
+  if (hooks_.leave) hooks_.leave(*slots_[id], reason);
   grid_.remove(id);
   eraseSorted(active_, id);
   slots_[id].reset();
@@ -122,10 +124,10 @@ void World::sendCorrection(PlayerSlot& p, uint32_t seq, double now, bool byServe
   p.serverCorrectionResent = false;
 }
 
-void World::orderKick(PlayerSlot& s, const char* reason) {
+void World::orderKick(PlayerSlot& s, std::string reason) {
   if (s.kicked) return;
   s.kicked = true;
-  pendingKicks_.push_back(KickOrder{s.id, reason});
+  pendingKicks_.push_back(KickOrder{s.id, std::move(reason)});
 }
 
 double World::maxSpeedOf(cbmp::MoveState a, cbmp::MoveState b) const {
@@ -204,9 +206,23 @@ bool World::onEvent(EntityId id, const cbmp::Event& ev, double now) {
       orderKick(*p, "flood de eventos");
     return false;
   }
-  // Sem "dono do jogo" no subprojeto 2: só o eco volta ao remetente; o resto é descartado.
-  if (ev.name == "echo") pending_.push_back(Outgoing{id, ev});
+  if (hooks_.event) hooks_.event(*p, ev);  // scripts (o eco é o resource Lua de exemplo)
   return true;
+}
+
+void World::queueEvent(EntityId to, cbmp::Event ev) {
+  const PlayerSlot* p = slot(to);
+  if (!p || p->kicked) return;
+  pending_.push_back(Outgoing{to, std::move(ev)});
+}
+
+void World::broadcastEvent(const cbmp::Event& ev) {
+  for (EntityId id : active_)
+    if (!slots_[id]->kicked) pending_.push_back(Outgoing{id, ev});
+}
+
+void World::kick(EntityId id, std::string reason) {
+  if (PlayerSlot* p = slot(id)) orderKick(*p, std::move(reason));
 }
 
 void World::onSnapshotAck(EntityId id, uint32_t tick, double now) {

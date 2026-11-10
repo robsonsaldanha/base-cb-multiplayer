@@ -482,7 +482,7 @@ TEST_CASE("host: players snapshot, tasks, command replies and the command queue 
   REQUIRE(env.ev("__players"));
   REQUIRE(waitFor([&] { return env.gotCmd("players=3"); }));
 
-  env.host->runOnScriptThread([](ScriptContext& ctx) { ctx.emit(CmdKick{5, "x"}); });
+  env.host->runOnScriptThread([](ScriptContext& ctx) { ctx.emit(CmdKick{5, "x", ""}); });
   std::vector<ScriptToSim> out;
   REQUIRE(waitFor([&] {
     env.host->drainCommands(out);
@@ -497,7 +497,7 @@ TEST_CASE("host: players snapshot, tasks, command replies and the command queue 
 
   // fila scripts → simulação limitada
   env.host->runOnScriptThread([](ScriptContext& ctx) {
-    for (int i = 0; i < 5; ++i) ctx.emit(CmdKick{static_cast<uint16_t>(i), ""});
+    for (int i = 0; i < 5; ++i) ctx.emit(CmdKick{static_cast<uint16_t>(i), "", ""});
   });
   REQUIRE(waitFor([&] { return env.host->metrics().commandsDropped == 2; }));
   out.clear();

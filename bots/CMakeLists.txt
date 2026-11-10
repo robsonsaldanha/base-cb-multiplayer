@@ -7,7 +7,7 @@ if(WIN32)
   target_link_libraries(cb-bots PRIVATE winmm)
 endif()
 
-add_executable(cbbots_tests tests/test_gaps.cpp)
+add_executable(cbbots_tests tests/test_gaps.cpp tests/test_echo.cpp)
 target_include_directories(cbbots_tests PRIVATE src)
 target_link_libraries(cbbots_tests PRIVATE Catch2::Catch2WithMain)
 catch_discover_tests(cbbots_tests)

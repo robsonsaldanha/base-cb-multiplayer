@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -38,6 +39,9 @@ std::string pendingIpKey(const std::array<uint8_t, 16>& ipv6);
 // Encerramento de um jogador autenticado pela rede (DecodeError / tipo proibido): id, sub, did, motivo.
 using ViolationSink =
     std::function<void(EntityId, const std::string& sub, const std::string& did, const std::string& reason)>;
+// Checagem na entrada (depois do ticket válido, antes de ocupar o slot): motivo do Reject ou nullopt para aceitar.
+// Roda na thread da simulação; não pode bloquear (ex.: bans em memória).
+using AdmissionCheck = std::function<std::optional<std::string>(const std::string& sub, const std::string& did)>;
 
 // Inicializa o GameNetworkingSockets uma vez por processo (chamadas seguintes devolvem o mesmo resultado).
 bool initNetworking(std::string& err);
@@ -74,6 +78,7 @@ class NetServer {
   // Envia Kick, fecha com linger e remove o jogador do mundo.
   void kick(EntityId id, const std::string& reason);
   void setViolationSink(ViolationSink sink) { violations_ = std::move(sink); }
+  void setAdmission(AdmissionCheck check) { admission_ = std::move(check); }
 
   size_t pendingCount() const { return pending_.size(); }
   size_t sessionCount() const { return sessions_.size(); }
@@ -119,6 +124,7 @@ class NetServer {
   std::unordered_map<EntityId, uint32_t> connOf_;
   std::unordered_map<std::string, uint32_t> connBySub_;
   ViolationSink violations_;
+  AdmissionCheck admission_;
   std::vector<EntityId> slow_;  // reaproveitado em send()
 };
 

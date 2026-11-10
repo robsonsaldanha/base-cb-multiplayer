@@ -38,6 +38,9 @@ struct ServerConfig {
   std::optional<std::string> metricsToken;
   std::string resourcesDir = "resources";
   std::string logsDir = "logs";
+  // scripting: limites por resource Lua (memória por estado, aviso e aborto da vigia) e arquivo de bans.
+  int scriptMemoryLimitMB = 256, scriptWarnMs = 50, scriptAbortMs = 5000;
+  std::string bansFile = "bans.json";
 
   // Lançam std::runtime_error (pt-BR: campo + motivo).
   static ServerConfig load(const std::filesystem::path& path);

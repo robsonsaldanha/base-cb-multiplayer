@@ -55,6 +55,10 @@ python3 tools/loadtest.py --count 512 --duration 300 --cluster 0.3 --assert
 O script faz (1) a carga, lendo `/metrics` a cada 5 s, e (2) três cenários de segurança, cada um com servidor próprio
 (teleporte, flood de eventos, tickets com seed errada).
 
+O eco dos bots (evento `echo`, payload JSON `{"t":<µs>}`) é respondido pelo resource Lua de exemplo
+`resources.example/echo`, que o script copia para a pasta de resources de cada servidor de teste; o `cb-server` não
+tem mais eco em C++. Assim a carga também exercita a thread de scripts e a API `cb.*`.
+
 ## 6. Interpretar o resultado
 
 A tabela impressa e `build-native/loadtest/report.json` trazem, na carga:

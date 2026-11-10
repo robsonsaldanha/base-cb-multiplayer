@@ -357,18 +357,82 @@ TEST_CASE("world addPlayer beyond maxPlayers returns nullopt and ids are reused"
   REQUIRE(s.state == cbmp::MoveState::Idle);
 }
 
-TEST_CASE("world echo event returns to sender only") {
+TEST_CASE("world forwards accepted client events to the hook and echoes nothing itself") {
+  ServerConfig cfg;
+  cfg.eventsPerSecond = 1;
+  cfg.eventsBurst = 2;
+  Harness h(cfg);
+  std::vector<std::pair<cbserver::EntityId, std::string>> seen;
+  cbserver::WorldHooks hooks;
+  hooks.event = [&](const cbserver::PlayerSlot& p, const Event& e) {
+    seen.emplace_back(p.id, e.name + ":" + std::string(e.payload.begin(), e.payload.end()));
+  };
+  h.world.setHooks(std::move(hooks));
+  auto a = h.add("ana");
+  auto b = h.add("bia", {100, 0, 0});
+  REQUIRE(h.world.onEvent(a, Event{"echo", {'h', 'i'}}, 0.0));
+  REQUIRE(h.world.onEvent(b, Event{"outro", {'x'}}, 0.0));
+  REQUIRE(h.world.onEvent(a, Event{"echo", {'2'}}, 0.0));
+  REQUIRE_FALSE(h.world.onEvent(a, Event{"echo", {'3'}}, 0.0));  // cota: não chega ao gancho
+  h.step();
+  REQUIRE(h.msgs<Event>(a).empty());  // o eco agora é do resource Lua
+  REQUIRE(h.msgs<Event>(b).empty());
+  using P = std::pair<cbserver::EntityId, std::string>;
+  REQUIRE(seen == std::vector<P>{{a, "echo:hi"}, {b, "outro:x"}, {a, "echo:2"}});
+}
+
+TEST_CASE("world join and leave hooks carry the player and the reason") {
+  Harness h;
+  std::vector<std::string> log;
+  cbserver::WorldHooks hooks;
+  hooks.join = [&](const cbserver::PlayerSlot& p) { log.push_back("join " + std::to_string(p.id) + " " + p.name + " " + p.did); };
+  hooks.leave = [&](const cbserver::PlayerSlot& p, std::string_view why) {
+    log.push_back("leave " + std::to_string(p.id) + " " + p.did + " " + std::string(why));
+  };
+  h.world.setHooks(std::move(hooks));
+  auto a = h.add("ana");
+  h.world.removePlayer(a, "expulso: teste");
+  auto b = h.add("bia");
+  h.world.removePlayer(b);
+  h.world.removePlayer(77);  // inexistente: nada
+  REQUIRE(log == std::vector<std::string>{"join 1 ana did-ana", "leave 1 did-ana expulso: teste", "join 1 bia did-bia",
+                                          "leave 1 did-bia saiu"});
+  h.world.setHooks({});
+  h.add("caio");
+  REQUIRE(log.size() == 4);
+}
+
+TEST_CASE("world queueEvent and broadcastEvent deliver server events in the next tick") {
   Harness h;
   auto a = h.add("ana");
   auto b = h.add("bia", {100, 0, 0});
-  REQUIRE(h.world.onEvent(a, Event{"echo", {1, 2, 3}}, 0.0));
-  REQUIRE(h.world.onEvent(a, Event{"outro", {9}}, 0.0));
+  h.world.queueEvent(a, Event{"so-a", {1}});
+  h.world.queueEvent(99, Event{"ninguem", {2}});  // id inexistente: ignorado
+  h.world.broadcastEvent(Event{"todos", {3}});
   h.step();
   auto ea = h.msgs<Event>(a);
-  REQUIRE(ea.size() == 1);
-  REQUIRE(ea[0].name == "echo");
-  REQUIRE(ea[0].payload == std::vector<uint8_t>{1, 2, 3});
-  REQUIRE(h.msgs<Event>(b).empty());
+  auto eb = h.msgs<Event>(b);
+  REQUIRE(ea.size() == 2);
+  REQUIRE(ea[0].name == "so-a");
+  REQUIRE(ea[1].name == "todos");
+  REQUIRE(eb.size() == 1);
+  REQUIRE(eb[0].name == "todos");
+  REQUIRE(eb[0].payload == std::vector<uint8_t>{3});
+  h.step();
+  REQUIRE(h.msgs<Event>(a).empty());
+}
+
+TEST_CASE("world kick orders a KickOrder once with the given reason") {
+  Harness h;
+  auto a = h.add("ana");
+  h.world.kick(a, "pedido do script");
+  h.world.kick(a, "de novo");
+  h.world.kick(42, "inexistente");
+  h.step();
+  REQUIRE(h.kicks.size() == 1);
+  REQUIRE(h.kicks[0].who == a);
+  REQUIRE(h.kicks[0].reason == "pedido do script");
+  REQUIRE_FALSE(h.world.onEvent(a, Event{"x", {}}, 0.0));  // expulso: eventos ignorados
 }
 
 TEST_CASE("world removed player id reused in same tick produces Leave then Enter") {

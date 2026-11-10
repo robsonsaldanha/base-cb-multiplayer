@@ -1,4 +1,5 @@
 #include "bot.hpp"
+#include "echo.hpp"
 #include "gaps.hpp"
 
 #include <algorithm>
@@ -273,11 +274,11 @@ struct Swarm {
         b.z = c->pos.z;
       }
     } else if (const auto* e = std::get_if<cbmp::Event>(&m)) {
-      if (e->name == "echo" && e->payload.size() == sizeof(double)) {
-        double sent = 0;
-        std::memcpy(&sent, e->payload.data(), sizeof sent);
-        b.rttSum += t - sent;
-        ++b.rttN;
+      if (e->name == "echo") {
+        if (auto sent = decodeEcho(e->payload)) {
+          b.rttSum += t - *sent;
+          ++b.rttN;
+        }
       }
     } else if (std::holds_alternative<cbmp::EntityEnter>(m)) {
       ++b.enters;
@@ -322,9 +323,7 @@ struct Swarm {
       if (b.nextInput < t) b.nextInput = t + kInputPeriod;  // atrasou muito: não tenta compensar
     }
     if (t >= b.nextEcho) {
-      cbmp::Event e{"echo", std::vector<uint8_t>(sizeof(double))};
-      std::memcpy(e.payload.data(), &t, sizeof t);
-      send(b, e);
+      send(b, cbmp::Event{"echo", encodeEcho(t)});  // respondido pelo resource Lua de exemplo `echo`
       b.nextEcho = t + kEchoPeriod;
     }
   }

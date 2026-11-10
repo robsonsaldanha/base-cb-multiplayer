@@ -157,7 +157,7 @@ void NetServer::stop() {
   for (auto& [conn, s] : sessions_) {
     sendTo(conn, cbmp::Kick{"servidor encerrando"});
     sockets->CloseConnection(conn, kEndKicked, "servidor encerrando", true);
-    world_.removePlayer(s.id);
+    world_.removePlayer(s.id, "servidor encerrando");
     metrics_.removePlayer(s.id);
   }
   for (auto& [conn, p] : pending_) sockets->CloseConnection(conn, kEndKicked, "servidor encerrando", false);
@@ -334,6 +334,12 @@ void NetServer::onHello(uint32_t conn, const cbmp::Hello& h) {
     reject(conn, t.error());
     return;
   }
+  if (admission_) {
+    if (auto why = admission_(t->sub, t->did)) {
+      reject(conn, *why);
+      return;
+    }
+  }
   if (auto old = connBySub_.find(t->sub); old != connBySub_.end())
     endSession(old->second, "conectado em outro lugar", true);
   auto id = world_.addPlayer(t->sub, t->did, t->name, now_);
@@ -421,7 +427,7 @@ void NetServer::endSession(uint32_t conn, const std::string& reason, bool sendKi
   if (auto b = connBySub_.find(s.sub); b != connBySub_.end() && b->second == conn) connBySub_.erase(b);
   if (sendKick) sendTo(conn, cbmp::Kick{reason});
   SteamNetworkingSockets()->CloseConnection(conn, kEndKicked, reason.c_str(), sendKick);
-  world_.removePlayer(s.id);
+  world_.removePlayer(s.id, reason);
   metrics_.removePlayer(s.id);
   spdlog::info("jogador {} saiu: {}", s.id, reason);
 }

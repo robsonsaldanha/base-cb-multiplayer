@@ -2,7 +2,7 @@
 """Teste de carga e de segurança do cb-server com cb-bots (sem dependências fora da biblioteca padrão).
 
 Carga: sobe o cb-server em modo dev (chave derivada de uma seed aleatória, hub null, sim.spawn devTrustFirstInput,
-maxPlayers = count + 16), espera /info, roda o cb-bots, lê /metrics a cada 5 s, encerra e avalia os limites da spec:
+maxPlayers = count + 16, resource Lua resources.example/echo copiado para a pasta de resources), espera /info, roda o cb-bots, lê /metrics a cada 5 s, encerra e avalia os limites da spec:
   tick p99 <= 25 ms, banda média por jogador <= 64 kbps, RSS <= 512 MB, nenhum bot caiu/recusado/expulso,
   nenhum bot > 1 s sem snapshot.
 Banda: o cb-server conta os bytes de payload das mensagens GNS enviadas a cada conexão de jogador (sem cabeçalhos
@@ -44,6 +44,7 @@ LIMITS = {
     "rssMB": 512.0,
     "maxSnapshotGapMs": 1000.0,
 }
+ECHO_RESOURCE = ROOT / "resources.example" / "echo"
 SERVER_ID = "srv_dev"  # serverId do cb-server em modo dev (sem hub)
 # Todos os bots saem do mesmo IP e a rampa (50/s) abre ~2–3 conexões por tick; o padrão de 4 pendentes por IP
 # recusaria parte delas entre dois pumps. O limite por IP é testado nos testes unitários do net.
@@ -97,6 +98,8 @@ class Server:
         self.port = free_port()
         workdir.mkdir(parents=True, exist_ok=True)
         (workdir / "resources").mkdir(exist_ok=True)
+        # O eco dos bots é feito em Lua pelo resource de exemplo (não há mais eco em C++ no servidor).
+        shutil.copytree(ECHO_RESOURCE, workdir / "resources" / "echo", dirs_exist_ok=True)
         cfg = {
             "name": "loadtest",
             "description": "",

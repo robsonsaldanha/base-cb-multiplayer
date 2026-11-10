@@ -57,7 +57,7 @@ ServerConfig ServerConfig::fromJson(const json& j) {
   ServerConfig c;
   static const char* kKnown[] = {"name",   "description", "tags",     "locale",       "maxPlayers", "port",
                                  "hub",    "auth",        "net",      "sim",          "movement",   "events",
-                                 "metrics", "resourcesDir", "logsDir"};
+                                 "metrics", "resourcesDir", "logsDir", "scripting"};
   for (auto it = j.begin(); it != j.end(); ++it) {
     bool known = false;
     for (auto* k : kKnown) known = known || it.key() == k;
@@ -158,6 +158,15 @@ ServerConfig ServerConfig::fromJson(const json& j) {
   if (const json* e = sub(j, "events", "")) {
     getInt(*e, "perSecond", "events.", 1, 100000, c.eventsPerSecond);
     getInt(*e, "burst", "events.", 1, 100000, c.eventsBurst);
+  }
+  if (const json* sc = sub(j, "scripting", "")) {
+    if (!sc->is_object()) fail("scripting", "deve ser um objeto");
+    getInt(*sc, "memoryLimitMB", "scripting.", 1, 65536, c.scriptMemoryLimitMB);
+    getInt(*sc, "warnMs", "scripting.", 1, 600000, c.scriptWarnMs);
+    getInt(*sc, "abortMs", "scripting.", 1, 600000, c.scriptAbortMs);
+    if (c.scriptAbortMs <= c.scriptWarnMs) fail("scripting.abortMs", "deve ser maior que 'scripting.warnMs'");
+    getStr(*sc, "bansFile", "scripting.", c.bansFile);
+    if (c.bansFile.empty()) fail("scripting.bansFile", "não pode ser vazio");
   }
   if (const json* m = sub(j, "metrics", "")) {
     if (const json* t = sub(*m, "token", "metrics.")) {
