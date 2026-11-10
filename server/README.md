@@ -1,7 +1,10 @@
 # cb-server
 
 Servidor dedicado de jogo: rede UDP (GameNetworkingSockets), HTTP na mesma porta (TCP) para `/info`, manifest, arquivos
-e `/metrics`, simulação a 20 Hz com validação de movimento e anti-cheat. Spec: `docs/superpowers/specs/2026-11-09-sub2-cb-server-design.md`.
+e `/metrics`, simulação a 20 Hz com validação de movimento e anti-cheat, scripts Lua 5.4 por resource (com MySQL/MariaDB
+e HTTPS de saída) e painel admin web com login Discord via Hub. Specs:
+`docs/superpowers/specs/2026-11-09-sub2-cb-server-design.md` e `docs/superpowers/specs/2026-11-10-sub3-lua-mysql-admin-design.md`.
+Guia de quem escreve resources: [`docs/RESOURCES.md`](../docs/RESOURCES.md).
 
 ## Build
 
@@ -63,6 +66,21 @@ JSON; todos os campos são opcionais. Valores abaixo são os padrões.
 | `metrics.token` | `null` | texto; habilita acesso remoto ao `/metrics` |
 | `resourcesDir` | `"resources"` | caminho |
 | `logsDir` | `"logs"` | caminho |
+| `scripting.memoryLimitMB` | `256` | 1 a 65536; teto de memória de cada resource Lua |
+| `scripting.warnMs` | `50` | 1 a 600000; chamada ao Lua mais longa que isso gera aviso da vigia |
+| `scripting.abortMs` | `5000` | 1 a 600000, maior que `warnMs`; chamada abortada e resource reiniciado (3× em 60 s = parado) |
+| `scripting.bansFile` | `"bans.json"` | caminho não vazio; bans quando não há `db` |
+| `scripting.eventOutKBps` | `8` | 1 a 1000000; cota por jogador (KiB/s) de eventos servidor → cliente vindos de scripts |
+| `scripting.eventOutBurstKB` | `32` | 8 a 1000000; rajada dessa cota |
+| `db` | `null` | objeto (abaixo) ou `null` = sem banco |
+| `db.host` | — | obrigatório, 1 a 255 caracteres |
+| `db.port` | `3306` | 1 a 65535 |
+| `db.user` | — | obrigatório, 1 a 80 caracteres |
+| `db.password` | `""` | texto (nunca aparece em logs, erros ou métricas) |
+| `db.database` | — | obrigatório, 1 a 64 caracteres |
+| `db.pool` | `4` | 1 a 64 conexões |
+| `db.timeoutMs` | `5000` | 100 a 600000; prazo de cada consulta (fila + execução) |
+| `db.tls` | `"auto"` | `auto`, `off`, `required` ou `verify` (abaixo) |
 | `admin.admins` | `[]` | ids Discord (texto, 17 a 20 dígitos), até 100; repetidos são ignorados. Vazio e sem `devToken` = painel desligado |
 | `admin.port` | `30510` | 1 a 65535, diferente de `port` |
 | `admin.bind` | `"127.0.0.1"` | IP literal sem porta (`127.0.0.1`, `::1`, `0.0.0.0`, `::`, IP da máquina) |
@@ -83,6 +101,70 @@ JSON; todos os campos são opcionais. Valores abaixo são os padrões.
 - `sim.spawn.mode = "devTrustFirstInput"` (o jogador aparece onde mandar o primeiro Input, sem validação) só vale em modo
   dev; fora dele a config é recusada. Em produção use `origin`.
 - As velocidades de `movement.maxSpeedCmS` são provisórias até o subprojeto 5.
+
+## Scripts Lua
+
+Cada resource com `"server": [...]` no `resource.json` roda num estado Lua 5.4 isolado (sandbox sem `io`, `os.execute`,
+`debug`, arquivos), numa thread de scripts separada da simulação: script lento ou travado nunca segura o tick. A API
+(`cb.on`, `cb.events`, `cb.players`, `cb.commands`, `cb.timers`, `cb.log`, `cb.audit`, `cb.db`, `cb.http`,
+`cb.config`, `cb.resource`) está em [`docs/RESOURCES.md`](../docs/RESOURCES.md).
+
+- **Vigia:** chamada acima de `scripting.warnMs` gera aviso no log (`[<resource>] vigia: execução levou N ms`); acima
+  de `scripting.abortMs` é abortada e o resource reinicia com espera (1 s, 2 s); 3 abortos em 60 s deixam o resource
+  parado (`Failed`) até um `start`/`restart` pelo painel. Uma chamada presa por mais de `abortMs + 10 s` (operação C
+  única) dispara o supervisor: log CRÍTICO, todos os resources `Failed`, scripts param de receber eventos; a simulação
+  segue e é preciso reiniciar o servidor.
+- **Ordem de subida:** pelas `dependencies`; ciclo, dependência ausente ou erro no script deixam só os envolvidos em
+  `Failed` (motivo no log e no painel). Na subida o log lista os que não subiram.
+- **HTTP de saída** (`cb.http`): só https, só hosts de `permissions.http` de cada resource, nunca endereços
+  privados/loopback; CAs do sistema (no Linux, pacote `ca-certificates`; no Windows, as lojas ROOT/CA sem busca de
+  intermediários na rede: servidores que não mandam a cadeia completa falham).
+- O resource de exemplo `resources.example/echo` (eco dos bots de carga) não é carregado em produção: só o que estiver
+  em `resourcesDir`.
+
+## Banco de dados
+
+Opcional. Com a seção `db`, `cb.db` fica disponível aos resources com `permissions.db` e os bans passam do
+`bans.json` para a tabela `cb_bans` (criada se faltar):
+
+```json
+{
+  "db": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "cbserver",
+    "password": "troque-me",
+    "database": "cbserver",
+    "pool": 4,
+    "timeoutMs": 5000,
+    "tls": "auto"
+  }
+}
+```
+
+- MariaDB ou MySQL 8, via MariaDB Connector/C (`libmariadb`, LGPL, ligada dinamicamente). Sempre TCP (inclusive para
+  `localhost`), `utf8mb4`, só consultas parametrizadas, `LOAD DATA LOCAL` desligado.
+- `tls`: `auto` = `off` para `localhost`/`127.0.0.1`/`::1` e `verify` para os demais; `off` não verifica nada (e não
+  impede o servidor de negociar TLS se exigir); `required` = TLS sem conferir o certificado; `verify` = TLS com
+  certificado e nome conferidos pelas CAs do sistema. Não há opção de CA própria: com certificado autoassinado ou de
+  CA interna use `required`. Erro de conexão em `verify` que pareça de TLS sugere `required` no log.
+- O servidor sobe mesmo com o banco fora do ar: as consultas falham na hora enquanto ele reconecta (espera crescente).
+  Os bans do banco só valem depois da primeira carga (log CRÍTICO após 5 falhas seguidas; `/metrics.db.bansLoaded`).
+- `pool: 1` gera aviso: uma transação aberta segura a única conexão. No máximo `pool − 1` transações ao mesmo tempo.
+- Na subida o log mostra `banco: user@host:porta/banco (pool, timeout, tls)` (sem a senha), a pasta dos plugins de
+  autenticação e `bans: backend mysql|json`.
+
+## Distribuição
+
+Além do executável, leve ao lado dele:
+
+- **Windows:** `libmariadb.dll` (e as demais DLLs que o build copia para `Release/`) e a pasta `plugins/libmariadb/`.
+- **Linux:** `libmariadb.so*` (o triplet `vcpkg-triplets/x64-linux.cmake` liga só ela dinamicamente; confira com
+  `ldd cb-server` na máquina de destino que ela é encontrada, ajustando `LD_LIBRARY_PATH` ou o RPATH do pacote) e a
+  pasta `plugins/libmariadb/`. Pacotes do sistema: `ca-certificates` (CAs do `cb.http` e do `db.tls = "verify"`).
+- Sem `plugins/libmariadb/`, contas MySQL 8 com `caching_sha2_password` (padrão do MySQL 8) e contas `ed25519` do
+  MariaDB não conectam. O build já copia a pasta para junto do `cb-server`.
+- A libmariadb é LGPL 2.1: distribua o aviso de licença dela junto (ligação dinâmica; a DLL/.so pode ser trocada).
 
 ## Portas e firewall
 
@@ -167,10 +249,14 @@ Cada subpasta de `resourcesDir` é um resource:
 
 ```
 resources/<pasta>/
-  resource.json        {"name": "...", "version": "..."}  (sem ele a pasta é ignorada com aviso)
+  resource.json        {"name": "...", "version": "...", "server": [...], "dependencies": [...], "config": {...},
+                        "permissions": {"db": true, "http": ["host"]}}  (sem ele a pasta é ignorada com aviso)
   client/  ui/  files/    publicados ao cliente (manifest + /cb/files/<sha256>)
-  server/                 nunca publicado
+  server/                 scripts Lua do servidor; nunca publicado
 ```
+
+Os campos de scripts (`server`, `dependencies`, `config`, `permissions`) estão em
+[`docs/RESOURCES.md`](../docs/RESOURCES.md#estrutura-de-um-resource-e-resourcejson).
 
 "Erro" impede a subida; "ignorado" só gera aviso no log.
 
@@ -187,8 +273,11 @@ O manifest traz caminho, SHA-256 e tamanho de cada arquivo; o cliente baixa por 
 
 ## Logs
 
-- `logs/server.log`: log geral (também no console), rotação de 10 MB x 5 arquivos.
-- `logs/audit-AAAA-MM-DD.jsonl`: auditoria (scripts `cb.audit`, comandos de admin, bans e ações do painel).
+- `logs/server.log`: log geral (também no console), rotação de 10 MB x 5 arquivos. Inclui o que os scripts escrevem
+  (`cb.log`, `print`, erros com traceback, avisos da vigia), sempre com `[<resource>]` e com controles escapados.
+- `logs/audit-AAAA-MM-DD.jsonl`: auditoria — `cb.audit` dos scripts, `kick`/`ban`/`unban` feitos por scripts,
+  `command` (comandos do console e comandos de admin do chat), `ban_write_dropped` (gravação de ban recusada pelo
+  banco), `admin_login`/`admin_logout`/`admin` (painel).
 - `logs/anticheat-AAAA-MM-DD.jsonl`: uma linha JSON por evento, com `type`, `ts` (unix), `id` (entidade) e, quando o
   jogador existe, `did` (conta Discord) e `sub`. Tipos: `correction` (`seq`, `pos`), `kick` (`reason`) e `net_close`
   (`reason`; conexão fechada por violação de rede).
@@ -196,8 +285,13 @@ O manifest traz caminho, SHA-256 e tamanho de cada arquivo; o cliente baixa por 
 ## /metrics
 
 `GET /metrics` devolve JSON: `tickP50Ms`, `tickP99Ms`, `tickMaxMs`, `players`, `pending`, `corrections`, `kicks`,
-`droppedEvents`, `decodeErrors`, `sendFailures`, `avgKbpsPerPlayer`/`maxKbpsPerPlayer` (payload),
-`wireAvgKbpsPerPlayer`/`wireMaxKbpsPerPlayer`, `rssBytes`, `cpuPercent`.
+`droppedEvents`, `decodeErrors`, `sendFailures`, `encodeErrors`, `avgKbpsPerPlayer`/`maxKbpsPerPlayer` (payload),
+`wireAvgKbpsPerPlayer`/`wireMaxKbpsPerPlayer`, `rssBytes`, `cpuPercent` e os contadores dos scripts:
+`scriptEventsDropped` (eventos de cliente descartados com a fila dos scripts cheia), `scriptJoinLeaveDropped`,
+`scriptCommandsDropped`/`scriptCommandsRejected` (comandos de script descartados/inválidos),
+`scriptEventsOutDropped` (eventos acima da cota `scripting.eventOut*`), `scriptLogDropped`, `scriptAuditDropped`.
+Com `db` configurado há também o objeto `db`: `queries`, `errors`, `timeouts`, `qps`, `p50Ms`, `p99Ms`, `busy`,
+`connected`, `size`, `queued`, `activeTx`, `bansLoaded`, `bansPendingWrites`.
 
 Acesso: só de loopback, ou de fora com `Authorization: Bearer <metrics.token>`. Cuidado: um proxy reverso na mesma
 máquina conecta por loopback e, sem filtro, expõe o `/metrics` a todos; bloqueie essa rota no proxy.
@@ -217,9 +311,14 @@ Correções emitidas pelo próprio servidor (spawn, teleporte) têm carência de
 - Limite de taxa de novas conexões por IP: adiado (existe só o limite de pendentes).
 - Velocidades provisórias até o subprojeto 5.
 - Cliente que nunca alcança uma correção feita pelo servidor (spawn/teleporte) **não é expulso**: a Correction é
-  reenviada uma vez após 30 s e os inputs dele seguem ignorados (fica parado no servidor). Um teto com kick fica
-  para o subprojeto 3.
+  reenviada uma vez após 30 s e os inputs dele seguem ignorados (fica parado no servidor). O teto com kick continua
+  pendente (`docs/PENDENCIAS.md`).
 - HTTP escuta só em IPv4 (`0.0.0.0`); o jogo (GNS) escuta em IPv4 e IPv6. Corrigir antes do launcher (subprojeto 4).
+- Uma única thread roda todos os scripts: um resource pesado atrasa os outros (nunca a simulação).
+- Comandos de script com `admin = true` só funcionam pelo console do painel; pelo chat são recusados para todos (ainda
+  não há lista de admins de jogo ligada à API).
+- Sessões do painel, bans lidos do MySQL e limites do painel ficam em memória/na subida: restart desloga os admins;
+  bans gravados por outro servidor no mesmo banco só valem depois de reiniciar.
 
 ## Teste de carga
 

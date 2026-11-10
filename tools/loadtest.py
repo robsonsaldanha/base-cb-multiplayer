@@ -15,6 +15,11 @@ Segurança (curtos, cada um com servidor próprio):
   flood      bot 0 manda 500 eventos/s → Kick
   seed errada  tickets assinados com outra seed → todos recusados
 
+Script lento (servidor próprio, 32 bots por 20 s): além do echo, um resource de teste ("slow", só deste script,
+fora de resources.example) prende a thread de scripts num laço de 2 a 3 s dentro de cb.events.on('echo') a cada 10 s.
+Esperado: a simulação não espera (tick p99 <= 25 ms, tick máx < 1 s, nenhum bot > 1 s sem snapshot, nenhuma queda),
+a vigia avisa no log ("[slow] vigia: execução levou ...") e não aborta (2–3 s < aborto de 5 s), e o eco continua.
+
 Uso: python3 tools/loadtest.py --count 256 --duration 120 --cluster 0.3 --assert
 """
 from __future__ import annotations
@@ -50,6 +55,26 @@ SERVER_ID = "srv_dev"  # serverId do cb-server em modo dev (sem hub)
 # recusaria parte delas entre dois pumps. O limite por IP é testado nos testes unitários do net.
 PENDING_PER_IP = 64
 KICK_REASONS = {"teleport": "movimento inválido", "flood": "flood de eventos"}
+
+# Resource só do cenário "script lento" (não é exemplo para comunidades; por isso não fica em resources.example).
+# os.time() tem resolução de 1 s: o laço dura de 2 a 3 s, acima do aviso da vigia (50 ms) e abaixo do aborto (5 s).
+SLOW_RESOURCE = {
+    "resource.json": json.dumps({"name": "slow", "version": "1.0.0", "server": ["server/main.lua"]}),
+    "server/main.lua": """-- Teste de carga: prende a thread de scripts de 2 a 3 s a cada 10 s, dentro de um handler de evento.
+local proxima = 0
+cb.events.on('echo', function(p, data)
+  local agora = os.time()
+  if agora < proxima then return end
+  proxima = agora + 10
+  local fim = agora + 3
+  local voltas = 0
+  while os.time() < fim do voltas = voltas + 1 end
+  cb.log.info('laço lento terminou; voltas:', voltas)
+end)
+""",
+}
+SLOW_WARN = "[slow] vigia: execução levou"
+SLOW_ABORT = "[slow] vigia: execução abortada"
 
 
 def log(msg: str) -> None:
@@ -146,7 +171,8 @@ class AdminPanel:
 
 
 class Server:
-    def __init__(self, server_bin: Path, workdir: Path, pubkey: str, max_players: int, admin: bool = False):
+    def __init__(self, server_bin: Path, workdir: Path, pubkey: str, max_players: int, admin: bool = False,
+                 slow: bool = False):
         self.workdir = workdir
         self.port = free_port()
         self.panel: AdminPanel | None = None
@@ -154,6 +180,11 @@ class Server:
         (workdir / "resources").mkdir(exist_ok=True)
         # O eco dos bots é feito em Lua pelo resource de exemplo (não há mais eco em C++ no servidor).
         shutil.copytree(ECHO_RESOURCE, workdir / "resources" / "echo", dirs_exist_ok=True)
+        if slow:
+            for rel, content in SLOW_RESOURCE.items():
+                p = workdir / "resources" / "slow" / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(content, encoding="utf-8")
         cfg = {
             "name": "loadtest",
             "description": "",
@@ -219,6 +250,15 @@ class Server:
             return http_json(self.port, "/metrics")
         except Exception:
             return None
+
+    def log_text(self) -> str:
+        """logs/server.log (ou, se não existir, a saída do console), para procurar avisos."""
+        for p in (self.workdir / "logs" / "server.log", self.workdir / "server.out.log"):
+            try:
+                return p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+        return ""
 
     def stop(self) -> int | None:
         self._stop.set()
@@ -427,6 +467,73 @@ def run_security(server_bin: Path, bots_bin: Path, out_dir: Path) -> list[dict]:
     return results
 
 
+# ------------------------------------------------------------------------------------------- script lento
+
+def run_slow_script(server_bin: Path, bots_bin: Path, out_dir: Path, count: int, duration: float) -> dict:
+    seed = secrets.token_hex(32)
+    work = out_dir / "slow-script"
+    shutil.rmtree(work, ignore_errors=True)
+    srv = Server(server_bin, work, dev_key(bots_bin, seed), count + 16, slow=True)
+    try:
+        srv.wait_ready()
+        log(f"script lento: {count} bots por {duration} s (resource 'slow' com laço de 2–3 s a cada 10 s)")
+        srv.start_polling(2.0)
+        bots = run_bots(bots_bin, srv.port, seed, work / "bots-report.json", count, duration, 0.3, 2000)
+    finally:
+        rc = srv.stop()
+    text = srv.log_text()
+    live = [s for s in srv.samples if s.get("players", 0) > 0]
+    r = {
+        "name": "slow-script",
+        "serverExit": rc,
+        "bots": bots,
+        "samples": srv.samples,
+        "tickP99Ms": max((s["tickP99Ms"] for s in live), default=0.0),
+        "tickMaxMs": max((s["tickMaxMs"] for s in live), default=0.0),
+        "watchdogWarnings": text.count(SLOW_WARN),
+        "watchdogAborts": text.count(SLOW_ABORT),
+        "warningLines": [l.strip() for l in text.splitlines() if SLOW_WARN in l][:5],
+    }
+    r["violations"] = slow_violations(r, count)
+    return r
+
+
+def slow_violations(r: dict, count: int) -> list[str]:
+    v = []
+    b = r["bots"]
+    if not r["samples"]:
+        v.append("nenhuma amostra de /metrics")
+    if r["tickP99Ms"] > LIMITS["tickP99Ms"]:
+        v.append(f"tick p99 {r['tickP99Ms']:.2f} ms > {LIMITS['tickP99Ms']}")
+    if r["tickMaxMs"] >= 1000.0:  # o laço dura 2–3 s: um tick dessa ordem = a simulação esperou o script
+        v.append(f"tick máx {r['tickMaxMs']:.0f} ms (a simulação esperou a thread de scripts?)")
+    if b["connected"] != count or b["failedToConnect"] or b["disconnected"] or b["kicked"]:
+        v.append(f"bots: conectados {b['connected']}/{count}, falhas {b['failedToConnect']}, caíram {b['disconnected']}, "
+                 f"expulsos {b['kicked']}")
+    if b["maxSnapshotGapMs"] > LIMITS["maxSnapshotGapMs"]:
+        v.append(f"bot sem snapshot por {b['maxSnapshotGapMs']:.0f} ms > {LIMITS['maxSnapshotGapMs']:.0f}")
+    if r["watchdogWarnings"] < 1:
+        v.append(f"nenhum aviso da vigia ('{SLOW_WARN}') no log")
+    if r["watchdogAborts"]:
+        v.append(f"a vigia abortou o laço {r['watchdogAborts']}x (esperado só aviso: 2–3 s < 5 s)")
+    if b.get("echoReplies", 0) <= 0:
+        v.append("nenhuma resposta de eco (a thread de scripts não voltou a atender)")
+    if r.get("serverExit") not in (0, None):
+        v.append(f"cb-server saiu com código {r['serverExit']}")
+    return v
+
+
+def print_slow(r: dict) -> None:
+    b = r["bots"]
+    log(f"  script lento: tick p99 {r['tickP99Ms']:.2f} ms, máx {r['tickMaxMs']:.2f} ms; snapshot gap máx "
+        f"{b['maxSnapshotGapMs']:.0f} ms; bots {b['connected']}/{b['count']} (caíram {b['disconnected']}, "
+        f"expulsos {b['kicked']}); eco {b.get('echoReplies', 0)}/{b.get('echoSent', 0)} (RTT médio "
+        f"{b['avgRttMs']:.0f} ms); avisos da vigia {r['watchdogWarnings']}, abortos {r['watchdogAborts']}")
+    for line in r["warningLines"][:2]:
+        log(f"    {line}")
+    log(f"  script lento: {'OK' if not r['violations'] else 'FALHOU — ' + '; '.join(r['violations'])}")
+
+
 def main() -> int:
     sys.stdout.reconfigure(errors="replace")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -441,6 +548,9 @@ def main() -> int:
     ap.add_argument("--skip-load", action="store_true")
     ap.add_argument("--skip-security", action="store_true")
     ap.add_argument("--no-admin", action="store_true", help="não liga o painel admin na carga")
+    ap.add_argument("--skip-slow-script", action="store_true", help="pula o cenário do script lento")
+    ap.add_argument("--slow-count", type=int, default=32, help="bots no cenário do script lento")
+    ap.add_argument("--slow-duration", type=float, default=20, help="duração (s) do cenário do script lento")
     args = ap.parse_args()
 
     server_bin = find_binary("cb-server", args.server_bin)
@@ -450,7 +560,7 @@ def main() -> int:
     log(f"cb-server: {server_bin}")
     log(f"cb-bots:   {bots_bin}")
 
-    report: dict = {"args": vars(args), "limits": LIMITS, "load": [], "security": []}
+    report: dict = {"args": vars(args), "limits": LIMITS, "load": [], "security": [], "slowScript": None}
     path = out_dir / "report.json"
     ok = False
     try:
@@ -472,6 +582,15 @@ def main() -> int:
             sec = run_security(server_bin, bots_bin, out_dir)
             report["security"] = sec
             ok = ok and all(not s["violations"] for s in sec)
+        if not args.skip_slow_script:
+            try:
+                slow = run_slow_script(server_bin, bots_bin, out_dir, args.slow_count, args.slow_duration)
+                print_slow(slow)
+            except Exception as e:  # erro no cenário conta como violação
+                slow = {"name": "slow-script", "error": f"erro: {e}", "violations": [f"erro: {e}"]}
+                log(f"script lento: FALHOU — {slow['error']}")
+            report["slowScript"] = slow
+            ok = ok and not slow["violations"]
     except BaseException as e:
         ok = False
         report["error"] = f"{type(e).__name__}: {e}"
