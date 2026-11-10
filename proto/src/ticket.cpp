@@ -1,6 +1,6 @@
 // Porta de verifyTicket de packages/contracts/src/ticket.ts. Ordem das checagens (igual ao TS):
 // formato/charset → base64url canônico → JSON (válido, compacto, sem chaves duplicadas) → forma (inteiros
-// seguros, literais inteiros simples) → versão → kid → assinatura → audience → iat futuro → expiração.
+// seguros, literais inteiros simples, nonce opcional texto) → versão → kid → assinatura → audience → iat futuro → expiração.
 #include <cbmp/ticket.hpp>
 
 #include <cbmp/base64url.hpp>
@@ -20,6 +20,8 @@ namespace cbmp {
 namespace {
 constexpr int64_t kMaxSafeInteger = 9007199254740991;  // Number.MAX_SAFE_INTEGER
 constexpr std::string_view kPayloadKeys[] = {"v", "kid", "sub", "did", "name", "aud", "iat", "exp", "jti"};
+// Claims opcionais: no máximo uma vez.
+constexpr std::string_view kOptionalKeys[] = {"nonce"};
 
 bool isDigit(char c) { return c >= '0' && c <= '9'; }
 
@@ -85,10 +87,12 @@ size_t countOccurrences(std::string_view t, std::string_view needle) {
   return n;
 }
 
-// noDuplicateKeys: text.split(`"<chave>":`).length === 2 para cada chave do payload.
+// noDuplicateKeys: text.split(`"<chave>":`).length === 2 para cada chave do payload e <= 2 para as opcionais.
 bool noDuplicateKeys(std::string_view t) {
   for (const auto k : kPayloadKeys)
     if (countOccurrences(t, quotedKey(k)) != 1) return false;
+  for (const auto k : kOptionalKeys)
+    if (countOccurrences(t, quotedKey(k)) > 1) return false;
   return true;
 }
 
@@ -320,6 +324,9 @@ std::expected<TicketPayload, TicketError> verifyTicket(std::string_view ticket, 
   for (size_t i = 0; i < 6; ++i)
     if ((fields[i] = stringField(json, names[i])) == nullptr) return unexpected(TicketError::Malformed);
   if (iatIt == json.end() || expIt == json.end()) return unexpected(TicketError::Malformed);
+  // nonce opcional: se presente, texto (`!('nonce' in o) || typeof o.nonce === 'string'`)
+  const auto nonceIt = json.find("nonce");
+  if (nonceIt != json.end() && !nonceIt->is_string()) return unexpected(TicketError::Malformed);
   const auto iat = safeInteger(*iatIt);
   const auto exp = safeInteger(*expIt);
   if (!iat || !exp || !plainIntegerLiterals(text)) return unexpected(TicketError::Malformed);
@@ -340,7 +347,18 @@ std::expected<TicketPayload, TicketError> verifyTicket(std::string_view ticket, 
   if (*iat - kClockSkewSeconds > nowSeconds) return unexpected(TicketError::NotYetValid);
   // exp + skew < now
   if (*exp + kClockSkewSeconds < nowSeconds) return unexpected(TicketError::Expired);
-  return TicketPayload{1, kid, *fields[1], *fields[2], *fields[3], aud, *fields[5], *iat, *exp};
+  TicketPayload out;
+  out.v = 1;
+  out.kid = kid;
+  out.sub = *fields[1];
+  out.did = *fields[2];
+  out.name = *fields[3];
+  out.aud = aud;
+  out.jti = *fields[5];
+  out.iat = *iat;
+  out.exp = *exp;
+  if (nonceIt != json.end()) out.nonce = nonceIt->get<std::string>();
+  return out;
 }
 
 bool JtiCache::seenOrInsert(const std::string& jti, int64_t expiresAt, int64_t now) {

@@ -4,12 +4,6 @@ Itens levantados nas revisões que não bloquearam o merge, com o momento em que
 subprojeto (ou área) sugerido como dono. Itens resolvidos saem desta lista (o histórico fica no git e nos relatórios
 das tasks).
 
-## Antes do launcher (subprojeto 4)
-
-- **`nonce` no ticket de admin**: o `state` do painel só prova que *algum* navegador começou o fluxo; um ticket
-  roubado pode ser pareado com o state do próprio atacante. O Hub deve amarrar o hash do state no ticket (claim
-  `nonce`) e o painel conferir. Mudança no Hub e no contrato. Dono: Hub.
-
 ## Antes do cliente no jogo (subprojeto 5)
 
 - **Contrato do cliente por escrito**: snapshots não confiáveis em partes; descartar tick ≤ último montado; ignorar ids

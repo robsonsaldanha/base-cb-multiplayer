@@ -106,3 +106,23 @@ describe('ticket: JSON compacto e sem chaves duplicadas', () => {
     expect(verifyTicket(signTicket({ ...base, name: 'x"aud":y' }, priv), opts).ok).toBe(true);
   });
 });
+
+describe('ticket: claim opcional nonce (tickets de admin)', () => {
+  const signRaw = (text: string) => {
+    const body = Buffer.from(text, 'utf8');
+    return body.toString('base64url') + '.' + sign(null, body, priv).toString('base64url');
+  };
+  const opts = { publicKeys: keys, audience: 'srv_abc', nowSeconds: base.iat };
+  it('ticket com nonce valida e devolve o nonce; sem nonce não traz o campo', () => {
+    const withNonce: TicketPayload = { ...base, nonce: 'n0nce_-AZ' };
+    expect(verifyTicket(signTicket(withNonce, priv), opts)).toEqual({ ok: true, payload: withNonce });
+    const r = verifyTicket(signTicket(base, priv), opts);
+    expect(r.ok && 'nonce' in r.payload).toBe(false);
+  });
+  it('nonce não-texto ou duplicado → malformed', () => {
+    const json = JSON.stringify(base);
+    expect(verifyTicket(signRaw(json.replace('}', ',"nonce":5}')), opts)).toEqual({ ok: false, error: 'malformed' });
+    expect(verifyTicket(signRaw(json.replace('}', ',"nonce":null}')), opts)).toEqual({ ok: false, error: 'malformed' });
+    expect(verifyTicket(signRaw(json.replace('}', ',"nonce":"a","nonce":"b"}')), opts)).toEqual({ ok: false, error: 'malformed' });
+  });
+});

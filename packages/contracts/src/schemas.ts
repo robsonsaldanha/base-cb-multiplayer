@@ -150,12 +150,14 @@ export const ServerListing = z.object({
   httpPort: Port,
   version: z.string(),
   protocol: z.number().int(),
+  /** Destaque ligado por admin da plataforma (PATCH /v1/admin/servers/:id); a lista vem com os destacados primeiro. */
+  featured: z.boolean(),
 });
 export type ServerListing = z.infer<typeof ServerListing>;
 
 /** Resposta de GET /v1/servers/:id. Offline: só dados básicos; online: tudo que o launcher precisa para conectar. */
 export const ServerDetail = z.discriminatedUnion('online', [
-  ServerListing.pick({ id: true, name: true, description: true, tags: true, locale: true }).extend({ online: z.literal(false) }),
+  ServerListing.pick({ id: true, name: true, description: true, tags: true, locale: true, featured: true }).extend({ online: z.literal(false) }),
   ServerListing.extend({ online: z.literal(true) }),
 ]);
 export type ServerDetail = z.infer<typeof ServerDetail>;
@@ -183,6 +185,10 @@ export const ResourceManifest = z.object({
   totalSize: z.number().int().min(0),
 });
 export type ResourceManifest = z.infer<typeof ResourceManifest>;
+
+/** Corpo de PATCH /v1/admin/servers/:id (só admin da plataforma). */
+export const AdminServerPatch = z.object({ featured: z.boolean() }).strict();
+export type AdminServerPatch = z.infer<typeof AdminServerPatch>;
 
 export const ErrorBody = z.object({ error: z.string(), message: z.string() });
 export type ErrorBody = z.infer<typeof ErrorBody>;

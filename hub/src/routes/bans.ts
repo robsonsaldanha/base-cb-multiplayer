@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { HttpError } from '../errors';
-import { bearer, isPlatformAdmin, requireUser } from '../auth';
+import { bearer, requirePlatformAdmin } from '../auth';
 
 export async function banRoutes(app: FastifyInstance) {
   const { config, store, now } = app.deps;
@@ -15,11 +15,7 @@ export async function banRoutes(app: FastifyInstance) {
     return store.listGlobalBans().map(({ discordId, reason, createdAt }) => ({ discordId, reason, createdAt }));
   });
 
-  const requireAdmin = (req: Parameters<typeof requireUser>[0]) => {
-    const u = requireUser(req);
-    if (!isPlatformAdmin(config, u)) throw new HttpError(403, 'forbidden', 'apenas administradores da plataforma');
-    return u;
-  };
+  const requireAdmin = (req: Parameters<typeof requirePlatformAdmin>[0]) => requirePlatformAdmin(req, config);
 
   app.post('/v1/admin/bans/global', async (req, reply) => {
     const admin = requireAdmin(req);

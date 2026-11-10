@@ -27,7 +27,7 @@ describe('heartbeat e lista', () => {
     const list = (await app.inject({ method: 'GET', url: '/v1/servers' })).json();
     expect(list).toEqual([{
       id: server.id, name: 'Castelo Bruxo', description: '', tags: ['rp'], locale: 'pt-BR', players: 12, maxPlayers: 512,
-      host: '203.0.113.7', gamePort: 30500, httpPort: 30500, version: '0.1.0', protocol: 1,
+      host: '203.0.113.7', gamePort: 30500, httpPort: 30500, version: '0.1.0', protocol: 1, featured: false,
     }]);
   });
 

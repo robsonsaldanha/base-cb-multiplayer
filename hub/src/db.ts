@@ -2,7 +2,12 @@ import Database from 'better-sqlite3';
 
 export type DB = Database.Database;
 
-const MIGRATIONS: string[] = [
+type Migration = string | ((db: DB) => void);
+
+const hasColumn = (db: DB, table: string, column: string) =>
+  (db.prepare(`PRAGMA table_info('${table}')`).all() as { name: string }[]).some((c) => c.name === column);
+
+const MIGRATIONS: Migration[] = [
   `
   CREATE TABLE users (
     id TEXT PRIMARY KEY, discord_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL, avatar TEXT, created_at INTEGER NOT NULL
@@ -42,18 +47,29 @@ const MIGRATIONS: string[] = [
   ALTER TABLE oauth_states ADD COLUMN return_server_id TEXT;
   ALTER TABLE oauth_states ADD COLUMN return_state TEXT;
   `,
+  // Destaque (admin da plataforma). Idempotente: reaplicar não falha nem duplica a coluna.
+  (db) => {
+    if (!hasColumn(db, 'servers', 'featured')) db.exec('ALTER TABLE servers ADD COLUMN featured INTEGER NOT NULL DEFAULT 0');
+  },
 ];
+
+/** Aplica as migrações pendentes (pelo `user_version`), cada uma numa transação. */
+export function migrate(db: DB): void {
+  const version = db.pragma('user_version', { simple: true }) as number;
+  for (let i = version; i < MIGRATIONS.length; i++) {
+    const m = MIGRATIONS[i]!;
+    db.transaction(() => {
+      if (typeof m === 'string') db.exec(m);
+      else m(db);
+      db.pragma(`user_version = ${i + 1}`);
+    })();
+  }
+}
 
 export function openDb(file: string): DB {
   const db = new Database(file);
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
-  const version = db.pragma('user_version', { simple: true }) as number;
-  for (let i = version; i < MIGRATIONS.length; i++) {
-    db.transaction(() => {
-      db.exec(MIGRATIONS[i]!);
-      db.pragma(`user_version = ${i + 1}`);
-    })();
-  }
+  migrate(db);
   return db;
 }

@@ -5,6 +5,7 @@
 
 #include <httplib.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -256,9 +257,21 @@ struct AdminEnv {
     return send("POST", path, h, body.dump());
   }
 
+  // Ticket sem nonce (como os do Hub sem state); o painel recusa no login por ticket.
   std::string ticket(const std::string& did, const std::string& aud = std::string(kServer) + "#admin",
-                     const std::string& name = "Admin") {
-    return signer.signDid("sub-" + did, did, "jti-" + std::to_string(++jti), fake.unixTime.load(), aud, "dev", name);
+                     const std::string& name = "Admin", const std::string& nonce = "") {
+    return signer.signDid("sub-" + did, did, "jti-" + std::to_string(++jti), fake.unixTime.load(), aud, "dev", name, nonce);
+  }
+  // nonce do Hub: base64url(sha256(state)).
+  static std::string nonceFor(const std::string& state) {
+    std::array<unsigned char, crypto_hash_sha256_BYTES> h{};
+    crypto_hash_sha256(h.data(), reinterpret_cast<const unsigned char*>(state.data()), state.size());
+    return cbmp::base64urlEncode(std::vector<uint8_t>(h.begin(), h.end()));
+  }
+  // Ticket como o Hub emite para o login iniciado com `state` (nonce amarrado a ele).
+  std::string ticketFor(const std::string& state, const std::string& did = kAdmin,
+                        const std::string& aud = std::string(kServer) + "#admin") {
+    return ticket(did, aud, "Admin", nonceFor(state));
   }
   // GET /auth/start → state do cookie.
   std::string startState() {
@@ -276,7 +289,7 @@ struct AdminEnv {
   // Login completo; devolve "cbadmin=<sessão>" para o cabeçalho Cookie.
   std::string login(const std::string& did = kAdmin) {
     auto st = startState();
-    auto r = loginWith(ticket(did), st, st);
+    auto r = loginWith(ticketFor(st, did), st, st);
     INFO(r.body);
     REQUIRE(r.status == 200);
     auto v = cookieValue(r, "cbadmin");
@@ -334,7 +347,7 @@ TEST_CASE("admin: /auth/start sets a strict state cookie and redirects to the Hu
 TEST_CASE("admin: login with a valid admin ticket creates a session") {
   AdminEnv env;
   auto st = env.startState();
-  auto r = env.loginWith(env.ticket(kAdmin), st, st);
+  auto r = env.loginWith(env.ticketFor(st), st, st);
   INFO(r.body);
   REQUIRE(r.status == 200);
   REQUIRE(r.j()["did"] == kAdmin);
@@ -357,19 +370,19 @@ TEST_CASE("admin: login with a valid admin ticket creates a session") {
 TEST_CASE("admin: a game ticket (audience without #admin) is refused") {
   AdminEnv env;
   auto st = env.startState();
-  auto r = env.loginWith(env.ticket(kAdmin, kServer), st, st);
+  auto r = env.loginWith(env.ticketFor(st, kAdmin, kServer), st, st);
   REQUIRE(r.status == 401);
   REQUIRE(cookieValue(r, "cbadmin").empty());
   // nem o de outro servidor
   st = env.startState();
-  REQUIRE(env.loginWith(env.ticket(kAdmin, "srv_outro#admin"), st, st).status == 401);
+  REQUIRE(env.loginWith(env.ticketFor(st, kAdmin, "srv_outro#admin"), st, st).status == 401);
   REQUIRE(env.fake.hasAudit("admin_login", "bad_ticket"));
 }
 
 TEST_CASE("admin: a valid ticket of a did outside admins is refused") {
   AdminEnv env;
   auto st = env.startState();
-  auto r = env.loginWith(env.ticket(kOther), st, st);
+  auto r = env.loginWith(env.ticketFor(st, kOther), st, st);
   REQUIRE(r.status == 403);
   REQUIRE(cookieValue(r, "cbadmin").empty());
   REQUIRE(env.fake.hasAudit("not_admin", kOther));
@@ -377,30 +390,60 @@ TEST_CASE("admin: a valid ticket of a did outside admins is refused") {
 
 TEST_CASE("admin: a repeated jti is refused") {
   AdminEnv env;
-  const auto tk = env.ticket(kAdmin);
+  // Mesmo jti, nonce de cada state (o nonce certo não salva um jti repetido).
+  auto signWith = [&](const std::string& st) {
+    return env.signer.signDid("sub-a", kAdmin, "jti-fixo", env.fake.unixTime.load(), std::string(kServer) + "#admin", "dev",
+                              "Admin", AdminEnv::nonceFor(st));
+  };
   auto st = env.startState();
-  REQUIRE(env.loginWith(tk, st, st).status == 200);
+  REQUIRE(env.loginWith(signWith(st), st, st).status == 200);
   st = env.startState();
-  auto r = env.loginWith(tk, st, st);
+  auto r = env.loginWith(signWith(st), st, st);
   REQUIRE(r.status == 401);
   REQUIRE_THAT(r.body, ContainsSubstring("usado"));
+}
+
+TEST_CASE("admin: ticket nonce must equal base64url(sha256(state of the cookie))") {
+  AdminEnv env;
+  // vetor fixo: o Hub calcula createHash('sha256').update(state).digest('base64url')
+  REQUIRE(AdminEnv::nonceFor("Abc_def-0123456789xyz").size() == 43);
+  auto st = env.startState();
+  auto r = env.loginWith(env.ticket(kAdmin), st, st);  // sem nonce
+  REQUIRE(r.status == 401);
+  REQUIRE(cookieValue(r, "cbadmin").empty());
+  REQUIRE(env.fake.hasAudit("admin_login", "bad_nonce"));
+  // nonce de outro state (ticket roubado de outro navegador, pareado com o state do atacante)
+  st = env.startState();
+  const auto victim = env.startState();
+  r = env.loginWith(env.ticketFor(victim), st, st);
+  REQUIRE(r.status == 401);
+  REQUIRE(cookieValue(r, "cbadmin").empty());
+  // nonce = state cru (sem hash) também não vale
+  st = env.startState();
+  REQUIRE(env.loginWith(env.ticket(kAdmin, std::string(kServer) + "#admin", "Admin", st), st, st).status == 401);
+  // nonce certo entra
+  st = env.startState();
+  r = env.loginWith(env.ticketFor(st), st, st);
+  INFO(r.body);
+  REQUIRE(r.status == 200);
+  REQUIRE(!cookieValue(r, "cbadmin").empty());
 }
 
 TEST_CASE("admin: state must match the cookie and is single use") {
   AdminEnv env;
   auto st = env.startState();
   auto other = env.startState();
-  REQUIRE(env.loginWith(env.ticket(kAdmin), st, "").status == 403);     // sem cookie
-  REQUIRE(env.loginWith(env.ticket(kAdmin), st, other).status == 403);  // cookie de outro início
-  REQUIRE(env.loginWith(env.ticket(kAdmin), "", st).status == 403);     // sem state no corpo
+  REQUIRE(env.loginWith(env.ticketFor(st), st, "").status == 403);     // sem cookie
+  REQUIRE(env.loginWith(env.ticketFor(st), st, other).status == 403);  // cookie de outro início
+  REQUIRE(env.loginWith(env.ticketFor(st), "", st).status == 403);     // sem state no corpo
   const std::string forged = (st[0] == 'A' ? "B" : "A") + st.substr(1);  // nunca emitido
-  REQUIRE(env.loginWith(env.ticket(kAdmin), forged, forged).status == 403);
-  REQUIRE(env.loginWith(env.ticket(kAdmin), st, st).status == 200);
-  REQUIRE(env.loginWith(env.ticket(kAdmin), st, st).status == 403);  // uso único
+  REQUIRE(env.loginWith(env.ticketFor(forged), forged, forged).status == 403);
+  REQUIRE(env.loginWith(env.ticketFor(st), st, st).status == 200);
+  REQUIRE(env.loginWith(env.ticketFor(st), st, st).status == 403);  // uso único
   // vencido (10 min)
   auto old = env.startState();
   env.fake.mono = env.fake.mono.load() + 601;
-  REQUIRE(env.loginWith(env.ticket(kAdmin), old, old).status == 403);
+  REQUIRE(env.loginWith(env.ticketFor(old), old, old).status == 403);
 }
 
 TEST_CASE("admin: dev token login only when configured, compared in full") {
@@ -436,7 +479,7 @@ TEST_CASE("admin: https publicUrl gives __Host- session cookie and Secure state 
   REQUIRE(!st.empty());
   httplib::Headers h{{"Origin", "https://painel.example.com"}, {"X-CB-Admin", "1"},
                      {"Cookie", "__Secure-cbadmin_state=" + st}};
-  auto r = env.send("POST", "/auth/login", h, json{{"ticket", env.ticket(kAdmin)}, {"state", st}}.dump());
+  auto r = env.send("POST", "/auth/login", h, json{{"ticket", env.ticketFor(st)}, {"state", st}}.dump());
   INFO(r.body);
   REQUIRE(r.status == 200);
   const auto line = setCookieLine(r, "__Host-cbadmin");
@@ -456,12 +499,12 @@ TEST_CASE("admin: only failed logins are charged and a valid ticket + state alwa
   std::vector<std::string> states;
   for (int i = 0; i < 6; ++i) states.push_back(env.startState());
   // sucessos não gastam
-  for (int i = 0; i < 2; ++i) REQUIRE(env.loginWith(env.ticket(kAdmin), states[i], states[i]).status == 200);
+  for (int i = 0; i < 2; ++i) REQUIRE(env.loginWith(env.ticketFor(states[i]), states[i], states[i]).status == 200);
   for (int i = 0; i < 3; ++i) REQUIRE(env.post("/auth/login", {{"ticket", "x"}, {"state", "y"}}).status == 403);
   REQUIRE(env.post("/auth/login", {{"ticket", "x"}, {"state", "y"}}).status == 429);  // orçamento de falhas do IP
   REQUIRE(env.loginWith("x.y", states[2], states[2]).status == 429);                  // ticket ruim também
   // par ticket + state válido entra mesmo com o orçamento esgotado
-  REQUIRE(env.loginWith(env.ticket(kAdmin), states[3], states[3]).status == 200);
+  REQUIRE(env.loginWith(env.ticketFor(states[3]), states[3], states[3]).status == 200);
   REQUIRE(env.get("/auth/start").status == 302);  // início não é bloqueado pelas falhas
   env.fake.mono = env.fake.mono.load() + 61;      // janela passou
   REQUIRE(env.post("/auth/login", {{"ticket", "x"}, {"state", "y"}}).status == 403);
@@ -493,7 +536,7 @@ TEST_CASE("admin: a flood of failed logins writes O(1) audit lines per window an
   REQUIRE(countAudit("rate_limited") == 0);  // resumo só na virada da janela
   // par válido continua entrando no meio da enxurrada
   auto st = env.startState();
-  REQUIRE(env.loginWith(env.ticket(kAdmin), st, st).status == 200);
+  REQUIRE(env.loginWith(env.ticketFor(st), st, st).status == 200);
   // janela virou: uma linha de resumo com a contagem, e só uma
   env.fake.mono = env.fake.mono.load() + 61;
   for (int i = 0; i < 4; ++i) env.post("/auth/login", {{"ticket", "x"}, {"state", "y"}});
@@ -561,7 +604,7 @@ TEST_CASE("admin: the global failure budget never locks out a valid login (trust
     REQUIRE(from("10.0.0." + std::to_string(i + 1), {{"ticket", "x"}, {"state", "y"}}).status == 403);
   REQUIRE(from("10.0.0.50", {{"ticket", "x"}, {"state", "y"}}).status == 429);  // global esgotado
   auto st = env.startState();
-  REQUIRE(from("10.0.0.51", {{"ticket", env.ticket(kAdmin)}, {"state", st}}, "cbadmin_state=" + st).status == 200);
+  REQUIRE(from("10.0.0.51", {{"ticket", env.ticketFor(st)}, {"state", st}}, "cbadmin_state=" + st).status == 200);
   // a auditoria registra o IP do cliente (último salto não confiável do X-Forwarded-For)
   REQUIRE(env.fake.hasAudit("\"ip\":\"10.0.0.51\"", "\"ok\""));
   REQUIRE(env.fake.hasAudit("\"ip\":\"10.0.0.1\"", "bad_state"));
@@ -1030,7 +1073,8 @@ struct Live {
     REQUIRE(!st.empty());
     const int64_t now =
         std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-    auto tk = signer.signDid("sub-a", kAdmin, "jti-live", now, std::string(kServer) + "#admin");
+    auto tk = signer.signDid("sub-a", kAdmin, "jti-live", now, std::string(kServer) + "#admin", "dev", "Jogador",
+                             AdminEnv::nonceFor(st));
     auto r = call("POST", "/auth/login", "cbadmin_state=" + st, json{{"ticket", tk}, {"state", st}});
     REQUIRE(r);
     REQUIRE(r->status == 200);

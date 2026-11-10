@@ -15,6 +15,7 @@ import { serverRoutes } from './routes/servers';
 import { banRoutes } from './routes/bans';
 import { panelRoutes } from './routes/panel';
 import { adminLoginRoutes } from './routes/admin-login';
+import { adminServerRoutes } from './routes/admin-servers';
 
 export interface HubDeps {
   config: HubConfig;
@@ -77,6 +78,7 @@ export async function buildApp(deps: HubDeps): Promise<FastifyInstance> {
   await app.register(banRoutes);
   await app.register(panelRoutes);
   await app.register(adminLoginRoutes);
+  await app.register(adminServerRoutes);
   // Tasks seguintes registram rotas aqui.
   return app;
 }

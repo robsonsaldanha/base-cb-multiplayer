@@ -1,5 +1,5 @@
 #pragma once
-// Assinatura de tickets nos testes: mesmo formato do Hub (JSON compacto na ordem v,kid,sub,did,name,aud,iat,exp,jti).
+// Assinatura de tickets nos testes: mesmo formato do Hub (JSON compacto na ordem v,kid,sub,did,name,aud,iat,exp,jti[,nonce]).
 #include <array>
 #include <cstdint>
 #include <stdexcept>
@@ -32,12 +32,15 @@ struct DevSigner {
     return signDid(sub, "did-" + sub, jti, now, aud, kid, name);
   }
 
-  // Igual a sign, com o did explícito (tickets de admin: did = id Discord).
+  // Igual a sign, com o did explícito (tickets de admin: did = id Discord). `nonce` não vazio vira o claim opcional
+  // "nonce" no fim do JSON (igual ao Hub com state).
   std::string signDid(const std::string& sub, const std::string& did, const std::string& jti, int64_t now,
-                      const std::string& aud, const std::string& kid = "dev", const std::string& name = "Jogador") const {
+                      const std::string& aud, const std::string& kid = "dev", const std::string& name = "Jogador",
+                      const std::string& nonce = "") const {
     const std::string json = R"({"v":1,"kid":")" + kid + R"(","sub":")" + sub + R"(","did":")" + did +
                              R"(","name":")" + name + R"(","aud":")" + aud + R"(","iat":)" + std::to_string(now) +
-                             R"(,"exp":)" + std::to_string(now + 300) + R"(,"jti":")" + jti + R"("})";
+                             R"(,"exp":)" + std::to_string(now + 300) + R"(,"jti":")" + jti + R"(")" +
+                             (nonce.empty() ? std::string() : R"(,"nonce":")" + nonce + R"(")") + "}";
     const std::vector<uint8_t> body(json.begin(), json.end());
     std::array<uint8_t, crypto_sign_BYTES> sig{};
     crypto_sign_detached(sig.data(), nullptr, body.data(), body.size(), sk.data());

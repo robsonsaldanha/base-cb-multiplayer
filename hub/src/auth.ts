@@ -38,3 +38,10 @@ export function requireUser(req: FastifyRequest, opts: AuthOptions = {}): UserRo
 export function isPlatformAdmin(config: HubConfig, user: UserRow): boolean {
   return config.platformAdmins.includes(user.discordId);
 }
+
+/** Sessão (Bearer) de admin da plataforma: 401 sem login, 403 se não for admin. Mesma guarda dos bans globais. */
+export function requirePlatformAdmin(req: FastifyRequest, config: HubConfig): UserRow {
+  const u = requireUser(req);
+  if (!isPlatformAdmin(config, u)) throw new HttpError(403, 'forbidden', 'apenas administradores da plataforma');
+  return u;
+}

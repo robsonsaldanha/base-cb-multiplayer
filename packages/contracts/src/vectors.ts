@@ -51,7 +51,7 @@ export function buildVectors(): TicketVectors {
   const at = (name: string, ticket: string, expected: 'ok' | TicketError, extra: Partial<TicketVectorCase> = {}): TicketVectorCase =>
     ({ name, ticket, audience: 'srv_test', nowSeconds: payload.iat, expected, ...extra });
   return {
-    description: 'Vetores de ticket CB-MP. Ordem das checagens: formato/charset, base64url canônico, JSON (válido; compacto: nenhum espaço/tab/quebra de linha fora de strings; cada chave v/kid/sub/did/name/aud/iat/exp/jti aparece exatamente uma vez, contando ocorrências de "<chave>": no corpo), forma (incluindo inteiros seguros; v, iat e exp devem ser literais inteiros simples no JSON: sem 1.0, sem expoente), versão, kid, assinatura (64 bytes + verificação), audience, iat > now+60 (not_yet_valid), exp+60 < now (expired).',
+    description: 'Vetores de ticket CB-MP. Ordem das checagens: formato/charset, base64url canônico, JSON (válido; compacto: nenhum espaço/tab/quebra de linha fora de strings; cada chave v/kid/sub/did/name/aud/iat/exp/jti aparece exatamente uma vez e a opcional nonce no máximo uma vez, contando ocorrências de "<chave>": no corpo), forma (incluindo inteiros seguros; nonce, se presente, é texto; v, iat e exp devem ser literais inteiros simples no JSON: sem 1.0, sem expoente), versão, kid, assinatura (64 bytes + verificação), audience, iat > now+60 (not_yet_valid), exp+60 < now (expired).',
     seedHex: seed.toString('hex'),
     publicKeys: [{ kid: 'test-1', publicKey: publicKeyToRaw(priv) }],
     cases: [
@@ -76,6 +76,9 @@ export function buildVectors(): TicketVectors {
       at('iat_literal_float', floatTicket, 'malformed'),
       at('json_com_espacos', spacedTicket, 'malformed'),
       at('chave_duplicada', dupAudTicket, 'malformed'),
+      at('com_nonce', sign64({ ...payload, nonce: 'Mr8oz8WcM8oBo0O-aJzzDj2fWBrLTFVNe5kNJotFqSQ' }), 'ok'),
+      at('nonce_nao_texto', signRaw(json.replace('}', ',"nonce":5}')), 'malformed'),
+      at('nonce_duplicado', signRaw(json.replace('}', ',"nonce":"a","nonce":"b"}')), 'malformed'),
     ],
   };
 }

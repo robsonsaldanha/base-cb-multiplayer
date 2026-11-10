@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { PassThrough } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 import { HeartbeatBody, publicKeyFromRaw, verifyTicket } from '@cbmp/contracts';
@@ -280,6 +281,22 @@ describe('POST /v1/auth/server-admin (emite o ticket)', () => {
     const t = await setup();
     const loc = (await login(t, { state: STATE })).headers.location as string;
     expect(loc).toBe(`${ADMIN}/auth/callback#ticket=${ticketFrom(loc)}&state=${STATE}`);
+  });
+
+  it('com state: ticket traz nonce = base64url(sha256(state)); sem state: sem nonce', async () => {
+    const t = await setup();
+    const keys = await keysOf(t);
+    const verify = (loc: string) => {
+      const r = verifyTicket(ticketFrom(loc), { publicKeys: keys, audience: `${t.server.id}#admin`, nowSeconds: T0 });
+      expect(r.ok).toBe(true);
+      return r.ok ? r.payload : null;
+    };
+    const withState = verify((await login(t, { state: STATE })).headers.location as string);
+    expect(withState!.nonce).toBe(createHash('sha256').update(STATE).digest('base64url'));
+    expect(withState!.nonce).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    const without = verify((await login(t)).headers.location as string);
+    expect(without).not.toBeNull();
+    expect('nonce' in without!).toBe(false);
   });
 
   it('ticket verifica com aud "<serverId>#admin", TTL 300 s, did/sub do usuário e jti novo', async () => {

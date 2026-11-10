@@ -8,6 +8,8 @@ export interface UserRow { id: string; discordId: string; name: string; avatar: 
 export interface ServerRow {
   id: string; ownerId: string; name: string; description: string; tags: string[]; locale: string;
   useGlobalBans: boolean; createdAt: number;
+  /** Destaque na lista pública (só admin da plataforma liga/desliga). */
+  featured: boolean;
 }
 export interface StatusRow {
   serverId: string; ip: string; gamePort: number; httpPort: number; players: number; maxPlayers: number;
@@ -35,7 +37,7 @@ const toUser = (r: Raw): UserRow => ({ id: r.id as string, discordId: r.discord_
 const toServer = (r: Raw): ServerRow => ({
   id: r.id as string, ownerId: r.owner_id as string, name: r.name as string, description: r.description as string,
   tags: JSON.parse(r.tags as string) as string[], locale: r.locale as string, useGlobalBans: r.use_global_bans === 1,
-  createdAt: r.created_at as number,
+  createdAt: r.created_at as number, featured: r.featured === 1,
 });
 const toStatus = (r: Raw): StatusRow => ({
   serverId: r.server_id as string, ip: r.ip as string, gamePort: r.game_port as number, httpPort: r.http_port as number,
@@ -182,6 +184,12 @@ export class Store {
     return res.changes === 1 ? key : null;
   }
 
+  /** Liga/desliga o destaque (admin da plataforma); null se o servidor não existe. */
+  setFeatured(id: string, featured: boolean): ServerRow | null {
+    const res = this.db.prepare('UPDATE servers SET featured = ? WHERE id = ?').run(featured ? 1 : 0, id);
+    return res.changes === 1 ? this.getServer(id) : null;
+  }
+
   deleteServer(id: string, ownerId: string): boolean {
     return this.db.prepare('DELETE FROM servers WHERE id = ? AND owner_id = ?').run(id, ownerId).changes === 1;
   }
@@ -222,7 +230,7 @@ export class Store {
 
   listOnline(now: number): { server: ServerRow; status: StatusRow }[] {
     const rows = this.db.prepare(`SELECT s.*, st.* FROM servers s JOIN server_status st ON st.server_id = s.id
-      WHERE st.verified = 1 AND st.last_heartbeat >= ? ORDER BY st.players DESC, s.name`).all(now - ONLINE_WINDOW) as Raw[];
+      WHERE st.verified = 1 AND st.last_heartbeat >= ? ORDER BY s.featured DESC, st.players DESC, s.name`).all(now - ONLINE_WINDOW) as Raw[];
     return rows.map((r) => ({ server: toServer(r), status: toStatus(r) }));
   }
 

@@ -1,5 +1,5 @@
 {
-  "description": "Vetores de ticket CB-MP. Ordem das checagens: formato/charset, base64url canônico, JSON (válido; compacto: nenhum espaço/tab/quebra de linha fora de strings; cada chave v/kid/sub/did/name/aud/iat/exp/jti aparece exatamente uma vez, contando ocorrências de \"<chave>\": no corpo), forma (incluindo inteiros seguros; v, iat e exp devem ser literais inteiros simples no JSON: sem 1.0, sem expoente), versão, kid, assinatura (64 bytes + verificação), audience, iat > now+60 (not_yet_valid), exp+60 < now (expired).",
+  "description": "Vetores de ticket CB-MP. Ordem das checagens: formato/charset, base64url canônico, JSON (válido; compacto: nenhum espaço/tab/quebra de linha fora de strings; cada chave v/kid/sub/did/name/aud/iat/exp/jti aparece exatamente uma vez e a opcional nonce no máximo uma vez, contando ocorrências de \"<chave>\": no corpo), forma (incluindo inteiros seguros; nonce, se presente, é texto; v, iat e exp devem ser literais inteiros simples no JSON: sem 1.0, sem expoente), versão, kid, assinatura (64 bytes + verificação), audience, iat > now+60 (not_yet_valid), exp+60 < now (expired).",
   "seedHex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
   "publicKeys": [
     {
@@ -151,6 +151,27 @@
     {
       "name": "chave_duplicada",
       "ticket": "eyJ2IjoxLCJraWQiOiJ0ZXN0LTEiLCJzdWIiOiJ1c3JfdGVzdCIsImRpZCI6IjExMTExMTExMTExMTExMTExMSIsIm5hbWUiOiJKb2dhZG9yIMOHw6NvIiwiYXVkIjoic3J2X291dHJvIiwiYXVkIjoic3J2X3Rlc3QiLCJpYXQiOjE4MDAwMDAwMDAsImV4cCI6MTgwMDAwMDMwMCwianRpIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIn0.Chru36eNZ1WQsSdy10yWKYQNWFXg8abnseLRzSPUiO5wBYZL9pyWyWcmkNySZmuSqqFufp4FkxBMZCyG0RPxDg",
+      "audience": "srv_test",
+      "nowSeconds": 1800000000,
+      "expected": "malformed"
+    },
+    {
+      "name": "com_nonce",
+      "ticket": "eyJ2IjoxLCJraWQiOiJ0ZXN0LTEiLCJzdWIiOiJ1c3JfdGVzdCIsImRpZCI6IjExMTExMTExMTExMTExMTExMSIsIm5hbWUiOiJKb2dhZG9yIMOHw6NvIiwiYXVkIjoic3J2X3Rlc3QiLCJpYXQiOjE4MDAwMDAwMDAsImV4cCI6MTgwMDAwMDMwMCwianRpIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwibm9uY2UiOiJNcjhvejhXY004b0JvME8tYUp6ekRqMmZXQnJMVEZWTmU1a05Kb3RGcVNRIn0.D83xiWXSkmS7CU7ITQb7UPPJitKwNPujhZ2Mkf3X74p72bZ6cIe4OQynAoVt-2_p8UYmgfVzAGFNIBdK1OL2Bg",
+      "audience": "srv_test",
+      "nowSeconds": 1800000000,
+      "expected": "ok"
+    },
+    {
+      "name": "nonce_nao_texto",
+      "ticket": "eyJ2IjoxLCJraWQiOiJ0ZXN0LTEiLCJzdWIiOiJ1c3JfdGVzdCIsImRpZCI6IjExMTExMTExMTExMTExMTExMSIsIm5hbWUiOiJKb2dhZG9yIMOHw6NvIiwiYXVkIjoic3J2X3Rlc3QiLCJpYXQiOjE4MDAwMDAwMDAsImV4cCI6MTgwMDAwMDMwMCwianRpIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwibm9uY2UiOjV9.wQ_kkWCq00ZzZiXLuhQsGnRyCLxaPvrU2Jw38Lrt0r2P3maZxrE8ajuWiq6lxe6KUQmMTJ7LpvH1cNowKFwNBA",
+      "audience": "srv_test",
+      "nowSeconds": 1800000000,
+      "expected": "malformed"
+    },
+    {
+      "name": "nonce_duplicado",
+      "ticket": "eyJ2IjoxLCJraWQiOiJ0ZXN0LTEiLCJzdWIiOiJ1c3JfdGVzdCIsImRpZCI6IjExMTExMTExMTExMTExMTExMSIsIm5hbWUiOiJKb2dhZG9yIMOHw6NvIiwiYXVkIjoic3J2X3Rlc3QiLCJpYXQiOjE4MDAwMDAwMDAsImV4cCI6MTgwMDAwMDMwMCwianRpIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwibm9uY2UiOiJhIiwibm9uY2UiOiJiIn0.XZ75reiOYXb62OToJcJqO-1kJgzEalGMKEUhGDt8g6S24fDEtZ6bjbXoz-ZKaQlouYPQZCiaMHQE33X7V0bRDw",
       "audience": "srv_test",
       "nowSeconds": 1800000000,
       "expected": "malformed"
