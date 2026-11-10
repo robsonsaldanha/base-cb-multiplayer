@@ -103,9 +103,11 @@ ResourceStore ResourceStore::scan(const fs::path& dir) {
       std::ifstream mf(metaPath);
       auto meta = nlohmann::json::parse(mf);
       if (!meta.is_object() || !meta.contains("name") || !meta["name"].is_string() || !meta.contains("version") ||
-          !meta["version"].is_string() || meta["name"].get<std::string>().empty())
+          !meta["version"].is_string())
         throw std::runtime_error("faltam 'name' e 'version' (texto)");
       entry.name = meta["name"].get<std::string>();
+      if (!cbmp::validResourceName(entry.name))
+        throw std::runtime_error("'name' deve ter 1 a 64 caracteres A-Z a-z 0-9 . _ -");
       entry.version = meta["version"].get<std::string>();
     } catch (const std::exception& ex) {
       throw std::runtime_error("resource.json inválido em '" + folder + "': " + ex.what());

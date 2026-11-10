@@ -47,7 +47,7 @@ std::string u8(const fs::path& p) {
   return std::string(s.begin(), s.end());
 }
 
-bool validName(const std::string& n) { return n.size() <= 64 && cbmp::safeSegment(n); }
+bool validName(const std::string& n) { return cbmp::validResourceName(n); }
 
 std::string secs(double s) {
   char b[32];

@@ -242,7 +242,9 @@ int run(const std::string& cfgPath) {
                           {"protocol", cbmp::kProtocolVersion}, {"version", kVersion}};
   });
   try {
-    http.start("0.0.0.0", cfg.port);
+    const std::string mode = http.startPublic(cfg.port);
+    spdlog::info("HTTP escutando na porta {} ({})", http.boundPort(),
+                 mode == "dual-stack" ? "IPv4 e IPv6" : "somente IPv4");
   } catch (const std::exception& e) {
     spdlog::error("{}", e.what());
     net.stop();

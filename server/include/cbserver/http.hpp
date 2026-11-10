@@ -29,6 +29,9 @@ class HttpServer {
 
   // port 0 = porta efêmera (ver boundPort()). Lança std::runtime_error se não conseguir abrir.
   void start(const std::string& host, int port);
+  // Escuta em IPv4 e IPv6 ao mesmo tempo: socket "::" com IPV6_V6ONLY=0 (Windows e Linux). Se não der, cai para
+  // "0.0.0.0". Devolve o que ficou ativo: "dual-stack" ou "ipv4". Lança std::runtime_error se nada abrir.
+  std::string startPublic(int port);
   void stop();
   int boundPort() const { return boundPort_; }
 

@@ -67,7 +67,6 @@ namespace cbscript {
 namespace {
 
 constexpr uintmax_t kMaxScriptBytes = uintmax_t{16} << 20;
-constexpr size_t kMaxNameLen = 64;
 constexpr size_t kMaxPrintBytes = size_t{64} << 10;
 constexpr int kMaxPrintPerSec = 200;
 char kLoadingSentinel;  // endereço usado como light userdata no cache do require
@@ -710,7 +709,7 @@ ResourceManifest loadManifest(const fs::path& dir) {
   }
   if (!j.is_object()) throw fail("o conteúdo deve ser um objeto JSON");
 
-  auto validName = [](const std::string& n) { return n.size() <= kMaxNameLen && cbmp::safeSegment(n); };
+  auto validName = [](const std::string& n) { return cbmp::validResourceName(n); };
   auto stringArray = [&](const char* key) {
     std::vector<std::string> out;
     if (!j.contains(key)) return out;

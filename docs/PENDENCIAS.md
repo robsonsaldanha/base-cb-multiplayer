@@ -6,14 +6,6 @@ das tasks).
 
 ## Antes do launcher (subprojeto 4)
 
-- **HTTP do `cb-server` só em IPv4** (`server/src/main.cpp`, bind `0.0.0.0`), enquanto o jogo (GNS) aceita IPv6 e o
-  Hub pode anunciar `host` IPv6. Fazer bind dual-stack (`::` com `IPV6_V6ONLY=0`) ou nos dois endereços. Dono: sub4.
-- **Nome do resource no manifest público** (`ResourceStore`, `server/src/manifest.cpp`): `name` só precisa ser texto
-  não vazio. O lado de scripts (`loadManifest`) já exige `A-Z a-z 0-9 . _ -` (até 64), mas um resource sem scripts com
-  nome fora disso ainda é publicado. Aplicar a mesma regra no `ResourceStore`; o launcher deve sanitizar de qualquer
-  forma. Dono: sub4.
-- **Resource de exemplo com arquivos de cliente** para o launcher testar download: `resources.example/echo` só tem
-  `server/`. Acrescentar um exemplo com `client/`/`ui/`/`files/`. Dono: sub4.
 - **`nonce` no ticket de admin**: o `state` do painel só prova que *algum* navegador começou o fluxo; um ticket
   roubado pode ser pareado com o state do próprio atacante. O Hub deve amarrar o hash do state no ticket (claim
   `nonce`) e o painel conferir. Mudança no Hub e no contrato. Dono: Hub.

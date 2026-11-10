@@ -121,7 +121,9 @@ Cada resource com `"server": [...]` no `resource.json` roda num estado Lua 5.4 i
   privados/loopback; CAs do sistema (no Linux, pacote `ca-certificates`; no Windows, as lojas ROOT/CA sem busca de
   intermediários na rede: servidores que não mandam a cadeia completa falham).
 - O resource de exemplo `resources.example/echo` (eco dos bots de carga) não é carregado em produção: só o que estiver
-  em `resourcesDir`.
+  em `resourcesDir`. `resources.example/hello-client` publica 5 arquivos de cliente (`client/`, `ui/`, `files/`) para
+  testar o download do launcher.
+- O `name` de cada resource (`resource.json`) deve ter 1 a 64 caracteres `A-Z a-z 0-9 . _ -`; fora disso o servidor não sobe.
 
 ## Banco de dados
 
@@ -170,7 +172,7 @@ Além do executável, leve ao lado dele:
 ## Portas e firewall
 
 Abra **UDP 30500** (jogo) e **TCP 30500** (HTTP: `/info`, `/cb/manifest`, `/cb/files/<sha256>`, `/metrics`), ou o `port`
-configurado. O HTTP escuta em `0.0.0.0`. O painel admin (**TCP 30510**) escuta só em `127.0.0.1` por padrão: **não**
+configurado. O HTTP escuta em `::` com `IPV6_V6ONLY=0` (IPv4 e IPv6 no mesmo socket); se o sistema não deixar, cai para `0.0.0.0` e o log avisa "somente IPv4". O painel admin (**TCP 30510**) escuta só em `127.0.0.1` por padrão: **não**
 abra essa porta no firewall; publique o painel por um proxy reverso com TLS (abaixo).
 
 ## Painel admin
@@ -314,7 +316,7 @@ Correções emitidas pelo próprio servidor (spawn, teleporte) têm carência de
 - Cliente que nunca alcança uma correção feita pelo servidor (spawn/teleporte) **não é expulso**: a Correction é
   reenviada uma vez após 30 s e os inputs dele seguem ignorados (fica parado no servidor). O teto com kick continua
   pendente (`docs/PENDENCIAS.md`).
-- HTTP escuta só em IPv4 (`0.0.0.0`); o jogo (GNS) escuta em IPv4 e IPv6. Corrigir antes do launcher (subprojeto 4).
+- O HTTP faz bind dual-stack; sem suporte a IPv6 no sistema ele fica só em IPv4 (o log diz qual dos dois ficou ativo).
 - Uma única thread roda todos os scripts: um resource pesado atrasa os outros (nunca a simulação).
 - Sessões do painel, bans lidos do MySQL e limites do painel ficam em memória/na subida: restart desloga os admins;
   bans gravados por outro servidor no mesmo banco só valem depois de reiniciar.
