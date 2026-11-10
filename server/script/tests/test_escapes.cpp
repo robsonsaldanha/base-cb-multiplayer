@@ -440,3 +440,36 @@ TEST_CASE("R4 semantics: string.rep and plain find unchanged") {
   REQUIRE(f.isTrue("return ('aXbXc'):find('X') == 2 and select(2, ('(a(b))'):gsub('%b()', '')) == 1"));
   REQUIRE(f.isTrue("return table.concat({1, 2, 3}, ',') == '1,2,3' and type(os.date('%c')) == 'string'"));
 }
+
+// ---- Fix round 5: pesos de %f e retro-referência; _LOADED sem o _G do script ----
+
+TEST_CASE("escape R5: frontier with a huge class and back-references are aborted") {
+  Limits big = shortLimits(size_t{256} << 20);
+  const Case cases[] = {
+      {"r5_95_frontier_class",
+       "local cls = '%f[' .. ('a'):rep(1 << 24) .. ']x' local s = ('b'):rep(1e5) s:find(cls) return 'done'"},
+      {"r5_96_backref", "local s = ('a'):rep(1 << 24) s:find('(a*)%1x') return 'done'"},
+      {"r5_97_backref_small", "local s = ('a'):rep(1 << 22) s:find('(a*)%1x') return 'done'"},
+  };
+  for (const auto& c : cases) expectAbort(c, big);
+}
+
+TEST_CASE("R5: error tracebacks do not walk the script globals (repro 98)") {
+  Limits lim = shortLimits(size_t{256} << 20);
+  lim.warnAfter = 5s;
+  lim.abortAfter = 8s;
+  Fixture f(lim);
+  Timed fill = guarded("r5_98_fill", [&] { return runRaw(*f.r, "local G = _G for i = 1, 4e6 do G[i] = true end"); });
+  INFO(fill.res.error);
+  REQUIRE(fill.res.ok);
+  Timed t = guarded("r5_98_traceback", [&] {
+    return runRaw(*f.r, "local function g(n) if n == 0 then error('x') end g(n - 1) return 1 end g(40)");
+  });
+  std::printf("TIMING %-28s %5lld ms\n", "r5_98_traceback_4e6_globals", t.ms);
+  REQUIRE_FALSE(t.res.ok);
+  REQUIRE(contains(t.res.error, "stack traceback"));
+  REQUIRE(contains(t.res.error, "function 'error'"));  // nomes ainda vêm do retrato fixo em _LOADED._G
+  REQUIRE(t.ms < 50);
+  // erros de argumento continuam com o nome qualificado da biblioteca
+  REQUIRE(f.isTrue("local ok, e = pcall(string.rep) return not ok and e:find('rep', 1, true) ~= nil"));
+}

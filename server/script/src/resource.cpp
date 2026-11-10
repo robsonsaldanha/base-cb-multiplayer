@@ -264,8 +264,9 @@ local function copy(t, keys)
   return r
 end
 
-local env = copy(G, {"assert", "error", "getmetatable", "ipairs", "next", "pairs", "pcall", "rawequal", "rawget",
-  "rawlen", "rawset", "select", "tonumber", "tostring", "type", "xpcall", "_VERSION"})
+local baseNames = {"assert", "error", "getmetatable", "ipairs", "next", "pairs", "pcall", "rawequal", "rawget",
+  "rawlen", "rawset", "select", "tonumber", "tostring", "type", "xpcall", "_VERSION"}
+local env = copy(G, baseNames)
 env.string = copy(G.string)
 env.string.dump = nil
 env.table = copy(G.table)
@@ -311,9 +312,15 @@ local smt = getmt("")
 smt.__index = env.string
 smt.__metatable = false
 
+-- Retrato fixo das funções globais para o registro (_LOADED._G): luaL_traceback/luaL_argerror percorrem _LOADED
+-- para dar nome às funções; o _G real é do script (tamanho controlado por ele) e não pode ficar lá.
+local snapshot = copy(env, baseNames)
+for _, k in ipairs({"load", "collectgarbage", "setmetatable", "print", "require"}) do snapshot[k] = env[k] end
+
 for k in next, G do G[k] = nil end
 for k, v in next, env do G[k] = v end
 G._G = G
+return snapshot
 )lua";
 
 // "util.mod" → "server/util/mod.lua"; vazio se o nome não for seguro (charset, ponto no início/fim, "..").
@@ -450,11 +457,29 @@ Resource::Resource(ResourceManifest m, fs::path dir, Limits lim, std::function<v
 #else
   lua_pushboolean(L, 0);
 #endif
-  if (lua_pcall(L, 4, 0, 0) != LUA_OK) {
+  if (lua_pcall(L, 4, 1, 0) != LUA_OK) {
     std::string e = lua_tostring(L, -1);
     lua_pop(L, 1);
     throw std::runtime_error("cbscript: falha ao montar o sandbox: " + e);
   }
+  // _LOADED só com tabelas que o script não alcança (as bibliotecas originais e o retrato acima): sem o _G real,
+  // nenhum lua_next do host (findfield em tracebacks e erros de argumento) depende de dados do script.
+  // O sol2 também registra o _G como _LOADED.base: qualquer entrada que aponte para o _G real sai.
+  lua_getfield(L, LUA_REGISTRYINDEX, LUA_LOADED_TABLE);
+  lua_pushglobaltable(L);
+  lua_pushnil(L);
+  while (lua_next(L, -3) != 0) {  // [snap, loaded, G, k, v]
+    if (lua_rawequal(L, -1, -3)) {
+      lua_pushvalue(L, -2);
+      lua_pushnil(L);
+      lua_rawset(L, -6);  // loaded[k] = nil (permitido durante a travessia)
+    }
+    lua_pop(L, 1);
+  }
+  lua_pop(L, 1);          // [snap, loaded]
+  lua_pushvalue(L, -2);
+  lua_setfield(L, -2, LUA_GNAME);
+  lua_pop(L, 2);
   lua_gc(L, LUA_GCCOLLECT);
   std::lock_guard<std::mutex> lk(registryMu());
   registry().push_back(sh_.get());

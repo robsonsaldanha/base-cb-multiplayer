@@ -1,10 +1,10 @@
 cbmp: libraries poll the interrupt request in long C loops (Lua 5.4.7).
-lstrlib: match() steps, singlematch (weighted by class length), %b scan and lmemfind
-(weighted by needle length) poll every 4096 work units; string.rep of empty pieces
-returns "" at once. ltablib: insert/remove/move/concat per iteration and every sort
-comparison. loslib: os.date per conversion. Re-check on upgrade: MatchState, match,
-singlematch, matchbalance, lmemfind, prepstate, str_rep; tinsert/tremove/tmove/tconcat/
-sort_comp; os_date.
+lstrlib: match() steps, singlematch and %f (weighted by class length), back-references
+(weighted by capture length), %b scan and lmemfind (weighted by needle length) poll every
+4096 work units; string.rep of empty pieces returns "" at once. ltablib: insert/remove/
+move/concat per iteration and every sort comparison. loslib: os.date per conversion.
+Re-check on upgrade: MatchState, match, singlematch, match_capture, matchbalance, lmemfind,
+prepstate, str_rep; tinsert/tremove/tmove/tconcat/sort_comp; os_date.
 
 --- a/src/lstrlib.c
 +++ b/src/lstrlib.c
@@ -69,7 +69,15 @@ sort_comp; os_date.
        if (*s == e) {
          if (--cont == 0) return s+1;
        }
-@@ -571,6 +593,7 @@
+@@ -560,6 +582,7 @@
+   size_t len;
+   l = check_capture(ms, l);
+   len = ms->capture[l].len;
++  cbmp_tick(ms->L, &ms->cbmp_steps, len);  /* cbmp patch: back-reference compare */
+   if ((size_t)(ms->src_end-s) >= len &&
+       memcmp(ms->capture[l].init, s, len) == 0)
+     return s+len;
+@@ -571,6 +594,7 @@
    if (l_unlikely(ms->matchdepth-- == 0))
      luaL_error(ms->L, "pattern too complex");
    init: /* using goto to optimize tail recursion */
@@ -77,7 +85,15 @@ sort_comp; os_date.
    if (p != ms->p_end) {  /* end of pattern? */
      switch (*p) {
        case '(': {  /* start capture */
-@@ -670,12 +693,13 @@
+@@ -605,6 +629,7 @@
+             if (l_unlikely(*p != '['))
+               luaL_error(ms->L, "missing '[' after '%%f' in pattern");
+             ep = classend(ms, p);  /* points to what is next */
++            cbmp_tick(ms->L, &ms->cbmp_steps, (size_t)(ep - p));  /* cbmp patch */
+             previous = (s == ms->src_init) ? '\0' : *(s - 1);
+             if (!matchbracketclass(uchar(previous), p, ep - 1) &&
+                matchbracketclass(uchar(*s), p, ep - 1)) {
+@@ -670,12 +695,13 @@
  
  
  
@@ -92,7 +108,7 @@ sort_comp; os_date.
      l2--;  /* 1st char will be checked by 'memchr' */
      l1 = l1-l2;  /* 's2' cannot be found after that */
      while (l1 > 0 && (init = (const char *)memchr(s1, *s2, l1)) != NULL) {
-@@ -686,6 +710,7 @@
+@@ -686,6 +712,7 @@
          l1 -= init-s1;
          s1 = init;
        }
@@ -100,7 +116,7 @@ sort_comp; os_date.
      }
      return NULL;  /* not found */
    }
-@@ -758,6 +783,7 @@
+@@ -758,6 +785,7 @@
                         const char *s, size_t ls, const char *p, size_t lp) {
    ms->L = L;
    ms->matchdepth = MAXCCALLS;
@@ -108,7 +124,7 @@ sort_comp; os_date.
    ms->src_init = s;
    ms->src_end = s + ls;
    ms->p_end = p + lp;
-@@ -782,7 +808,7 @@
+@@ -782,7 +810,7 @@
    /* explicit request or no special characters? */
    if (find && (lua_toboolean(L, 4) || nospecials(p, lp))) {
      /* do a plain search */
