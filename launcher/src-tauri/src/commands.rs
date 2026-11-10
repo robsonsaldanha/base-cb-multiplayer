@@ -1,15 +1,20 @@
 //! Superfície única exposta à UI. Cada comando aqui precisa constar em `build.rs` e na capability.
 
 use crate::auth::{self, Auth};
+use crate::content::{ContentStore, Limits, Progress};
 use crate::error::{AppError, AppResult};
+use crate::paths;
 use crate::settings::{validate_game_dir, Settings, SettingsUpdate};
 use serde::Serialize;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Evento para a UI quando o login muda (deep link tratado, logout).
 pub const AUTH_CHANGED: &str = "auth://changed";
+/// Progresso do download do conteúdo do servidor (`content::Progress`, no máx. 10/s).
+pub const CONTENT_PROGRESS: &str = "content://progress";
 
 pub struct AppState {
     settings_path: PathBuf,
@@ -162,6 +167,35 @@ pub async fn me(auth: State<'_, Arc<Auth>>) -> AppResult<Profile> {
     })
 }
 
+// ----- conteúdo do servidor (orquestrado pelo `play` da Task 7) -----
+
+/// Cache e montagens nas pastas do launcher.
+pub fn content_store() -> ContentStore {
+    ContentStore::new(paths::cache_dir(), paths::servers_dir())
+}
+
+/// Limites do manifest vindos das configurações (`maxServerContentMB`).
+pub fn content_limits(s: &Settings) -> Limits {
+    Limits::new(s.max_server_content_mb)
+}
+
+/// `cacheLimitMB` em bytes.
+pub fn cache_limit_bytes(s: &Settings) -> u64 {
+    s.cache_limit_mb.saturating_mul(1024 * 1024)
+}
+
+/// Hashes que o LRU nunca apaga: os montados para servidores favoritos ou recentes.
+pub fn cache_keep(store: &ContentStore, s: &Settings) -> HashSet<String> {
+    store.mounted_hashes(s.favorites.iter().chain(&s.recent).map(String::as_str))
+}
+
+/// Repassa o progresso do download à UI como `content://progress` (o `ContentStore` já limita a 10/s).
+pub fn progress_emitter(app: AppHandle) -> impl Fn(Progress) + Send + Sync + 'static {
+    move |p| {
+        let _ = app.emit(CONTENT_PROGRESS, p);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +276,55 @@ mod tests {
         })
         .unwrap();
         assert_eq!(v, serde_json::json!({ "loggedIn": false, "error": null }));
+    }
+
+    #[test]
+    fn conteudo_usa_limites_e_keep_das_configuracoes() {
+        use crate::content::{Manifest, ManifestFile, ResourceEntry};
+        use sha2::{Digest, Sha256};
+
+        let s = Settings {
+            favorites: vec!["srv_fav".into()],
+            recent: vec!["srv_rec".into()],
+            cache_limit_mb: 3,
+            max_server_content_mb: 5,
+            ..Settings::default()
+        };
+        assert_eq!(content_limits(&s), Limits::new(5));
+        assert_eq!(cache_limit_bytes(&s), 3 * 1024 * 1024);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ContentStore::new(dir.path().join("cache"), dir.path().join("servers"));
+        let mut manifests = vec![];
+        for (i, id) in ["srv_fav", "srv_rec", "srv_outro"].iter().enumerate() {
+            let data = vec![i as u8; 8];
+            let sha: String = Sha256::digest(&data)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            std::fs::create_dir_all(store.root()).unwrap();
+            std::fs::write(store.root().join(&sha), &data).unwrap();
+            let m = Manifest {
+                server_id: id.to_string(),
+                protocol: 1,
+                resources: vec![ResourceEntry {
+                    name: "r".into(),
+                    version: "1".into(),
+                    files: vec![ManifestFile {
+                        path: "a.lua".into(),
+                        sha256: sha.clone(),
+                        size: 8,
+                    }],
+                }],
+                total_size: 8,
+            };
+            store.mount(id, &m).unwrap();
+            manifests.push(sha);
+        }
+        assert_eq!(
+            cache_keep(&store, &s),
+            HashSet::from([manifests[0].clone(), manifests[1].clone()])
+        );
     }
 
     #[test]

@@ -24,7 +24,9 @@ url = "=2.5.8"
 # Cliente do Hub: rustls com o provedor `ring` (o mesmo que o plugin updater já usa).
 reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
-tokio = { version = "=1.54.1", features = ["sync"] }
+tokio = { version = "=1.54.1", features = ["sync", "rt", "fs", "io-util", "time", "macros"] }
+# Cancelamento do download de conteúdo.
+tokio-util = "=0.7.20"
 sha2 = "=0.10.9"
 base64 = "=0.23.1"
 getrandom = "=0.3.4"
@@ -43,6 +45,8 @@ toml = "=1.2.1"
 # Hub falso dos testes.
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
 tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
+# Corpo em stream do cb-server falso (queda no meio, lento, chunked).
+futures-util = { version = "=0.3.34", default-features = false }
 
 [profile.release]
 codegen-units = 1

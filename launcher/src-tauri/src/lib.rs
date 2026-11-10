@@ -3,6 +3,7 @@
 
 pub mod auth;
 pub mod commands;
+pub mod content;
 pub mod error;
 pub mod hub;
 pub mod paths;
