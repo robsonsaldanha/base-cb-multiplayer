@@ -8,6 +8,7 @@
 #include <limits>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 #include <lua.hpp>
@@ -46,6 +47,15 @@ bool tooDeep(const json& j, int depth, int maxDepth) {
   if (depth + 1 > maxDepth) return true;
   for (const auto& e : j)
     if (tooDeep(e, depth + 1, maxDepth)) return true;
+  return false;
+}
+
+// Número que não cabe em double (ex.: 1E400 vira inf no parser).
+bool nonFinite(const json& j) {
+  if (j.is_number_float()) return !std::isfinite(j.get<double>());
+  if (!j.is_structured()) return false;
+  for (const auto& e : j)
+    if (nonFinite(e)) return true;
   return false;
 }
 
@@ -208,6 +218,10 @@ struct Enc {
   std::string& err;
   const JsonOptions& o;
   int nullIdx;  // índice absoluto do sentinela na pilha, ou 0
+  // Tabelas já visitadas nesta chamada. Cada tabela é varrida no máximo uma vez: uma tabela repetida (mesmo sem
+  // ciclo) faria lua_next percorrer de novo todas as posições vazias da parte de array (milhões por visita, numa
+  // única chamada C sem vigia). Recusar repetição limita o trabalho total ao tamanho do estado.
+  std::unordered_set<const void*> seen;
 
   bool over() {
     if (out.size() <= o.maxBytes) return false;
@@ -306,6 +320,10 @@ struct Enc {
       err = "profundidade máxima (" + std::to_string(o.maxDepth) + ") excedida";
       return false;
     }
+    if (!seen.insert(lua_topointer(L, idx)).second) {
+      err = "tabela repetida ou ciclo (cada tabela só pode aparecer uma vez no JSON)";
+      return false;
+    }
     if (!lua_checkstack(L, 4)) {
       err = "pilha do Lua esgotada";
       return false;
@@ -390,13 +408,22 @@ bool jsonToLua(lua_State* L, std::string_view text, std::string& err, const Json
       err = "JSON passa de " + std::to_string(opt.maxBytes) + " bytes";
       return false;
     }
-    json j = json::parse(text.begin(), text.end(), nullptr, /*allow_exceptions=*/false);
-    if (j.is_discarded()) {
+    json j;
+    try {
+      j = json::parse(text.begin(), text.end());
+    } catch (const json::out_of_range&) {  // 406: número que estoura o double (1E400)
+      err = "número fora do intervalo (não cabe em double)";
+      return false;
+    } catch (const json::exception&) {
       err = "JSON malformado (ou texto não UTF-8)";
       return false;
     }
     if (tooDeep(j, 0, opt.maxDepth)) {
       err = "profundidade máxima (" + std::to_string(opt.maxDepth) + ") excedida";
+      return false;
+    }
+    if (nonFinite(j)) {
+      err = "número fora do intervalo (não cabe em double)";
       return false;
     }
     std::vector<Node> tape;
@@ -408,9 +435,13 @@ bool jsonToLua(lua_State* L, std::string_view text, std::string& err, const Json
     PushCtx ctx{tape.data(), 0, opt.nullRef};
     lua_pushcfunction(L, pushProtected);
     lua_pushlightuserdata(L, &ctx);
-    if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
-      const char* m = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : "erro";
-      err = std::string("sem memória para montar o valor JSON (") + m + ")";
+    const int st = lua_pcall(L, 1, 1, 0);
+    if (st != LUA_OK) {
+      const char* m = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : "erro não textual";
+      if (st == LUA_ERRMEM)
+        err = std::string("sem memória para montar o valor JSON (") + m + ")";
+      else  // p.ex. aborto da vigia (tempo esgotado) chegando durante a montagem
+        err = std::string("falha ao montar o valor JSON: ") + m;
       lua_pop(L, 1);
       return false;
     }
@@ -435,7 +466,7 @@ bool luaToJson(lua_State* L, int idx, std::string& out, std::string& err, const 
       lua_rawgeti(L, LUA_REGISTRYINDEX, opt.nullRef);
       nullIdx = lua_gettop(L);
     }
-    Enc e{L, out, err, opt, nullIdx};
+    Enc e{L, out, err, opt, nullIdx, {}};
     bool ok = e.value(idx, 0);
     lua_settop(L, base);
     return ok;

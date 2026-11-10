@@ -25,9 +25,11 @@
 // - Abortos por tempo detectados dentro de um gancho/tarefa são adiados (pendingTimeouts) até o gancho voltar: parar
 //   um resource no meio da iteração de running() invalidaria o que o despachante está percorrendo.
 // - Back-off: o n-ésimo aborto dentro da janela agenda o reinício para agora + base·2^(n-1) (relógio injetado);
-//   no maxTimeouts-ésimo o resource fica Failed e só volta por ação do admin. Dependentes parados junto voltam
-//   depois que ele subir (bringBack).
-// - Supervisor: o batimento é (inCall, callStart, callRes) sob beatMu, escrito no início/fim da chamada mais externa.
+//   no maxTimeouts-ésimo o resource fica Failed e só volta por ação do admin. Quem depende de um resource parado
+//   ou aguardando reinício entra na lista bringBack dele (em cadeia) e volta quando ele subir.
+// - Supervisor: batimento = pilha de chamadas abertas + instante do último início/fim (qualquer nível), sob beatMu.
+// - Abandono: ~ScriptHost com chamada presa marca `abandoned` (sob beatMu, atômico em relação ao fim da chamada) e
+//   desanexa a thread; quando a chamada voltar, endCall()/log() a estacionam para sempre.
 
 namespace cbscript {
 
@@ -40,7 +42,6 @@ std::string u8(const fs::path& p) {
   auto s = p.generic_u8string();
   return std::string(s.begin(), s.end());
 }
-fs::path fromU8(const std::string& s) { return fs::path(std::u8string(s.begin(), s.end())); }
 
 bool validName(const std::string& n) { return n.size() <= 64 && cbmp::safeSegment(n); }
 
@@ -49,6 +50,16 @@ std::string secs(double s) {
   std::snprintf(b, sizeof b, "%.1f", s);
   return b;
 }
+
+// Estaciona a thread atual para sempre (cv nunca sinalizada; objetos vazados para não depender da saída do processo).
+[[noreturn]] void parkForever() {
+  static auto* m = new std::mutex;
+  static auto* cv = new std::condition_variable;
+  std::unique_lock<std::mutex> lk(*m);
+  for (;;) cv->wait(lk);
+}
+
+constexpr size_t kBackstopFactor = 4;
 
 }  // namespace
 
@@ -59,15 +70,30 @@ struct Task {
   std::function<void()> cancel;  // host parado ou destruído antes de rodar
 };
 
+// Promessa de um pedido de controle; resolvida uma única vez (pela tarefa, pelo cancelamento ou pelo supervisor).
+struct Ctl {
+  std::promise<bool> p;
+  std::atomic<bool> done{false};
+  void resolve(bool v) {
+    if (done.exchange(true)) return;
+    try {
+      p.set_value(v);
+    } catch (const std::future_error&) {
+    }
+  }
+};
+
+enum class Start { Up, Failed, Waiting };
+
 struct Slot {
   HostedResource h;
   fs::path dir;
   State state = State::Stopped;
   std::string lastError;
-  std::string fixedError;            // manifest inválido/duplicado na varredura: não sobe até reescanear
-  std::deque<double> timeouts;       // instantes (relógio injetado) dos abortos por tempo
-  std::optional<double> restartAt;   // reinício automático agendado
-  std::vector<std::string> bringBack;  // dependentes a religar quando este subir
+  std::string fixedError;              // manifest inválido/duplicado na varredura
+  std::deque<double> timeouts;         // instantes (relógio injetado) dos abortos por tempo
+  std::optional<double> restartAt;     // reinício automático agendado
+  std::vector<std::string> bringBack;  // dependentes a (re)subir quando este subir
   bool timeoutPending = false;
   bool stopping = false;
   std::chrono::steady_clock::duration busy{};
@@ -90,7 +116,12 @@ struct HostImpl final : ScriptContext {
   std::deque<SimToScript> events;
   std::deque<Task> tasks;
   bool stopReq = false;
-  std::atomic<uint64_t> eventsDropped{0};
+  bool backstopLogged = false;
+  std::atomic<uint64_t> eventsDropped{0}, backstopDropped{0};
+
+  // ---- pedidos de controle em aberto (ctlMu) ----
+  std::mutex ctlMu;
+  std::vector<std::weak_ptr<Ctl>> ctls;
 
   // ---- fila Script→Sim (cmdMu) ----
   std::mutex cmdMu;
@@ -109,13 +140,14 @@ struct HostImpl final : ScriptContext {
 
   // ---- batimento (beatMu) ----
   mutable std::mutex beatMu;
-  bool inCall = false;
-  double callStart = 0;
-  std::string callRes;
-  uint64_t callSeq = 0;
+  std::vector<std::string> callStack;  // chamadas ao Lua abertas (resource de cada nível)
+  double lastBeat = 0;                 // último início/fim de chamada, qualquer nível
+  uint64_t beatSeq = 0;
+  std::atomic<bool> abandoned{false};  // escrito sob beatMu
 
   // ---- threads ----
   std::thread scriptThread, supThread;
+  std::atomic<std::thread::id> scriptId{};
   std::atomic<bool> started{false}, finished{false};
   std::mutex supMu;
   std::condition_variable supCv;
@@ -168,6 +200,11 @@ struct HostImpl final : ScriptContext {
   }
   double now() const override { return clock(); }
   void log(LogLevel lv, const std::string& msg) override {
+    if (abandoned.load()) {
+      // Host destruído: nada de log. A thread de scripts (voltando de uma chamada presa) estaciona aqui.
+      if (std::this_thread::get_id() == scriptId.load()) parkForever();
+      return;
+    }
     try {
       if (opt.log) {
         opt.log(lv, msg);
@@ -183,21 +220,39 @@ struct HostImpl final : ScriptContext {
     }
   }
 
+  // Roda um gancho/tarefa do usuário; exceções viram log (nunca derrubam a thread de scripts).
+  template <class F>
+  bool safely(const std::string& what, F&& f) {
+    try {
+      f();
+      return true;
+    } catch (const std::exception& e) {
+      log(LogLevel::Error, what + ": " + e.what());
+    } catch (...) {
+      log(LogLevel::Error, what + ": exceção desconhecida");
+    }
+    return false;
+  }
+
   // ================= batimento =================
   bool beginCall(const std::string& name) {
-    if (depth++ > 0) return false;
-    double t = clock();
+    const bool outer = depth++ == 0;
     std::lock_guard<std::mutex> lk(beatMu);
-    inCall = true;
-    callStart = t;
-    callRes = name;
-    ++callSeq;
-    return true;
+    callStack.push_back(name);
+    lastBeat = clock();
+    ++beatSeq;
+    return outer;
   }
   void endCall() {
-    if (--depth > 0) return;
-    std::lock_guard<std::mutex> lk(beatMu);
-    inCall = false;
+    --depth;
+    std::unique_lock<std::mutex> lk(beatMu);
+    if (abandoned.load()) {
+      lk.unlock();
+      parkForever();  // a chamada presa voltou depois de ~ScriptHost: não toca em mais nada
+    }
+    callStack.pop_back();
+    lastBeat = clock();
+    ++beatSeq;
   }
 
   template <class F>
@@ -320,20 +375,27 @@ struct HostImpl final : ScriptContext {
     s.lastError = msg;
     s.restartAt.reset();
     if (logIt) log(LogLevel::Error, "[" + s.h.name() + "] " + msg);
-    abandonBringBack(s);
+    abandonBringBack(s, 0);
   }
-  void abandonBringBack(Slot& s) {
-    for (auto& b : s.bringBack) {
+  // s não vai mais subir sozinho: quem esperava por ele (em cadeia) fica Stopped com o motivo.
+  void abandonBringBack(Slot& s, int level) {
+    auto back = std::move(s.bringBack);
+    s.bringBack.clear();
+    for (auto& b : back) {
       auto it = slots.find(b);
       if (it == slots.end() || it->second->h.running_) continue;
-      it->second->state = State::Stopped;
-      it->second->lastError = "parado: a dependência '" + s.h.name() + "' falhou";
+      Slot& d = *it->second;
+      if (d.state != State::Failed) {
+        d.state = State::Stopped;
+        d.lastError = "parado: a dependência '" + s.h.name() + "' falhou";
+      }
+      if (level < 64) abandonBringBack(d, level + 1);
     }
-    s.bringBack.clear();
   }
   void addBringBack(Slot& s, const std::vector<std::string>& names) {
     for (auto& n : names)
-      if (std::find(s.bringBack.begin(), s.bringBack.end(), n) == s.bringBack.end()) s.bringBack.push_back(n);
+      if (n != s.h.name() && std::find(s.bringBack.begin(), s.bringBack.end(), n) == s.bringBack.end())
+        s.bringBack.push_back(n);
   }
 
   void destroyState(Slot& s) {
@@ -347,11 +409,7 @@ struct HostImpl final : ScriptContext {
   void teardown(Slot& s) {
     if (s.h.running_ && opt.onStopping && !halted.load()) {
       s.stopping = true;
-      try {
-        opt.onStopping(*this, s.h);
-      } catch (const std::exception& e) {
-        log(LogLevel::Error, "[" + s.h.name() + "] onStopping: " + e.what());
-      }
+      safely("[" + s.h.name() + "] onStopping", [&] { opt.onStopping(*this, s.h); });
       s.stopping = false;
     }
     destroyState(s);
@@ -379,8 +437,9 @@ struct HostImpl final : ScriptContext {
     return stopped;
   }
 
-  // Cria o estado, roda os scripts e dispara onStarted. Em sucesso religa os dependentes pendentes (bringBack).
-  bool launch(Slot& s) {
+  // Cria o estado, roda os scripts e dispara onStarted. Em sucesso (re)sobe quem esperava por ele (bringBack).
+  Start launch(Slot& s) {
+    if (s.h.running_) return Start::Up;
     const std::string name = s.h.name();
     try {
       s.h.res_ = std::make_unique<Resource>(s.h.manifest_, s.dir, limits,
@@ -388,14 +447,16 @@ struct HostImpl final : ScriptContext {
     } catch (const std::exception& e) {
       destroyState(s);
       fail(s, std::string("falha ao criar o estado Lua: ") + e.what());
-      return false;
-    }
-    try {
-      if (opt.onSetup) opt.onSetup(*this, s.h);
-    } catch (const std::exception& e) {
+      return Start::Failed;
+    } catch (...) {
       destroyState(s);
-      fail(s, std::string("falha ao preparar a API: ") + e.what());
-      return false;
+      fail(s, "falha ao criar o estado Lua");
+      return Start::Failed;
+    }
+    if (opt.onSetup && !safely("[" + name + "] onSetup", [&] { opt.onSetup(*this, s.h); })) {
+      destroyState(s);
+      fail(s, "falha ao preparar a API (onSetup)", false);
+      return Start::Failed;
     }
     std::string err;
     bool timedOut = false;
@@ -404,7 +465,7 @@ struct HostImpl final : ScriptContext {
     const bool ok = s.h.res_->runMain(err, &timedOut);
     if (outer) s.busy += std::chrono::steady_clock::now() - t0;
     endCall();
-    if (halted.load()) return false;
+    if (halted.load()) return Start::Failed;
     if (!ok) {
       log(LogLevel::Error, err);
       destroyState(s);
@@ -413,18 +474,14 @@ struct HostImpl final : ScriptContext {
       else
         fail(s, err, false);
       publishStatus();
-      return false;
+      return s.restartAt ? Start::Waiting : Start::Failed;
     }
     s.h.running_ = true;
     s.state = State::Running;
     s.lastError.clear();
     order.push_back(&s);
     log(LogLevel::Info, "[" + name + "] iniciado");
-    try {
-      if (opt.onStarted) opt.onStarted(*this, s.h);
-    } catch (const std::exception& e) {
-      log(LogLevel::Error, "[" + name + "] onStarted: " + e.what());
-    }
+    if (opt.onStarted) safely("[" + name + "] onStarted", [&] { opt.onStarted(*this, s.h); });
     publishStatus();
     auto back = std::move(s.bringBack);
     s.bringBack.clear();
@@ -433,23 +490,24 @@ struct HostImpl final : ScriptContext {
       if (it == slots.end() || it->second->h.running_ || it->second->state == State::Failed) continue;
       startFresh(b);
     }
-    return true;
+    return Start::Up;
   }
 
-  bool startFresh(const std::string& name) {
+  Start startFresh(const std::string& name) {
     std::vector<std::string> chain;
     std::set<std::string> failedNow;
     return startOne(name, chain, failedNow);
   }
 
   // Sobe `name` (e, antes, as dependências). `chain` detecta ciclos; `failedNow` evita sobrescrever a causa original.
-  bool startOne(const std::string& name, std::vector<std::string>& chain, std::set<std::string>& failedNow) {
+  // Waiting: algo na cadeia aguarda reinício; `name` entrou no bringBack da dependência e sobe quando ela subir.
+  Start startOne(const std::string& name, std::vector<std::string>& chain, std::set<std::string>& failedNow) {
     Slot* sp = findOrDiscover(name);
-    if (sp == nullptr) return false;
+    if (sp == nullptr) return Start::Failed;
     Slot& s = *sp;
-    if (s.h.running_) return true;
-    if (failedNow.count(name)) return false;
-    if (halted.load()) return false;
+    if (s.h.running_) return Start::Up;
+    if (failedNow.count(name) || halted.load()) return Start::Failed;
+    if (s.restartAt) return Start::Waiting;  // reinício próprio agendado (start manual zera antes de chamar)
     auto inChain = std::find(chain.begin(), chain.end(), name);
     if (inChain != chain.end()) {
       std::string cyc;
@@ -459,13 +517,14 @@ struct HostImpl final : ScriptContext {
         fail(*slots.at(*it), "ciclo de dependências: " + cyc);
         failedNow.insert(*it);
       }
-      return false;
+      publishStatus();
+      return Start::Failed;
     }
     auto failHere = [&](const std::string& msg) {
       if (!failedNow.count(name)) fail(s, msg);
       failedNow.insert(name);
       publishStatus();
-      return false;
+      return Start::Failed;
     };
     if (!s.fixedError.empty()) return failHere(s.fixedError);
     try {
@@ -483,23 +542,26 @@ struct HostImpl final : ScriptContext {
         chain.pop_back();
         return failHere("dependência ausente: '" + dep + "'");
       }
-      if (d->restartAt && !d->h.running_) {
+      const Start r = startOne(dep, chain, failedNow);
+      if (r == Start::Waiting) {
+        chain.pop_back();
         addBringBack(*d, {name});
         s.state = State::Stopped;
         s.lastError = "aguardando a dependência '" + dep + "' reiniciar";
-        chain.pop_back();
-        return false;
+        publishStatus();
+        return Start::Waiting;
       }
-      if (!startOne(dep, chain, failedNow)) {
+      if (r == Start::Failed) {
         chain.pop_back();
-        if (failedNow.count(name)) return false;  // já marcado (ciclo)
+        if (failedNow.count(name)) return Start::Failed;  // já marcado (ciclo)
         return failHere("dependência '" + dep + "' não subiu");
       }
     }
     chain.pop_back();
-    const bool ok = launch(s);
-    if (!ok && s.state == State::Failed) failedNow.insert(name);
-    return ok;
+    if (s.h.running_) return Start::Up;  // subiu no meio (bringBack de uma dependência)
+    const Start r = launch(s);
+    if (r == Start::Failed && s.state == State::Failed) failedNow.insert(name);
+    return r;
   }
 
   void handleTimeout(Slot& s) {
@@ -543,8 +605,9 @@ struct HostImpl final : ScriptContext {
       s.restartAt.reset();
       if (s.h.running_) continue;
       log(LogLevel::Info, "[" + n + "] reiniciando após aborto por tempo");
-      if (!startFresh(n) && s.state != State::Failed && !s.restartAt) abandonBringBack(s);
+      startFresh(n);  // Failed já abandona o bringBack; Waiting o mantém
       settle();
+      publishStatus();
     }
   }
 
@@ -568,11 +631,12 @@ struct HostImpl final : ScriptContext {
     for (auto& [n, s] : slots)
       if (!s->fixedError.empty()) failedNow.insert(n);
     for (auto& n : names) {
-      if (halted.load()) return;
+      if (halted.load()) break;
       std::vector<std::string> chain;
       startOne(n, chain, failedNow);
       settle();
     }
+    publishStatus();
   }
 
   bool doStart(const std::string& name) {
@@ -583,7 +647,7 @@ struct HostImpl final : ScriptContext {
     }
     s->timeouts.clear();
     s->restartAt.reset();
-    return startFresh(name);
+    return startFresh(name) == Start::Up;
   }
   bool doStop(const std::string& name) {
     Slot* s = findOrDiscover(name);
@@ -602,7 +666,7 @@ struct HostImpl final : ScriptContext {
     s->restartAt.reset();
     if (s->h.running_) addBringBack(*s, stopOne(*s));
     s->state = State::Stopped;
-    return startFresh(name);
+    return startFresh(name) == Start::Up;
   }
 
   // ================= filas e threads =================
@@ -619,6 +683,29 @@ struct HostImpl final : ScriptContext {
     return false;
   }
 
+  std::future<bool> control(std::function<bool(HostImpl&)> f) {
+    auto c = std::make_shared<Ctl>();
+    auto fut = c->p.get_future();
+    {
+      std::lock_guard<std::mutex> lk(ctlMu);
+      ctls.erase(std::remove_if(ctls.begin(), ctls.end(),
+                                [](const std::weak_ptr<Ctl>& w) {
+                                  auto p = w.lock();
+                                  return !p || p->done.load();
+                                }),
+                 ctls.end());
+      ctls.push_back(c);
+    }
+    enqueue(Task{[c, f](ScriptContext& ctx) {
+                   auto& I = static_cast<HostImpl&>(ctx);
+                   const bool r = f(I);
+                   I.publishStatus();  // quem recebe o resultado já vê o status atualizado
+                   c->resolve(r);
+                 },
+                 [c] { c->resolve(false); }});
+    return fut;
+  }
+
   void cancelAll(std::deque<Task>& ts, size_t from = 0) {
     for (size_t i = from; i < ts.size(); ++i)
       if (ts[i].cancel) ts[i].cancel();
@@ -626,6 +713,7 @@ struct HostImpl final : ScriptContext {
   }
 
   void threadMain() {
+    scriptId.store(std::this_thread::get_id());
     for (;;) {
       std::deque<Task> ts;
       std::deque<SimToScript> evs;
@@ -635,6 +723,7 @@ struct HostImpl final : ScriptContext {
         qCv.wait_for(lk, opt.idleWait, [&] { return !tasks.empty() || !events.empty() || stopReq; });
         ts.swap(tasks);
         evs.swap(events);
+        backstopLogged = false;
         stop = stopReq;
       }
       if (halted.load()) {
@@ -647,12 +736,7 @@ struct HostImpl final : ScriptContext {
           cancelAll(ts, i);
           break;
         }
-        try {
-          ts[i].run(*this);
-        } catch (const std::exception& e) {
-          log(LogLevel::Error, std::string("tarefa da thread de scripts falhou: ") + e.what());
-          if (ts[i].cancel) ts[i].cancel();
-        }
+        if (!safely("tarefa da thread de scripts", [&] { ts[i].run(*this); }) && ts[i].cancel) ts[i].cancel();
         settle();
         publishStatus();
       }
@@ -661,23 +745,13 @@ struct HostImpl final : ScriptContext {
           eventsDropped.fetch_add(evs.size() - i);
           break;
         }
-        if (opt.onEvent) {
-          try {
-            opt.onEvent(*this, evs[i]);
-          } catch (const std::exception& e) {
-            log(LogLevel::Error, std::string("despacho de evento falhou: ") + e.what());
-          }
-        }
+        if (opt.onEvent) safely("despacho de evento", [&] { opt.onEvent(*this, evs[i]); });
         settle();
       }
       if (halted.load()) break;
       pollRestarts();
       if (opt.onTick) {
-        try {
-          opt.onTick(*this);
-        } catch (const std::exception& e) {
-          log(LogLevel::Error, std::string("onTick falhou: ") + e.what());
-        }
+        safely("onTick", [&] { opt.onTick(*this); });
         settle();
       }
       publishStatus();
@@ -701,8 +775,8 @@ struct HostImpl final : ScriptContext {
   }
 
   void trip(const std::string& res, double elapsed) {
-    const std::string reason = "chamada ao Lua em '" + res + "' passou de " + secs(elapsed) +
-                               " s sem voltar (limite " + secs(abortSec + opt.supervisorGraceSec) +
+    const std::string reason = "chamada ao Lua em '" + res + "' sem progresso por " + secs(elapsed) +
+                               " s (limite " + secs(abortSec + opt.supervisorGraceSec) +
                                " s; operação C não interrompível?). Host de scripts parado: nenhum resource roda "
                                "até reiniciar o servidor";
     {
@@ -716,15 +790,23 @@ struct HostImpl final : ScriptContext {
     }
     log(LogLevel::Critical, "[" + res + "] " + reason);
     std::deque<Task> ts;
-    size_t n = 0;
+    std::deque<SimToScript> evs;
     {
       std::lock_guard<std::mutex> lk(qMu);
-      n = events.size();
-      events.clear();
+      evs.swap(events);
       ts.swap(tasks);
     }
-    eventsDropped.fetch_add(n);
+    eventsDropped.fetch_add(evs.size());
     cancelAll(ts);
+    // Pedidos de controle em aberto (inclusive o que está preso e os já retirados da fila pela thread de scripts).
+    std::vector<std::weak_ptr<Ctl>> cs;
+    {
+      std::lock_guard<std::mutex> lk(ctlMu);
+      cs.swap(ctls);
+    }
+    for (auto& w : cs)
+      if (auto c = w.lock()) c->resolve(false);
+    // evs/ts/cs destruídos aqui, fora dos locks
   }
 
   void supMain() {
@@ -735,24 +817,24 @@ struct HostImpl final : ScriptContext {
       if (supStop) break;
       lk.unlock();
       bool in;
-      double start;
+      double last;
       std::string res;
       uint64_t seq;
       {
         std::lock_guard<std::mutex> bl(beatMu);
-        in = inCall;
-        start = callStart;
-        res = callRes;
-        seq = callSeq;
+        in = !callStack.empty();
+        last = lastBeat;
+        res = in ? callStack.back() : std::string();
+        seq = beatSeq;
       }
-      if (in && !halted.load()) {
-        const double el = clock() - start;
+      if (in && !halted.load() && !abandoned.load()) {
+        const double el = clock() - last;
         if (el > abortSec + opt.supervisorGraceSec) {
           trip(res, el);
         } else if (el > abortSec + 1.0 && seq != warnedSeq) {
           warnedSeq = seq;
-          log(LogLevel::Warn, "[" + res + "] chamada ao Lua passou do prazo de aborto (" + secs(el) +
-                                  " s) e ainda não voltou; o supervisor para o host em " +
+          log(LogLevel::Warn, "[" + res + "] chamada ao Lua sem progresso há " + secs(el) +
+                                  " s (passou do prazo de aborto e ainda não voltou); o supervisor para o host em " +
                                   secs(abortSec + opt.supervisorGraceSec) + " s");
         }
       }
@@ -782,13 +864,16 @@ ScriptHost::~ScriptHost() {
         I.scriptThread.join();
         break;
       }
-      bool stuck;
+      bool abandon = false;
       {
         std::lock_guard<std::mutex> lk(I.beatMu);
-        stuck = I.inCall;
+        if (I.halted.load() && !I.callStack.empty()) {
+          I.abandoned.store(true);  // sob beatMu: endCall verá a marca ou já terá fechado a chamada
+          abandon = true;
+        }
       }
-      if (I.halted.load() && stuck) {
-        // Chamada C presa para sempre: a thread fica com o HostImpl (shared_ptr) e termina sozinha se voltar.
+      if (abandon) {
+        // Chamada C presa: a thread fica com o HostImpl (shared_ptr) e estaciona para sempre se voltar.
         I.scriptThread.detach();
         break;
       }
@@ -807,6 +892,13 @@ ScriptHost::~ScriptHost() {
     left.swap(I.tasks);
   }
   I.cancelAll(left);
+  std::vector<std::weak_ptr<detail::Ctl>> cs;
+  {
+    std::lock_guard<std::mutex> lk(I.ctlMu);
+    cs.swap(I.ctls);
+  }
+  for (auto& w : cs)
+    if (auto c = w.lock()) c->resolve(false);
 }
 
 void ScriptHost::start() {
@@ -838,15 +930,30 @@ bool ScriptHost::post(SimToScript ev) {
     I.eventsDropped.fetch_add(1);
     return false;
   }
-  const bool droppable = std::holds_alternative<EvClientEvent>(ev) || std::holds_alternative<EvCommand>(ev);
+  const bool clientEvent = std::holds_alternative<EvClientEvent>(ev);
+  const size_t cap = I.opt.eventQueueCapacity;
+  bool critical = false, dropped = false;
   {
     std::lock_guard<std::mutex> lk(I.qMu);
-    if (I.halted.load() || (droppable && I.events.size() >= I.opt.eventQueueCapacity)) {
+    const size_t n = I.events.size();
+    if (I.halted.load() || (clientEvent && n >= cap)) {
       I.eventsDropped.fetch_add(1);
       return false;
     }
-    I.events.push_back(std::move(ev));
+    if (n >= cap * kBackstopFactor) {  // teto rígido: nada mais entra (nem Join/Leave/comandos)
+      dropped = true;
+      I.eventsDropped.fetch_add(1);
+      I.backstopDropped.fetch_add(1);
+      critical = !I.backstopLogged;
+      I.backstopLogged = true;
+    } else {
+      I.events.push_back(std::move(ev));
+    }
   }
+  if (critical)
+    I.log(LogLevel::Critical, "fila de eventos dos scripts no teto rígido (" + std::to_string(cap * kBackstopFactor) +
+                                  "): descartando inclusive entradas/saídas de jogadores e comandos");
+  if (dropped) return false;
   I.qCv.notify_one();
   return true;
 }
@@ -875,30 +982,14 @@ void ScriptHost::drainCommands(std::vector<ScriptToSim>& out) {
   }
 }
 
-namespace {
-template <class F>
-std::future<bool> control(HostImpl& I, F f) {
-  auto p = std::make_shared<std::promise<bool>>();
-  auto fut = p->get_future();
-  auto set = [p](bool v) {
-    try {
-      p->set_value(v);
-    } catch (const std::future_error&) {
-    }
-  };
-  I.enqueue(Task{[set, f](ScriptContext& c) { set(f(static_cast<HostImpl&>(c))); }, [set] { set(false); }});
-  return fut;
-}
-}  // namespace
-
 std::future<bool> ScriptHost::startResource(std::string name) {
-  return control(*impl_, [name](HostImpl& I) { return I.doStart(name); });
+  return impl_->control([name](HostImpl& I) { return I.doStart(name); });
 }
 std::future<bool> ScriptHost::stopResource(std::string name) {
-  return control(*impl_, [name](HostImpl& I) { return I.doStop(name); });
+  return impl_->control([name](HostImpl& I) { return I.doStop(name); });
 }
 std::future<bool> ScriptHost::restartResource(std::string name) {
-  return control(*impl_, [name](HostImpl& I) { return I.doRestart(name); });
+  return impl_->control([name](HostImpl& I) { return I.doRestart(name); });
 }
 
 std::vector<ResourceStatus> ScriptHost::status() const {
@@ -910,6 +1001,7 @@ HostMetrics ScriptHost::metrics() const {
   HostImpl& I = *impl_;
   HostMetrics m;
   m.eventsDropped = I.eventsDropped.load();
+  m.eventsBackstopDropped = I.backstopDropped.load();
   m.commandsDropped = I.cmdsDropped.load();
   {
     std::lock_guard<std::mutex> lk(I.qMu);
@@ -922,7 +1014,7 @@ HostMetrics ScriptHost::metrics() const {
   m.halted = I.halted.load();
   {
     std::lock_guard<std::mutex> lk(I.beatMu);
-    m.inLuaCall = I.inCall;
+    m.inLuaCall = !I.callStack.empty();
   }
   return m;
 }

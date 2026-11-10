@@ -20,7 +20,7 @@ struct JsonOptions {
 // Pode ser chamada pelo host ou de dentro de uma função C chamada pelo script: a montagem da tabela roda sob
 // lua_pcall, então erro de memória (teto do estado) vira `false`, nunca longjmp por quadros C++.
 // Mapeamento: objeto → tabela com chaves texto; array → sequência 1..n; inteiro → integer; número com ponto/expoente
-// → float; inteiro acima de int64 → float; texto → string (UTF-8 já validado); true/false → boolean.
+// → float; inteiro acima de int64 → float; número que não cabe em double (1E400) → erro; texto → string (UTF-8 já validado); true/false → boolean.
 bool jsonToLua(lua_State* L, std::string_view json, std::string& err, const JsonOptions& opt = {});
 
 // Serializa o valor no índice `idx` como JSON compacto. Só acesso cru (sem metamétodos, nenhum código do script roda)
@@ -28,8 +28,8 @@ bool jsonToLua(lua_State* L, std::string_view json, std::string& err, const Json
 // Mapeamento: nil/sentinela → null; boolean; integer → inteiro; float finito → número com '.' ou expoente (1.0 fica
 // "1.0", então inteiro vs float sobrevive à ida e volta); NaN/inf → erro; string → texto (precisa ser UTF-8
 // válido); tabela com chaves exatamente 1..n → array; tabela vazia → []; outras tabelas → objeto (chaves texto, e
-// chaves inteiras viram texto decimal; outras chaves → erro); function/userdata/thread → erro. Ciclo → erro de
-// profundidade.
+// chaves inteiras viram texto decimal; outras chaves → erro); function/userdata/thread → erro. A mesma tabela
+// aparecendo duas vezes (ciclo ou compartilhada) → erro: cada tabela é varrida no máximo uma vez por chamada.
 bool luaToJson(lua_State* L, int idx, std::string& out, std::string& err, const JsonOptions& opt = {});
 
 }  // namespace cbscript

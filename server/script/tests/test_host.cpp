@@ -19,7 +19,12 @@ namespace {
 
 struct FakeClock {
   std::atomic<double> t{1000.0};
-  double get() const { return t.load(); }
+  std::atomic<bool> closed{false};  // depois de ~ScriptHost: ninguém deveria mais ler o relógio
+  mutable std::atomic<int> lateReads{0};
+  double get() const {
+    if (closed.load()) lateReads.fetch_add(1);
+    return t.load();
+  }
   void advance(double s) { t.store(t.load() + s); }
 };
 
@@ -56,6 +61,12 @@ int luaBlock(lua_State* L) {
   doBlock(static_cast<Blocker*>(lua_touserdata(L, lua_upvalueindex(1))));
   return 0;
 }
+// once(): true só na primeira chamada (por ambiente de teste).
+int luaOnce(lua_State* L) {
+  auto* n = static_cast<std::atomic<int>*>(lua_touserdata(L, lua_upvalueindex(1)));
+  lua_pushboolean(L, n->fetch_add(1) == 0);
+  return 1;
+}
 CBSCRIPT_TEST_NOINLINE void doEmit(ScriptContext* ctx, const char* name) { ctx->emit(CmdEmit{-1, name, "{}"}); }
 int luaEmit(lua_State* L) {
   auto* ctx = static_cast<ScriptContext*>(lua_touserdata(L, lua_upvalueindex(1)));
@@ -89,6 +100,7 @@ struct HostEnv {
   TmpDir dir;
   FakeClock clock;
   Blocker blocker;
+  std::atomic<int> onceCount{0};
   mutable std::mutex mu;
   std::vector<std::pair<LogLevel, std::string>> logs;
   std::vector<std::string> started, stopping, seen;
@@ -108,6 +120,7 @@ struct HostEnv {
       lua_State* L = r.lua().lua().lua_state();
       setGlobalC(L, "block", luaBlock, &blocker);
       setGlobalC(L, "emit", luaEmit, &ctx);
+      setGlobalC(L, "once", luaOnce, &onceCount);
     };
     opt.onStarted = [this](ScriptContext&, HostedResource& r) {
       std::lock_guard<std::mutex> lk(mu);
@@ -445,13 +458,15 @@ TEST_CASE("host: event queue is bounded, drops client events and never Join/Leav
   REQUIRE_FALSE(o.fifth);
   REQUIRE(o.join);
   REQUIRE(o.leave);
-  REQUIRE_FALSE(o.cmd);
+  REQUIRE(o.cmd);  // comandos (admin, raros) não são descartados na capacidade, só no teto rígido
   auto m = env.host->metrics();
-  REQUIRE(m.eventsDropped == 2);
-  REQUIRE(m.eventQueueDepth == 6);
+  REQUIRE(m.eventsDropped == 1);
+  REQUIRE(m.eventsBackstopDropped == 0);
+  REQUIRE(m.eventQueueDepth == 7);
   env.blocker.release();
-  REQUIRE(waitFor([&] { return env.get(env.seen).size() == 7; }));
-  REQUIRE(env.get(env.seen) == Strs{"ev:stuck", "ev:a0", "ev:a1", "ev:a2", "ev:a3", "join:7", "leave:7"});
+  REQUIRE(waitFor([&] { return env.get(env.seen).size() == 8; }));
+  REQUIRE(env.get(env.seen) ==
+          Strs{"ev:stuck", "ev:a0", "ev:a1", "ev:a2", "ev:a3", "join:7", "leave:7", "cmd:x"});
   REQUIRE(env.host->metrics().eventQueueDepth == 0);
 }
 
@@ -548,4 +563,151 @@ TEST_CASE("host: supervisor halts the host when a C call never returns") {
   REQUIRE_FALSE(env.ev("y"));
   REQUIRE_FALSE(env.call(env.host->startResource("s2")));
   REQUIRE(env.get(env.started).size() == 2);
+}
+
+TEST_CASE("host: hard backstop at 4x capacity drops even Join/Leave with a critical log") {
+  HostEnv env;
+  env.opt.eventQueueCapacity = 2;  // teto rígido = 8
+  env.addRes("q", {}, "return { stuck = function() block() end }");
+  env.boot();
+  REQUIRE(env.ev("stuck"));
+  REQUIRE(waitFor([&] { return env.blocker.entered.load() == 1; }));
+  struct Out {
+    int accepted = 0;
+    bool overJoin = true, overCmd = true;
+  };
+  Out o = guarded("posts up to the backstop", [&] {
+    Out r;
+    for (int i = 0; i < 2; ++i) r.accepted += env.ev("e") ? 1 : 0;
+    for (int i = 0; i < 6; ++i) r.accepted += env.host->post(EvPlayerJoin{}) ? 1 : 0;
+    r.overJoin = env.host->post(EvPlayerLeave{});
+    r.overCmd = env.host->post(EvCommand{std::nullopt, "", "c", nullptr});
+    return r;
+  });
+  REQUIRE(o.accepted == 8);
+  REQUIRE_FALSE(o.overJoin);
+  REQUIRE_FALSE(o.overCmd);
+  auto m = env.host->metrics();
+  REQUIRE(m.eventsBackstopDropped == 2);
+  REQUIRE(m.eventsDropped == 2);
+  REQUIRE(m.eventQueueDepth == 8);
+  int criticals = 0;
+  {
+    std::lock_guard<std::mutex> lk(env.mu);
+    for (auto& [lv, msg] : env.logs)
+      if (lv == LogLevel::Critical && contains(msg, "teto")) ++criticals;
+  }
+  REQUIRE(criticals == 1);  // um log por episódio
+  env.blocker.release();
+  REQUIRE(waitFor([&] { return env.host->metrics().eventQueueDepth == 0 && env.get(env.seen).size() == 9; }));
+}
+
+TEST_CASE("host: dependency chain waits for a dependency that timed out in its main script at boot") {
+  HostEnv env;  // revisão ATK1
+  env.addRes("a", {"b"}, "return {}");
+  env.addRes("b", {"c"}, "return {}");
+  env.addRes("c", {}, "if once() then while true do end end return {}");
+  env.boot();
+  INFO(env.allLogs());
+  REQUIRE(env.is("c", State::Stopped));
+  REQUIRE(contains(env.st("c").lastError, "rein"));
+  for (const char* n : {"a", "b"}) {
+    INFO(n << ": " << env.st(n).lastError);
+    REQUIRE(env.is(n, State::Stopped));
+    REQUIRE(contains(env.st(n).lastError, "aguardando"));
+  }
+  env.clock.advance(1.5);
+  REQUIRE(waitFor([&] { return env.is("a", State::Running) && env.is("b", State::Running) && env.is("c", State::Running); }));
+  REQUIRE(env.get(env.started) == Strs{"c", "b", "a"});
+}
+
+TEST_CASE("host: manual start of a transitive dependent while the dependency restart is pending") {
+  HostEnv env;  // revisão ATK2
+  env.addRes("a", {"b"}, "return {}");
+  env.addRes("b", {"c"}, "return {}");
+  env.addRes("c", {}, "return { hang = function() while true do end end }");
+  env.boot();
+  REQUIRE(env.ev("hang"));
+  REQUIRE(waitFor([&] { return env.is("c", State::Stopped) && env.is("a", State::Stopped); }));
+  REQUIRE_FALSE(env.call(env.host->startResource("a")));  // fica aguardando, não Failed
+  INFO(env.allLogs());
+  REQUIRE(env.is("a", State::Stopped));
+  REQUIRE(contains(env.st("a").lastError, "aguardando"));
+  REQUIRE(env.is("b", State::Stopped));
+  REQUIRE(contains(env.st("b").lastError, "aguardando"));
+  env.clock.advance(1.5);
+  REQUIRE(waitFor([&] { return env.is("a", State::Running) && env.is("b", State::Running) && env.is("c", State::Running); }));
+  // falha definitiva da dependência propaga "falhou" pela cadeia (o 1º aborto já contou; mais 2 = 3 em 60 s)
+  for (int i = 0; i < 2; ++i) {
+    REQUIRE(waitFor([&] { return env.is("c", State::Running); }));
+    REQUIRE(env.ev("hang"));
+    REQUIRE(waitFor([&] { return !env.is("c", State::Running); }));
+    env.clock.advance(5);
+  }
+  REQUIRE(waitFor([&] { return env.is("c", State::Failed); }));
+  for (const char* n : {"a", "b"}) {
+    INFO(n << ": " << env.st(n).lastError);
+    REQUIRE(env.is(n, State::Stopped));
+    REQUIRE(contains(env.st(n).lastError, "falhou"));
+  }
+}
+
+TEST_CASE("host: control futures resolve false when the supervisor halts, even the stuck one") {
+  HostEnv env;  // revisão ATK3
+  env.addRes("s1", {}, "return {}");
+  env.addRes("s2", {}, "return {}");
+  env.boot();
+  put(env.dir.p / "s1" / "server" / "main.lua", "block() return {}");
+  auto stuck = env.host->restartResource("s1");
+  REQUIRE(waitFor([&] { return env.blocker.entered.load() == 1; }));
+  auto queued = env.host->startResource("s2");  // fica na fila atrás da tarefa presa
+  env.clock.advance(11);
+  REQUIRE(waitFor([&] { return env.host->metrics().halted; }));
+  REQUIRE(stuck.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+  REQUIRE(queued.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+  REQUIRE_FALSE(stuck.get());
+  REQUIRE_FALSE(queued.get());
+  env.blocker.release();
+  REQUIRE(waitFor([&] { return !env.host->metrics().inLuaCall; }));
+  REQUIRE(env.host->metrics().halted);
+}
+
+TEST_CASE("host: a stuck call that returns after the host is destroyed touches nothing") {
+  HostEnv env;  // revisão ATK4 (use-after-free depois do detach)
+  std::atomic<bool> destroyed{false};
+  std::atomic<int> lateLogs{0}, lateHooks{0};
+  auto prevLog = env.opt.log;
+  env.opt.log = [&, prevLog](LogLevel l, const std::string& m) {
+    if (destroyed.load()) {
+      lateLogs.fetch_add(1);
+      return;
+    }
+    prevLog(l, m);
+  };
+  auto prevEvent = env.opt.onEvent;
+  env.opt.onEvent = [&, prevEvent](ScriptContext& ctx, SimToScript& ev) {
+    prevEvent(ctx, ev);
+    if (destroyed.load()) lateHooks.fetch_add(1);
+  };
+  auto prevStop = env.opt.onStopping;
+  env.opt.onStopping = [&, prevStop](ScriptContext& ctx, HostedResource& r) {
+    if (destroyed.load()) lateHooks.fetch_add(1);
+    prevStop(ctx, r);
+  };
+  // depois de voltar do bloqueio o script ainda tenta imprimir (log) e o despachante tenta outro resource
+  env.addRes("s1", {}, "return { stuck = function() block() print('depois') end }");
+  env.addRes("s2", {}, "return { stuck = function() print('s2') end }");
+  env.boot();
+  REQUIRE(env.ev("stuck"));
+  REQUIRE(waitFor([&] { return env.blocker.entered.load() == 1; }));
+  env.clock.advance(11);
+  REQUIRE(waitFor([&] { return env.host->metrics().halted; }));
+  env.destroy();  // desanexa a thread presa
+  destroyed = true;
+  env.clock.closed = true;
+  env.blocker.release();
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  REQUIRE(lateLogs.load() == 0);
+  REQUIRE(lateHooks.load() == 0);
+  REQUIRE(env.clock.lateReads.load() == 0);
 }

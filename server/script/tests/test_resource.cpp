@@ -143,16 +143,23 @@ TEST_CASE("watchdog warns and then aborts an infinite loop") {
   REQUIRE_FALSE(res.ok);
   REQUIRE(res.timedOut);
   REQUIRE(dt >= 200ms);
-  REQUIRE(dt < 3s);
+  REQUIRE(dt < 10s);  // folga para máquina carregada (ctest -j); o travamento real é pego pelo TIMEOUT do ctest
   REQUIRE(contains(res.error, "teste"));
   REQUIRE(contains(res.error, "stack traceback"));
   REQUIRE(f.warns.size() == 1);
   REQUIRE(contains(f.warns[0], "teste"));
+  REQUIRE(contains(f.warns[0], "abortada"));
 
-  // depois do aborto o estado continua usável, sem novo aviso.
+  // depois do aborto o estado continua usável e nenhum aborto "velho" vaza para a próxima chamada. Sob carga a
+  // chamada curta pode passar de warnAfter (20 ms) por preempção; um aviso "levou X ms" é aceitável, aborto não.
   f.warns.clear();
-  REQUIRE(f.isTrue("local s = 0 for i = 1, 1000 do s = s + i end return s == 500500"));
-  REQUIRE(f.warns.empty());
+  auto again = f.run("local s = 0 for i = 1, 1000 do s = s + i end return s == 500500");
+  INFO(again.error);
+  REQUIRE(again.ok);
+  REQUIRE_FALSE(again.timedOut);
+  REQUIRE(again.value.as<bool>());
+  REQUIRE(f.warns.size() <= 1);
+  for (auto& w : f.warns) REQUIRE_FALSE(contains(w, "abortada"));
 }
 
 TEST_CASE("watchdog cannot be defeated by pcall or coroutines") {

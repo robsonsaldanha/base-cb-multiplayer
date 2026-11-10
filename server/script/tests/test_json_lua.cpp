@@ -144,10 +144,10 @@ TEST_CASE("json_lua: depth limit is 32 in both directions") {
   REQUIRE_FALSE(e.ok);
   REQUIRE(contains(e.err, "profundidade"));
   REQUIRE(encode(lua, "local t = {} ; local c = t ; for i = 1, 31 do c[1] = {} ; c = c[1] end ; return t").ok);
-  // ciclo vira erro de profundidade (não laço infinito)
+  // ciclo é recusado (não laço infinito)
   Rt cyc = encode(lua, "local t = {} ; t.self = t ; return t");
   REQUIRE_FALSE(cyc.ok);
-  REQUIRE(contains(cyc.err, "profundidade"));
+  REQUIRE(contains(cyc.err, "ciclo"));
 }
 
 TEST_CASE("json_lua: payloads over 4096 bytes are rejected in both directions") {
@@ -278,4 +278,56 @@ TEST_CASE("json_lua: decode inside a script call under the memory cap fails clea
   REQUIRE(contains(res.res.value.as<std::string>(), "mem"));
   // o estado continua utilizável
   REQUIRE(f.isTrue("collectgarbage('step', 0) ; return decode('[1]')[1] == 1"));
+}
+
+TEST_CASE("json_lua: a repeated table is rejected and big sparse tables are scanned at most once") {
+  Lua lua;
+  Rt rep = encode(lua, "local e = {} ; return {e, e}");
+  REQUIRE_FALSE(rep.ok);
+  REQUIRE(contains(rep.err, "repetida"));
+  REQUIRE(encode(lua, "return {{}, {}}").out == "[[],[]]");
+  // Revisão I-1: tabela com parte de array enorme e vazia, referenciada 1500 vezes. Antes: ~22 s numa chamada C.
+  for (int n : {1 << 20, 1 << 22}) {
+    INFO(n);
+    lua.s["N"] = n;
+    lua.s.script("E = {} ; for i = 1, N do E[i] = true end ; for i = 1, N do E[i] = nil end ; "
+                 "L = {} ; for i = 1, 1500 do L[i] = E end");
+    struct R {
+      bool ok;
+      std::string err;
+      long long ms;
+    };
+    R r = guarded("luaToJson shared sparse table", [&] {
+      lua_State* L = lua.L();
+      lua_getglobal(L, "L");
+      std::string out, err;
+      auto t0 = std::chrono::steady_clock::now();
+      bool ok = luaToJson(L, -1, out, err);
+      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+      lua_pop(L, 1);
+      return R{ok, err, ms};
+    });
+    REQUIRE_FALSE(r.ok);
+    REQUIRE(contains(r.err, "repetida"));
+    REQUIRE(r.ms < 1000);
+  }
+}
+
+TEST_CASE("json_lua: numbers out of double range and edge values") {
+  Lua lua;
+  std::string err;
+  int top = lua_gettop(lua.L());
+  REQUIRE_FALSE(jsonToLua(lua.L(), "1E400", err));
+  REQUIRE(contains(err, "fora do intervalo"));
+  REQUIRE_FALSE(jsonToLua(lua.L(), "[1,{\"a\":-1e999}]", err));
+  REQUIRE(lua_gettop(lua.L()) == top);
+  REQUIRE(roundTrip(lua.L(), "-0").out == "0");
+  REQUIRE(roundTrip(lua.L(), "-0.0").out == "-0.0");
+  REQUIRE(nlohmann::json::parse(roundTrip(lua.L(), "18446744073709551615").out).is_number_float());
+  REQUIRE(nlohmann::json::parse(roundTrip(lua.L(), "-9223372036854775809").out).is_number_float());
+  REQUIRE_FALSE(jsonToLua(lua.L(), R"("\ud800")", err));  // surrogate solto (escape JSON)
+  // sem sentinela, null em array vira buraco: a volta é um objeto (documentado)
+  REQUIRE(nlohmann::json::parse(roundTrip(lua.L(), "[1,null,3]").out) ==
+          nlohmann::json::parse(R"({"1":1,"3":3})"));
+  REQUIRE(roundTrip(lua.L(), "{}").out == "[]");
 }

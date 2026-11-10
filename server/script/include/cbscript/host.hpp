@@ -5,9 +5,12 @@
 // - simulação: post / publishPlayers / drainCommands. Nunca esperam a thread de scripts: os mutexes envolvidos só
 //   protegem trocas O(1) de fila/ponteiro e nunca ficam presos enquanto o Lua roda.
 // - scripts (1): todo o Lua, os ganchos (HostOptions::on*) e as tarefas (runOnScriptThread).
-// - supervisor (1): olha o "batimento" (início/fim de cada chamada ao Lua). Chamada que passa de
-//   abortAfter + supervisorGraceSec (relógio injetado) sem voltar → log CRÍTICO, todos os resources Failed, eventos
-//   passam a ser descartados e o host fica parado para sempre (não religa sozinho, nem quando a chamada voltar).
+// - supervisor (1): olha o "batimento" (início/fim de cada chamada ao Lua, em qualquer nível de aninhamento). Sem
+//   batimento por mais de abortAfter + supervisorGraceSec (relógio injetado) com chamada aberta → log CRÍTICO, todos
+//   os resources Failed, eventos passam a ser descartados, pedidos de controle pendentes resolvem false e o host
+//   fica parado para sempre (não religa sozinho, nem quando a chamada voltar).
+// - Se o ScriptHost for destruído com a chamada ainda presa, a thread de scripts é desanexada e, quando (se) a
+//   chamada voltar, estaciona para sempre sem tocar em log, ganchos ou Lua (o estado vaza de propósito).
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -77,7 +80,9 @@ class ScriptContext {
 };
 
 struct HostOptions {
-  size_t eventQueueCapacity = 65536;    // acima disto: eventos de cliente e comandos descartados (Join/Leave nunca)
+  // Acima disto, eventos de cliente são descartados. Join/Leave e comandos (raros, de admin) passam do limite até o
+  // teto rígido de 4× a capacidade: dali em diante tudo é descartado, com log CRÍTICO (1 por episódio) e métrica.
+  size_t eventQueueCapacity = 65536;
   size_t commandQueueCapacity = 65536;  // scripts → simulação
   double supervisorGraceSec = 10.0;     // supervisor dispara em abortAfter + isto
   std::chrono::milliseconds supervisorPeriod{100};  // período real de checagem do supervisor
@@ -95,7 +100,8 @@ struct HostOptions {
 };
 
 struct HostMetrics {
-  uint64_t eventsDropped = 0;
+  uint64_t eventsDropped = 0;          // total de eventos descartados (inclui os do teto rígido)
+  uint64_t eventsBackstopDropped = 0;  // descartados pelo teto rígido (4× a capacidade), inclusive Join/Leave
   uint64_t commandsDropped = 0;
   size_t eventQueueDepth = 0;
   bool halted = false;  // supervisor disparou
@@ -117,7 +123,7 @@ class ScriptHost {
   void start();
 
   // ---- Chamados pela simulação (não bloqueiam) ----
-  bool post(SimToScript ev);  // false se descartado (fila cheia para cliente/comando, ou host parado)
+  bool post(SimToScript ev);  // false se descartado (fila cheia para evento de cliente, teto rígido, host parado)
   void publishPlayers(PlayersSnapshot players);
   void drainCommands(std::vector<ScriptToSim>& out);  // acrescenta ao fim de `out`
 
