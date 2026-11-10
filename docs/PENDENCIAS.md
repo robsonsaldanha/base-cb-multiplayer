@@ -86,6 +86,16 @@ Decisões registradas e limites aceitos; o comportamento atual está documentado
 
 ## Antes de abrir ao público
 
+- **Launcher (sub4)**:
+  - releases assinadas com a versão no comentário confiável (mod `cbmp-mod protocol=<N> version=<X.Y.Z>
+    sha256=<hex>`; launcher `--app-version`); um release antigo assinado sem versão é recusado pelo launcher
+    (`requireSignedVersion`). Rollback do launcher para uma versão antiga assinada continua impossível só enquanto
+    essa opção ficar ligada.
+  - "Limpar cache" com o jogo aberto pode apagar arquivos montados em uso (o launcher não acompanha o processo do
+    jogo depois de abrir); a UI deve avisar.
+  - Instalação do mod com disco cheio: a troca é atômica (staging + rename), mas não há teste automatizado de disco
+    cheio.
+
 - **Pacote de distribuição do `cb-server`**: levar `libmariadb.so*`/`libmariadb.dll` (LGPL, ligada dinamicamente) com
   o aviso de licença, a pasta `plugins/libmariadb/` ao lado do executável (sem ela, MySQL 8 com
   `caching_sha2_password` e contas `ed25519` não conectam) e, no Linux, depender de `ca-certificates`. Conferir o

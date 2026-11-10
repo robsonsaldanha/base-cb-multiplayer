@@ -283,11 +283,14 @@ pub async fn play(
 ) -> AppResult<LaunchOutcome> {
     let run = gate.try_begin()?;
     let settings = state.get_settings();
-    // Simulando, o jogo não é necessário (nem procurado). Senão: leitura curta de registro/disco.
+    // Simulando, o jogo não é necessário (nem procurado). Senão: registro/disco fora do executor assíncrono.
     let game = if settings.simulate_launch {
         None
     } else {
-        resolve_game(state.inner())
+        let h = app.clone();
+        tokio::task::spawn_blocking(move || resolve_game(&h.state::<AppState>()))
+            .await
+            .map_err(|_| AppError::new("internal_error", "Falha interna ao procurar o jogo."))?
     };
     let ctx = PlayContext {
         auth: auth.inner().clone(),

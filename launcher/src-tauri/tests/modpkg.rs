@@ -45,11 +45,29 @@ fn tauri_sig(k: &Keys, data: &[u8]) -> String {
     STANDARD.encode(raw_sig(k, data))
 }
 
-/// Texto do `.sig` como o minisign grava.
+/// Texto do `.sig` como o minisign grava (comentário confiável padrão: `timestamp:...`).
 fn raw_sig(k: &Keys, data: &[u8]) -> String {
-    minisign::sign(Some(&k.pk), &k.sk, Cursor::new(data), None, None)
+    raw_sig_with(k, data, None)
+}
+
+fn raw_sig_with(k: &Keys, data: &[u8], trusted: Option<&str>) -> String {
+    minisign::sign(Some(&k.pk), &k.sk, Cursor::new(data), trusted, None)
         .unwrap()
         .to_string()
+}
+
+/// Comentário confiável que o workflow de release grava na assinatura do mod.
+fn mod_comment(protocol: u32, version: &str, sha256: &str) -> String {
+    format!("cbmp-mod protocol={protocol} version={version} sha256={sha256}")
+}
+
+/// Assinatura de mod como a do release (base64 do `.sig`, comentário `cbmp-mod ...`).
+fn mod_sig(k: &Keys, data: &[u8], protocol: u32, version: &str) -> String {
+    STANDARD.encode(raw_sig_with(
+        k,
+        data,
+        Some(&mod_comment(protocol, version, &sha_hex(data))),
+    ))
 }
 
 fn sha_hex(data: &[u8]) -> String {
@@ -64,7 +82,8 @@ fn minisign_valido_alterado_chave_errada_e_sem_assinatura() {
     let k = keys();
     let data = b"conteudo do mod".to_vec();
     let pk = tauri_pubkey(&k);
-    verify_minisign(&data, &tauri_sig(&k, &data), &pk).unwrap();
+    let comment = verify_minisign(&data, &tauri_sig(&k, &data), &pk).unwrap();
+    assert!(comment.starts_with("timestamp:"), "{comment}");
     // `.sig` e `.pub` em texto puro (como o minisign grava) também valem.
     verify_minisign(
         &data,
@@ -76,19 +95,19 @@ fn minisign_valido_alterado_chave_errada_e_sem_assinatura() {
     let mut altered = data.clone();
     altered[0] ^= 1;
     let e = verify_minisign(&altered, &tauri_sig(&k, &data), &pk).unwrap_err();
-    assert_eq!(e.code, "signature_invalid");
+    assert_eq!(e.code, "mod_signature_invalid");
 
     let other = keys();
     let e = verify_minisign(&data, &tauri_sig(&other, &data), &pk).unwrap_err();
-    assert_eq!(e.code, "signature_invalid");
+    assert_eq!(e.code, "mod_signature_invalid");
 
     for sig in ["", "   ", "nao-e-base64!", &STANDARD.encode("lixo")] {
         let e = verify_minisign(&data, sig, &pk).unwrap_err();
-        assert_eq!(e.code, "signature_invalid", "{sig:?}");
+        assert_eq!(e.code, "mod_signature_invalid", "{sig:?}");
     }
     // Chave pública inválida também recusa (nunca "passa" sem verificar).
     let e = verify_minisign(&data, &tauri_sig(&k, &data), "").unwrap_err();
-    assert_eq!(e.code, "signature_invalid");
+    assert_eq!(e.code, "mod_signature_invalid");
 }
 
 // ----- zip -----
@@ -378,15 +397,32 @@ async fn env() -> Env {
 
 impl Env {
     fn publish(&self, version: &str, entries: &[Entry]) -> Vec<u8> {
-        let zip = zip_bytes(entries);
+        self.publish_p(3, version, entries)
+    }
+
+    fn publish_p(&self, protocol: u32, version: &str, entries: &[Entry]) -> Vec<u8> {
+        self.publish_zip(
+            zip_bytes(entries),
+            mod_sig_for(&self.keys, protocol, version),
+        )
+        .1
+    }
+
+    /// Publica `zip` com a assinatura que `sign` produz para ele; devolve (versão anunciada, zip).
+    fn publish_zip(&self, zip: Vec<u8>, sign: Signer) -> (String, Vec<u8>) {
+        let (version, sign) = sign;
         let p = Published {
-            version: version.into(),
-            signature: tauri_sig(&self.keys, &zip),
+            version: version.clone(),
+            signature: sign(&zip),
             sha256: sha_hex(&zip),
             zip: zip.clone(),
         };
         self.fake.lock().unwrap().published = Some(p);
-        zip
+        (version, zip)
+    }
+
+    fn package(&self) -> std::path::PathBuf {
+        self.mods.join("package")
     }
 
     fn downloads(&self) -> u32 {
@@ -402,6 +438,20 @@ impl Env {
             .await
     }
 }
+
+/// Versão anunciada + assinador "do release" (protocolo/versão/sha256 do próprio zip).
+fn mod_sig_for(k: &Keys, protocol: u32, version: &str) -> Signer {
+    let (pk, sk) = (k.pk.clone(), k.sk.clone());
+    let v = version.to_string();
+    let keys = Keys { pk, sk };
+    (
+        version.to_string(),
+        Box::new(move |zip: &[u8]| mod_sig(&keys, zip, protocol, &v)),
+    )
+}
+
+/// Versão anunciada + função que assina um zip.
+type Signer = (String, Box<dyn Fn(&[u8]) -> String>);
 
 fn record(mods: &Path) -> serde_json::Value {
     serde_json::from_slice(&std::fs::read(mods.join("installed.json")).unwrap()).unwrap()
@@ -475,13 +525,22 @@ async fn reinstala_quando_um_arquivo_instalado_muda_ou_some() {
     let dll = mod_dir(&e.game).join("cbmp.dll");
     std::fs::write(&dll, b"v1-adulterado").unwrap();
     assert!(!e.installer.check_installed(&e.game).unwrap());
+    // Reparo pelo pacote assinado guardado em `mods\package`: sem novo download.
     let st = e.ensure(3).await.unwrap();
     assert!(st.changed);
     assert_eq!(std::fs::read(&dll).unwrap(), b"v1");
-    assert_eq!(e.downloads(), 2);
+    assert_eq!(e.downloads(), 1);
+    assert!(e.package().join("cbmp-mod.zip").is_file());
 
+    // Sem pacote local (ou pacote adulterado): baixa de novo do Hub.
     std::fs::remove_file(mod_dir(&e.game).join("b.bin")).unwrap();
+    std::fs::write(e.package().join("cbmp-mod.zip"), b"lixo").unwrap();
     assert!(!e.installer.check_installed(&e.game).unwrap());
+    e.ensure(3).await.unwrap();
+    assert_eq!(e.downloads(), 2);
+    assert!(e.installer.check_installed(&e.game).unwrap());
+    std::fs::remove_dir_all(e.package()).unwrap();
+    std::fs::remove_file(&dll).unwrap();
     e.ensure(3).await.unwrap();
     assert_eq!(e.downloads(), 3);
     assert!(e.installer.check_installed(&e.game).unwrap());
@@ -523,7 +582,18 @@ async fn hub_com_versao_menor_nunca_faz_downgrade() {
         b"v2"
     );
 
-    // Instalada alterada e o Hub só tem versão menor: recusa (não baixa a menor).
+    // Instalada alterada e o Hub só tem versão menor: repara pelo pacote local (mesma versão, não é downgrade).
+    std::fs::write(mod_dir(&e.game).join("cbmp.dll"), b"x").unwrap();
+    let st = e.ensure(3).await.unwrap();
+    assert_eq!((st.version.as_str(), st.changed), ("2.0.0", true));
+    assert_eq!(
+        std::fs::read(mod_dir(&e.game).join("cbmp.dll")).unwrap(),
+        b"v2"
+    );
+    assert_eq!(e.downloads(), 1);
+
+    // Sem pacote local: recusa (não baixa a menor).
+    std::fs::remove_dir_all(e.package()).unwrap();
     std::fs::write(mod_dir(&e.game).join("cbmp.dll"), b"x").unwrap();
     let err = e.ensure(3).await.unwrap_err();
     assert_eq!(err.code, "mod_altered");
@@ -539,7 +609,7 @@ async fn outro_protocolo_instala_a_versao_oferecida() {
     let e = env().await;
     e.publish("5.0.0", &[Entry::File("cbmp.dll", b"p3")]);
     e.ensure(3).await.unwrap();
-    e.publish("1.0.0", &[Entry::File("cbmp.dll", b"p4")]);
+    e.publish_p(4, "1.0.0", &[Entry::File("cbmp.dll", b"p4")]);
     let st = e.ensure(4).await.unwrap();
     assert!(st.changed);
     assert_eq!((st.version.as_str(), st.protocol), ("1.0.0", 4));
@@ -566,15 +636,15 @@ async fn hash_ou_assinatura_errados_nao_instalam_nada() {
     {
         let mut f = e.fake.lock().unwrap();
         let p = f.published.as_mut().unwrap();
-        p.signature = tauri_sig(&other, &p.zip);
+        p.signature = mod_sig(&other, &p.zip, 3, "1.0.0");
     }
     let err = e.ensure(3).await.unwrap_err();
-    assert_eq!(err.code, "signature_invalid");
+    assert_eq!(err.code, "mod_signature_invalid");
     assert!(!mod_dir(&e.game).exists());
 
     // Assinatura vazia.
     e.fake.lock().unwrap().published.as_mut().unwrap().signature = " ".into();
-    assert_eq!(e.ensure(3).await.unwrap_err().code, "signature_invalid");
+    assert_eq!(e.ensure(3).await.unwrap_err().code, "mod_signature_invalid");
     assert!(!mod_dir(&e.game).exists());
     assert!(
         files_under(&e.mods).is_empty(),
@@ -624,6 +694,7 @@ async fn conexao_cortada_tenta_de_novo_e_avisa_lentidao() {
     assert_eq!(e.downloads(), 3, "3 tentativas");
 
     std::fs::remove_dir_all(mod_dir(&e.game)).unwrap();
+    std::fs::remove_dir_all(e.package()).unwrap();
     e.fake.lock().unwrap().truncate_next = 3;
     let err = e.ensure(3).await.unwrap_err();
     assert_eq!(err.code, "download_slow");
@@ -648,4 +719,177 @@ async fn cancelado_nao_instala() {
     let err = e.installer.ensure(&e.hub, 3, &e.game, c).await.unwrap_err();
     assert_eq!(err.code, "cancelled");
     assert!(!mod_dir(&e.game).exists());
+}
+
+// ----- o que está assinado manda (I-1) -----
+
+#[tokio::test]
+async fn versao_ou_protocolo_anunciados_diferentes_do_assinado_sao_recusados() {
+    let e = env().await;
+    let zip = zip_bytes(&[Entry::File("cbmp.dll", b"v1")]);
+    let k = Keys {
+        pk: e.keys.pk.clone(),
+        sk: e.keys.sk.clone(),
+    };
+    let cases: Vec<(&str, String)> = vec![
+        // Zip assinado como 1.0.0 anunciado como 9.9.9 (rollback disfarçado de upgrade).
+        ("9.9.9", mod_sig(&k, &zip, 3, "1.0.0")),
+        // Assinado para o protocolo 2, servido como 3.
+        ("1.0.0", mod_sig(&k, &zip, 2, "1.0.0")),
+        // Sem o comentário `cbmp-mod` (assinatura comum do minisign/Tauri).
+        ("1.0.0", tauri_sig(&k, &zip)),
+        // sha256 assinado de outro zip.
+        (
+            "1.0.0",
+            STANDARD.encode(raw_sig_with(
+                &k,
+                &zip,
+                Some(&mod_comment(3, "1.0.0", &sha_hex(b"outro"))),
+            )),
+        ),
+        // Campo a mais / formato diferente.
+        (
+            "1.0.0",
+            STANDARD.encode(raw_sig_with(
+                &k,
+                &zip,
+                Some(&format!(
+                    "{} extra=1",
+                    mod_comment(3, "1.0.0", &sha_hex(&zip))
+                )),
+            )),
+        ),
+    ];
+    for (announced, sig) in cases {
+        e.fake.lock().unwrap().published = Some(Published {
+            version: announced.into(),
+            zip: zip.clone(),
+            signature: sig,
+            sha256: sha_hex(&zip),
+        });
+        let err = e.ensure(3).await.unwrap_err();
+        assert_eq!(err.code, "mod_signature_invalid", "{announced}");
+        assert!(!mod_dir(&e.game).exists());
+        assert!(!e.mods.join("installed.json").exists());
+    }
+}
+
+#[tokio::test]
+async fn versao_registrada_e_a_assinada() {
+    let e = env().await;
+    e.publish("1.2.0", &[Entry::File("cbmp.dll", b"v12")]);
+    e.ensure(3).await.unwrap();
+    assert_eq!(record(&e.mods)["version"], "1.2.0");
+    // Um Hub comprometido anuncia um zip velho (assinado 1.0.0) como 99.0.0: recusado, 1.2.0 continua.
+    let old = zip_bytes(&[Entry::File("cbmp.dll", b"v10")]);
+    let k = Keys {
+        pk: e.keys.pk.clone(),
+        sk: e.keys.sk.clone(),
+    };
+    e.fake.lock().unwrap().published = Some(Published {
+        version: "99.0.0".into(),
+        signature: mod_sig(&k, &old, 3, "1.0.0"),
+        sha256: sha_hex(&old),
+        zip: old,
+    });
+    assert_eq!(e.ensure(3).await.unwrap_err().code, "mod_signature_invalid");
+    assert_eq!(record(&e.mods)["version"], "1.2.0");
+    assert_eq!(
+        std::fs::read(mod_dir(&e.game).join("cbmp.dll")).unwrap(),
+        b"v12"
+    );
+    // E a versão nova de verdade continua sendo aceita.
+    e.publish("1.3.0", &[Entry::File("cbmp.dll", b"v13")]);
+    assert_eq!(e.ensure(3).await.unwrap().version, "1.3.0");
+}
+
+// ----- instalação atômica (I-2) -----
+
+/// Zip "stored" com o byte `marker` do conteúdo de `name` trocado: o CRC só falha na extração.
+fn crc_broken_zip(entries: &[(&str, &[u8])], marker: &[u8]) -> Vec<u8> {
+    let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, data) in entries {
+        w.start_file(*name, opts).unwrap();
+        w.write_all(data).unwrap();
+    }
+    let mut z = w.finish().unwrap().into_inner();
+    let at = z
+        .windows(marker.len())
+        .position(|win| win == marker)
+        .expect("marcador");
+    z[at] ^= 0xFF;
+    z
+}
+
+#[tokio::test]
+async fn zip_que_falha_no_meio_da_extracao_preserva_o_mod_instalado() {
+    let e = env().await;
+    e.publish(
+        "1.0.1",
+        &[
+            Entry::File("a.dll", b"bom-a"),
+            Entry::File("b.dll", b"bom-b"),
+        ],
+    );
+    e.ensure(3).await.unwrap();
+    // 1.0.2 assinado (por um build comprometido, por exemplo) com o CRC do 2º arquivo quebrado.
+    let bad = crc_broken_zip(
+        &[("a.dll", b"novo-a"), ("b.dll", b"MARCADOR-CRC-XYZ")],
+        b"MARCADOR-CRC-XYZ",
+    );
+    e.publish_zip(bad, mod_sig_for(&e.keys, 3, "1.0.2"));
+    let err = e.ensure(3).await.unwrap_err();
+    assert_eq!(err.code, "mod_invalid", "{err}");
+    assert!(e.installer.check_installed(&e.game).unwrap());
+    assert_eq!(record(&e.mods)["version"], "1.0.1");
+    assert_eq!(
+        std::fs::read(mod_dir(&e.game).join("a.dll")).unwrap(),
+        b"bom-a"
+    );
+    let win64 = mod_dir(&e.game).parent().unwrap().to_path_buf();
+    assert!(!win64.join("cbmp.staging").exists() && !win64.join("cbmp.old").exists());
+}
+
+#[test]
+fn tamanho_mentiroso_nao_mexe_na_pasta_existente() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("cbmp");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("atual.dll"), b"funciona").unwrap();
+    let mut bytes = zip_bytes(&[
+        Entry::File("a.dll", b"1"),
+        Entry::File("b.dll", &[7u8; 4096]),
+    ]);
+    patch_declared_size(&mut bytes, "b.dll", 10);
+    let z = write_zip(tmp.path(), &bytes);
+    assert_eq!(extract_zip(&z, &dest).unwrap_err().code, "mod_invalid");
+    assert_eq!(files_under(&dest), vec!["atual.dll"]);
+    assert!(!tmp.path().join("cbmp.staging").exists());
+    // Zip bom troca a pasta inteira.
+    let good = write_zip(tmp.path(), &zip_bytes(&[Entry::File("novo.dll", b"n")]));
+    extract_zip(&good, &dest).unwrap();
+    assert_eq!(files_under(&dest), vec!["novo.dll"]);
+    assert!(!tmp.path().join("cbmp.old").exists());
+}
+
+#[test]
+fn sobras_de_troca_interrompida_sao_resolvidas() {
+    use cbmp_launcher_lib::modpkg::recover_mod_dir;
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("cbmp");
+    // Queda entre `cbmp` → `cbmp.old` e `cbmp.staging` → `cbmp`: a versão anterior volta.
+    std::fs::create_dir_all(tmp.path().join("cbmp.old")).unwrap();
+    std::fs::write(tmp.path().join("cbmp.old").join("v1.dll"), b"1").unwrap();
+    std::fs::create_dir_all(tmp.path().join("cbmp.staging")).unwrap();
+    std::fs::write(tmp.path().join("cbmp.staging").join("meio.dll"), b"?").unwrap();
+    recover_mod_dir(&dest).unwrap();
+    assert_eq!(files_under(&dest), vec!["v1.dll"]);
+    assert!(!tmp.path().join("cbmp.old").exists() && !tmp.path().join("cbmp.staging").exists());
+    // Queda depois da troca: `cbmp` novo existe e `cbmp.old` sobrou → `.old` sai.
+    std::fs::create_dir_all(tmp.path().join("cbmp.old")).unwrap();
+    recover_mod_dir(&dest).unwrap();
+    assert_eq!(files_under(&dest), vec!["v1.dll"]);
+    assert!(!tmp.path().join("cbmp.old").exists());
 }

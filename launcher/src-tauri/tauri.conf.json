@@ -48,6 +48,7 @@
     },
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJEQ0I0NzgwOTFFOTE2MjkKUldRcEZ1bVJnRWZMdmJmTTJ1aXo5TVRyVldxa2RXUW5oMmNPWmp3eFR4Uml5YUoxMndOS3BQSlMK",
+      "requireSignedVersion": true,
       "endpoints": ["https://hub.cbmp.invalid/v1/launcher/update/{{target}}/{{arch}}/{{current_version}}"],
       "windows": { "installMode": "passive" }
     }

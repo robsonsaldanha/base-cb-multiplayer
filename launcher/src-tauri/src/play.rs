@@ -142,6 +142,17 @@ fn unavailable(msg: &str) -> AppError {
     )
 }
 
+/// Corre `fut` contra o cancelamento (pedidos ao Hub/servidor não esperam o prazo de rede para parar).
+async fn cancellable<T>(
+    cancel: &CancellationToken,
+    fut: impl std::future::Future<Output = AppResult<T>>,
+) -> AppResult<T> {
+    tokio::select! {
+        _ = cancel.cancelled() => Err(cancelled()),
+        r = fut => r,
+    }
+}
+
 async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> AppResult<T> + Send + 'static,
 ) -> AppResult<T> {
@@ -172,7 +183,7 @@ pub async fn play(
     }
 
     let hub = ctx.auth.hub();
-    let detail = hub.server(server_id).await?;
+    let detail = cancellable(&cancel, hub.server(server_id)).await?;
     if !detail.online {
         return Err(unavailable("offline"));
     }
@@ -191,13 +202,13 @@ pub async fn play(
     check()?;
 
     on_stage(Stage::Ticket);
-    let mut ticket = ctx.auth.ticket(server_id).await?;
+    let mut ticket = cancellable(&cancel, ctx.auth.ticket(server_id)).await?;
     let issued_at = (ctx.clock)();
     check()?;
 
     on_stage(Stage::Manifest);
     let base = content::server_base_url(&host, http_port)?;
-    let manifest = content::fetch_manifest(&base).await?;
+    let manifest = cancellable(&cancel, content::fetch_manifest(&base)).await?;
     content::validate_manifest(&manifest, server_id, protocol, &ctx.limits)?;
     check()?;
 
@@ -237,7 +248,7 @@ pub async fn play(
     on_stage(Stage::Connect);
     if (ctx.clock)() - issued_at > TICKET_RENEW_AFTER_SECS {
         log::info!("ticket renovado antes de abrir");
-        ticket = ctx.auth.ticket(server_id).await?;
+        ticket = cancellable(&cancel, ctx.auth.ticket(server_id)).await?;
     }
     let info = ConnectInfo {
         host,

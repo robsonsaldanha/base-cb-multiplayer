@@ -2,14 +2,22 @@
 //!
 //! - Baixa com 3 tentativas e espera crescente (o Hub derruba quem fica abaixo de 32 KiB/s e não serve `Range`),
 //!   confere tamanho e sha256 anunciados e a assinatura minisign com a chave embutida (`keys/update.pub`, a mesma do
-//!   updater). Assinatura inválida → nada é instalado.
+//!   updater).
+//! - **O que está assinado manda, não o Hub.** O comentário confiável da assinatura (coberto por ela) tem de ser
+//!   exatamente `cbmp-mod protocol=<N> version=<X.Y.Z> sha256=<hex>` e bater com o protocolo pedido, a versão
+//!   anunciada e o sha256 do zip. A versão registrada e usada na regra de downgrade é a assinada. Qualquer
+//!   divergência → `mod_signature_invalid` e nada é instalado.
 //! - Zip validado inteiro antes de gravar: só caminhos relativos seguros (sem `..`, absolutos, `\`, `:`, segmentos
 //!   vazios), sem links, sem criptografia, só stored/deflate, cada arquivo até 512 MiB declarados e o total até 2 GiB.
 //!   A extração confere que cada arquivo tem exatamente o tamanho declarado.
-//! - Instala só em `<jogo>\Phoenix\Binaries\Win64\cbmp\` (pasta inteira do launcher, trocada a cada instalação); nada
-//!   fora dela no jogo. `mods\installed.json` guarda versão, protocolo, pasta do jogo e sha256 de cada arquivo; é
-//!   apagado antes de mexer na pasta e gravado por último, então instalação interrompida reinstala na próxima vez.
-//! - Nunca faz downgrade: versão oferecida menor (semver) que a instalada no mesmo protocolo mantém a instalada.
+//! - **Instalação atômica** em `<jogo>\Phoenix\Binaries\Win64\cbmp\` (pasta inteira do launcher; nada fora dela no
+//!   jogo): extrai em `cbmp.staging` (mesma pasta pai), relê cada arquivo e confere o hash, e só então troca
+//!   (`cbmp` → `cbmp.old`, `cbmp.staging` → `cbmp`, apaga `cbmp.old`). Qualquer falha antes da troca deixa o mod que
+//!   funciona intacto; sobras de uma queda são resolvidas na próxima vez ([`recover_mod_dir`]).
+//! - `mods\installed.json` guarda versão (assinada), protocolo, pasta do jogo e sha256 de cada arquivo; o zip
+//!   assinado e o `.sig` ficam em `mods\package\` para reparo local (arquivos alterados → reinstala do pacote, com a
+//!   assinatura conferida de novo, sem depender do Hub).
+//! - Nunca faz downgrade: versão menor (semver) que a instalada no mesmo protocolo mantém a instalada.
 
 use crate::content::{hex, remove_entry, safe_rel_path};
 use crate::error::{AppError, AppResult};
@@ -41,6 +49,12 @@ pub const MOD_FOLDER: &str = "cbmp";
 const RETRY_DELAY: Duration = Duration::from_secs(3);
 const INSTALLED_FILE: &str = "installed.json";
 const DOWNLOAD_DIR: &str = "download";
+/// Último pacote instalado (zip assinado + `.sig`), para reparo local.
+const PACKAGE_DIR: &str = "package";
+const PACKAGE_ZIP: &str = "cbmp-mod.zip";
+const PACKAGE_SIG: &str = "cbmp-mod.zip.sig";
+/// Começo do comentário confiável da assinatura do mod.
+pub const MOD_COMMENT_PREFIX: &str = "cbmp-mod";
 /// Assinatura minisign antiga (sem pré-hash) exige o arquivo inteiro na memória: só até este tamanho.
 const MAX_LEGACY_SIGNED: u64 = 64 * 1024 * 1024;
 
@@ -83,7 +97,7 @@ pub fn mod_dir(game: &GameInstall) -> PathBuf {
 
 fn signature_invalid() -> AppError {
     AppError::new(
-        "signature_invalid",
+        "mod_signature_invalid",
         "A assinatura do mod não confere; nada foi instalado.",
     )
 }
@@ -134,25 +148,28 @@ fn decode_signature(sig: &str) -> AppResult<minisign_verify::Signature> {
     minisign_verify::Signature::decode(&text).map_err(|_| signature_invalid())
 }
 
-/// Confere a assinatura minisign de `data` (`sig`/`pubkey` em texto ou base64 do texto, como no Tauri). Aceita o
-/// formato antigo sem pré-hash, como o plugin updater.
-pub fn verify_minisign(data: &[u8], sig: &str, pubkey: &str) -> AppResult<()> {
+/// Confere a assinatura minisign de `data` (`sig`/`pubkey` em texto ou base64 do texto, como no Tauri) e devolve o
+/// comentário confiável (coberto pela assinatura). Aceita o formato antigo sem pré-hash, como o plugin updater.
+pub fn verify_minisign(data: &[u8], sig: &str, pubkey: &str) -> AppResult<String> {
     let pk = decode_pubkey(pubkey)?;
     let sig = decode_signature(sig)?;
     pk.verify(data, &sig, true).map_err(|_| {
         log::warn!("assinatura minisign recusada");
         signature_invalid()
-    })
+    })?;
+    Ok(sig.trusted_comment().to_string())
 }
 
-/// Como [`verify_minisign`], lendo o arquivo em blocos (assinatura com pré-hash, a padrão).
-pub fn verify_minisign_file(path: &Path, sig: &str, pubkey: &str) -> AppResult<()> {
+/// Como [`verify_minisign`], lendo o arquivo em blocos. Devolve o comentário confiável e o sha256 do arquivo.
+pub fn verify_minisign_file(path: &Path, sig: &str, pubkey: &str) -> AppResult<(String, String)> {
     let pk = decode_pubkey(pubkey)?;
     let signature = decode_signature(sig)?;
     let io = |e: std::io::Error| AppError::io(path, &e);
+    let comment = signature.trusted_comment().to_string();
     match pk.verify_stream(&signature) {
         Ok(mut v) => {
             let mut f = std::fs::File::open(path).map_err(io)?;
+            let mut hasher = Sha256::new();
             let mut buf = vec![0u8; 256 * 1024];
             loop {
                 let n = f.read(&mut buf).map_err(io)?;
@@ -160,11 +177,13 @@ pub fn verify_minisign_file(path: &Path, sig: &str, pubkey: &str) -> AppResult<(
                     break;
                 }
                 v.update(&buf[..n]);
+                hasher.update(&buf[..n]);
             }
             v.finalize().map_err(|_| {
                 log::warn!("assinatura minisign recusada");
                 signature_invalid()
-            })
+            })?;
+            Ok((comment, hex(&hasher.finalize())))
         }
         Err(minisign_verify::Error::UnsupportedLegacyMode) => {
             let len = std::fs::metadata(path).map_err(io)?.len();
@@ -173,13 +192,62 @@ pub fn verify_minisign_file(path: &Path, sig: &str, pubkey: &str) -> AppResult<(
             }
             let data = std::fs::read(path).map_err(io)?;
             pk.verify(&data, &signature, true)
-                .map_err(|_| signature_invalid())
+                .map_err(|_| signature_invalid())?;
+            Ok((comment, hex(&Sha256::digest(&data))))
         }
         Err(_) => {
             log::warn!("assinatura minisign de outra chave");
             Err(signature_invalid())
         }
     }
+}
+
+/// O que a assinatura do mod garante (comentário confiável).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedMod {
+    pub protocol: u32,
+    pub version: semver::Version,
+    pub sha256: String,
+}
+
+/// Lê `cbmp-mod protocol=<N> version=<X.Y.Z> sha256=<hex>` (exatamente esses campos, nessa ordem).
+pub fn parse_mod_comment(comment: &str) -> Option<SignedMod> {
+    let mut it = comment.trim().split(' ');
+    if it.next()? != MOD_COMMENT_PREFIX {
+        return None;
+    }
+    let protocol = it.next()?.strip_prefix("protocol=")?;
+    let version = it.next()?.strip_prefix("version=")?;
+    let sha256 = it.next()?.strip_prefix("sha256=")?;
+    if it.next().is_some()
+        || protocol.is_empty()
+        || !protocol.bytes().all(|b| b.is_ascii_digit())
+        || sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    Some(SignedMod {
+        protocol: protocol.parse().ok()?,
+        version: semver::Version::parse(version).ok()?,
+        sha256: sha256.to_string(),
+    })
+}
+
+/// Confere a assinatura do zip em `path` e devolve o que ela garante. O sha256 assinado tem de ser o do arquivo.
+pub fn verify_mod_file(path: &Path, sig: &str, pubkey: &str) -> AppResult<SignedMod> {
+    let (comment, sha) = verify_minisign_file(path, sig, pubkey)?;
+    let signed = parse_mod_comment(&comment).ok_or_else(|| {
+        log::warn!("assinatura do mod sem o comentário confiável cbmp-mod");
+        signature_invalid()
+    })?;
+    if signed.sha256 != sha {
+        log::warn!("sha256 assinado não é o do zip");
+        return Err(signature_invalid());
+    }
+    Ok(signed)
 }
 
 // ----- zip -----
@@ -269,16 +337,38 @@ fn join_rel(base: &Path, rel: &str) -> PathBuf {
     rel.split('/').fold(base.to_path_buf(), |p, s| p.join(s))
 }
 
-/// Extrai `zip` em `dest` com segurança: valida tudo antes (nada é gravado se algo for recusado), troca a pasta
-/// `dest` inteira e devolve cada arquivo com sha256 (ordenado por caminho).
-pub fn extract_zip(zip: &Path, dest: &Path) -> AppResult<Vec<InstalledFile>> {
-    let (mut ar, planned) = open_planned(zip)?;
+fn sibling(dest: &Path, suffix: &str) -> PathBuf {
+    let mut name = dest.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    dest.with_file_name(name)
+}
 
-    remove_entry(dest).map_err(|e| AppError::io(dest, &e))?;
-    std::fs::create_dir_all(dest).map_err(|e| AppError::io(dest, &e))?;
+/// Resolve sobras de uma troca interrompida em `dest`: `.staging` sai; `.old` volta a ser `dest` se `dest` sumiu
+/// (queda entre as duas renomeações), senão sai.
+pub fn recover_mod_dir(dest: &Path) -> AppResult<()> {
+    let staging = sibling(dest, ".staging");
+    let old = sibling(dest, ".old");
+    remove_entry(&staging).map_err(|e| AppError::io(&staging, &e))?;
+    if std::fs::symlink_metadata(&old).is_ok() {
+        if std::fs::symlink_metadata(dest).is_ok() {
+            remove_entry(&old).map_err(|e| AppError::io(&old, &e))?;
+        } else {
+            log::warn!("troca do mod interrompida; restaurando a versão anterior");
+            std::fs::rename(&old, dest).map_err(|e| AppError::io(dest, &e))?;
+        }
+    }
+    Ok(())
+}
+
+/// Extrai os arquivos planejados em `dir` (pasta nova) e devolve cada um com sha256.
+fn extract_into(
+    ar: &mut Archive,
+    planned: Vec<Planned>,
+    dir: &Path,
+) -> AppResult<Vec<InstalledFile>> {
     let mut files = Vec::new();
     for p in planned {
-        let target = join_rel(dest, &p.rel);
+        let target = join_rel(dir, &p.rel);
         if p.dir {
             std::fs::create_dir_all(&target).map_err(|e| AppError::io(&target, &e))?;
             continue;
@@ -324,7 +414,53 @@ pub fn extract_zip(zip: &Path, dest: &Path) -> AppResult<Vec<InstalledFile>> {
             size: p.size,
         });
     }
+    // Relê o que foi gravado: o que vai para o jogo é exatamente o que foi extraído.
+    for f in &files {
+        let path = join_rel(dir, &f.path);
+        let (sha, len) = hash_file(&path).map_err(|e| AppError::io(&path, &e))?;
+        if sha != f.sha256 || len != f.size {
+            return Err(mod_invalid("arquivo gravado difere do pacote"));
+        }
+    }
     files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+/// Instala `zip` em `dest` de forma atômica: valida tudo (nada é gravado se algo for recusado), extrai em
+/// `<dest>.staging`, confere os hashes e só então troca as pastas. Em qualquer falha `dest` fica como estava.
+/// Devolve cada arquivo com sha256 (ordenado por caminho).
+pub fn extract_zip(zip: &Path, dest: &Path) -> AppResult<Vec<InstalledFile>> {
+    let (mut ar, planned) = open_planned(zip)?;
+    recover_mod_dir(dest)?;
+    let staging = sibling(dest, ".staging");
+    let old = sibling(dest, ".old");
+    std::fs::create_dir_all(&staging).map_err(|e| AppError::io(&staging, &e))?;
+    let files = match extract_into(&mut ar, planned, &staging) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = remove_entry(&staging);
+            return Err(e);
+        }
+    };
+    let had_dest = std::fs::symlink_metadata(dest).is_ok();
+    if had_dest {
+        if let Err(e) = std::fs::rename(dest, &old) {
+            let _ = remove_entry(&staging);
+            return Err(AppError::io(dest, &e));
+        }
+    }
+    if let Err(e) = std::fs::rename(&staging, dest) {
+        if had_dest {
+            let _ = std::fs::rename(&old, dest);
+        }
+        let _ = remove_entry(&staging);
+        return Err(AppError::io(dest, &e));
+    }
+    if had_dest {
+        if let Err(e) = remove_entry(&old) {
+            log::warn!("pasta antiga do mod não apagada (sai na próxima vez): {e}");
+        }
+    }
     Ok(files)
 }
 
@@ -401,6 +537,10 @@ impl ModInstaller {
             .is_some_and(|r| r.game_dir == game.dir && files_intact(&r, game)))
     }
 
+    fn package_dir(&self) -> PathBuf {
+        self.mods_dir.join(PACKAGE_DIR)
+    }
+
     /// Garante o mod mais novo do Hub para `protocol` em `game` (ver o topo do módulo).
     pub async fn ensure(
         &self,
@@ -419,65 +559,116 @@ impl ModInstaller {
             )
         })?;
         let url = validate_offer(&info, protocol, hub.base())?;
+        // Versão anunciada (não assinada): só decide se vale baixar. Instalar e registrar usam a assinada.
         let offered = semver::Version::parse(&info.version).map_err(|_| bad_offer())?;
 
+        let dest = mod_dir(game);
+        {
+            let d = dest.clone();
+            blocking(move || recover_mod_dir(&d)).await?;
+        }
         let current = self
             .installed()
-            .filter(|r| r.protocol == protocol && r.game_dir == game.dir);
-        if let Some(r) = current {
+            .filter(|r| r.protocol == protocol && r.game_dir == game.dir)
+            .and_then(|r| semver::Version::parse(&r.version).ok().map(|v| (r, v)));
+        if let Some((r, cur)) = &current {
             let intact = {
                 let (r, g) = (r.clone(), game.clone());
                 tokio::task::spawn_blocking(move || files_intact(&r, &g))
                     .await
                     .unwrap_or(false)
             };
-            let unchanged = |r: &Installed| ModState {
+            let unchanged = ModState {
                 version: r.version.clone(),
                 protocol,
                 changed: false,
             };
-            if let Ok(cur) = semver::Version::parse(&r.version) {
-                if offered < cur {
-                    if intact {
+            if offered <= *cur {
+                if intact {
+                    if offered < *cur {
                         log::info!(
                             "Hub oferece mod {} menor que o instalado {}; mantido",
                             info.version,
                             r.version
                         );
-                        return Ok(unchanged(&r));
                     }
+                    return Ok(unchanged);
+                }
+                log::warn!("arquivos do mod alterados; reparando pelo pacote local");
+                match self.repair(r, game).await {
+                    Ok(()) => {
+                        return Ok(ModState {
+                            changed: true,
+                            ..unchanged
+                        })
+                    }
+                    Err(e) => log::warn!("reparo local do mod falhou: {}", e.code),
+                }
+                if offered < *cur {
                     return Err(AppError::new(
                         "mod_altered",
                         format!(
-                            "Os arquivos do mod {} foram alterados e o Hub só oferece uma versão anterior. \
-                             Não fazemos downgrade: aguarde uma versão nova do mod.",
+                            "Os arquivos do mod {} foram alterados, o pacote local não serve para reparar e o Hub \
+                             só oferece uma versão anterior. Não fazemos downgrade: verifique os arquivos do jogo \
+                             na Steam/Epic ou aguarde uma versão nova do mod.",
                             r.version
                         ),
                     ));
                 }
-                if offered == cur && intact {
-                    return Ok(unchanged(&r));
-                }
-            }
-            if !intact {
-                log::warn!("arquivos do mod alterados; reinstalando");
+            } else if !intact {
+                log::warn!("arquivos do mod alterados; instalando a versão nova");
             }
         }
-        self.install(&info, &url, game, cancel).await?;
+        let signed = self
+            .download_and_install(
+                &info,
+                &url,
+                protocol,
+                current.as_ref().map(|(_, v)| v),
+                game,
+                cancel,
+            )
+            .await?;
         Ok(ModState {
-            version: info.version,
+            version: signed.version.to_string(),
             protocol,
             changed: true,
         })
     }
 
-    async fn install(
+    /// Reinstala a versão registrada a partir de `mods\package\`, conferindo a assinatura de novo.
+    async fn repair(&self, r: &Installed, game: &GameInstall) -> AppResult<()> {
+        let pkg = self.package_dir();
+        let (zip, sig_path) = (pkg.join(PACKAGE_ZIP), pkg.join(PACKAGE_SIG));
+        let sig = std::fs::read_to_string(&sig_path).map_err(|e| AppError::io(&sig_path, &e))?;
+        let (pk, record, rec) = (self.pubkey.clone(), self.record_path(), r.clone());
+        let dest = mod_dir(game);
+        blocking(move || {
+            let signed = verify_mod_file(&zip, &sig, &pk)?;
+            let same = signed.protocol == rec.protocol
+                && signed.sha256 == rec.sha256
+                && semver::Version::parse(&rec.version).is_ok_and(|v| v == signed.version);
+            if !same {
+                return Err(signature_invalid());
+            }
+            let files = extract_zip(&zip, &dest)?;
+            write_record(&record, &Installed { files, ..rec })
+        })
+        .await?;
+        log::info!("mod {} reparado pelo pacote local", r.version);
+        Ok(())
+    }
+
+    /// Baixa, confere a assinatura e o que ela garante, instala de forma atômica, guarda o pacote e grava o registro.
+    async fn download_and_install(
         &self,
         info: &ModInfo,
         url: &Url,
+        protocol: u32,
+        installed: Option<&semver::Version>,
         game: &GameInstall,
         cancel: CancellationToken,
-    ) -> AppResult<()> {
+    ) -> AppResult<SignedMod> {
         let dl_dir = self.mods_dir.join(DOWNLOAD_DIR);
         // Uma instalação por vez (o `play` é serializado): sobras de downloads antigos saem.
         remove_entry(&dl_dir).map_err(|e| AppError::io(&dl_dir, &e))?;
@@ -490,33 +681,55 @@ impl ModInstaller {
 
         self.download(url, info, &zip_path, &cancel).await?;
 
-        let (zp, sig, pk) = (
-            zip_path.clone(),
-            info.signature.clone(),
-            self.pubkey.clone(),
-        );
-        tokio::task::spawn_blocking(move || verify_minisign_file(&zp, &sig, &pk))
-            .await
-            .map_err(|_| AppError::new("internal_error", "Falha interna ao verificar o mod."))??;
+        let signed = {
+            let (zp, sig, pk) = (
+                zip_path.clone(),
+                info.signature.clone(),
+                self.pubkey.clone(),
+            );
+            blocking(move || verify_mod_file(&zp, &sig, &pk)).await?
+        };
+        // O assinado tem de ser exatamente o que foi pedido e anunciado.
+        let announced = semver::Version::parse(&info.version).ok();
+        if signed.protocol != protocol
+            || signed.sha256 != info.sha256
+            || announced.as_ref() != Some(&signed.version)
+        {
+            log::warn!(
+                "assinatura do mod é de outro pacote (assinado p{} v{}, anunciado p{} v{})",
+                signed.protocol,
+                signed.version,
+                protocol,
+                info.version
+            );
+            return Err(signature_invalid());
+        }
+        // Regra de downgrade com a versão assinada.
+        if installed.is_some_and(|cur| signed.version < *cur) {
+            return Err(signature_invalid());
+        }
         if cancel.is_cancelled() {
             return Err(cancelled());
         }
 
         let record_path = self.record_path();
+        let pkg = self.package_dir();
         let dest = mod_dir(game);
         let record_base = Installed {
-            version: info.version.clone(),
-            protocol: info.protocol,
+            version: signed.version.to_string(),
+            protocol,
             game_dir: game.dir.clone(),
-            sha256: info.sha256.clone(),
+            sha256: signed.sha256.clone(),
             files: Vec::new(),
         };
-        tokio::task::spawn_blocking(move || -> AppResult<()> {
-            // Zip recusado não mexe em nada (nem no registro da instalação atual).
-            open_planned(&zip_path)?;
-            // Registro sai antes de mexer na pasta: queda no meio vira "não instalado".
-            remove_entry(&record_path).map_err(|e| AppError::io(&record_path, &e))?;
+        let sig = info.signature.clone();
+        blocking(move || -> AppResult<()> {
+            // Troca atômica: em qualquer falha o mod atual e o registro ficam como estavam.
             let files = extract_zip(&zip_path, &dest)?;
+            // Pacote para reparo local (falha aqui só perde o reparo, não a instalação).
+            if let Err(e) = keep_package(&pkg, &zip_path, &sig) {
+                log::warn!("pacote do mod não guardado para reparo: {}", e.code);
+            }
             write_record(
                 &record_path,
                 &Installed {
@@ -525,14 +738,9 @@ impl ModInstaller {
                 },
             )
         })
-        .await
-        .map_err(|_| AppError::new("internal_error", "Falha interna ao instalar o mod."))??;
-        log::info!(
-            "mod {} (protocolo {}) instalado",
-            info.version,
-            info.protocol
-        );
-        Ok(())
+        .await?;
+        log::info!("mod {} (protocolo {}) instalado", signed.version, protocol);
+        Ok(signed)
     }
 
     /// Até [`ATTEMPTS`] tentativas com espera crescente; queda/lentidão no fim vira `download_slow`.
@@ -646,6 +854,26 @@ impl Drop for RemoveOnDrop {
             log::warn!("pasta de download do mod não apagada: {e}");
         }
     }
+}
+
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> AppResult<T> + Send + 'static,
+) -> AppResult<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|_| AppError::new("internal_error", "Falha interna ao instalar o mod."))?
+}
+
+/// Guarda o zip assinado e o `.sig` em `mods\package\` (substitui o anterior).
+fn keep_package(pkg: &Path, zip: &Path, sig: &str) -> AppResult<()> {
+    remove_entry(pkg).map_err(|e| AppError::io(pkg, &e))?;
+    std::fs::create_dir_all(pkg).map_err(|e| AppError::io(pkg, &e))?;
+    let dst = pkg.join(PACKAGE_ZIP);
+    std::fs::rename(zip, &dst)
+        .or_else(|_| std::fs::copy(zip, &dst).map(|_| ()))
+        .map_err(|e| AppError::io(&dst, &e))?;
+    let sig_path = pkg.join(PACKAGE_SIG);
+    std::fs::write(&sig_path, sig.trim()).map_err(|e| AppError::io(&sig_path, &e))
 }
 
 /// Oferta do Hub coerente: protocolo pedido, sha256 em hex, tamanho dentro do limite e URL na mesma origem do Hub.

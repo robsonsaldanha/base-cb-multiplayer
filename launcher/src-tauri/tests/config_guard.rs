@@ -477,6 +477,9 @@ fn tauri_conf_tem_os_valores_exigidos() {
         Some(pubkey.trim()),
         "pubkey do tauri.conf.json difere de keys/update.pub"
     );
+    // A versão anunciada pelo Hub tem de ser a assinada (sem rollback para um launcher antigo assinado).
+    assert_eq!(up["requireSignedVersion"], serde_json::json!(true));
+    assert!(up["allowDowngrades"].is_null() || up["allowDowngrades"] == serde_json::json!(false));
     let endpoints = up["endpoints"].as_array().unwrap();
     assert_eq!(endpoints.len(), 1);
     let ep = endpoints[0].as_str().unwrap();

@@ -100,12 +100,20 @@ Código do `game.rs` escrito do zero (não copiar o launcher atual do CB nem nad
    removidas.
 6. **Mod**: versão para o `protocol` do servidor; ausente/alterado → baixa, confere assinatura, extrai (zip sem
    caminhos fora da pasta, sem links) na pasta do jogo, grava lista de arquivos com hash em `mods\installed.json`.
+   - A assinatura cobre também versão e protocolo: o comentário confiável do `.sig` (assinado com a chave privada) é
+     exatamente `cbmp-mod protocol=<N> version=<X.Y.Z> sha256=<hex>`; protocolo, versão e sha256 têm de bater com o
+     zip e com o que está sendo instalado, senão `mod_signature_invalid`. A versão registrada e usada na regra "nunca
+     downgrade" é a assinada, nunca a anunciada pelo Hub.
+   - Instalação atômica: extrai em `cbmp.staging` (mesma pasta pai), confere o hash de cada arquivo e só então troca
+     (`cbmp` → `cbmp.old`, `cbmp.staging` → `cbmp`, apaga `.old`); sobras de uma queda são resolvidas na próxima vez.
+     O zip assinado fica em `mods\package\` para reparo local.
 7. **Abrir**: grava `%LOCALAPPDATA%\CBMultiplayer\run\connect.json` `{host, port, ticket, serverId, contentDir,
    protocol}` com ACL só do usuário; o mod lê e apaga; o launcher apaga após 60 s se ainda existir. Abre o
    executável do jogo direto (Steam/Epic cuidam do DRM). Nunca passa ticket por linha de comando ou variável de
    ambiente.
    - **Modo simular** (padrão enquanto não houver mod com `protocol` compatível): não abre o jogo; mostra "Pronto para
-     abrir" e o conteúdo do arquivo de conexão sem o ticket.
+     abrir" e o conteúdo do arquivo de conexão sem o ticket. O `connect.json` (com o ticket, ACL só do usuário) é
+     gravado mesmo assim e apagado em 60 s.
 
 ### Cache
 Limite `cacheLimitMB` (padrão 10 240); acima dele, remove os arquivos menos usados que não estejam montados para um
@@ -134,7 +142,13 @@ Logs do launcher em `%LOCALAPPDATA%\CBMultiplayer\logs` (rotação), sem tokens,
 - Conteúdo baixado nunca é executado nem aberto pelo launcher.
 - Deep link aceita só `cbmp://auth` com parâmetros válidos; qualquer outro é ignorado e registrado.
 - Updates e mod: assinatura minisign/Ed25519 obrigatória (chave pública embutida; privada só em secret do CI de
-  release, nunca no repo). Hub só repassa.
+  release, nunca no repo). Hub só repassa. A versão também é assinada (comentário confiável): mod
+  `cbmp-mod protocol=<N> version=<X.Y.Z> sha256=<hex>`; launcher no formato do Tauri (`...\tversion:X.Y.Z`, de
+  `tauri signer sign --app-version`/`tauri build`) com `requireSignedVersion: true`, e o launcher confere de novo.
+  Um Hub comprometido não consegue servir uma versão antiga assinada como se fosse nova.
+- Pasta do jogo achada pela Epic (`%ProgramData%`, onde qualquer usuário local cria arquivos) só vale se o `.item`,
+  a pasta do jogo, o executável e `Phoenix\Binaries\Win64` tiverem dono SYSTEM/Administradores/TrustedInstaller/o
+  usuário atual e nenhuma outra conta com escrita.
 - Tokens só no Credential Manager; access token só em memória.
 - Authenticode fica em `PENDENCIAS` (exige certificado; sem ele há aviso do SmartScreen).
 

@@ -167,7 +167,9 @@ fn epic_pelos_manifests_item() {
     let roots = Roots {
         epic_manifests: manifests,
     };
-    let found = locate(&FakeRegistry::default(), &roots).expect("jogo da Epic");
+    // Confiança por dono/DACL é testada à parte (a pasta temporária pode ter ACL de outras contas).
+    let found = game::locate_with(&FakeRegistry::default(), &roots, &Distrust(vec![]))
+        .expect("jogo da Epic");
     assert_eq!(found.store, Store::Epic);
     assert_eq!(found.dir, game_dir);
 }
@@ -266,4 +268,93 @@ fn vdf_com_escapes_e_formato_antigo() {
     for bad in ["\"a\" {", "\"a\" \"b", "}", "{", "\"a\""] {
         let _ = parse_vdf(bad);
     }
+}
+
+// ----- confiança (dono/permissões) dos caminhos da Epic -----
+
+/// Recusa os caminhos listados (dono "outro usuário" simulado).
+struct Distrust(Vec<PathBuf>);
+
+impl game::Trust for Distrust {
+    fn trusted(&self, path: &Path) -> bool {
+        !self.0.iter().any(|p| p == path)
+    }
+}
+
+fn epic_setup(tmp: &Path) -> (Roots, PathBuf, PathBuf) {
+    let manifests = tmp.join("Manifests");
+    let game_dir = tmp.join("Epic Games").join("HogwartsLegacy");
+    fake_game(&game_dir);
+    write_item(
+        &manifests,
+        "HL.item",
+        serde_json::json!({ "DisplayName": "Hogwarts Legacy", "InstallLocation": game_dir }),
+    );
+    let item = manifests.join("HL.item");
+    (
+        Roots {
+            epic_manifests: manifests,
+        },
+        item,
+        game_dir,
+    )
+}
+
+#[test]
+fn epic_plantado_por_outro_usuario_e_ignorado() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (roots, item, game_dir) = epic_setup(tmp.path());
+    let reg = FakeRegistry::default();
+    let ok = game::locate_with(&reg, &roots, &Distrust(vec![])).unwrap();
+    assert_eq!((ok.store, &ok.dir), (Store::Epic, &game_dir));
+    let bins = game_dir.join("Phoenix").join("Binaries").join("Win64");
+    for bad in [
+        item,
+        game_dir.clone(),
+        game_dir.join("HogwartsLegacy.exe"),
+        bins,
+    ] {
+        assert_eq!(
+            game::locate_with(&reg, &roots, &Distrust(vec![bad.clone()])),
+            None,
+            "{}",
+            bad.display()
+        );
+    }
+}
+
+#[cfg(windows)]
+fn icacls(path: &Path, args: &[&str]) {
+    let st = std::process::Command::new("icacls")
+        .arg(path)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(st.success());
+}
+
+#[cfg(windows)]
+#[test]
+fn confianca_real_pelo_dono_e_pela_dacl() {
+    use game::Trust;
+    let tmp = tempfile::tempdir().unwrap();
+    // Pasta só deste usuário (a temporária pode herdar entradas de outras contas, como num PC compartilhado).
+    cbmp_launcher_lib::launch::acl::restrict_dir_to_current_user(tmp.path()).unwrap();
+    let (roots, item, game_dir) = epic_setup(tmp.path());
+    // Criados por este usuário numa pasta só dele: confiáveis.
+    assert!(game::SystemTrust.trusted(&item));
+    assert_eq!(
+        locate(&FakeRegistry::default(), &roots).map(|g| g.dir),
+        Some(game_dir.clone())
+    );
+    // "Todos" com escrita na pasta do jogo: qualquer conta poderia trocar o executável → ignorado.
+    icacls(&game_dir, &["/grant", "*S-1-1-0:(W)"]);
+    assert!(!game::SystemTrust.trusted(&game_dir));
+    assert_eq!(locate(&FakeRegistry::default(), &roots), None);
+    icacls(&game_dir, &["/remove:g", "*S-1-1-0"]);
+    assert!(game::SystemTrust.trusted(&game_dir));
+    // Idem no próprio `.item`.
+    icacls(&item, &["/grant", "*S-1-5-32-545:(M)"]);
+    assert_eq!(locate(&FakeRegistry::default(), &roots), None);
 }

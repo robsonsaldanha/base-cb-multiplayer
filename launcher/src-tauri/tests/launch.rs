@@ -77,7 +77,7 @@ fn connect_json_tem_dacl_so_do_usuario_atual() {
     // GENERIC_ALL vira FILE_ALL_ACCESS no arquivo.
     assert_eq!(dacl.aces[0].mask, 0x001F_01FF);
     // Contraprova: um arquivo comum da mesma pasta herda outras entradas (o teste distingue os dois casos).
-    let plain = run.join("comum.txt");
+    let plain = tmp.path().join("comum.txt");
     std::fs::write(&plain, b"x").unwrap();
     let inherited = acl::read_dacl(&plain).unwrap();
     assert!(!inherited.protected);
@@ -87,6 +87,22 @@ fn connect_json_tem_dacl_so_do_usuario_atual() {
         inherited.aces
     );
     std::fs::remove_file(&plain).unwrap();
+    // A pasta `run\` também é só do usuário, e o que nasce nela herda só ele.
+    let run_dacl = acl::read_dacl(&run).unwrap();
+    assert!(run_dacl.protected);
+    assert!(
+        run_dacl.aces.iter().all(|a| a.sid == me),
+        "{:?}",
+        run_dacl.aces
+    );
+    let child = run.join("filho.txt");
+    std::fs::write(&child, b"x").unwrap();
+    assert!(acl::read_dacl(&child)
+        .unwrap()
+        .aces
+        .iter()
+        .all(|a| a.sid == me));
+    std::fs::remove_file(&child).unwrap();
     // Sem `.tmp` para trás.
     let names: Vec<_> = std::fs::read_dir(&run)
         .unwrap()
@@ -227,11 +243,19 @@ struct Fake {
     port: u16,
     /// Relógio do launcher (o mesmo do `Auth` e do `play`).
     clock: Arc<AtomicI64>,
+    /// Mod publicado: (zip, assinatura, versão anunciada) e as consultas recebidas.
+    mod_pkg: Option<(Vec<u8>, String, String)>,
+    mod_queries: Vec<String>,
+    /// Atraso (ms) antes de responder o ticket.
+    ticket_delay_ms: u64,
 }
 
 type Shared = Arc<Mutex<Fake>>;
 
 struct Env {
+    /// Chave pública do par gerado neste teste (formato do Tauri).
+    pubkey: String,
+    keys: (minisign::PublicKey, minisign::SecretKey),
     _tmp: tempfile::TempDir,
     root: PathBuf,
     fake: Shared,
@@ -248,6 +272,8 @@ async fn refresh() -> Response {
 }
 
 async fn ticket(State(s): State<Shared>) -> Response {
+    let delay = s.lock().unwrap().ticket_delay_ms;
+    tokio::time::sleep(Duration::from_millis(delay)).await;
     let mut f = s.lock().unwrap();
     f.tickets += 1;
     Json(serde_json::json!({ "ticket": format!("{TICKET_MARK}_{}", f.tickets) })).into_response()
@@ -299,6 +325,31 @@ async fn file(State(s): State<Shared>, AxPath(sha): AxPath<String>) -> Response 
     }
 }
 
+async fn mod_latest(State(s): State<Shared>, uri: axum::http::Uri) -> Response {
+    let mut f = s.lock().unwrap();
+    f.mod_queries.push(uri.query().unwrap_or("").to_string());
+    let Some((zip, sig, version)) = f.mod_pkg.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no_mod", "message": "x" })),
+        )
+            .into_response();
+    };
+    Json(serde_json::json!({
+        "version": version, "protocol": PROTOCOL,
+        "url": format!("http://127.0.0.1:{}/v1/dl/mod-p{PROTOCOL}-v{version}/m.zip", f.port),
+        "sha256": sha_hex(&zip), "size": zip.len(), "signature": sig,
+    }))
+    .into_response()
+}
+
+async fn mod_dl(State(s): State<Shared>) -> Response {
+    match s.lock().unwrap().mod_pkg.clone() {
+        Some((zip, _, _)) => zip.into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 fn sha_hex(d: &[u8]) -> String {
     Sha256::digest(d)
         .iter()
@@ -337,6 +388,8 @@ async fn env() -> Env {
         .route("/v1/servers/{id}", get(server))
         .route("/cb/manifest", get(manifest))
         .route("/cb/files/{sha}", get(file))
+        .route("/v1/mod/latest", get(mod_latest))
+        .route("/v1/dl/{tag}/{asset}", get(mod_dl))
         .with_state(fake.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -346,7 +399,13 @@ async fn env() -> Env {
     vault.set("rt_1").unwrap();
     let hub = HubClient::new(&format!("http://127.0.0.1:{port}")).unwrap();
     let auth = Arc::new(Auth::with_clock(hub, vault, shared_clock(&clock)));
+    let kp = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+    use base64::Engine as _;
+    let pubkey =
+        base64::engine::general_purpose::STANDARD.encode(kp.pk.to_box().unwrap().to_string());
     Env {
+        pubkey,
+        keys: (kp.pk, kp.sk),
         _tmp: tmp,
         root,
         fake,
@@ -361,7 +420,7 @@ impl Env {
             auth: self.auth.clone(),
             content: ContentStore::new(self.root.join("cache"), self.root.join("servers"))
                 .with_retry_delay(Duration::from_millis(5)),
-            mods: ModInstaller::new(self.root.join("mods"), "chave-nao-usada".into()),
+            mods: ModInstaller::new(self.root.join("mods"), self.pubkey.clone()),
             run_dir: self.root.join("run"),
             clock: shared_clock(&self.clock),
             simulate,
@@ -510,4 +569,92 @@ async fn play_e_um_por_vez() {
     assert!(!again.cancel.is_cancelled());
     drop(again);
     assert!(!gate.cancel(), "nada em andamento");
+}
+
+/// Fluxo completo sem simular: mod pedido com o protocolo do servidor, instalado no jogo, conexão gravada e o
+/// executável aberto (cópia do `whoami.exe`, nunca o jogo real).
+#[cfg(windows)]
+#[tokio::test]
+async fn play_sem_simular_instala_o_mod_e_abre_o_jogo() {
+    use std::io::Write as _;
+    let e = env().await;
+    let dir = e.root.join("HL");
+    let win64 = dir.join("Phoenix").join("Binaries").join("Win64");
+    std::fs::create_dir_all(&win64).unwrap();
+    let sys = std::env::var_os("SystemRoot").unwrap();
+    let exe = dir.join("HogwartsLegacy.exe");
+    std::fs::copy(Path::new(&sys).join("System32").join("whoami.exe"), &exe).unwrap();
+    let game = GameInstall {
+        dir: dir.clone(),
+        exe,
+        store: Store::Manual,
+    };
+    // Mod 1.0.0 do protocolo do servidor, assinado como no release.
+    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    w.start_file("cbmp.dll", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    w.write_all(b"mod").unwrap();
+    let zip = w.finish().unwrap().into_inner();
+    let comment = format!(
+        "cbmp-mod protocol={PROTOCOL} version=1.0.0 sha256={}",
+        sha_hex(&zip)
+    );
+    let sig = minisign::sign(
+        Some(&e.keys.0),
+        &e.keys.1,
+        std::io::Cursor::new(&zip),
+        Some(&comment),
+        None,
+    )
+    .unwrap()
+    .to_string();
+    use base64::Engine as _;
+    let sig = base64::engine::general_purpose::STANDARD.encode(sig);
+    e.fake.lock().unwrap().mod_pkg = Some((zip, sig, "1.0.0".into()));
+
+    let (r, stages) = e.run(&e.ctx(false, Some(game))).await;
+    let out = r.unwrap();
+    assert_eq!(out, LaunchOutcome::Started);
+    assert_eq!(
+        stages,
+        vec![
+            Stage::Ticket,
+            Stage::Manifest,
+            Stage::Download,
+            Stage::Mount,
+            Stage::Mod,
+            Stage::Connect,
+            Stage::Launch
+        ]
+    );
+    assert_eq!(
+        e.fake.lock().unwrap().mod_queries,
+        vec![format!("protocol={PROTOCOL}")]
+    );
+    assert_eq!(
+        std::fs::read(win64.join("cbmp").join("cbmp.dll")).unwrap(),
+        b"mod"
+    );
+    assert_eq!(e.connect()["ticket"], format!("{TICKET_MARK}_1"));
+}
+
+#[tokio::test]
+async fn cancelar_interrompe_pedido_em_andamento() {
+    let e = env().await;
+    // Ticket que nunca chega: o cancelamento tem de encerrar sem esperar o prazo de rede.
+    let c = CancellationToken::new();
+    let c2 = c.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        c2.cancel();
+    });
+    e.fake.lock().unwrap().ticket_delay_ms = 60_000;
+    let ctx = e.ctx(true, None);
+    let r = tokio::time::timeout(
+        Duration::from_secs(5),
+        play(&ctx, SERVER, &|_| {}, |_| {}, c),
+    )
+    .await
+    .expect("cancelamento não pode esperar o prazo de rede");
+    assert_eq!(r.unwrap_err().code, "cancelled");
 }

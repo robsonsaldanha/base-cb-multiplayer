@@ -61,6 +61,44 @@ fn signature_invalid() -> AppError {
     )
 }
 
+/// Versão gravada pelo Tauri no comentário confiável da assinatura (`timestamp:..\tfile:..\tversion:X.Y.Z`,
+/// `tauri build` / `tauri signer sign --app-version`). O comentário é coberto pela assinatura.
+pub fn signed_launcher_version(trusted_comment: &str) -> Option<&str> {
+    trusted_comment
+        .split('\t')
+        .find_map(|f| f.strip_prefix("version:"))
+        .filter(|v| !v.is_empty())
+}
+
+/// Confere de novo (além do plugin, que já exige `requireSignedVersion`) que o pacote baixado está assinado com a
+/// chave embutida **e para a versão anunciada**: um Hub comprometido não consegue servir um launcher antigo
+/// assinado como se fosse novo.
+pub fn verify_launcher_package(
+    bytes: &[u8],
+    signature: &str,
+    pubkey: &str,
+    announced: &str,
+) -> AppResult<()> {
+    let comment = crate::modpkg::verify_minisign(bytes, signature, pubkey)
+        .map_err(|_| signature_invalid())?;
+    let signed = signed_launcher_version(&comment).ok_or_else(|| {
+        log::warn!("atualização assinada sem versão");
+        signature_invalid()
+    })?;
+    let same = match (
+        semver::Version::parse(signed.trim_start_matches('v')),
+        semver::Version::parse(announced.trim_start_matches('v')),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if !same {
+        log::warn!("atualização assinada para {signed}, anunciada como {announced}");
+        return Err(signature_invalid());
+    }
+    Ok(())
+}
+
 /// Falha do download que vale tentar de novo (rede, corpo cortado, status de erro do Hub).
 pub fn retriable(e: &tauri_plugin_updater::Error) -> bool {
     use tauri_plugin_updater::Error as E;
@@ -166,6 +204,7 @@ pub async fn install(app: &tauri::AppHandle, hub_url: &str) -> AppResult<()> {
         }
     }
     let bytes = bytes.ok_or(last)?;
+    verify_launcher_package(&bytes, &update.signature, pubkey(), &update.version)?;
     log::info!("instalando atualização {}", update.version);
     update.install(bytes).map_err(|e| {
         log::warn!("instalação da atualização falhou: {e}");
@@ -213,6 +252,51 @@ mod tests {
             "update_failed"
         );
         assert!(!retriable(&E::ReleaseNotFound));
+    }
+
+    fn signer() -> (minisign::PublicKey, minisign::SecretKey) {
+        let kp = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+        (kp.pk, kp.sk)
+    }
+
+    fn b64(s: String) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(s)
+    }
+
+    #[test]
+    fn pacote_do_launcher_precisa_estar_assinado_para_a_versao_anunciada() {
+        let (pk, sk) = signer();
+        let pubkey = b64(pk.to_box().unwrap().to_string());
+        let data = b"instalador".to_vec();
+        let sign = |comment: &str| {
+            b64(minisign::sign(
+                Some(&pk),
+                &sk,
+                std::io::Cursor::new(&data),
+                Some(comment),
+                None,
+            )
+            .unwrap()
+            .to_string())
+        };
+        let ok = sign("timestamp:1\tfile:CBMultiplayer_1.2.0_x64-setup.exe\tversion:1.2.0");
+        verify_launcher_package(&data, &ok, &pubkey, "1.2.0").unwrap();
+        // Launcher antigo assinado (1.0.0) anunciado como novo.
+        let old = sign("timestamp:1\tfile:x.exe\tversion:1.0.0");
+        assert_eq!(
+            verify_launcher_package(&data, &old, &pubkey, "1.2.0")
+                .unwrap_err()
+                .code,
+            "signature_invalid"
+        );
+        // Assinatura sem versão (CLI antigo).
+        let none = sign("timestamp:1\tfile:x.exe");
+        assert!(verify_launcher_package(&data, &none, &pubkey, "1.2.0").is_err());
+        // Bytes alterados.
+        assert!(verify_launcher_package(b"outro", &ok, &pubkey, "1.2.0").is_err());
+        assert_eq!(signed_launcher_version("a:1\tversion:2.0.0"), Some("2.0.0"));
+        assert_eq!(signed_launcher_version("version:"), None);
     }
 
     #[test]

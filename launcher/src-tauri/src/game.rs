@@ -122,10 +122,12 @@ pub struct Roots {
 impl Roots {
     /// Pastas reais do sistema.
     pub fn system() -> Self {
-        let program_data = std::env::var_os("ProgramData")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        // Pasta conhecida pela API (não pela variável de ambiente).
+        #[cfg(windows)]
+        let known = crate::paths::program_data();
+        #[cfg(not(windows))]
+        let known: Option<PathBuf> = None;
+        let program_data = known.unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
         Self {
             epic_manifests: program_data
                 .join("Epic")
@@ -170,9 +172,46 @@ pub fn validate_game_dir(dir: &Path) -> AppResult<GameInstall> {
 
 /// Procura na Steam e depois na Epic; `None` se nada válido for achado.
 pub fn locate(reg: &dyn Registry, roots: &Roots) -> Option<GameInstall> {
+    locate_with(reg, roots, &SystemTrust)
+}
+
+/// Como [`locate`], com a verificação de dono/permissões injetável (testes).
+pub fn locate_with(reg: &dyn Registry, roots: &Roots, trust: &dyn Trust) -> Option<GameInstall> {
     locate_steam(reg)
-        .or_else(|| locate_epic(&roots.epic_manifests))
+        .or_else(|| locate_epic(&roots.epic_manifests, trust))
         .inspect(|g| log::info!("Hogwarts Legacy encontrado ({:?})", g.store))
+}
+
+/// Se um caminho achado automaticamente é confiável: dono e quem pode escrever nele.
+///
+/// `%ProgramData%` deixa qualquer usuário local criar arquivos e pastas, então um `.item` da Epic (e a pasta para
+/// onde ele aponta) podem ter sido plantados por outra conta do PC para o launcher abrir o executável dela.
+pub trait Trust {
+    fn trusted(&self, path: &Path) -> bool;
+}
+
+/// Regra real: dono SYSTEM, Administradores, TrustedInstaller ou o usuário atual, e nenhuma outra conta com direito
+/// de escrita (ver [`crate::launch::acl::trusted`]). Fora do Windows aceita tudo.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemTrust;
+
+impl Trust for SystemTrust {
+    #[cfg(windows)]
+    fn trusted(&self, path: &Path) -> bool {
+        use crate::launch::acl;
+        let ok = acl::current_user_sid()
+            .and_then(|me| acl::read_security(path).map(|sec| acl::trusted(&sec, &me)))
+            .unwrap_or(false);
+        if !ok {
+            log::warn!("caminho com dono ou permissões não confiáveis ignorado");
+        }
+        ok
+    }
+
+    #[cfg(not(windows))]
+    fn trusted(&self, _path: &Path) -> bool {
+        true
+    }
 }
 
 fn with_store(g: GameInstall, store: Store) -> GameInstall {
@@ -290,7 +329,7 @@ fn steam_game_in(lib: &Path) -> Option<GameInstall> {
         .map(|g| with_store(g, Store::Steam))
 }
 
-fn locate_epic(manifests: &Path) -> Option<GameInstall> {
+fn locate_epic(manifests: &Path, trust: &dyn Trust) -> Option<GameInstall> {
     let rd = std::fs::read_dir(manifests).ok()?;
     let mut items: Vec<PathBuf> = rd
         .flatten()
@@ -303,6 +342,9 @@ fn locate_epic(manifests: &Path) -> Option<GameInstall> {
         .collect();
     items.sort();
     for item in items {
+        if !trust.trusted(&item) {
+            continue;
+        }
         let Some(text) = read_text(&item) else {
             continue;
         };
@@ -322,7 +364,11 @@ fn locate_epic(manifests: &Path) -> Option<GameInstall> {
             continue;
         };
         if let Ok(g) = validate_game_dir(&native_path(loc)) {
-            return Some(with_store(g, Store::Epic));
+            // A pasta do jogo, o executável e a pasta onde o mod é instalado (e o jogo carrega DLLs) também.
+            let bins = BINARIES.iter().fold(g.dir.clone(), |p, s| p.join(s));
+            if [&g.dir, &g.exe, &bins].iter().all(|p| trust.trusted(p)) {
+                return Some(with_store(g, Store::Epic));
+            }
         }
     }
     None

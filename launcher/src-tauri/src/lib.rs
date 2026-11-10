@@ -62,17 +62,23 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 // Sobras de downloads e arquivos do cache fora do índice, sob a trava do play (não corre junto
                 // com o primeiro download).
-                let gate = handle.state::<play::PlayGate>();
-                let _run = gate.begin().await;
-                let store = content.clone();
-                let _ = tokio::task::spawn_blocking(move || store.startup()).await;
-                // Jogo ainda não configurado: procura na Steam/Epic e grava se achar.
-                let state = handle.state::<AppState>();
-                if state.get_settings().game_dir.is_none()
-                    && commands::resolve_game(&state).is_none()
                 {
-                    log::info!("Hogwarts Legacy não encontrado automaticamente");
+                    let gate = handle.state::<play::PlayGate>();
+                    let _run = gate.begin().await;
+                    let store = content.clone();
+                    let _ = tokio::task::spawn_blocking(move || store.startup()).await;
                 }
+                // Jogo ainda não configurado: procura na Steam/Epic (fora da trava e do executor) e grava se achar.
+                let h = handle.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let state = h.state::<AppState>();
+                    if state.get_settings().game_dir.is_none()
+                        && commands::resolve_game(&state).is_none()
+                    {
+                        log::info!("Hogwarts Legacy não encontrado automaticamente");
+                    }
+                })
+                .await;
             });
             // Atualização do launcher: ao iniciar e a cada 6 h; só avisa a UI.
             update::spawn_periodic(app.handle().clone(), hub_url.clone());

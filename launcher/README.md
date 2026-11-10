@@ -69,33 +69,47 @@ privada. Só o workflow de release liga essa opção e assina.
 A checagem roda ao abrir e a cada 6 h (`update://available` para a UI); nada é instalado sozinho. `check_update`
 devolve `{available, version, notes}` e `install_update` baixa (3 tentativas com espera crescente: o Hub derruba quem
 fica abaixo de 32 KiB/s e não serve `Range`), confere a assinatura e instala (o instalador fecha o launcher). Pacote
-anunciado fora da origem do Hub é recusado.
+anunciado fora da origem do Hub é recusado. A versão também precisa estar assinada: `requireSignedVersion: true` no
+`tauri.conf.json` (o comentário confiável do `.sig` traz `version:X.Y.Z`, gravado por `tauri build` ou
+`tauri signer sign --app-version`) e o launcher confere de novo que a versão assinada é a anunciada. Assim um Hub
+comprometido não consegue oferecer um launcher antigo assinado como se fosse novo.
 
 ## Jogo, mod e Jogar
 
 - **Pasta do jogo**: na abertura, se `gameDir` estiver vazio, procura na Steam (`SteamPath` do HKCU ou `InstallPath`
   do HKLM WOW6432Node → `steamapps\libraryfolders.vdf` → `appmanifest_990080.acf` → `steamapps\common\<installdir>`)
-  e na Epic (`C:\ProgramData\Epic\EpicGamesLauncher\Data\Manifests\*.item`). `pick_game_dir` abre o seletor (plugin
-  dialog, só pelo Rust). Toda pasta precisa ter `HogwartsLegacy.exe` e `Phoenix\Binaries\Win64` (senão
-  `game_invalid`).
+  e na Epic (`<FOLDERID_ProgramData>\Epic\EpicGamesLauncher\Data\Manifests\*.item`). `pick_game_dir` abre o seletor
+  (plugin dialog, só pelo Rust). Toda pasta precisa ter `HogwartsLegacy.exe` e `Phoenix\Binaries\Win64` (senão
+  `game_invalid`). Como qualquer usuário local cria arquivos em `%ProgramData%`, um resultado da Epic só vale se o
+  `.item`, a pasta do jogo, o executável e `Phoenix\Binaries\Win64` tiverem dono SYSTEM, Administradores,
+  TrustedInstaller ou o usuário atual e nenhuma outra conta com direito de escrita (dono e DACL lidos com
+  `GetNamedSecurityInfoW`).
 - **Mod**: `GET /v1/mod/latest?protocol=N` → zip baixado do próprio Hub (3 tentativas), tamanho e sha256 conferidos,
-  assinatura minisign com a mesma chave do updater. O zip é validado inteiro antes de gravar (sem `..`, absolutos,
-  `\`, `:`, links, criptografia; cada arquivo até 512 MiB declarados) e extraído só em
-  `<jogo>\Phoenix\Binaries\Win64\cbmp\` (pasta do launcher, trocada inteira). `mods\installed.json` guarda versão,
-  protocolo e sha256 de cada arquivo; arquivo alterado → reinstala. Nunca faz downgrade: se o Hub oferecer versão
-  menor que a instalada no mesmo protocolo, a instalada fica.
-- **Jogar** (`play(serverId)`, um por vez; outro pedido → `busy`; `cancel_play` interrompe): detalhe do servidor →
-  ticket → manifest (validado) → download → montagem (+ limite do cache, sem desmontar o servidor atual) → mod (só
-  fora do modo simular) → `run\connect.json` → abrir. Etapas em `play://stage` (`{serverId, stage}`, com `stage` em
-  `ticket|manifest|download|mount|mod|connect|launch`). Ticket com mais de 240 s é renovado antes de gravar a conexão.
-  `clear_cache` usa a mesma trava.
+  assinatura minisign com a mesma chave do updater. O comentário confiável da assinatura tem de ser exatamente
+  `cbmp-mod protocol=<N> version=<X.Y.Z> sha256=<hex>` e bater com o protocolo pedido, a versão anunciada e o zip
+  (senão `mod_signature_invalid`); a versão registrada e comparada é a assinada. O zip é validado inteiro antes de
+  gravar (sem `..`, absolutos, `\`, `:`, links, criptografia; cada arquivo até 512 MiB declarados) e instalado de
+  forma atômica em `<jogo>\Phoenix\Binaries\Win64\cbmp\`: extrai em `cbmp.staging`, relê os hashes e só então troca
+  (`cbmp` → `cbmp.old` → apagado); qualquer falha antes da troca deixa o mod atual intacto, e sobras de uma queda são
+  resolvidas na próxima vez. `mods\installed.json` guarda versão, protocolo e sha256 de cada arquivo; o zip assinado e
+  o `.sig` ficam em `mods\package\` para reparo: arquivo alterado → reinstala do pacote local (assinatura conferida de
+  novo) ou baixa de novo. Nunca faz downgrade: se o Hub oferecer versão menor que a instalada no mesmo protocolo, a
+  instalada fica (`mod_altered` se ela estiver alterada e não houver pacote local para reparar).
+- **Jogar** (`play(serverId)`, um por vez; outro pedido → `busy`; `cancel_play` interrompe, inclusive pedidos ao Hub
+  em andamento): detalhe do servidor → ticket → manifest (validado) → download → montagem (+ limite do cache, sem
+  desmontar o servidor atual) → mod (só fora do modo simular) → `run\connect.json` → abrir. Etapas em `play://stage`
+  (`{serverId, stage}`, com `stage` em `ticket|manifest|download|mount|mod|connect|launch`). Ticket com mais de
+  240 s é renovado antes de gravar a conexão. `clear_cache` usa a mesma trava, mas o launcher não acompanha o jogo
+  depois de abri-lo: limpar o cache com o jogo aberto pode apagar arquivos em uso (a UI deve avisar).
 - **`run\connect.json`** (lido e apagado pelo mod; o launcher apaga após 60 s se ainda existir; sobra antiga sai na
-  abertura): `{host, port, ticket, serverId, contentDir, protocol, contentReadOnly: true}`. Criado com DACL protegida
-  só do usuário atual. **`contentDir` é somente leitura para o mod**: os arquivos de `servers\<id>` são hard links do
-  cache verificado (compartilhados com outros servidores); escrever neles corromperia o cache.
+  abertura): `{host, port, ticket, serverId, contentDir, protocol, contentReadOnly: true}`. A pasta `run\` e o arquivo
+  têm DACL protegida só do usuário atual. **`contentDir` é somente leitura para o mod**: os arquivos de
+  `servers\<id>` são hard links do cache verificado (compartilhados com outros servidores); escrever neles
+  corromperia o cache.
 - **Abrir**: o executável do jogo é aberto direto, sem argumentos e sem variáveis novas (o ticket nunca vai para
-  linha de comando nem ambiente). No **modo simular** (padrão enquanto não houver mod) nada é aberto e o `play`
-  devolve `{kind: "simulated", preview}` com o conteúdo da conexão sem o ticket.
+  linha de comando nem ambiente). No **modo simular** (padrão enquanto não houver mod) o jogo não é aberto e o `play`
+  devolve `{kind: "simulated", preview}` com o conteúdo da conexão sem o ticket; o `connect.json` (com o ticket) é
+  gravado mesmo assim e apagado em 60 s, para testar um mod/cliente à mão.
 
 ## Login
 

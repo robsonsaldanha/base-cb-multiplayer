@@ -106,6 +106,9 @@ pub fn connect_json(info: &ConnectInfo) -> Vec<u8> {
 pub fn write_connect_file(run_dir: &Path, info: &ConnectInfo) -> AppResult<PathBuf> {
     use std::io::Write;
     std::fs::create_dir_all(run_dir).map_err(|e| AppError::io(run_dir, &e))?;
+    // A própria pasta `run\` também só do usuário (herdado pelo que nascer nela): o `.tmp` já nasce restrito,
+    // antes mesmo da ACL explícita abaixo.
+    acl::restrict_dir_to_current_user(run_dir)?;
     let path = run_dir.join(CONNECT_FILE);
     let tmp = run_dir.join(format!("{CONNECT_FILE}.tmp"));
     let _ = std::fs::remove_file(&tmp);
@@ -196,10 +199,32 @@ pub fn launch(
     }
 }
 
-/// DACL de arquivos (Windows): restringir ao usuário atual e ler de volta.
+/// Segurança de arquivos (Windows): restringir ao usuário atual, ler dono e DACL de volta.
 pub mod acl {
     use crate::error::{AppError, AppResult};
     use std::path::Path;
+
+    /// SYSTEM.
+    pub const SID_SYSTEM: &str = "S-1-5-18";
+    /// BUILTIN\Administrators.
+    pub const SID_ADMINS: &str = "S-1-5-32-544";
+    /// NT SERVICE\TrustedInstaller (dono de pastas do Windows/Program Files).
+    pub const SID_TRUSTED_INSTALLER: &str =
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+    /// OWNER RIGHTS (vale para o dono, seja quem for).
+    pub const SID_OWNER_RIGHTS: &str = "S-1-3-4";
+    /// ACE só herdada pelos filhos (não vale para o próprio objeto).
+    pub const INHERIT_ONLY_ACE: u8 = 0x08;
+    /// Direitos que deixam alterar o conteúdo/ACL: gravar/criar arquivo, criar pasta, apagar filho, apagar,
+    /// trocar DACL/dono, GENERIC_ALL/GENERIC_WRITE.
+    pub const WRITE_RIGHTS: u32 = 0x0000_0002
+        | 0x0000_0004
+        | 0x0000_0040
+        | 0x0001_0000
+        | 0x0004_0000
+        | 0x0008_0000
+        | 0x1000_0000
+        | 0x4000_0000;
 
     /// Uma entrada da DACL.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,6 +232,8 @@ pub mod acl {
         pub sid: String,
         pub allowed: bool,
         pub mask: u32,
+        /// `ACE_HEADER.AceFlags` (herança).
+        pub flags: u8,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,10 +243,34 @@ pub mod acl {
         pub aces: Vec<Ace>,
     }
 
+    /// Dono + DACL.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Security {
+        pub owner: String,
+        pub dacl: Dacl,
+    }
+
+    /// Dono confiável (SYSTEM, Administradores, TrustedInstaller ou `me`) e nenhuma ACE de permissão de escrita
+    /// para outra conta. Função pura (testável com SIDs falsos).
+    pub fn trusted(sec: &Security, me: &str) -> bool {
+        let ok_sid =
+            |s: &str| s == me || s == SID_SYSTEM || s == SID_ADMINS || s == SID_TRUSTED_INSTALLER;
+        ok_sid(&sec.owner)
+            && sec.dacl.aces.iter().all(|a| {
+                !a.allowed
+                    || a.flags & INHERIT_ONLY_ACE != 0
+                    || a.mask & WRITE_RIGHTS == 0
+                    || ok_sid(&a.sid)
+                    || a.sid == SID_OWNER_RIGHTS
+            })
+    }
+
     fn acl_error(what: &str, code: u32) -> AppError {
         AppError::new(
             "permission_denied",
-            format!("Não foi possível proteger o arquivo de conexão ({what}: erro {code})."),
+            format!(
+                "Não foi possível ler ou proteger as permissões do arquivo ({what}: erro {code})."
+            ),
         )
     }
 
@@ -238,8 +289,8 @@ pub mod acl {
         use windows_sys::Win32::Security::{
             GetAce, GetSecurityDescriptorControl, GetTokenInformation, TokenUser,
             ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE,
-            PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
-            TOKEN_QUERY, TOKEN_USER,
+            OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+            PSID, SE_DACL_PROTECTED, SUB_CONTAINERS_AND_OBJECTS_INHERIT, TOKEN_QUERY, TOKEN_USER,
         };
         use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -276,8 +327,8 @@ pub mod acl {
         }
 
         fn user_sid(buf: &[u8]) -> PSID {
-            // SAFETY: `buf` veio de GetTokenInformation(TokenUser) e tem pelo menos um TOKEN_USER (alinhamento:
-            // lido sem referência alinhada).
+            // SAFETY: `buf` veio de GetTokenInformation(TokenUser) e tem pelo menos um TOKEN_USER (lido sem
+            // referência alinhada).
             unsafe {
                 std::ptr::read_unaligned(buf.as_ptr().cast::<TOKEN_USER>())
                     .User
@@ -303,13 +354,17 @@ pub mod acl {
             sid_string(user_sid(&buf))
         }
 
-        pub fn restrict_to_current_user(path: &Path) -> AppResult<()> {
+        pub fn restrict(path: &Path, inherit: bool) -> AppResult<()> {
             let buf = token_user()?;
             let sid = user_sid(&buf);
             let ea = EXPLICIT_ACCESS_W {
                 grfAccessPermissions: GENERIC_ALL,
                 grfAccessMode: SET_ACCESS,
-                grfInheritance: NO_INHERITANCE,
+                grfInheritance: if inherit {
+                    SUB_CONTAINERS_AND_OBJECTS_INHERIT
+                } else {
+                    NO_INHERITANCE
+                },
                 Trustee: TRUSTEE_W {
                     pMultipleTrustee: std::ptr::null_mut(),
                     MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
@@ -346,18 +401,19 @@ pub mod acl {
             Ok(())
         }
 
-        pub fn read_dacl(path: &Path) -> AppResult<Dacl> {
+        pub fn read_security(path: &Path) -> AppResult<Security> {
             let w = wide(path);
+            let mut owner: PSID = std::ptr::null_mut();
             let mut dacl: *mut ACL = std::ptr::null_mut();
             let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-            // SAFETY: caminho terminado em zero; `sd` alocado pela API (LocalFree abaixo); `dacl` aponta para dentro
-            // dele.
+            // SAFETY: caminho terminado em zero; `sd` alocado pela API (LocalFree abaixo); `owner` e `dacl` apontam
+            // para dentro dele.
             let r = unsafe {
                 GetNamedSecurityInfoW(
                     w.as_ptr(),
                     SE_FILE_OBJECT,
-                    DACL_SECURITY_INFORMATION,
-                    std::ptr::null_mut(),
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                    &mut owner,
                     std::ptr::null_mut(),
                     &mut dacl,
                     std::ptr::null_mut(),
@@ -374,6 +430,11 @@ pub mod acl {
                 if unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut rev) } == 0 {
                     return Err(acl_error("controle", unsafe { GetLastError() }));
                 }
+                let owner = if owner.is_null() {
+                    String::new()
+                } else {
+                    sid_string(owner)?
+                };
                 let mut aces = Vec::new();
                 if !dacl.is_null() {
                     // SAFETY: `dacl` válido enquanto `sd` vive.
@@ -390,10 +451,13 @@ pub mod acl {
                             ACCESS_ALLOWED_ACE_TYPE => true,
                             ACCESS_DENIED_ACE_TYPE => false,
                             other => {
+                                // Tipo que não interpretamos (callback/objeto): conta como permissão total de um
+                                // SID desconhecido, para quem verifica confiança recusar.
                                 aces.push(Ace {
                                     sid: format!("<tipo {other}>"),
-                                    allowed: false,
-                                    mask: 0,
+                                    allowed: true,
+                                    mask: u32::MAX,
+                                    flags: header.AceFlags,
                                 });
                                 continue;
                             }
@@ -408,12 +472,24 @@ pub mod acl {
                             sid: sid_string(sid_ptr)?,
                             allowed,
                             mask,
+                            flags: header.AceFlags,
                         });
                     }
+                } else {
+                    // DACL nula = acesso total para todos.
+                    aces.push(Ace {
+                        sid: "S-1-1-0".into(),
+                        allowed: true,
+                        mask: u32::MAX,
+                        flags: 0,
+                    });
                 }
-                Ok(Dacl {
-                    protected: control & SE_DACL_PROTECTED != 0,
-                    aces,
+                Ok(Security {
+                    owner,
+                    dacl: Dacl {
+                        protected: control & SE_DACL_PROTECTED != 0,
+                        aces,
+                    },
                 })
             })();
             // SAFETY: alocado por GetNamedSecurityInfoW.
@@ -431,13 +507,25 @@ pub mod acl {
     /// Troca a DACL de `path` por uma protegida com só o usuário atual (acesso total).
     #[cfg(windows)]
     pub fn restrict_to_current_user(path: &Path) -> AppResult<()> {
-        win::restrict_to_current_user(path)
+        win::restrict(path, false)
+    }
+
+    /// Como [`restrict_to_current_user`], para uma pasta: a entrada é herdada por tudo que for criado dentro.
+    #[cfg(windows)]
+    pub fn restrict_dir_to_current_user(path: &Path) -> AppResult<()> {
+        win::restrict(path, true)
+    }
+
+    /// Lê dono e DACL de `path` (`GetNamedSecurityInfoW`).
+    #[cfg(windows)]
+    pub fn read_security(path: &Path) -> AppResult<Security> {
+        win::read_security(path)
     }
 
     /// Lê a DACL de `path` (`GetNamedSecurityInfoW`).
     #[cfg(windows)]
     pub fn read_dacl(path: &Path) -> AppResult<Dacl> {
-        win::read_dacl(path)
+        win::read_security(path).map(|s| s.dacl)
     }
 
     /// Fora do Windows (não suportado): permissão 0600.
@@ -451,5 +539,86 @@ pub mod acl {
         }
         let _ = (path, acl_error);
         Ok(())
+    }
+
+    /// Fora do Windows (não suportado): permissão 0700.
+    #[cfg(not(windows))]
+    pub fn restrict_dir_to_current_user(path: &Path) -> AppResult<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| AppError::io(path, &e))?;
+        }
+        let _ = path;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const ME: &str = "S-1-5-21-1-2-3-1001";
+        const OTHER: &str = "S-1-5-21-1-2-3-1002";
+        const USERS: &str = "S-1-5-32-545";
+
+        fn ace(sid: &str, mask: u32, flags: u8) -> Ace {
+            Ace {
+                sid: sid.into(),
+                allowed: true,
+                mask,
+                flags,
+            }
+        }
+
+        fn sec(owner: &str, aces: Vec<Ace>) -> Security {
+            Security {
+                owner: owner.into(),
+                dacl: Dacl {
+                    protected: false,
+                    aces,
+                },
+            }
+        }
+
+        #[test]
+        fn confianca_por_dono_e_escrita_de_terceiros() {
+            let read = 0x0012_00A9;
+            let base = vec![
+                ace(SID_SYSTEM, 0x001F_01FF, 0),
+                ace(SID_ADMINS, 0x001F_01FF, 0),
+                ace(USERS, read, 0),
+            ];
+            for owner in [ME, SID_SYSTEM, SID_ADMINS, SID_TRUSTED_INSTALLER] {
+                assert!(trusted(&sec(owner, base.clone()), ME), "{owner}");
+            }
+            assert!(
+                !trusted(&sec(OTHER, base.clone()), ME),
+                "dono é outro usuário"
+            );
+            // Outra conta com direito de escrita/criação/troca de ACL.
+            for mask in [
+                0x2,
+                0x4,
+                0x40,
+                0x0001_0000,
+                0x0004_0000,
+                0x0008_0000,
+                0x1000_0000,
+                0x4000_0000,
+            ] {
+                let mut aces = base.clone();
+                aces.push(ace(USERS, mask, 0));
+                assert!(!trusted(&sec(SID_ADMINS, aces), ME), "{mask:#x}");
+            }
+            // Só herdada pelos filhos, ou negação: não conta.
+            let mut aces = base.clone();
+            aces.push(ace(USERS, 0x001F_01FF, INHERIT_ONLY_ACE));
+            aces.push(Ace {
+                allowed: false,
+                ..ace(OTHER, 0x001F_01FF, 0)
+            });
+            assert!(trusted(&sec(SID_ADMINS, aces), ME));
+        }
     }
 }

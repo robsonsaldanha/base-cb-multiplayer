@@ -37,21 +37,24 @@ fn default_data_dir() -> PathBuf {
 /// `FOLDERID_LocalAppData` do usuário atual (`None` se a API falhar).
 #[cfg(windows)]
 pub fn local_app_data() -> Option<PathBuf> {
+    known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_LocalAppData)
+}
+
+/// `FOLDERID_ProgramData` (`C:\ProgramData`), pela API e não pela variável de ambiente.
+#[cfg(windows)]
+pub fn program_data() -> Option<PathBuf> {
+    known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramData)
+}
+
+#[cfg(windows)]
+fn known_folder(id: &windows_sys::core::GUID) -> Option<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{
-        FOLDERID_LocalAppData, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
-    };
+    use windows_sys::Win32::UI::Shell::{SHGetKnownFolderPath, KF_FLAG_DEFAULT};
     let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
-    // SAFETY: GUID estático; `raw` recebe um buffer alocado pela API que liberamos com CoTaskMemFree em qualquer caso.
-    let hr = unsafe {
-        SHGetKnownFolderPath(
-            &FOLDERID_LocalAppData,
-            KF_FLAG_DEFAULT as _,
-            std::ptr::null_mut(),
-            &mut raw,
-        )
-    };
+    // SAFETY: GUID válido; `raw` recebe um buffer alocado pela API que liberamos com CoTaskMemFree em qualquer caso.
+    let hr =
+        unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT as _, std::ptr::null_mut(), &mut raw) };
     let out = if hr >= 0 && !raw.is_null() {
         // SAFETY: em sucesso `raw` é uma string UTF-16 terminada em zero.
         let len = unsafe { (0..).take_while(|&i| *raw.add(i) != 0).count() };
@@ -115,5 +118,7 @@ mod tests {
         let known = local_app_data().expect("FOLDERID_LocalAppData");
         assert!(known.is_absolute() && known.is_dir());
         assert_eq!(default_data_dir(), known.join(APP_DIR));
+        let pd = program_data().expect("FOLDERID_ProgramData");
+        assert!(pd.is_absolute() && pd.is_dir());
     }
 }
