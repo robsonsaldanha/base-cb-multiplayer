@@ -205,6 +205,8 @@ int run(const std::string& cfgPath) {
   api.http = std::make_shared<cbscript::HttpOutPool>();
   api.audit = [auditLog](const std::string& line) { auditLog->info("{}", line); };
   api.unixNow = unixNow;
+  // Comandos {admin = true} pelo chat: só dids de admin.admins (o console do painel tem as regras dele).
+  api.isAdmin = cbserver::chatAdminCheck(cfg.admin);
   auto apiStats = std::make_shared<cbscript::ApiStats>();
   api.stats = apiStats;
   cbscript::HostOptions hostOpt;

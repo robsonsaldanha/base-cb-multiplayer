@@ -277,6 +277,12 @@ bool validCidr(std::string_view s) {
 
 }  // namespace
 
+std::function<bool(const std::string&)> chatAdminCheck(const AdminSettings& admin) {
+  return [admins = admin.admins](const std::string& did) {
+    return !did.empty() && std::find(admins.begin(), admins.end(), did) != admins.end();
+  };
+}
+
 bool isLoopbackBind(std::string_view ip) {
   std::array<int, 4> o{};
   if (parseIpv4(ip, o)) return o[0] == 127;

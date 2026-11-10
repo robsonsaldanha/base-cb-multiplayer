@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -42,6 +43,10 @@ struct AdminSettings {
   std::vector<std::string> trustedProxies;  // IPs/CIDRs cujo X-Forwarded-For é aceito (padrão: nenhum)
   bool enabled() const { return !admins.empty() || devToken.has_value(); }
 };
+
+// Checagem de admin para comandos de script com {admin = true} digitados no chat (ApiOptions::isAdmin): did em
+// admin.admins. Cópia da lista no momento da chamada (mudar a lista exige reiniciar). Lista vazia = ninguém.
+std::function<bool(const std::string&)> chatAdminCheck(const AdminSettings& admin);
 
 // Bind loopback (127.0.0.0/8, ::1).
 bool isLoopbackBind(std::string_view ip);

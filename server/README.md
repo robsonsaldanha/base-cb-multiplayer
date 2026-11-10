@@ -81,7 +81,7 @@ JSON; todos os campos são opcionais. Valores abaixo são os padrões.
 | `db.pool` | `4` | 1 a 64 conexões |
 | `db.timeoutMs` | `5000` | 100 a 600000; prazo de cada consulta (fila + execução) |
 | `db.tls` | `"auto"` | `auto`, `off`, `required` ou `verify` (abaixo) |
-| `admin.admins` | `[]` | ids Discord (texto, 17 a 20 dígitos), até 100; repetidos são ignorados. Vazio e sem `devToken` = painel desligado |
+| `admin.admins` | `[]` | ids Discord (texto, 17 a 20 dígitos), até 100; repetidos são ignorados. Vazio e sem `devToken` = painel desligado. Também são quem pode usar pelo chat os comandos de script com `admin = true` (lido na subida) |
 | `admin.port` | `30510` | 1 a 65535, diferente de `port` |
 | `admin.bind` | `"127.0.0.1"` | IP literal sem porta (`127.0.0.1`, `::1`, `0.0.0.0`, `::`, IP da máquina) |
 | `admin.publicUrl` | `null` | origem `https://host[:porta]` (http só em loopback), sem caminho; anunciada ao Hub (`adminUrl`). Sem ela não há login via Hub |
@@ -315,8 +315,6 @@ Correções emitidas pelo próprio servidor (spawn, teleporte) têm carência de
   pendente (`docs/PENDENCIAS.md`).
 - HTTP escuta só em IPv4 (`0.0.0.0`); o jogo (GNS) escuta em IPv4 e IPv6. Corrigir antes do launcher (subprojeto 4).
 - Uma única thread roda todos os scripts: um resource pesado atrasa os outros (nunca a simulação).
-- Comandos de script com `admin = true` só funcionam pelo console do painel; pelo chat são recusados para todos (ainda
-  não há lista de admins de jogo ligada à API).
 - Sessões do painel, bans lidos do MySQL e limites do painel ficam em memória/na subida: restart desloga os admins;
   bans gravados por outro servidor no mesmo banco só valem depois de reiniciar.
 

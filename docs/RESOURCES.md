@@ -402,8 +402,9 @@ Registra um comando usado no chat do jogo (`/nome args`) e no console do painel 
 - `opcoes.admin = true`:
   - **console do painel admin:** só comandos com `admin = true` são aceitos; os outros são recusados. Cada uso é
     auditado com o Discord ID do admin (`{"type":"command","by":"<did>",...}`);
-  - **chat:** só jogadores reconhecidos como admin pelo servidor podem usar. Hoje o `cb-server` não liga nenhuma lista
-    de admins de jogo, então pelo chat esses comandos respondem `sem permissão` para todos (pendência registrada).
+  - **chat:** só jogadores cujo Discord ID está em `admin.admins` do `server.cfg` (a mesma lista do painel; mudar a
+    lista exige reiniciar o servidor). Os demais recebem `sem permissão para '/<nome>'`; com a lista vazia (padrão),
+    ninguém usa esses comandos pelo chat. Cada uso pelo chat é auditado (`{"type":"command","by":"<did>","id":...}`).
 - Como o cliente manda um comando: evento `cb:command` com payload = texto JSON (`"/dado 20"`). A resposta volta no
   evento `cb:reply`.
 
@@ -763,4 +764,4 @@ Contadores em `/metrics`: `scriptEventsDropped`, `scriptCommandsDropped`, `scrip
 | handler de `emitLocal` "não rodou" | ele roda depois do callback atual terminar, não dentro dele |
 | `vigia: execução levou N ms` | callback lento; divida o trabalho (timers) ou mova para o banco |
 | resource em `Failed` "abortado por tempo 3 vezes" | laço longo ou infinito; corrija e dê `restart` pelo painel |
-| `sem permissão para '/x'` no chat | comando `admin = true`: use o console do painel |
+| `sem permissão para '/x'` no chat | comando `admin = true` e o Discord ID do jogador não está em `admin.admins` |

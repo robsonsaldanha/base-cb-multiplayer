@@ -14,9 +14,8 @@ das tasks).
   forma. Dono: sub4.
 - **Resource de exemplo com arquivos de cliente** para o launcher testar download: `resources.example/echo` só tem
   `server/`. Acrescentar um exemplo com `client/`/`ui/`/`files/`. Dono: sub4.
-- **Comandos `admin = true` pelo chat**: `ApiOptions::isAdmin` não está ligado no `main.cpp`, então todo jogador recebe
-  "sem permissão" (o console do painel funciona). Ligar a `admin.admins` (ou a uma lista própria de admins de jogo) e
-  testar com o chat do cliente. Dono: sub4/sub5 (quando houver chat no cliente).
+- **Comandos `admin = true` pelo chat** usam `admin.admins` (lida na subida). Falta testar com o chat do cliente real e
+  decidir se admins de jogo devem ter uma lista separada da do painel. Dono: sub5 (quando houver chat no cliente).
 - **`nonce` no ticket de admin**: o `state` do painel só prova que *algum* navegador começou o fluxo; um ticket
   roubado pode ser pareado com o state do próprio atacante. O Hub deve amarrar o hash do state no ticket (claim
   `nonce`) e o painel conferir. Mudança no Hub e no contrato. Dono: Hub.

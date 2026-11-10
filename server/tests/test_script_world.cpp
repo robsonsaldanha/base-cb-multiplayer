@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -21,6 +22,7 @@
 #include "cbscript/api.hpp"
 #include "cbscript/bans.hpp"
 #include "cbscript/host.hpp"
+#include "cbserver/config.hpp"
 #include "cbserver/script_bridge.hpp"
 #include "world_harness.hpp"
 
@@ -74,11 +76,13 @@ struct Env {
   Harness h;
   std::mutex mu;
   std::vector<std::string> logs;
+  std::vector<std::string> audits;
   std::unique_ptr<cbscript::ScriptHost> host;
   std::unique_ptr<cbserver::ScriptBridge> bridge;
 
   explicit Env(const std::string& probe, std::chrono::milliseconds abortAfter = std::chrono::milliseconds(300),
-               std::shared_ptr<cbscript::BanStore> bans = nullptr) {
+               std::shared_ptr<cbscript::BanStore> bans = nullptr,
+               std::function<bool(const std::string&)> isAdmin = {}) {
     fs::copy(fs::path(CBMP_EXAMPLE_RESOURCES) / "echo", dir.p / "echo", fs::copy_options::recursive);
     put(dir.p / "probe" / "resource.json",
         R"({"name":"probe","version":"1.0.0","server":["server/main.lua"]})");
@@ -92,6 +96,11 @@ struct Env {
     };
     cbscript::ApiOptions api;
     api.bans = std::move(bans);
+    api.isAdmin = std::move(isAdmin);
+    api.audit = [this](const std::string& line) {
+      std::lock_guard<std::mutex> lk(mu);
+      audits.push_back(line);
+    };
     cbscript::installApi(opt, api);
     cbscript::Limits lim;
     lim.warnAfter = std::chrono::milliseconds(50);
@@ -244,6 +253,65 @@ TEST_CASE("bridge: chat command arrives as cb:command and the reply comes back a
   REQUIRE(env.h.world.onEvent(a, Event{"cb:command", bytes("{bad")}, env.h.now));
   for (int i = 0; i < 10; ++i) env.tick();
   REQUIRE(env.h.msgs<Event>(a).empty());
+}
+
+TEST_CASE("bridge: chat admin commands follow admin.admins from server.cfg; empty list means no one") {
+  const char* probe = R"(
+    cb.on('playerJoin', function(p) cb.log.info('join ' .. p.id) end)
+    cb.commands.register('segredo', function(src) return 'segredo ' .. src end, {admin = true})
+  )";
+  const std::string adminDid = "123456789012345678", otherDid = "876543210987654321";
+  // Respostas cb:reply de cada id (as saídas de cada tick são recolhidas antes do próximo).
+  auto replies = [](Env& env, std::vector<cbserver::EntityId> ids) {
+    std::map<cbserver::EntityId, std::string> r;
+    env.ticksUntil([&] {
+      for (auto id : ids)
+        for (const auto& e : env.h.msgs<Event>(id))
+          if (e.name == "cb:reply") r[id] = text(e.payload);
+      return r.size() == ids.size();
+    });
+    return r;
+  };
+  auto join = [](Env& env, const std::string& did, const std::string& name) {
+    auto id = env.h.world.addPlayer("sub-" + name, did, name, env.h.now, cbmp::PlayerState{});
+    REQUIRE(id);
+    REQUIRE(env.ticksUntil([&] { return env.hasLog("join " + std::to_string(*id)); }));
+    return *id;
+  };
+  {
+    const auto cfg = cbserver::ServerConfig::fromJson(nlohmann::json::parse(
+        R"({"admin": {"admins": [")" + adminDid + R"("]}})"));
+    Env env(probe, std::chrono::milliseconds(300), nullptr, cbserver::chatAdminCheck(cfg.admin));
+    INFO(env.allLogs());
+    auto adm = join(env, adminDid, "adm");
+    auto bob = join(env, otherDid, "bob");
+    REQUIRE(env.h.world.onEvent(adm, Event{"cb:command", bytes(R"("/segredo")")}, env.h.now));
+    REQUIRE(env.h.world.onEvent(bob, Event{"cb:command", bytes(R"("/segredo")")}, env.h.now));
+    auto r = replies(env, {adm, bob});
+    CHECK(r[adm] == "\"segredo " + std::to_string(adm) + "\"");
+    CHECK(r[bob].find("sem permiss") != std::string::npos);
+    // Comando de admin pelo chat continua auditado com o did de quem digitou.
+    std::lock_guard<std::mutex> lk(env.mu);
+    int audited = 0;
+    for (auto& a : env.audits) {
+      auto j = nlohmann::json::parse(a);
+      if (j["type"] == "command" && j["line"] == "segredo") {
+        ++audited;
+        CHECK(j["by"] == adminDid);
+      }
+    }
+    CHECK(audited == 1);
+  }
+  {
+    // Lista vazia (padrão): ninguém usa comandos de admin pelo chat.
+    const auto cfg = cbserver::ServerConfig::fromJson(nlohmann::json::object());
+    REQUIRE(cfg.admin.admins.empty());
+    Env env(probe, std::chrono::milliseconds(300), nullptr, cbserver::chatAdminCheck(cfg.admin));
+    INFO(env.allLogs());
+    auto adm = join(env, adminDid, "adm");
+    REQUIRE(env.h.world.onEvent(adm, Event{"cb:command", bytes(R"("/segredo")")}, env.h.now));
+    CHECK(replies(env, {adm})[adm].find("sem permiss") != std::string::npos);
+  }
 }
 
 TEST_CASE("bridge: the simulation never waits for a busy script thread") {
