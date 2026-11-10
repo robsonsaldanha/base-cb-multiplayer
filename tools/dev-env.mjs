@@ -13,6 +13,8 @@
 //                         Lida só para assinar; nunca copiada nem impressa. Recusada se estiver dentro do repositório.
 //         --cb-server <exe> (padrão build-native\windows-release\server\Release\cb-server.exe; ou CBMP_CB_SERVER)
 //         --force        refaz releases que já existem (sem ele, --build-releases pula o que já está pronto)
+//         --hub-port <n>, --game-port <n>  portas do Hub (padrão 8787) e do cb-server (padrão 30500). Só para testes
+//                        automáticos: o launcher "Teste local" instalado procura o Hub em 127.0.0.1:8787.
 //
 // Idempotente: rodar de novo reaproveita os dados do Hub, o servidor cadastrado (estado em <pasta>\state.json) e as
 // releases prontas. Nada aqui vai para produção: Hub só em 127.0.0.1, login de dev, releases de teste.
@@ -26,9 +28,11 @@ import { dirname, join, relative, resolve, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const HUB_PORT = 8787;
-const HUB_URL = `http://127.0.0.1:${HUB_PORT}`;
-const GAME_PORT = 30500;
+// Portas padrão (as que o launcher "Teste local" conhece: Hub fixo em 127.0.0.1:8787). --hub-port/--game-port só para
+// o teste de ponta a ponta (launcher/src-tauri/tests/e2e.rs), que usa portas livres para não colidir com um --run aberto.
+let HUB_PORT = 8787;
+let HUB_URL = `http://127.0.0.1:${HUB_PORT}`;
+let GAME_PORT = 30500;
 const SERVER_NAME = 'Castelo Bruxo (teste)';
 const DEV_DID = '111111111111111111';
 const DEV_NAME = 'Dev Local';
@@ -56,11 +60,19 @@ function parseArgs(argv) {
       case '--dir': o.dir = val(); break;
       case '--key': o.key = val(); break;
       case '--cb-server': o.cbServer = val(); break;
+      case '--hub-port': o.hubPort = port(a, val()); break;
+      case '--game-port': o.gamePort = port(a, val()); break;
       case '-h': case '--help': o.help = true; break;
       default: fail(`opção desconhecida: ${a} (use --help)`);
     }
   }
   return o;
+}
+
+function port(flag, v) {
+  const n = Number(v);
+  if (!/^[1-9]\d{0,4}$/.test(v) || n > 65535) fail(`${flag} inválida: ${v}`);
+  return n;
 }
 
 function usage() {
@@ -168,14 +180,41 @@ function buildMod(p, o) {
   writeFileSync(join(out, 'notes.txt'), `Mod de teste ${MOD_VERSION} (protocolo ${MOD_PROTOCOL}), gerado por tools/dev-env.mjs.\n`);
 }
 
-function buildLauncher(p, o, version, keyText) {
+// O que entra no binário do launcher (testes e examples ficam de fora): um release pronto só é reaproveitado se isso
+// não mudou desde o build. Sem essa conferência, um instalador antigo (outra pasta de dados, outro Hub) passaria por novo.
+const LAUNCHER_INPUTS = ['launcher/src-tauri/src', 'launcher/src-tauri/Cargo.toml', 'launcher/src-tauri/Cargo.lock',
+  'launcher/src-tauri/build.rs', 'launcher/src-tauri/tauri.conf.json', 'launcher/src-tauri/tauri.localtest.conf.json',
+  'launcher/src-tauri/capabilities', 'launcher/src-tauri/permissions', 'launcher/src-tauri/keys', 'launcher/src-tauri/icons',
+  'launcher/ui/src', 'launcher/ui/index.html', 'launcher/ui/package.json', 'launcher/ui/vite.config.ts', 'package-lock.json'];
+
+/** sha256 do conteúdo dos arquivos que entram no launcher (versionados e novos não ignorados; sem testes). */
+function sourceStamp() {
+  const r = spawnSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', ...LAUNCHER_INPUTS], { cwd: REPO, encoding: 'utf8' });
+  if (r.status !== 0) fail('git ls-files falhou (o dev-env precisa rodar dentro do repositório git)');
+  const files = [...new Set(r.stdout.split('\0').filter(Boolean))].sort();
+  const h = createHash('sha256');
+  for (const f of files) {
+    if (/(^|\/)(tests|__tests__)\//.test(f) || /\.test\.ts$/.test(f)) continue;
+    const full = join(REPO, f);
+    if (!existsSync(full)) continue; // apagado e ainda não commitado
+    h.update(`${f}\0`).update(readFileSync(full)).update('\0');
+  }
+  return h.digest('hex');
+}
+
+function buildLauncher(p, o, version, keyText, stamp) {
   const tag = `launcher-v${version}`;
   const out = join(p.releases, tag);
   const exe = `${PRODUCT}_${version}_x64-setup.exe`;
-  if (!o.force && existsSync(join(out, exe)) && existsSync(join(out, `${exe}.sig`))) {
-    log(`${tag}: já existe (use --force para refazer)`);
+  // Nome com ponto inicial: o Hub (HUB_RELEASES_DIR) não o lista como asset.
+  const stampFile = join(out, '.source-stamp');
+  const built = existsSync(join(out, exe)) && existsSync(join(out, `${exe}.sig`));
+  const same = built && existsSync(stampFile) && readFileSync(stampFile, 'utf8').trim() === stamp;
+  if (!o.force && same) {
+    log(`${tag}: já existe e o código do launcher não mudou (use --force para refazer)`);
     return;
   }
+  if (built && !o.force) log(`${tag}: o código do launcher mudou desde o build anterior (ou build sem registro); refazendo`);
   const bundle = join(REPO, 'launcher', 'src-tauri', 'target', 'release', 'bundle', 'nsis');
   rmSync(bundle, { recursive: true, force: true });
   log(`${tag}: build release do launcher de teste local (alguns minutos)…`);
@@ -191,6 +230,7 @@ function buildLauncher(p, o, version, keyText) {
   mkdirSync(out, { recursive: true });
   for (const f of [exe, `${exe}.sig`]) copyFileSync(join(bundle, f), join(out, f));
   writeFileSync(join(out, 'notes.txt'), `Versão de teste ${version} do launcher (Teste local), gerada por tools/dev-env.mjs.\n`);
+  writeFileSync(stampFile, `${stamp}\n`);
   log(`${tag}: pronto (${comment.replace(/\t/g, ' ')})`);
 }
 
@@ -199,7 +239,8 @@ function buildReleases(p, o) {
   mkdirSync(p.releases, { recursive: true });
   // O mod primeiro: o assinador confere a chave com keys/update.pub e para tudo se não for o par.
   buildMod(p, o);
-  for (const v of LAUNCHER_VERSIONS) buildLauncher(p, o, v, keyText);
+  const stamp = sourceStamp();
+  for (const v of LAUNCHER_VERSIONS) buildLauncher(p, o, v, keyText, stamp);
   log(`releases em ${p.releases}`);
 }
 
@@ -426,14 +467,15 @@ ${haveInstaller ? '' : `
  Releases de teste ausentes: rode antes "node tools/dev-env.mjs --build-releases" (alguns minutos).
 `}
  O que fazer (só nesta máquina):
+  Passo a passo completo: docs/TESTES-MANUAIS-SUB4.md. Resumo:
   1. Instale o launcher de teste: ${installer}
      (nome "${PRODUCT}"; o SmartScreen pode avisar: "Mais informações" → "Executar assim mesmo").
-  2. Abra o "${PRODUCT}" e clique em Entrar. O navegador abre a página do Hub de teste:
+  2. Abra o "${PRODUCT}" e clique em "Entrar com Discord". O navegador abre a página do Hub de teste:
      confirme "Entrar como dev" (conta fictícia ${DEV_NAME}). Login com Discord de verdade só com
      DISCORD_CLIENT_ID/DISCORD_CLIENT_SECRET de um app de teste nas variáveis de ambiente (nunca em arquivo).
-  3. A lista mostra "${SERVER_NAME}" em destaque. Jogar baixa o hello-client e o mod de teste; com
-     "simular abertura" ligado o launcher para em "Pronto para abrir" sem abrir o jogo.
-  4. Auto-update: o launcher 0.1.0 encontra a 0.1.1 neste Hub (Configurações → atualizar).
+  3. A lista mostra "${SERVER_NAME}" em destaque. Com "Modo simular" ligado (padrão), Jogar baixa e confere o
+     hello-client e para em "Pronto para abrir" sem abrir o jogo (o mod de teste só é baixado fora do modo simular).
+  4. Auto-update: o launcher 0.1.0 encontra a 0.1.1 neste Hub (Configurações → Instalar atualização).
   5. Pastas: %LOCALAPPDATA%\\CBMultiplayer-TesteLocal (cache, servers, mods, logs\\launcher.log); o build de
      teste local tem pasta própria (o oficial usa %LOCALAPPDATA%\\CBMultiplayer).
 
@@ -450,6 +492,8 @@ if (o.help || (!o.buildReleases && !o.run && !o.stop)) {
   usage();
   process.exit(o.help ? 0 : 1);
 }
+if (o.hubPort) { HUB_PORT = o.hubPort; HUB_URL = `http://127.0.0.1:${HUB_PORT}`; }
+if (o.gamePort) GAME_PORT = o.gamePort;
 const p = paths(o);
 if (inside(REPO, p.dir)) fail(`a pasta de trabalho não pode ficar dentro do repositório (${p.dir})`);
 mkdirSync(p.dir, { recursive: true });

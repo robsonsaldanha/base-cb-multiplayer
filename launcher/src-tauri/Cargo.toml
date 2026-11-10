@@ -70,6 +70,11 @@ futures-util = { version = "=0.3.34", default-features = false }
 # Par de chaves minisign gerado no próprio teste (nunca a chave de dev nem a de release).
 minisign = "=0.10.0"
 
+# Assinatura/conferência do workflow de release: `cargo test` roda os testes dele (pares gerados no próprio teste).
+[[example]]
+name = "release_sign"
+test = true
+
 [profile.release]
 codegen-units = 1
 lto = true

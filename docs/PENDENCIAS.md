@@ -23,6 +23,19 @@ das tasks).
 - **Política de teleporte**: `setState` limpa `correctionTimes`; decidir se mantém o histórico.
 - **Comandos `admin = true` pelo chat** usam `admin.admins` (lida na subida). Falta testar com o chat do cliente real e
   decidir se admins de jogo devem ter uma lista separada da do painel. Dono: sub5.
+- **Mod real e a entrega pelo launcher** (sub4 entregou só o canal): o launcher instala o mod por `protocol` a partir
+  do Hub (`mod-pN-vX.Y.Z`, assinado). Falta o mod em si e um build que publique o zip como artefato `cbmp-mod` (um
+  único `.zip`) para o `release.yml` (`kind=mod`, `mod_run_id`) assinar e publicar. Enquanto não houver mod com
+  `protocol` compatível, o launcher fica em "Modo simular".
+- **Contrato do `connect.json` para o mod** (escrito pelo launcher em `<dados>\run\connect.json`, `launcher/README.md`):
+  `{host, port, ticket, serverId, contentDir, protocol, contentReadOnly: true}`, UTF-8, DACL só do usuário. O mod lê,
+  **apaga** o arquivo e usa o ticket uma vez (TTL de 300 s no Hub); o launcher apaga sozinho depois de 60 s se ainda
+  existir e remove sobras ao abrir. Nunca procurar o ticket em linha de comando ou variável de ambiente. `contentDir`
+  é **somente leitura** (hard links do cache verificado, compartilhados entre servidores): o mod não pode gravar nada
+  ali. Conferir `protocol` com o do mod e recusar se diferente.
+- **Pasta de dados por build** (revisão 9a, M-8): o launcher oficial usa `%LOCALAPPDATA%\CBMultiplayer` e o build
+  "Teste local" usa `%LOCALAPPDATA%\CBMultiplayer-TesteLocal` (`run\` e `mods\` inclusive). O mod não pode fixar o
+  nome da pasta: receber o caminho do `run\` do launcher (ex.: arquivo ao lado do mod instalado) ou procurar nos dois.
 
 ## Servidor: resíduos do subprojeto 3 (Lua / MySQL / admin)
 
@@ -83,16 +96,36 @@ Decisões registradas e limites aceitos; o comportamento atual está documentado
   - o resumo de logins recusados da janela em curso se perde se o processo morrer sem `stop`;
   - sem teste automatizado com navegador real (fluxo verificado à mão no Chromium).
 - `kid`/`name` vindos do Hub vão para o log sem remover caracteres de controle.
+- **`cb.players.ban` grava `bans.json` com fsync na thread de scripts, dentro da janela do vigia** (revisão 9a, M-7):
+  num disco lento a gravação durável (arquivo + pasta) pode passar do `abortMs` (5 s) e o handler do resource é
+  abortado no meio (o ban fica gravado ou não, conforme o ponto do aborto). Os testes usam vigia folgada
+  (`ApiEnv::roomyWatchdog`). Corrigir movendo a gravação para fora da thread de scripts (fila + confirmação), ou
+  descontando o tempo de disco do vigia.
 
 ## Antes de abrir ao público
 
 - **Launcher (sub4)**:
-  - releases assinadas com a versão no comentário confiável (mod `cbmp-mod protocol=<N> version=<X.Y.Z>
-    sha256=<hex>`; launcher `--app-version`); um release antigo assinado sem versão é recusado pelo launcher
-    (`requireSignedVersion`). Rollback do launcher para uma versão antiga assinada continua impossível só enquanto
-    essa opção ficar ligada.
-  - "Limpar cache" com o jogo aberto pode apagar arquivos montados em uso (o launcher não acompanha o processo do
-    jogo depois de abrir); a UI deve avisar.
+  - **Trocar a chave de assinatura dev** (key id `BDCB478091E91629`) pela de produção antes do primeiro release real
+    (`launcher/README.md`, "Chaves"); o `release.yml` recusa assinar com a dev. Efeito (revisão 9a, M-6): o build
+    "Teste local" embute a mesma `keys/update.pub`, então os releases de teste do `tools/dev-env.mjs` assinados com
+    a dev deixam de valer. Rodar `docs/TESTES-MANUAIS-SUB4.md` antes da troca, ou decidir então embutir a pública dev
+    só no perfil `local-test`.
+  - **Endereço real do Hub**: `https://hub.cbmp.invalid` é placeholder (`settings::DEFAULT_HUB_URL` e endpoint do
+    updater no `tauri.conf.json`).
+  - **Assinatura Authenticode** do instalador e do executável: exige certificado de code signing. Sem ela o SmartScreen
+    avisa na primeira execução ("Mais informações" → "Executar assim mesmo"); a integridade dos updates é garantida
+    pelo minisign de qualquer forma.
+  - **`cbmp://` registrado pelos dois builds** (revisão 9a, M-2): com o oficial e o "Teste local" instalados, o login
+    cai no que foi instalado por último. Hoje basta manter só um instalado. Separar exigiria outro esquema no build de
+    teste e o Hub aceitar os dois no `launcherLink` (e na CSP do formulário de dev).
+  - **Linux/macOS**: o launcher é só Windows x64 (o código Rust é portável onde não custa nada, mas não é testado fora
+    do Windows; localizador do jogo, ACL do `connect.json` e cofre são específicos do Windows).
+  - Rollback do launcher para uma versão antiga assinada continua impossível só enquanto `requireSignedVersion` ficar
+    ligado no `tauri.conf.json` (o comentário confiável traz a versão; o `config_guard` exige a opção).
+  - "Limpar cache" com o jogo aberto: a UI avisa para fechar o jogo, mas o launcher não acompanha o processo do jogo
+    depois de abrir; no Windows a remoção de um arquivo em uso falha (não corrompe).
+  - Conteúdo e ping ignoram o proxy do sistema (`.no_proxy()`, para a regra de endereços valer): redes que só saem por
+    proxy não pingam nem baixam conteúdo (o jogo também não conectaria). Documentado em `launcher/README.md`.
   - Instalação do mod com disco cheio: a troca é atômica (staging + rename), mas não há teste automatizado de disco
     cheio.
 

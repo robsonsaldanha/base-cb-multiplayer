@@ -1,0 +1,187 @@
+name: release
+# Publica um release ASSINADO que o Hub repassa ao launcher (HUB_RELEASES_REPO = este repositório):
+#   kind=launcher → tag launcher-vX.Y.Z: CBMultiplayer_X.Y.Z_x64-setup.exe + .sig (updater do Tauri, version:X.Y.Z no
+#                   comentário confiável).
+#   kind=mod      → tag mod-pN-vX.Y.Z: cbmp-mod-pN-vX.Y.Z.zip + .zip.sig (comentário confiável exato
+#                   "cbmp-mod protocol=N version=X.Y.Z sha256=<hex>") + .zip.sha256. O zip vem do artefato "cbmp-mod"
+#                   de outra execução de workflow (mod_run_id), gerado pelo build do mod (subprojeto 5).
+# A chave privada só existe no secret CBMP_UPDATE_KEY (formato do Tauri; senha em CBMP_UPDATE_KEY_PASSWORD, opcional)
+# e só chega aos passos que assinam. Recusa assinar enquanto keys/update.pub for a chave de desenvolvimento
+# (key id BDCB478091E91629). Tudo é conferido com a chave pública embutida, como o launcher confere, antes de publicar.
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: 'O que publicar'
+        required: true
+        type: choice
+        options: [launcher, mod]
+      version:
+        description: 'Versão X.Y.Z (sem "v")'
+        required: true
+        type: string
+      protocol:
+        description: 'Protocolo do mod (só kind=mod; inteiro, ex. 1)'
+        required: false
+        type: string
+        default: ''
+      mod_run_id:
+        description: 'kind=mod: id da execução que gerou o artefato "cbmp-mod" (um único .zip)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+# Um release por vez (tags e versões não se atropelam).
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    permissions:
+      contents: write # criar a tag e o Release
+      actions: read # baixar o artefato do mod de outra execução
+    # Entradas só por variável de ambiente (nunca ${{ }} dentro dos scripts).
+    env:
+      KIND: ${{ inputs.kind }}
+      VERSION: ${{ inputs.version }}
+      PROTOCOL: ${{ inputs.protocol }}
+      MOD_RUN_ID: ${{ inputs.mod_run_id }}
+      GH_TOKEN: ${{ github.token }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Conferir entradas e tag
+        run: |
+          set -euo pipefail
+          num='(0|[1-9][0-9]{0,8})'
+          [[ "$VERSION" =~ ^$num\.$num\.$num$ ]] || { echo "versão inválida: '$VERSION' (esperado X.Y.Z)"; exit 1; }
+          case "$KIND" in
+            launcher)
+              [[ -z "$PROTOCOL" && -z "$MOD_RUN_ID" ]] || { echo "protocol/mod_run_id só valem para kind=mod"; exit 1; }
+              TAG="launcher-v$VERSION" ;;
+            mod)
+              [[ "$PROTOCOL" =~ ^$num$ ]] || { echo "protocol inválido: '$PROTOCOL' (inteiro, sem zeros à esquerda)"; exit 1; }
+              [[ "$MOD_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]] || { echo "mod_run_id inválido: '$MOD_RUN_ID'"; exit 1; }
+              TAG="mod-p$PROTOCOL-v$VERSION" ;;
+            *) echo "kind inválido: '$KIND'"; exit 1 ;;
+          esac
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+            echo "a tag $TAG já existe: versões publicadas não são substituídas"; exit 1
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "release: $TAG"
+
+      - name: Conferir o secret
+        env:
+          CBMP_UPDATE_KEY: ${{ secrets.CBMP_UPDATE_KEY }}
+        run: |
+          [[ -n "${CBMP_UPDATE_KEY// /}" ]] || { echo "secret CBMP_UPDATE_KEY ausente (launcher/README.md, \"Chaves\")"; exit 1; }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      # Ações de terceiros fixadas por commit (o instalador é gerado sob elas).
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: launcher/src-tauri -> target
+          # Release usa o próprio cache (não reaproveita o de PRs).
+          shared-key: release
+      - run: npm ci
+
+      # Antes de qualquer build: com a chave dev em keys/update.pub nada é assinado.
+      - name: Recusar a chave de desenvolvimento
+        working-directory: launcher/src-tauri
+        run: cargo run --quiet --locked --example release_sign -- check-pubkey
+
+      # Mesmos testes do CI (inclui os do assinador, com pares gerados no teste) antes de publicar qualquer coisa.
+      - run: npm test -w launcher/ui
+      - run: npm run build -w launcher/ui
+      - run: npm run check:dist -w launcher/ui
+      - run: cargo test --locked
+        working-directory: launcher/src-tauri
+
+      # ------------------------------------------------------------------------------------------------- launcher
+      - name: Build assinado do launcher
+        if: env.KIND == 'launcher'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.CBMP_UPDATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.CBMP_UPDATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          npm run tauri -w launcher/ui -- build --ci \
+            --config "{\"version\":\"$VERSION\",\"bundle\":{\"createUpdaterArtifacts\":true}}" -- --locked
+
+      - name: Conferir e separar o instalador
+        if: env.KIND == 'launcher'
+        run: |
+          set -euo pipefail
+          rel=launcher/src-tauri/target/release
+          # Tripwire: nada do perfil de teste local no binário oficial.
+          for s in '127.0.0.1:8787' 'Teste local' 'localtest' 'TesteLocal'; do
+            if grep -q -a -F "$s" "$rel/CBMultiplayer.exe"; then echo "binário oficial contém '$s'"; exit 1; fi
+          done
+          src="$rel/bundle/nsis/CB Multiplayer_${VERSION}_x64-setup.exe"
+          [[ -f "$src" && -f "$src.sig" ]] || { echo "build não gerou $src e .sig"; ls -la "$rel/bundle/nsis" || true; exit 1; }
+          # Sem espaço no nome (o GitHub troca espaços em nomes de asset).
+          mkdir -p dist
+          dst="dist/CBMultiplayer_${VERSION}_x64-setup.exe"
+          cp "$src" "$dst"
+          cp "$src.sig" "$dst.sig"
+          cd launcher/src-tauri
+          cargo run --quiet --locked --example release_sign -- verify-launcher \
+            --installer "../../$dst" --sig "../../$dst.sig" --version "$VERSION"
+
+      # ------------------------------------------------------------------------------------------------------ mod
+      - name: Baixar o zip do mod
+        if: env.KIND == 'mod'
+        uses: actions/download-artifact@v4
+        with:
+          name: cbmp-mod
+          path: mod-in
+          run-id: ${{ inputs.mod_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Assinar e conferir o mod
+        if: env.KIND == 'mod'
+        env:
+          CBMP_UPDATE_KEY: ${{ secrets.CBMP_UPDATE_KEY }}
+          CBMP_UPDATE_KEY_PASSWORD: ${{ secrets.CBMP_UPDATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          zips=(mod-in/*.zip)
+          [[ ${#zips[@]} -eq 1 ]] || { echo "o artefato cbmp-mod deve ter exatamente um .zip (tem ${#zips[@]})"; exit 1; }
+          mkdir -p dist
+          cd launcher/src-tauri
+          cargo run --quiet --locked --example release_sign -- sign-mod \
+            --zip "../../${zips[0]}" --protocol "$PROTOCOL" --version "$VERSION" --out ../../dist
+
+      - name: Conferir o mod gravado
+        if: env.KIND == 'mod'
+        working-directory: launcher/src-tauri
+        run: cargo run --quiet --locked --example release_sign -- verify-mod --dir ../../dist --protocol "$PROTOCOL" --version "$VERSION"
+
+      # ---------------------------------------------------------------------------------------------- publicação
+      - name: Criar o Release
+        run: |
+          set -euo pipefail
+          ls -la dist
+          if [[ "$KIND" == launcher ]]; then
+            notes="CB Multiplayer $VERSION (instalador NSIS, Windows x64). Assinado para o updater do launcher."
+          else
+            notes="Mod do cliente $VERSION para o protocolo $PROTOCOL. Assinado; o launcher instala pelo Hub."
+          fi
+          gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "$TAG" --notes "$notes" --latest=false
