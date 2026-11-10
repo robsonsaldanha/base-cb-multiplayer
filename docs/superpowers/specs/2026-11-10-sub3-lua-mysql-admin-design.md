@@ -39,9 +39,15 @@ Fora do escopo: Lua no cliente (subprojeto 5), UI HTML dentro do jogo, voz, NPCs
 
 ### Sandbox
 
-- Bibliotecas: `base` sem `dofile`, `loadfile`, `collectgarbage("count")` permitido; `load` só com modo `"t"` e
-  ambiente explícito; `string`, `table`, `math`, `utf8`, `coroutine`; `os` reduzido a `time`, `clock`, `date`.
-  Sem `io`, `debug` (exceto `traceback` interno), `package` nativo.
+- Bibliotecas: `base` sem `dofile`, `loadfile`; `collectgarbage` só `"count"` e `"step"`; `load` só com modo `"t"`
+  (ambiente `nil` → ambiente sandbox do resource); `string` sem `dump`, `table` (`move` reimplementado sob o vigia),
+  `math`, `utf8`, `coroutine`; `os` reduzido a `time`, `clock`, `date`. Sem `io`, `debug` (exceto `traceback` interno),
+  `package` nativo. `print` limitado (64 KiB por linha, 200 linhas/s por resource).
+- Lua 5.4.7 **com patches mínimos** (overlay no vcpkg): hooks reabilitados ao fechar/resetar corrotinas (`__close`
+  não escapa do vigia) e orçamento de passos nas funções de padrão (`find`/`match`/`gmatch`/`gsub`) que respeita o
+  prazo do vigia. Vigia checado a cada chamada (inclusive C) via flag atômico, além da contagem de instruções.
+- Supervisor no host: callback que passar do prazo de aborto + 10 s sem retornar → log CRÍTICO, todos os resources
+  `Failed`, Lua deixa de receber eventos (a simulação continua).
 - `require(nome)`: carrega `<resource>/server/<nome com / >.lua` (mesma regra de caminho seguro do manifest), cache por
   resource; nada fora da pasta.
 - Memória: alocador por estado com teto (`scripting.memoryLimitMB`, padrão 256) → erro de memória no callback.
