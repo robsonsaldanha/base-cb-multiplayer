@@ -1,6 +1,8 @@
 #include "cbserver/world.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <exception>
 #include <cmath>
 #include <utility>
 
@@ -16,6 +18,8 @@ constexpr double kBaselineMaxAgeSec = 1.0;
 constexpr double kCorrectionWindowSec = 1.0;  // após uma Correction, não envia/conta outra por até 1 s
 constexpr double kServerGraceSec = 30.0;       // carência das janelas do servidor antes de reenviar a Correction
 constexpr int kMaxIgnoredWindows = 5;          // janelas de correção seguidas vencidas com o cliente longe → kick
+
+std::atomic<uint32_t> gNextSession{1};
 
 void trimWindow(std::deque<double>& q, double now) {
   while (!q.empty() && q.front() < now - kWindowSec) q.pop_front();
@@ -60,6 +64,8 @@ std::optional<EntityId> World::addPlayer(std::string sub, std::string did, std::
     if (slots_[i]) continue;
     auto p = std::make_unique<PlayerSlot>();
     p->id = static_cast<EntityId>(i);
+    p->session = gNextSession.fetch_add(1);
+    if (p->session == 0) p->session = gNextSession.fetch_add(1);  // 0 = "sem checagem"
     p->sub = std::move(sub);
     p->did = std::move(did);
     p->name = std::move(name);
@@ -74,6 +80,7 @@ std::optional<EntityId> World::addPlayer(std::string sub, std::string did, std::
     }
     active_.insert(std::lower_bound(active_.begin(), active_.end(), p->id), p->id);
     slots_[i] = std::move(p);
+    if (hooks_.join) hooks_.join(*slots_[i]);
     return static_cast<EntityId>(i);
   }
   return std::nullopt;
@@ -84,8 +91,9 @@ void World::forget(PlayerSlot& viewer, EntityId gone) {
     std::erase_if(rec.ents, [gone](const SentEntity& e) { return e.id == gone; });
 }
 
-void World::removePlayer(EntityId id) {
+void World::removePlayer(EntityId id, std::string_view reason) {
   if (!slot(id)) return;
+  if (hooks_.leave) hooks_.leave(*slots_[id], reason);
   grid_.remove(id);
   eraseSorted(active_, id);
   slots_[id].reset();
@@ -122,10 +130,10 @@ void World::sendCorrection(PlayerSlot& p, uint32_t seq, double now, bool byServe
   p.serverCorrectionResent = false;
 }
 
-void World::orderKick(PlayerSlot& s, const char* reason) {
+void World::orderKick(PlayerSlot& s, std::string reason) {
   if (s.kicked) return;
   s.kicked = true;
-  pendingKicks_.push_back(KickOrder{s.id, reason});
+  pendingKicks_.push_back(KickOrder{s.id, std::move(reason)});
 }
 
 double World::maxSpeedOf(cbmp::MoveState a, cbmp::MoveState b) const {
@@ -204,9 +212,67 @@ bool World::onEvent(EntityId id, const cbmp::Event& ev, double now) {
       orderKick(*p, "flood de eventos");
     return false;
   }
-  // Sem "dono do jogo" no subprojeto 2: só o eco volta ao remetente; o resto é descartado.
-  if (ev.name == "echo") pending_.push_back(Outgoing{id, ev});
+  if (hooks_.event) hooks_.event(*p, ev);  // scripts (o eco é o resource Lua de exemplo)
   return true;
+}
+
+bool World::takeOut(PlayerSlot& p, size_t bytes, double now) {
+  const double rate = std::max(0.0, cfg_.scriptEventOutKBps) * 1024.0;
+  const double burst = std::max(0.0, cfg_.scriptEventOutBurstKB) * 1024.0;
+  if (p.outLast < 0)
+    p.outTokens = burst;
+  else
+    p.outTokens = std::min(burst, p.outTokens + std::max(0.0, now - p.outLast) * rate);
+  p.outLast = now;
+  const double need = static_cast<double>(bytes + kEventOverheadBytes);
+  if (p.outTokens < need) {
+    ++eventsOutDropped_;
+    return false;
+  }
+  p.outTokens -= need;
+  return true;
+}
+
+bool World::queueEvent(EntityId to, uint32_t session, cbmp::Event ev, double now) {
+  PlayerSlot* p = slot(to);
+  if (!p || p->kicked || (session != 0 && p->session != session)) return false;
+  if (!takeOut(*p, ev.name.size() + ev.payload.size(), now)) return false;
+  pending_.push_back(Outgoing{to, cbmp::Message{std::move(ev)}});
+  return true;
+}
+
+size_t World::broadcastEvent(cbmp::Event ev, double now) {
+  const size_t bytes = ev.name.size() + ev.payload.size();
+  std::shared_ptr<const SharedMessage> msg;
+  size_t n = 0;
+  for (EntityId id : active_) {
+    PlayerSlot& p = *slots_[id];
+    if (p.kicked || !takeOut(p, bytes, now)) continue;
+    if (!msg) {
+      auto m = std::make_shared<SharedMessage>();
+      m->msg = cbmp::Message{std::move(ev)};
+      try {
+        m->bytes = cbmp::encode(m->msg);
+      } catch (const std::exception&) {
+        ++eventsOutDropped_;  // não cabe no protocolo: ninguém recebe
+        return 0;
+      }
+      msg = std::move(m);
+    }
+    pending_.push_back(Outgoing{id, msg});
+    ++n;
+  }
+  return n;
+}
+
+void World::kick(EntityId id, std::string reason, uint32_t session) {
+  PlayerSlot* p = slot(id);
+  if (p && (session == 0 || p->session == session)) orderKick(*p, std::move(reason));
+}
+
+void World::kickDid(const std::string& did, const std::string& reason) {
+  for (EntityId id : active_)
+    if (slots_[id]->did == did) orderKick(*slots_[id], reason);
 }
 
 void World::onSnapshotAck(EntityId id, uint32_t tick, double now) {

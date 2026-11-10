@@ -1,0 +1,143 @@
+cbmp: cross-thread interrupt request for the VM (Lua 5.4.7).
+Adds global_State.cbmp_interrupt (set from any OS thread via lua_cbmp_setinterrupt),
+ORs it into the VM 'trap' (updatetrap / function entry) and, in luaG_traceexec, calls
+the host callback stored in the thread extra space (luaE_cbmpinterrupt). Also zeroes
+the main thread extra space in lua_newstate. Re-check on upgrade: lstate.h/lstate.c,
+lapi.c, lua.h, lvm.c (updatetrap, startfunc), ldebug.c (luaG_traceexec).
+--- a/src/lstate.h
++++ b/src/lstate.h
+@@ -300,6 +300,9 @@
+   TString *strcache[STRCACHE_N][STRCACHE_M];  /* cache for strings in API */
+   lua_WarnFunction warnf;  /* warning function */
+   void *ud_warn;         /* auxiliary data to 'warnf' */
++  /* cbmp patch: interrupt request, set by another OS thread (only a store of
++  ** this flag; nothing else in the state is touched) and polled by the VM. */
++  volatile l_signalT cbmp_interrupt;
+ } global_State;
+ 
+ 
+@@ -402,6 +405,7 @@
+ LUAI_FUNC void luaE_warning (lua_State *L, const char *msg, int tocont);
+ LUAI_FUNC void luaE_warnerror (lua_State *L, const char *where);
+ LUAI_FUNC int luaE_resetthread (lua_State *L, int status);
++LUAI_FUNC void luaE_cbmpinterrupt (lua_State *L);  /* cbmp patch */
+ 
+ 
+ #endif
+--- a/src/lstate.c
++++ b/src/lstate.c
+@@ -343,6 +343,22 @@
+ }
+ 
+ 
++/*
++** cbmp patch: the host keeps, in the extra space of every thread, a pointer to
++** 'struct { void (*check) (lua_State *L); }' (or NULL). 'check' runs on the Lua
++** thread when an interrupt is pending; it may raise an error (timeout) or clear
++** the request with 'lua_cbmp_setinterrupt(L, 0)'.
++*/
++void luaE_cbmpinterrupt (lua_State *L) {
++  typedef struct { void (*check) (lua_State *L); } cbmp_interrupt_cb;
++  const cbmp_interrupt_cb *cb = *(const cbmp_interrupt_cb **)lua_getextraspace(L);
++  if (cb != NULL && cb->check != NULL)
++    cb->check(L);
++  else
++    G(L)->cbmp_interrupt = 0;  /* nobody to handle it */
++}
++
++
+ LUA_API int lua_closethread (lua_State *L, lua_State *from) {
+   int status;
+   lua_lock(L);
+@@ -373,6 +389,10 @@
+   g->currentwhite = bitmask(WHITE0BIT);
+   L->marked = luaC_white(g);
+   preinit_thread(L, g);
++  /* cbmp patch: no interrupt callback (extra space) and no pending request
++  ** yet; new threads copy the extra space from the main thread. */
++  memset(lua_getextraspace(L), 0, LUA_EXTRASPACE);
++  g->cbmp_interrupt = 0;
+   g->allgc = obj2gco(L);  /* by now, only object is the main thread */
+   L->next = NULL;
+   incnny(L);  /* main thread is always non yieldable */
+--- a/src/lapi.c
++++ b/src/lapi.c
+@@ -1235,6 +1235,23 @@
+ */
+ 
+ 
++/*
++** cbmp patch: interrupt request. 'lua_cbmp_setinterrupt' may be called from
++** any OS thread (it only reads the immutable 'l_G' and stores the flag); the
++** VM polls the flag at calls, returns and jumps, and libraries poll it in long
++** C loops with 'lua_cbmp_poll' (Lua thread only).
++*/
++LUA_API void lua_cbmp_setinterrupt (lua_State *L, int on) {
++  G(L)->cbmp_interrupt = on;
++}
++
++
++LUA_API void lua_cbmp_poll (lua_State *L) {
++  if (l_unlikely(G(L)->cbmp_interrupt))
++    luaE_cbmpinterrupt(L);
++}
++
++
+ LUA_API int lua_error (lua_State *L) {
+   TValue *errobj;
+   lua_lock(L);
+--- a/src/lua.h
++++ b/src/lua.h
+@@ -348,6 +348,11 @@
+ 
+ LUA_API int   (lua_error) (lua_State *L);
+ 
++/* cbmp patch: cross-thread interrupt request (see lapi.c) */
++#define LUA_CBMP_INTERRUPT	1
++LUA_API void  (lua_cbmp_setinterrupt) (lua_State *L, int on);
++LUA_API void  (lua_cbmp_poll) (lua_State *L);
++
+ LUA_API int   (lua_next) (lua_State *L, int idx);
+ 
+ LUA_API void  (lua_concat) (lua_State *L, int n);
+--- a/src/lvm.c
++++ b/src/lvm.c
+@@ -1072,7 +1072,8 @@
+ 
+ 
+ 
+-#define updatetrap(ci)  (trap = ci->u.l.trap)
++/* cbmp patch: a pending interrupt request also sets 'trap' */
++#define updatetrap(ci)  (trap = ci->u.l.trap | G(L)->cbmp_interrupt)
+ 
+ #define updatebase(ci)	(base = ci->func.p + 1)
+ 
+@@ -1158,7 +1159,7 @@
+ #include "ljumptab.h"
+ #endif
+  startfunc:
+-  trap = L->hookmask;
++  trap = L->hookmask | G(L)->cbmp_interrupt;  /* cbmp patch */
+  returning:  /* trap already set */
+   cl = ci_func(ci);
+   k = cl->p->k;
+--- a/src/ldebug.c
++++ b/src/ldebug.c
+@@ -918,9 +918,16 @@
+ */
+ int luaG_traceexec (lua_State *L, const Instruction *pc) {
+   CallInfo *ci = L->ci;
+-  lu_byte mask = L->hookmask;
++  lu_byte mask;
+   const Proto *p = ci_func(ci)->p;
+   int counthook;
++  if (l_unlikely(G(L)->cbmp_interrupt)) {  /* cbmp patch: pending interrupt */
++    ci->u.l.savedpc = pc + 1;  /* as for hooks: 'pc' of the next instruction */
++    if (!isIT(*pc))  /* top not being used? */
++      L->top.p = ci->top.p;  /* correct top */
++    luaE_cbmpinterrupt(L);  /* may raise an error */
++  }
++  mask = L->hookmask;
+   if (!(mask & (LUA_MASKLINE | LUA_MASKCOUNT))) {  /* no hooks? */
+     ci->u.l.trap = 0;  /* don't need to stop again */
+     return 0;  /* turn off 'trap' */

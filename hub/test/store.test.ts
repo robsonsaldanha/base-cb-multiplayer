@@ -39,7 +39,9 @@ describe('Store', () => {
 
   it('oauth state e login code são de uso único e expiram', () => {
     const st = store.createOauthState('launcher', T, 'CH');
-    expect(store.consumeOauthState(st, T + 1)).toEqual({ client: 'launcher', codeChallenge: 'CH' });
+    expect(store.consumeOauthState(st, T + 1)).toEqual({ client: 'launcher', codeChallenge: 'CH', returnTo: null });
+    const ret = store.createOauthState('panel', T, undefined, { serverId: 'srv_AAAAAAAAAAAA', state: null });
+    expect(store.consumeOauthState(ret, T + 1)).toEqual({ client: 'panel', codeChallenge: null, returnTo: { serverId: 'srv_AAAAAAAAAAAA', state: null } });
     expect(store.consumeOauthState(st, T + 2)).toBeNull();
     expect(store.consumeOauthState(store.createOauthState('panel', T), T + 601)).toBeNull();
     const u = store.upsertUserFromDiscord({ discordId: '1', name: 'A', avatar: null }, T);

@@ -1,0 +1,524 @@
+// Regressões da revisão de segurança (fix round 1): fugas da vigia, require por link/junção, limites menores.
+// Todo caso que já travou roda em guarded() (prazo rígido de 10 s): uma regressão falha em vez de pendurar o CI.
+#include <catch2/catch_test_macros.hpp>
+
+#include <cstdio>
+#include <string>
+#include <vector>
+
+#include "test_util.hpp"
+
+namespace {
+
+// O aborto (abortAfter = 200 ms de parede) é conferido pelo tempo de CPU da thread do Lua: carga na máquina
+// (ctest -j16) só reduz a CPU que a thread recebe, enquanto uma regressão (operação C cara sem checagem da vigia)
+// gasta segundos de CPU antes de voltar. 450 ms de CPU = 2× o prazo + folga. Cada carga abaixo custa ≥ 5 s (ou
+// infinito) sem os patches. O guard de parede de 10 s continua como detector de travamento; o limite de parede
+// solto (5 s) só pega uma regressão que de algum modo não apareça na CPU.
+constexpr double kMaxAbortCpuMs = 450;
+constexpr long long kMaxAbortWallMs = 5000;
+
+struct Case {
+  const char* name;
+  const char* code;
+};
+
+void expectAbort(const Case& c, Limits lim = shortLimits()) {
+  Fixture f(lim);
+  Timed t = guarded(c.name, [&] { return runRaw(*f.r, c.code); });
+  std::printf("TIMING %-28s %5lld ms wall %6.0f ms cpu timedOut=%d\n", c.name, t.ms, t.cpuMs,
+              t.res.timedOut ? 1 : 0);
+  INFO(c.name << ": " << t.res.error);
+  REQUIRE_FALSE(t.res.ok);
+  REQUIRE(t.res.timedOut);
+  REQUIRE(t.cpuMs <= kMaxAbortCpuMs);
+  REQUIRE(t.ms <= kMaxAbortWallMs);
+  // o estado continua usável
+  Timed after = guarded(c.name, [&] { return runRaw(*f.r, "return 'vivo'"); });
+  INFO(after.res.error);
+  REQUIRE(after.res.ok);
+}
+
+}  // namespace
+
+TEST_CASE("escape C1: __close after an abort runs under the watchdog") {
+  const Case cases[] = {
+      {"c1_wrap_close_loop",
+       "local co = coroutine.wrap(function() "
+       "  local x <close> = setmetatable({}, {__close = function() while true do end end}) "
+       "  while true do end "
+       "end) return tostring(pcall(co))"},
+      {"c1_create_resume_close",
+       "local co = coroutine.create(function() "
+       "  local x <close> = setmetatable({}, {__close = function() while true do end end}) "
+       "  while true do end "
+       "end) coroutine.resume(co) return tostring(coroutine.close(co))"},
+      {"c1_close_suspended_loop",
+       "local co = coroutine.create(function() "
+       "  local x <close> = setmetatable({}, {__close = function() local i = 0 while true do i = i + 1 end end}) "
+       "  coroutine.yield() "
+       "end) coroutine.resume(co) return tostring(coroutine.close(co))"},
+  };
+  for (const auto& c : cases) expectAbort(c);
+}
+
+TEST_CASE("escape C1: closing a stored aborted coroutine in a later call") {
+  Fixture f;
+  Timed t1 = guarded("c1_store", [&] {
+    return runRaw(*f.r,
+                  "G_co = coroutine.create(function() "
+                  "  local x <close> = setmetatable({}, {__close = function() while true do end end}) "
+                  "  while true do end "
+                  "end) coroutine.resume(G_co)");
+  });
+  std::printf("TIMING %-28s %5lld ms timedOut=%d\n", "c1_store", t1.ms, t1.res.timedOut ? 1 : 0);
+  REQUIRE(t1.res.timedOut);
+  Timed t2 = guarded("c1_close_later", [&] { return runRaw(*f.r, "return tostring(coroutine.close(G_co))"); });
+  std::printf("TIMING %-28s %5lld ms timedOut=%d\n", "c1_close_later", t2.ms, t2.res.timedOut ? 1 : 0);
+  INFO(t2.res.error);
+  REQUIRE(t2.res.timedOut);
+  REQUIRE(t2.cpuMs <= kMaxAbortCpuMs);
+  REQUIRE(t2.ms <= kMaxAbortWallMs);
+}
+
+TEST_CASE("escape C2: loops of long C calls are aborted at the call boundary") {
+  Limits big = shortLimits(size_t{256} << 20);
+  const Case cases[] = {
+      {"c2_rep_loop", "local x for i = 1, 1e9 do x = string.rep('a', 1 << 24) end"},
+      {"c2_concat_loop", "local s = string.rep('a', 1 << 24) local t = {s, s} for i = 1, 1e9 do local x = table.concat(t) end"},
+      {"c2_find_plain_loop", "local s = string.rep('a', 1 << 25) for i = 1, 1e9 do local x = s:find('b', 1, true) end"},
+      {"c2_gc_step_loop",
+       "local t = {} for i = 1, 2e5 do t[i] = {i} end while true do collectgarbage('step', 1 << 30) end"},
+  };
+  for (const auto& c : cases) expectAbort(c, big);
+}
+
+TEST_CASE("escape I1: catastrophic patterns are interrupted inside C") {
+  const Case cases[] = {
+      {"i1_find_backtrack", "return tostring(string.find(string.rep('a', 3000), string.rep('a-', 20) .. 'b'))"},
+      {"i1_gmatch_backtrack",
+       "local s = ('a'):rep(1e6) local n = 0 for w in s:gmatch('a-a-a-a-a-a-b') do n = n + 1 end return n"},
+      {"i1_gsub_backtrack", "return (string.gsub(string.rep('a', 3000), string.rep('a-', 20) .. 'b', 'x'))"},
+  };
+  for (const auto& c : cases) expectAbort(c);
+}
+
+TEST_CASE("escape I1: table.move with a huge range is aborted") {
+  expectAbort({"i1_table_move", "table.move({}, 1, 1e14, 2) return 'done'"});
+}
+
+TEST_CASE("table.move keeps standard semantics") {
+  Fixture f;
+  REQUIRE(f.isTrue("local t = table.move({1, 2, 3}, 1, 3, 2) return t[1] == 1 and t[2] == 1 and t[3] == 2 and t[4] == 3"));
+  REQUIRE(f.isTrue("local t = table.move({1, 2, 3}, 2, 3, 1) return t[1] == 2 and t[2] == 3 and t[3] == 3"));
+  REQUIRE(f.isTrue("local d = table.move({1, 2}, 1, 2, 5, {}) return d[5] == 1 and d[6] == 2 and d[1] == nil"));
+  REQUIRE(f.isTrue("local t = {1} return table.move(t, 3, 2, 1) == t"));
+  REQUIRE(f.isTrue("return not pcall(table.move, {}, 'x', 2, 1)"));
+  REQUIRE(f.isTrue("return not pcall(table.move, {}, 1.5, 2, 1)"));
+  REQUIRE(f.isTrue("return not pcall(table.move, {}, -1, math.maxinteger, 1)"));
+}
+
+// string.rep monta o resultado dobrando o trecho já copiado (patch cbmp-i1): mesmo resultado do laço original.
+TEST_CASE("string.rep keeps standard semantics") {
+  Fixture f;
+  REQUIRE(f.isTrue("return ('ab'):rep(3) == 'ababab' and ('ab'):rep(3, ',') == 'ab,ab,ab'"));
+  REQUIRE(f.isTrue("return ('x'):rep(1, ',') == 'x' and ('x'):rep(0) == '' and ('x'):rep(-1, ',') == ''"));
+  REQUIRE(f.isTrue("return (''):rep(3, ',') == ',,' and (''):rep(1, ',') == '' and (''):rep(5) == ''"));
+  REQUIRE(f.isTrue("return ('a'):rep(2, '') == 'aa' and ('\\0'):rep(3) == '\\0\\0\\0'"));
+  // Contra a montagem ingênua, para vários n (potências de 2 e vizinhos) e tamanhos de pedaço/separador.
+  REQUIRE(f.isTrue("for _, s in ipairs({'', 'a', 'abc', ('q'):rep(37)}) do "
+                   "  for _, sep in ipairs({'', '-', 'xy', ('z'):rep(5)}) do "
+                   "    for n = 1, 70 do "
+                   "      local t = {} for i = 1, n do t[i] = s end "
+                   "      if s:rep(n, sep) ~= table.concat(t, sep) then return false end "
+                   "    end "
+                   "  end "
+                   "end return true"));
+  REQUIRE(f.isTrue("local r = ('ab'):rep(1 << 20) return #r == 2 << 20 and r:find('aa', 1, true) == nil and "
+                   "r:find('bb', 1, true) == nil and r:sub(-2) == 'ab'"));
+}
+
+TEST_CASE("collectgarbage allows only count and step") {
+  Fixture f;
+  REQUIRE(f.isTrue("return type(collectgarbage('count')) == 'number'"));
+  REQUIRE(f.isTrue("return type(collectgarbage('step')) == 'boolean'"));
+  REQUIRE(f.isTrue("return not pcall(collectgarbage)"));
+  REQUIRE(f.isTrue("return not pcall(collectgarbage, 'collect')"));
+  REQUIRE(f.isTrue("return not pcall(collectgarbage, 'isrunning')"));
+}
+
+TEST_CASE("print is size and rate limited") {
+  Fixture f;
+  auto t = guarded("print_flood", [&] { return runRaw(*f.r, "for i = 1, 1e4 do print(string.rep('x', 1000)) end"); });
+  std::printf("TIMING %-28s %5lld ms wall %6.0f ms cpu timedOut=%d\n", "print_flood", t.ms, t.cpuMs,
+              t.res.timedOut ? 1 : 0);
+  INFO(t.res.error);
+  REQUIRE(t.res.ok);
+  REQUIRE(f.warns.size() <= 205);
+  REQUIRE(f.warns.size() >= 200);
+
+  Fixture g;
+  auto big = g.run("print(string.rep('y', 200 * 1024))");
+  REQUIRE(big.ok);
+  REQUIRE(g.warns.size() == 1);
+  REQUIRE(g.warns[0].size() < 66 * 1024);
+  REQUIRE(contains(g.warns[0], "truncad"));
+}
+
+TEST_CASE("print drop summary is emitted once the second ends") {
+  Fixture f;
+  auto t = guarded("print_summary", [&] {
+    return runRaw(*f.r,
+                  "for i = 1, 300 do print('a') end "
+                  "local t0 = os.clock() while os.clock() - t0 < 0.15 do end");
+  });
+  REQUIRE(t.res.timedOut == false);
+  // segunda janela: um print novo faz sair o resumo dos descartados
+  std::this_thread::sleep_for(1100ms);
+  REQUIRE(f.run("print('b')").ok);
+  bool summary = false;
+  for (auto& w : f.warns)
+    if (contains(w, "100") && contains(w, "descartad")) summary = true;
+  REQUIRE(summary);
+}
+
+TEST_CASE("require refuses empty segments even when the file exists") {
+  Fixture f;
+  put(f.t.p / "server/x/.lua", "return 1");
+  put(f.t.p / "server/x.lua", "return 2");
+  REQUIRE(f.isTrue("return not pcall(require, 'x.')"));
+  REQUIRE(f.isTrue("return not pcall(require, '.x')"));
+  REQUIRE(f.isTrue("return require('x') == 2"));
+}
+
+#ifdef _WIN32
+TEST_CASE("require cache is case-insensitive on Windows") {
+  Fixture f;
+  put(f.t.p / "server/util/mod.lua", "N = (N or 0) + 1 return {}");
+  REQUIRE(f.isTrue("return require('util.mod') == require('Util.Mod') and N == 1"));
+}
+#endif
+
+namespace {
+// Junção (Windows, sem admin) ou link simbólico de diretório. false se não der para criar.
+bool makeDirLink(const fs::path& target, const fs::path& link) {
+  std::error_code ec;
+  fs::create_directory_symlink(target, link, ec);
+  if (!ec) return true;
+#ifdef _WIN32
+  std::string cmd = "cmd /c mklink /J \"" + link.string() + "\" \"" + target.string() + "\" >NUL 2>&1";
+  return std::system(cmd.c_str()) == 0 && fs::exists(link);
+#else
+  return false;
+#endif
+}
+}  // namespace
+
+TEST_CASE("require and server scripts refuse links and junctions") {
+  Fixture f;
+  TmpDir outside;
+  put(outside.p / "secret.lua", "return 'segredo'");
+  put(f.t.p / "server/ok.lua", "return 'ok'");
+  fs::create_directories(f.t.p / "server");
+  if (!makeDirLink(outside.p, f.t.p / "server" / "sub")) SKIP("não foi possível criar junção/link de diretório");
+  REQUIRE(f.isTrue("return require('ok') == 'ok'"));
+  auto res = f.run("return require('sub.secret')");
+  REQUIRE_FALSE(res.ok);
+  REQUIRE(contains(res.error, "require"));
+
+  ResourceManifest m;
+  m.name = "linkado";
+  m.serverScripts = {"server/sub/secret.lua"};
+  Resource r(m, f.t.p, shortLimits(), {});
+  std::string err;
+  REQUIRE_FALSE(r.runMain(err));
+  REQUIRE(contains(err, "secret.lua"));
+  std::error_code ec;
+  fs::remove(f.t.p / "server" / "sub", ec);  // remove o link, não o alvo
+}
+
+TEST_CASE("resource dir itself reached through a junction still works") {
+  TmpDir real;
+  TmpDir holder;
+  put(real.p / "server/main.lua", "return {v = 1}");
+  fs::path via = holder.p / "res";
+  if (!makeDirLink(real.p, via)) SKIP("não foi possível criar junção/link de diretório");
+  ResourceManifest m;
+  m.name = "via";
+  m.serverScripts = {"server/main.lua"};
+  {
+    Resource r(m, via, shortLimits(), {});
+    std::string err;
+    INFO(err);
+    REQUIRE(r.runMain(err));
+  }
+  std::error_code ec;
+  fs::remove(via, ec);
+}
+
+// ---- Fix round 2 ----
+
+TEST_CASE("escape R2: table.insert/remove with a huge __len are aborted") {
+  const Case cases[] = {
+      {"r2_tinsert_len",
+       "local t = setmetatable({}, {__len = function() return math.maxinteger - 1 end}) "
+       "table.insert(t, 1, 'x') return 'done'"},
+      {"r2_tremove_len",
+       "local t = setmetatable({}, {__len = function() return math.maxinteger - 1 end}) "
+       "table.remove(t, 1) return 'done'"},
+  };
+  for (const auto& c : cases) expectAbort(c);
+}
+
+TEST_CASE("escape R2: table.sort without comparator over huge strings is aborted") {
+  expectAbort({"r2_sort_strcmp",
+               "local big = ('a'):rep(1 << 22) local t = {} for i = 1, 3000 do t[i] = big end "
+               "table.sort(t) return 'done'"},
+              shortLimits(size_t{256} << 20));
+}
+
+TEST_CASE("escape R2: loops of one expensive operator are aborted") {
+  Limits big = shortLimits(size_t{256} << 20);
+  const Case cases[] = {
+      {"r2_lt_loop", "local s = ('a'):rep(1 << 25) local t = ('a'):rep(1 << 25) while true do local _ = s < t end"},
+      {"r2_eq_loop", "local s = ('a'):rep(1 << 25) local t = ('a'):rep(1 << 25) while true do local _ = s == t end"},
+      {"r2_concat_op_loop", "local s = ('a'):rep(1 << 24) while true do local _ = s .. s end"},
+      {"r2_empty_loop", "while true do end"},
+      {"r2_loop_after_child_abort",
+       "local co = coroutine.create(function() while true do end end) coroutine.resume(co) while true do end"},
+      {"r2_loop_in_wrapped_child", "coroutine.wrap(function() local s = ('a'):rep(1 << 25) "
+                                   "local t = ('a'):rep(1 << 25) while true do local _ = s < t end end)()"},
+  };
+  for (const auto& c : cases) expectAbort(c, big);
+}
+
+TEST_CASE("table.insert and table.remove keep standard semantics") {
+  Fixture f;
+  REQUIRE(f.isTrue("local t = {1, 2} table.insert(t, 3) return #t == 3 and t[3] == 3"));
+  REQUIRE(f.isTrue("local t = {1, 2} table.insert(t, 1, 0) return t[1] == 0 and t[2] == 1 and t[3] == 2"));
+  REQUIRE(f.isTrue("local t = {1, 2} table.insert(t, 3, 9) return t[3] == 9"));
+  REQUIRE(f.isTrue("local ok, e = pcall(table.insert, {1}, 5, 9) "
+                   "return not ok and e:find('position out of bounds', 1, true) ~= nil"));
+  REQUIRE(f.isTrue("local ok, e = pcall(table.insert, {}, 1, 2, 3) "
+                   "return not ok and e:find(\"wrong number of arguments to 'insert'\", 1, true) ~= nil"));
+  REQUIRE(f.isTrue("local ok, e = pcall(table.insert, nil, 1) "
+                   "return not ok and e:find('(table expected, got nil)', 1, true) ~= nil"));
+  REQUIRE(f.isTrue("local t = {1, 2, 3} return table.remove(t) == 3 and #t == 2"));
+  REQUIRE(f.isTrue("local t = {1, 2, 3} return table.remove(t, 1) == 1 and t[1] == 2 and t[2] == 3 and t[3] == nil"));
+  REQUIRE(f.isTrue("local t = {} return table.remove(t) == nil and table.remove(t, 0) == nil"));
+  REQUIRE(f.isTrue("local t = {1} return table.remove(t, 2) == nil and t[1] == 1"));
+  REQUIRE(f.isTrue("local ok, e = pcall(table.remove, {1}, 5) "
+                   "return not ok and e:find('position out of bounds', 1, true) ~= nil"));
+  REQUIRE(f.isTrue("local log = {} local t = setmetatable({}, {__len = function() return 2 end, "
+                   "__index = function(_, k) return k * 10 end, "
+                   "__newindex = function(t, k, v) log[#log + 1] = k rawset(t, k, v) end}) "
+                   "table.insert(t, 1, 'x') return table.concat(log, ',') == '3,2,1'"));
+}
+
+TEST_CASE("table.sort keeps standard behaviour") {
+  Fixture f;
+  REQUIRE(f.isTrue("local t = {3, 1, 2} table.sort(t) return t[1] == 1 and t[2] == 2 and t[3] == 3"));
+  REQUIRE(f.isTrue("local t = {3, 1, 2} table.sort(t, function(a, b) return a > b end) return t[1] == 3"));
+  REQUIRE(f.isTrue("local t = {'b', 'a'} table.sort(t) return t[1] == 'a'"));
+  REQUIRE(f.isTrue("return not pcall(table.sort, {1, 'x', 2})"));
+  REQUIRE(f.isTrue("return not pcall(table.sort, {1, 2}, 5)"));
+  REQUIRE(f.isTrue("local t = {} for i = 1, 100 do t[i] = i % 7 end "
+                   "local ok, e = pcall(table.sort, t, function(a, b) return true end) "
+                   "return not ok and e:find('invalid order function', 1, true) ~= nil"));
+}
+
+TEST_CASE("table.move type-checks its table arguments like C") {
+  Fixture f;
+  REQUIRE(f.isTrue("local ok, e = pcall(table.move, 1, 1, 2, 1) "
+                   "return not ok and e:find('#1 to', 1, true) and e:find('(table expected, got number)', 1, true) ~= nil"));
+  REQUIRE(f.isTrue("local ok, e = pcall(table.move, 1, 5, 1, 1) "
+                   "return not ok and e:find('#1 to', 1, true) and e:find('(table expected, got number)', 1, true) ~= nil"));
+  REQUIRE(f.isTrue("local ok, e = pcall(table.move, {}, 1, 2, 1, 'x') "
+                   "return not ok and e:find('#5 to', 1, true) and e:find('(table expected, got string)', 1, true) ~= nil"));
+  REQUIRE(f.isTrue("return table.move({1, 2}, '1', '2', 3)[4] == 2"));
+}
+
+TEST_CASE("coroutine library keeps standard behaviour") {
+  Fixture f;
+  REQUIRE(f.isTrue("local co = coroutine.create(function(a) local b = coroutine.yield(a + 1) return b * 2 end) "
+                   "local ok1, v1 = coroutine.resume(co, 1) local ok2, v2 = coroutine.resume(co, 10) "
+                   "return ok1 and v1 == 2 and ok2 and v2 == 20 and coroutine.status(co) == 'dead'"));
+  REQUIRE(f.isTrue("local ok, e = coroutine.resume(coroutine.create(function() error('x') end)) "
+                   "return not ok and e:find('x') ~= nil"));
+  REQUIRE(f.isTrue("local co = coroutine.create(function() end) coroutine.resume(co) "
+                   "local ok, e = coroutine.resume(co) return not ok and e == 'cannot resume dead coroutine'"));
+  REQUIRE(f.isTrue("return not pcall(coroutine.resume, 1)"));
+  REQUIRE(f.isTrue("local g = coroutine.wrap(function() coroutine.yield(1) coroutine.yield(2) end) "
+                   "return g() == 1 and g() == 2"));
+  REQUIRE(f.isTrue("local ok, e = pcall(coroutine.wrap(function() error('boom') end)) "
+                   "return not ok and e:find('boom') ~= nil"));
+  REQUIRE(f.isTrue("local closed = false local co = coroutine.create(function() "
+                   "local x <close> = setmetatable({}, {__close = function() closed = true end}) coroutine.yield() end) "
+                   "coroutine.resume(co) return coroutine.close(co) == true and closed"));
+  REQUIRE(f.isTrue("return not pcall(coroutine.close, coroutine.running())"));
+  REQUIRE(f.isTrue("local A local B = coroutine.create(function() return pcall(coroutine.close, A) end) "
+                   "A = coroutine.create(function() return coroutine.resume(B) end) "
+                   "local ok1, ok2, pok, perr = coroutine.resume(A) "
+                   "return ok1 and ok2 and not pok and perr:find('normal') ~= nil"));
+}
+
+// ---- Fix round 3: formas 70-75 do revisor (troca de thread em volta de operador caro) ----
+
+TEST_CASE("escape R3: expensive operator after coroutine switches is aborted") {
+  Limits big = shortLimits(size_t{256} << 20);
+  const std::string pre = "local s = ('a'):rep(1 << 25) local t = ('a'):rep(1 << 25) ";
+  const std::string codes[] = {
+      // 70: A retoma B, B cede de volta, A entra no laço
+      pre + "local B = coroutine.create(function() coroutine.yield() end) "
+            "local A = coroutine.create(function() coroutine.resume(B) while true do local _ = s < t end end) "
+            "coroutine.resume(A)",
+      // 71: yield de dentro de metamétodo, laço no chamador
+      pre + "local mt = {__index = function() coroutine.yield(1) return 1 end} "
+            "local co = coroutine.wrap(function() local x = setmetatable({}, mt).foo return x end) "
+            "co() while true do local _ = s == t end",
+      // 72: erros saindo de resume/wrap/close antes do laço
+      pre + "for i = 1, 5 do pcall(coroutine.wrap(function() error('x') end)) end "
+            "local co = coroutine.create(function() local _ <close> = setmetatable({}, {__close = function() end}) "
+            "error('y') end) coroutine.resume(co) coroutine.close(co) while true do local _ = s < t end",
+      // 73: iterador gmatch numa corrotina, laço numa função carregada
+      pre + "local it = coroutine.wrap(function() for w in ('abc'):gmatch('.') do coroutine.yield(w) end end) "
+            "it() it() local f = load('local s, t = ... while true do local _ = s < t end') f(s, t)",
+      // 74: resume de si mesma / wrap morta / close da corrente
+      pre + "local co; co = coroutine.create(function() return coroutine.resume(co) end) "
+            "coroutine.resume(co) coroutine.resume(co) local w = coroutine.wrap(function() end) w() pcall(w) "
+            "pcall(coroutine.close, coroutine.running()) while true do local _ = s < t end",
+      // 75: wrap aninhado 1000 níveis com o laço no fundo
+      pre + "local function nest(n) if n == 0 then while true do local _ = s < t end end "
+            "return coroutine.wrap(nest)(n - 1) end pcall(nest, 1000) while true do local _ = s < t end",
+  };
+  int k = 70;
+  for (const auto& code : codes) {
+    std::string name = "r3_shape_" + std::to_string(k++);
+    expectAbort({name.c_str(), code.c_str()}, big);
+  }
+}
+
+TEST_CASE("R3 semantics: native coroutine and table libraries (shape 76)") {
+  Fixture f;
+  auto res = f.run(
+      "local r = {} "
+      "r[#r+1] = select(2, pcall(coroutine.resume, 1)) "
+      "r[#r+1] = tostring(coroutine.resume(coroutine.create(function(...) return select('#', ...) end), 1, nil, 3)) "
+      "local co = coroutine.create(function() coroutine.yield(coroutine.running()) end) "
+      "local _, inner = coroutine.resume(co) r[#r+1] = tostring(inner == co) .. coroutine.status(co) "
+      "r[#r+1] = select(2, pcall(coroutine.close, coroutine.running())) "
+      "r[#r+1] = select(2, pcall(coroutine.wrap(function() error('boom') end))) "
+      "r[#r+1] = tostring(coroutine.close(coroutine.create(print))) "
+      "local t = {3,1,2} table.sort(t) r[#r+1] = table.concat(t) "
+      "r[#r+1] = select(2, pcall(table.sort, {1,'a'})) "
+      "t = {1,2,3} table.insert(t, 2, 9) table.insert(t, 7) "
+      "r[#r+1] = table.concat(t, ',') .. '/' .. table.remove(t, 1) .. '/' .. tostring(table.remove({})) "
+      "r[#r+1] = select(2, pcall(table.insert, {}, 5, 1)) "
+      "return table.concat(r, ' | ')");
+  INFO(res.error);
+  REQUIRE(res.ok);
+  std::string v = res.value.as<std::string>();
+  INFO(v);
+  REQUIRE(contains(v, "thread expected"));
+  REQUIRE(contains(v, "true | truesuspended"));
+  REQUIRE(contains(v, "cannot close a running coroutine"));
+  REQUIRE(contains(v, "boom"));
+  REQUIRE(contains(v, "| true | 123 |"));
+  REQUIRE(contains(v, "attempt to compare"));
+  REQUIRE(contains(v, "1,9,2,3,7/1/nil"));
+  REQUIRE(contains(v, "position out of bounds"));
+}
+
+// ---- Fix round 4: laços C restantes (repros 80-83, 91) e varredura das bibliotecas ----
+
+TEST_CASE("escape R4: remaining user-driven C loops are aborted") {
+  Limits big = shortLimits(size_t{256} << 20);
+  const Case cases[] = {
+      {"r4_81_plainfind_nm",
+       "local s = ('a'):rep(1 << 22) local p = ('a'):rep(1 << 21) .. 'b' return tostring(s:find(p, 1, true))"},
+      {"r4_82_nospecials_nm",
+       "local s = ('a'):rep(1 << 22) local p = ('a'):rep(1 << 21) .. 'b' return tostring(s:find(p))"},
+      {"r4_83_concat_type",
+       "local t = setmetatable({}, {__len = function() return math.maxinteger end, __index = type}) "
+       "return tostring(pcall(table.concat, t))"},
+      {"r4_91_plainfind_small",
+       "local s = ('a'):rep(1 << 20) local p = ('a'):rep(1 << 19) .. 'b' s:find(p, 1, true) return 'done'"},
+      // varredura: classe enorme repetida, %b quadrático, os.date com milhões de conversões
+      {"r4_sweep_huge_class",
+       "local cls = '[' .. ('b'):rep(1 << 20) .. ']' local s = ('a'):rep(1 << 20) "
+       "for w in s:gmatch(cls) do end return 'done'"},
+      {"r4_sweep_balance", "local s = ('('):rep(1 << 20) for w in s:gmatch('%b()') do end return 'done'"},
+      {"r4_sweep_osdate", "local f = ('%c'):rep(16e6) os.date(f) return 'done'"},
+  };
+  for (const auto& c : cases) expectAbort(c, big);
+}
+
+TEST_CASE("escape R4: string.rep of empty pieces returns at once (repro 80)") {
+  Fixture f;
+  Timed t = guarded("r4_80_rep_empty", [&] { return runRaw(*f.r, "return string.rep('', math.maxinteger)"); });
+  std::printf("TIMING %-28s %5lld ms ok=%d\n", "r4_80_rep_empty", t.ms, t.res.ok ? 1 : 0);
+  INFO(t.res.error);
+  REQUIRE(t.res.ok);
+  REQUIRE(t.res.value.as<std::string>().empty());
+  REQUIRE(t.cpuMs < 50);  // sem o patch: laço de 2^63 voltas (infinito)
+}
+
+TEST_CASE("R4 semantics: string.rep and plain find unchanged") {
+  Fixture f;
+  REQUIRE(f.isTrue("return string.rep('', 5) == '' and string.rep('', 0) == '' and string.rep('ab', 3, '-') == 'ab-ab-ab'"));
+  REQUIRE(f.isTrue("return string.rep('', math.maxinteger, '') == '' and string.rep('x', 2, '') == 'xx'"));
+  REQUIRE(f.isTrue("return ('hello world'):find('o w', 1, true) == 5 and ('abc'):find('d', 1, true) == nil"));
+  REQUIRE(f.isTrue("return ('aXbXc'):find('X') == 2 and select(2, ('(a(b))'):gsub('%b()', '')) == 1"));
+  REQUIRE(f.isTrue("return table.concat({1, 2, 3}, ',') == '1,2,3' and type(os.date('%c')) == 'string'"));
+}
+
+// ---- Fix round 5: pesos de %f e retro-referência; _LOADED sem o _G do script ----
+
+TEST_CASE("escape R5: frontier with a huge class and back-references are aborted") {
+  Limits big = shortLimits(size_t{256} << 20);
+  const Case cases[] = {
+      {"r5_95_frontier_class",
+       "local cls = '%f[' .. ('a'):rep(1 << 24) .. ']x' local s = ('b'):rep(1e5) s:find(cls) return 'done'"},
+      {"r5_96_backref", "local s = ('a'):rep(1 << 24) s:find('(a*)%1x') return 'done'"},
+      {"r5_97_backref_small", "local s = ('a'):rep(1 << 22) s:find('(a*)%1x') return 'done'"},
+  };
+  for (const auto& c : cases) expectAbort(c, big);
+}
+
+TEST_CASE("R5: error tracebacks do not walk the script globals (repro 98)") {
+  Limits lim = shortLimits(size_t{256} << 20);
+  lim.warnAfter = 5s;
+  lim.abortAfter = 8s;
+  Fixture f(lim);
+  Timed fill = guarded("r5_98_fill", [&] { return runRaw(*f.r, "local G = _G for i = 1, 4e6 do G[i] = true end"); });
+  INFO(fill.res.error);
+  REQUIRE(fill.res.ok);
+  Timed t = guarded("r5_98_traceback", [&] {
+    return runRaw(*f.r, "local function g(n) if n == 0 then error('x') end g(n - 1) return 1 end g(40)");
+  });
+  std::printf("TIMING %-28s %5lld ms\n", "r5_98_traceback_4e6_globals", t.ms);
+  REQUIRE_FALSE(t.res.ok);
+  REQUIRE(contains(t.res.error, "stack traceback"));
+  REQUIRE(contains(t.res.error, "function 'error'"));  // nomes ainda vêm do retrato fixo em _LOADED._G
+  std::printf("TIMING %-28s %6.0f ms cpu\n", "r5_98_traceback_cpu", t.cpuMs);
+  REQUIRE(t.cpuMs < 50);  // sem a limpeza do _LOADED: ~1,05 s de CPU (medido no round 5 da Task 2)
+  // erros de argumento continuam com o nome qualificado da biblioteca
+  REQUIRE(f.isTrue("local ok, e = pcall(string.rep) return not ok and e:find('rep', 1, true) ~= nil"));
+}
+
+// Medição (oculta, rode com "[.unpatched]"): custo de CPU das cargas finitas acima num lua_State comum, onde o callback
+// de interrupção é NULL (os polls dos patches viram no-op), ou seja, o custo de uma regressão da vigia nesses laços C.
+TEST_CASE("unpatched cost of the finite escape workloads", "[.unpatched]") {
+  const Case cases[] = {
+      {"r4_sweep_osdate", "local f = ('%c'):rep(16e6) os.date(f) return 'done'"},
+      {"r4_91_plainfind_small",
+       "local s = ('a'):rep(1 << 20) local p = ('a'):rep(1 << 19) .. 'b' s:find(p, 1, true) return 'done'"},
+  };
+  for (const auto& c : cases) {
+    sol::state lua;
+    lua.open_libraries(sol::lib::base, sol::lib::string, sol::lib::os, sol::lib::table);
+    const double c0 = threadCpuMs();
+    auto r = lua.safe_script(c.code, sol::script_pass_on_error);
+    std::printf("UNPATCHED %-24s %8.0f ms cpu ok=%d\n", c.name, threadCpuMs() - c0, r.valid() ? 1 : 0);
+  }
+}

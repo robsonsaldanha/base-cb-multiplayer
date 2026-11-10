@@ -12,6 +12,9 @@ struct BotOptions {
   uint16_t port = 30500;
   std::array<uint8_t, 32> seed{};   // seed Ed25519 da chave dev (assina os tickets)
   std::string serverId = "srv_dev";  // aud dos tickets
+  // kid dos tickets: "dev" (auth.devPublicKey) ou o kid de uma chave do Hub cuja seed você tem (Hub local de teste
+  // com a chave em <HUB_DATA_DIR>/keys/<kid>.pem derivada da mesma seed).
+  std::string kid = "dev";
   int count = 16;
   double areaM = 2000;      // lado do quadrado (centrado na origem) onde andam os bots espalhados
   double cluster = 0.3;     // fração de bots num círculo de 30 m no centro
@@ -23,9 +26,9 @@ struct BotOptions {
 };
 
 // Ticket assinado com a seed dev, no formato do Hub: base64url(JSON compacto) "." base64url(assinatura).
-// JSON na ordem v,kid,sub,did,name,aud,iat,exp,jti (kid "dev", exp = iat + 300).
+// JSON na ordem v,kid,sub,did,name,aud,iat,exp,jti (exp = iat + 300).
 std::string makeTicket(const std::array<uint8_t, 32>& seed, int index, const std::string& aud, int64_t iat,
-                       const std::string& jti);
+                       const std::string& jti, const std::string& kid = "dev");
 // Chave pública (base64url, 32 bytes raw) da seed — o valor de auth.devPublicKey do servidor.
 std::string devPublicKeyB64(const std::array<uint8_t, 32>& seed);
 

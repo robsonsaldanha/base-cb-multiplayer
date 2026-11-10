@@ -188,6 +188,7 @@ bool Heartbeat::sendOnce() {
                         {"protocol", info_.protocol},
                         {"tags", info_.tags},
                         {"locale", info_.locale}};
+    if (!info_.adminUrl.empty()) body["adminUrl"] = info_.adminUrl;
     httplib::Client cli(url_);
     configure(cli);
     httplib::Headers h{{"Authorization", "Bearer " + key_}};
@@ -212,6 +213,14 @@ bool Heartbeat::sendOnce() {
                      reason.substr(0, 80));
         lastListed_ = listed;
         lastReason_ = reason;
+      }
+      const std::string adminIgnored =
+          j.contains("adminUrlIgnored") && j["adminUrlIgnored"].is_string() ? j["adminUrlIgnored"].get<std::string>() : "";
+      if (adminIgnored != lastAdminIgnored_) {
+        if (!adminIgnored.empty())
+          spdlog::warn("hub: admin.publicUrl ignorada pelo Hub ({}); login de admin via Hub indisponível",
+                       adminIgnored.substr(0, 40));
+        lastAdminIgnored_ = adminIgnored;
       }
     }
     return true;

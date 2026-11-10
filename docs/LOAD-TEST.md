@@ -48,12 +48,25 @@ python3 tools/loadtest.py --count 512 --duration 300 --cluster 0.3 --assert
 - `--count 512` bots; `--duration 300` segundos de carga; `--cluster 0.3` = 30% dos bots aglomerados (pior caso de
   visibilidade/banda); `--area` (padrão 2000) é o lado da área de espalhamento.
 - `--assert` sai com código 1 se algum limite for violado (a carga é repetida 1x antes de falhar).
-- Outros: `--out-dir` (padrão `build-native/loadtest`), `--server-bin`, `--bots-bin`, `--skip-load`, `--skip-security`.
+- Outros: `--out-dir` (padrão `build-native/loadtest`), `--server-bin`, `--bots-bin`, `--skip-load`, `--skip-security`,
+  `--skip-slow-script`.
 - O servidor roda em modo dev (sem Hub), em porta aleatória de 127.0.0.1, com `maxPlayers = count + 16`.
+- O painel admin fica ligado na carga (porta aleatória de 127.0.0.1, login por `admin.devToken`): a cada amostra o
+  script lê `/api/players`, `/api/resources` e `/api/metrics` pelo painel; qualquer erro é violação. `--no-admin`
+  desliga.
   Nada é exposto na internet.
 
-O script faz (1) a carga, lendo `/metrics` a cada 5 s, e (2) três cenários de segurança, cada um com servidor próprio
-(teleporte, flood de eventos, tickets com seed errada).
+O script faz (1) a carga, lendo `/metrics` a cada 5 s, (2) três cenários de segurança, cada um com servidor próprio
+(teleporte, flood de eventos, tickets com seed errada) e (3) o cenário do **script lento**: servidor próprio com 32
+bots por 20 s (`--slow-count`, `--slow-duration`) e um resource de teste `slow`, gerado pelo próprio script (não fica
+em `resources.example`), que prende a thread de scripts num laço de 2 a 3 s dentro de `cb.events.on('echo')` a cada
+10 s. Passa se a simulação não esperar (tick p99 <= 25 ms, tick máximo < 1 s, nenhum bot > 1 s sem snapshot, nenhuma
+queda ou kick), se o log tiver o aviso da vigia `[slow] vigia: execução levou ...` sem aborto (2–3 s < 5 s) e se o eco
+continuar respondendo. `--skip-slow-script` pula o cenário; o resultado fica em `slowScript` no relatório.
+
+O eco dos bots (evento `echo`, payload JSON `{"t":<µs>}`) é respondido pelo resource Lua de exemplo
+`resources.example/echo`, que o script copia para a pasta de resources de cada servidor de teste; o `cb-server` não
+tem mais eco em C++. Assim a carga também exercita a thread de scripts e a API `cb.*`.
 
 ## 6. Interpretar o resultado
 

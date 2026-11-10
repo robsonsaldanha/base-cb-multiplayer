@@ -1,4 +1,5 @@
 #include "bot.hpp"
+#include "echo.hpp"
 #include "gaps.hpp"
 
 #include <algorithm>
@@ -65,6 +66,7 @@ struct Bot {
   uint64_t bytesIn = 0, snapshots = 0, corrections = 0, enters = 0;
   double rttSum = 0;
   uint64_t rttN = 0;
+  uint64_t echoSent = 0;
 };
 
 using Clock = std::chrono::steady_clock;
@@ -151,7 +153,7 @@ struct Swarm {
       jti += kHex[c & 15];
     }
     cbmp::Hello h;
-    h.ticket = makeTicket(opt.seed, b.idx, opt.serverId, iat, jti);
+    h.ticket = makeTicket(opt.seed, b.idx, opt.serverId, iat, jti, opt.kid);
     send(b, h);
     b.phase = Phase::Handshake;
   }
@@ -273,11 +275,11 @@ struct Swarm {
         b.z = c->pos.z;
       }
     } else if (const auto* e = std::get_if<cbmp::Event>(&m)) {
-      if (e->name == "echo" && e->payload.size() == sizeof(double)) {
-        double sent = 0;
-        std::memcpy(&sent, e->payload.data(), sizeof sent);
-        b.rttSum += t - sent;
-        ++b.rttN;
+      if (e->name == "echo") {
+        if (auto sent = decodeEcho(e->payload)) {
+          b.rttSum += t - *sent;
+          ++b.rttN;
+        }
       }
     } else if (std::holds_alternative<cbmp::EntityEnter>(m)) {
       ++b.enters;
@@ -322,9 +324,8 @@ struct Swarm {
       if (b.nextInput < t) b.nextInput = t + kInputPeriod;  // atrasou muito: não tenta compensar
     }
     if (t >= b.nextEcho) {
-      cbmp::Event e{"echo", std::vector<uint8_t>(sizeof(double))};
-      std::memcpy(e.payload.data(), &t, sizeof t);
-      send(b, e);
+      send(b, cbmp::Event{"echo", encodeEcho(t)});  // respondido pelo resource Lua de exemplo `echo`
+      ++b.echoSent;
       b.nextEcho = t + kEchoPeriod;
     }
   }
@@ -396,7 +397,7 @@ struct Swarm {
     int connected = 0, failed = 0, rejected = 0, disconnected = 0, kicked = 0;
     uint64_t bytesIn = 0, corrections = 0, snapshots = 0;
     double rttSum = 0, maxGap = 0, kbpsSum = 0;
-    uint64_t rttN = 0;
+    uint64_t rttN = 0, echoSent = 0;
     int kbpsN = 0, withoutSnapshots = 0;
     for (auto& b : bots) {
       if (!countsForStats(b)) continue;
@@ -431,6 +432,7 @@ struct Swarm {
       snapshots += b.snapshots;
       rttSum += b.rttSum;
       rttN += b.rttN;
+      echoSent += b.echoSent;
       maxGap = std::max(maxGap, b.maxGap);
     }
     nlohmann::json r{{"count", static_cast<int>(bots.size())},
@@ -443,6 +445,8 @@ struct Swarm {
                      {"p99SnapshotGapMs", gaps.p99Ms()},
                      {"botsWithoutSnapshots", withoutSnapshots},
                      {"avgRttMs", rttN ? rttSum / static_cast<double>(rttN) * 1000.0 : 0.0},
+                     {"echoReplies", rttN},
+                     {"echoSent", echoSent},
                      {"bytesIn", bytesIn},
                      {"avgKbpsInPerBot", kbpsN ? kbpsSum / kbpsN : 0.0},
                      {"snapshotsReceived", snapshots},
@@ -467,13 +471,13 @@ struct Swarm {
 }  // namespace
 
 std::string makeTicket(const std::array<uint8_t, 32>& seed, int index, const std::string& aud, int64_t iat,
-                       const std::string& jti) {
+                       const std::string& jti, const std::string& kid) {
   if (sodium_init() < 0) throw std::runtime_error("sodium_init falhou");
   std::array<uint8_t, crypto_sign_PUBLICKEYBYTES> pk{};
   std::array<uint8_t, crypto_sign_SECRETKEYBYTES> sk{};
   crypto_sign_seed_keypair(pk.data(), sk.data(), seed.data());
   const std::string i = std::to_string(index);
-  const std::string json = R"({"v":1,"kid":"dev","sub":"bot_)" + i + R"(","did":"9000000000000000)" + i +
+  const std::string json = R"({"v":1,"kid":")" + kid + R"(","sub":"bot_)" + i + R"(","did":"9000000000000000)" + i +
                            R"(","name":"Bot )" + i + R"(","aud":")" + aud + R"(","iat":)" + std::to_string(iat) +
                            R"(,"exp":)" + std::to_string(iat + 300) + R"(,"jti":")" + jti + R"("})";
   const std::vector<uint8_t> body(json.begin(), json.end());

@@ -4,7 +4,8 @@ import { z } from 'zod';
 import { ExchangeRequest, RefreshRequest, type TokenResponse } from '@cbmp/contracts';
 import { HttpError } from '../errors';
 import { SESSION_COOKIE, bearer, isPlatformAdmin, requireUser } from '../auth';
-import type { ClientKind, SessionTokens } from '../store';
+import type { ClientKind, ReturnTo, SessionTokens } from '../store';
+import { ADMIN_STATE_RE, SERVER_ID_RE, adminConfirmPath } from './admin-login';
 
 const OAUTH_COOKIE = 'cbmp_oauth';
 const OAUTH_COOKIE_PATH = '/v1/auth/discord';
@@ -13,7 +14,16 @@ const ClientQuery = z.object({
   client: z.enum(['launcher', 'panel']),
   code_challenge: z.string().regex(/^[A-Za-z0-9_-]{43}$/).optional(),
   code_challenge_method: z.literal('S256').optional(),
+  /** Só painel: volta para a confirmação de login de admin deste servidor (fica no state OAuth, não em cookie). */
+  return: z.string().regex(SERVER_ID_RE).optional(),
+  return_state: z.string().regex(ADMIN_STATE_RE).optional(),
 });
+
+/** Retorno pós-login: só no painel; o launcher ignora. */
+function returnOf(q: z.infer<typeof ClientQuery>): ReturnTo | undefined {
+  if (q.return_state !== undefined && q.return === undefined) throw new HttpError(400, 'invalid_body', 'return_state exige return');
+  return q.client === 'panel' && q.return ? { serverId: q.return, state: q.return_state ?? null } : undefined;
+}
 
 /** O launcher é cliente público: PKCE (S256) é obrigatório. O painel não usa. */
 function checkPkce(q: z.infer<typeof ClientQuery>): string | undefined {
@@ -37,14 +47,15 @@ export async function authRoutes(app: FastifyInstance) {
 
   const secure = config.publicUrl.startsWith('https://');
 
-  function finishLogin(reply: FastifyReply, userId: string, client: ClientKind, codeChallenge: string | null) {
+  function finishLogin(reply: FastifyReply, userId: string, client: ClientKind, codeChallenge: string | null, returnTo: ReturnTo | null = null) {
     if (client === 'panel') {
       const s = store.createSession(userId, 'panel', now());
       reply.setCookie(SESSION_COOKIE, s.access, {
         path: '/', httpOnly: true, sameSite: 'lax', secure,
         maxAge: s.accessExpiresAt - now(),
       });
-      return reply.redirect('/panel');
+      // Retorno amarrado ao state OAuth (uso único): sempre para a CONFIRMAÇÃO, nunca direto para um ticket.
+      return reply.redirect(returnTo ? adminConfirmPath(returnTo.serverId, returnTo.state) : '/panel');
     }
     const code = store.createLoginCode(userId, now(), codeChallenge ?? '');
     return reply.redirect(`cbmp://auth?code=${encodeURIComponent(code)}`);
@@ -53,7 +64,7 @@ export async function authRoutes(app: FastifyInstance) {
   app.get('/v1/auth/discord/login', async (req, reply) => {
     const q = ClientQuery.parse(req.query);
     const challenge = checkPkce(q);
-    const state = store.createOauthState(q.client, now(), challenge);
+    const state = store.createOauthState(q.client, now(), challenge, returnOf(q));
     reply.setCookie(OAUTH_COOKIE, state, { path: OAUTH_COOKIE_PATH, httpOnly: true, sameSite: 'lax', secure, maxAge: 600 });
     const url = new URL('https://discord.com/oauth2/authorize');
     url.search = new URLSearchParams({
@@ -76,7 +87,7 @@ export async function authRoutes(app: FastifyInstance) {
     }
     const du = await discord.getUser(await discord.exchangeCode(q.code, redirectUri));
     const user = store.upsertUserFromDiscord({ discordId: du.id, name: du.global_name ?? du.username, avatar: du.avatar }, now());
-    return finishLogin(reply, user.id, st.client, st.codeChallenge);
+    return finishLogin(reply, user.id, st.client, st.codeChallenge, st.returnTo);
   });
 
   if (config.devLogin) {
@@ -84,7 +95,7 @@ export async function authRoutes(app: FastifyInstance) {
       const q = ClientQuery.extend({ discordId: z.string().regex(/^\d{1,20}$/), name: z.string().min(1).max(32) }).parse(req.query);
       const challenge = checkPkce(q);
       const user = store.upsertUserFromDiscord({ discordId: q.discordId, name: q.name, avatar: null }, now());
-      return finishLogin(reply, user.id, q.client, challenge ?? null);
+      return finishLogin(reply, user.id, q.client, challenge ?? null, returnOf(q) ?? null);
     });
   }
 

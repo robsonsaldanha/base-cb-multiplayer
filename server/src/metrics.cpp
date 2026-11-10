@@ -114,7 +114,7 @@ nlohmann::json Metrics::snapshot() const {
   }
   std::sort(sorted.begin(), sorted.end());
   double maxUs = sorted.empty() ? 0 : static_cast<double>(sorted.back());
-  return {{"tickP50Ms", percentile(sorted, 0.50) / 1000.0},
+  nlohmann::json out = {{"tickP50Ms", percentile(sorted, 0.50) / 1000.0},
           {"tickP99Ms", percentile(sorted, 0.99) / 1000.0},
           {"tickMaxMs", maxUs / 1000.0},
           {"players", players.load()},
@@ -124,12 +124,30 @@ nlohmann::json Metrics::snapshot() const {
           {"droppedEvents", droppedEvents.load()},
           {"decodeErrors", decodeErrors.load()},
           {"sendFailures", sendFailures.load()},
+          {"encodeErrors", encodeErrors.load()},
+          {"scriptEventsDropped", scriptEventsDropped.load()},
+          {"scriptCommandsDropped", scriptCommandsDropped.load()},
+          {"scriptCommandsRejected", scriptCommandsRejected.load()},
+          {"scriptEventsOutDropped", scriptEventsOutDropped.load()},
+          {"scriptLogDropped", scriptLogDropped.load()},
+          {"scriptAuditDropped", scriptAuditDropped.load()},
+          {"scriptJoinLeaveDropped", scriptJoinLeaveDropped.load()},
           {"avgKbpsPerPlayer", avgKbps},
           {"maxKbpsPerPlayer", maxKbps},
           {"wireAvgKbpsPerPlayer", wireAvg},
           {"wireMaxKbpsPerPlayer", wireMax},
           {"rssBytes", static_cast<uint64_t>(rssBytes())},
           {"cpuPercent", cpu}};
+  {
+    std::lock_guard<std::mutex> lk(dbMu_);
+    if (!db_.is_null()) out["db"] = db_;
+  }
+  return out;
+}
+
+void Metrics::setDb(nlohmann::json db) {
+  std::lock_guard<std::mutex> lk(dbMu_);
+  db_ = std::move(db);
 }
 
 }  // namespace cbserver

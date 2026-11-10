@@ -3,6 +3,7 @@ import type { HeartbeatBody } from '@cbmp/contracts';
 import type { DB } from './db';
 
 export type ClientKind = 'launcher' | 'panel';
+export interface ReturnTo { serverId: string; state: string | null }
 export interface UserRow { id: string; discordId: string; name: string; avatar: string | null }
 export interface ServerRow {
   id: string; ownerId: string; name: string; description: string; tags: string[]; locale: string;
@@ -11,6 +12,8 @@ export interface ServerRow {
 export interface StatusRow {
   serverId: string; ip: string; gamePort: number; httpPort: number; players: number; maxPlayers: number;
   version: string; protocol: number; lastHeartbeat: number; verified: boolean; verifiedAt: number;
+  /** Origem normalizada do painel admin do servidor (null = não anunciada). */
+  adminUrl: string | null;
 }
 export interface SessionTokens { access: string; accessExpiresAt: number; refresh: string | null; refreshExpiresAt: number | null }
 export interface ServerInput { name: string; description: string; tags: string[]; locale: string; useGlobalBans: boolean }
@@ -38,7 +41,7 @@ const toStatus = (r: Raw): StatusRow => ({
   serverId: r.server_id as string, ip: r.ip as string, gamePort: r.game_port as number, httpPort: r.http_port as number,
   players: r.players as number, maxPlayers: r.max_players as number, version: r.version as string,
   protocol: r.protocol as number, lastHeartbeat: r.last_heartbeat as number, verified: r.verified === 1,
-  verifiedAt: r.verified_at as number,
+  verifiedAt: r.verified_at as number, adminUrl: (r.admin_url as string | null) ?? null,
 });
 
 export class Store {
@@ -104,16 +107,22 @@ export class Store {
   }
 
   // ---- OAuth state e códigos de login (uso único)
-  createOauthState(client: ClientKind, now: number, codeChallenge?: string): string {
+  /** `returnTo` (só painel): volta para a confirmação de login de admin daquele servidor; morre com o state. */
+  createOauthState(client: ClientKind, now: number, codeChallenge?: string, returnTo?: ReturnTo): string {
     const state = randomBytes(24).toString('base64url');
-    this.db.prepare('INSERT INTO oauth_states (state, client, created_at, code_challenge) VALUES (?, ?, ?, ?)').run(state, client, now, codeChallenge ?? null);
+    this.db.prepare('INSERT INTO oauth_states (state, client, created_at, code_challenge, return_server_id, return_state) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(state, client, now, codeChallenge ?? null, returnTo?.serverId ?? null, returnTo?.state ?? null);
     return state;
   }
 
-  consumeOauthState(state: string, now: number): { client: ClientKind; codeChallenge: string | null } | null {
-    const r = this.db.prepare('DELETE FROM oauth_states WHERE state = ? RETURNING client, created_at, code_challenge').get(state) as Raw | undefined;
+  consumeOauthState(state: string, now: number): { client: ClientKind; codeChallenge: string | null; returnTo: ReturnTo | null } | null {
+    const r = this.db.prepare('DELETE FROM oauth_states WHERE state = ? RETURNING client, created_at, code_challenge, return_server_id, return_state').get(state) as Raw | undefined;
     if (!r || now - (r.created_at as number) > OAUTH_STATE_TTL) return null;
-    return { client: r.client as ClientKind, codeChallenge: (r.code_challenge as string | null) ?? null };
+    const sid = (r.return_server_id as string | null) ?? null;
+    return {
+      client: r.client as ClientKind, codeChallenge: (r.code_challenge as string | null) ?? null,
+      returnTo: sid ? { serverId: sid, state: (r.return_state as string | null) ?? null } : null,
+    };
   }
 
   createLoginCode(userId: string, now: number, codeChallenge: string): string {
@@ -183,16 +192,19 @@ export class Store {
     return r ? toStatus(r) : null;
   }
 
-  /** Grava status e atualiza nome/descrição/tags/locale (server.cfg é a fonte da verdade). */
-  recordHeartbeat(serverId: string, hb: HeartbeatBody, ip: string, now: number): void {
+  /**
+   * Grava status e atualiza nome/descrição/tags/locale (server.cfg é a fonte da verdade).
+   * `adminUrl` já vem normalizada (origem) e filtrada pela rota; ausente apaga a anterior.
+   */
+  recordHeartbeat(serverId: string, hb: HeartbeatBody, ip: string, now: number, adminUrl: string | null = null): void {
     this.db.transaction(() => {
-      this.db.prepare(`INSERT INTO server_status (server_id, ip, game_port, http_port, players, max_players, version, protocol, last_heartbeat)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      this.db.prepare(`INSERT INTO server_status (server_id, ip, game_port, http_port, players, max_players, version, protocol, last_heartbeat, admin_url)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(server_id) DO UPDATE SET ip = excluded.ip, game_port = excluded.game_port, http_port = excluded.http_port,
           players = excluded.players, max_players = excluded.max_players, version = excluded.version,
-          protocol = excluded.protocol, last_heartbeat = excluded.last_heartbeat,
+          protocol = excluded.protocol, last_heartbeat = excluded.last_heartbeat, admin_url = excluded.admin_url,
           verified = CASE WHEN server_status.ip != excluded.ip OR server_status.http_port != excluded.http_port THEN 0 ELSE server_status.verified END`)
-        .run(serverId, ip, hb.gamePort, hb.httpPort, hb.players, hb.maxPlayers, hb.version, hb.protocol, now);
+        .run(serverId, ip, hb.gamePort, hb.httpPort, hb.players, hb.maxPlayers, hb.version, hb.protocol, now, adminUrl);
       this.db.prepare('UPDATE servers SET name = ?, description = ?, tags = ?, locale = ? WHERE id = ?')
         .run(hb.name, hb.description, JSON.stringify(hb.tags), hb.locale, serverId);
     })();

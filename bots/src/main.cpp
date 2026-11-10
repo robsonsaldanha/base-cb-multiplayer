@@ -20,6 +20,7 @@ namespace {
 constexpr const char* kUsage =
     "uso: cb-bots --server HOST:PORT --dev-seed <hex32> --server-id <id> --count N --area <m> --cluster <0..1>\n"
     "             --duration <s> --report <arquivo> [--teleport-every <s>] [--flood] [--ramp <por s>]\n"
+    "             [--kid <kid>]   (padrão \"dev\"; outro kid = chave de um Hub local de teste com a mesma seed)\n"
     "     cb-bots --dev-seed <hex32> --print-dev-key   (chave pública base64url para auth.devPublicKey)\n";
 
 bool parseSeed(const std::string& hex, std::array<uint8_t, 32>& out) {
@@ -65,6 +66,11 @@ int main(int argc, char** argv) {
         seedHex = val();
       } else if (a == "--server-id") {
         opt.serverId = val();
+      } else if (a == "--kid") {
+        opt.kid = val();
+        if (opt.kid.empty() || opt.kid.size() > 64 || opt.kid.find_first_not_of(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") != std::string::npos)
+          throw std::runtime_error("--kid deve ter 1 a 64 caracteres [A-Za-z0-9_-]");
       } else if (a == "--count") {
         opt.count = std::stoi(val());
       } else if (a == "--area") {

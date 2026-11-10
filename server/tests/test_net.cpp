@@ -289,6 +289,25 @@ TEST_CASE("net full server rejects with servidor cheio") {
   REQUIRE(b.first<cbmp::Reject>()->reason == "servidor cheio");
 }
 
+TEST_CASE("net admission check rejects banned players with its reason") {
+  Fixture f;
+  std::vector<std::string> asked;
+  f.net.setAdmission([&](const std::string& sub, const std::string& did) -> std::optional<std::string> {
+    asked.push_back(sub + "/" + did);
+    if (did == "did-u2") return std::string("banido: trapaça");
+    return std::nullopt;
+  });
+  TestClient a(f.port);
+  f.login(a, "u1", "j1");
+  TestClient b(f.port);
+  f.connect(b);
+  b.send(f.hello("u2", "j2"));
+  REQUIRE(f.until([&] { return b.first<cbmp::Reject>() != nullptr && b.closed(); }, {&b}));
+  REQUIRE(b.first<cbmp::Reject>()->reason == "banido: trapaça");
+  REQUIRE(f.world.playerCount() == 1);
+  REQUIRE(asked == std::vector<std::string>{"u1/did-u1", "u2/did-u2"});
+}
+
 TEST_CASE("net Input before Hello closes the connection") {
   Fixture f;
   TestClient c(f.port);
@@ -471,4 +490,19 @@ TEST_CASE("net network-level closes of players are reported to the violation sin
   REQUIRE(got[0].reason == "mensagem inválida");
   REQUIRE(got[1].sub == "u2");
   REQUIRE(got[1].reason == "mensagem não permitida");
+}
+
+TEST_CASE("net send drops messages that cannot be encoded, counts them and keeps running") {
+  Fixture f;
+  TestClient c(f.port);
+  f.login(c, "u1", "j1");
+  std::vector<cbserver::Outgoing> out;
+  out.emplace_back(cbserver::EntityId{1}, cbmp::Message{cbmp::Event{"big", std::vector<uint8_t>(5000, 'x')}});
+  out.emplace_back(cbserver::EntityId{1}, cbmp::Message{cbmp::Event{std::string(70, 'n'), {1}}});
+  out.emplace_back(cbserver::EntityId{1}, cbmp::Message{cbmp::Event{"ok", {1}}});
+  REQUIRE_NOTHROW(f.net.send(out));
+  REQUIRE(f.metrics.encodeErrors.load() == 2);
+  REQUIRE(f.metrics.snapshot()["encodeErrors"] == 2);
+  REQUIRE(f.until([&] { return c.first<cbmp::Event>() != nullptr; }, {&c}));
+  REQUIRE(c.first<cbmp::Event>()->name == "ok");
 }

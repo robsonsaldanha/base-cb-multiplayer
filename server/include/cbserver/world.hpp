@@ -3,10 +3,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <cbmp/messages.hpp>
@@ -34,6 +37,7 @@ struct SentRecord {
 
 struct PlayerSlot {
   EntityId id = 0;
+  uint32_t session = 0;  // único no processo (o id é reaproveitado; a sessão não)
   std::string sub, did, name;
   cbmp::PlayerState state;
   uint32_t lastInputSeq = 0;
@@ -56,12 +60,28 @@ struct PlayerSlot {
   double lastAckTime = 0;
   bool baselineFresh = false;  // calculado pelo World antes de montar snapshots (ack ≤ 1 s)
   bool kicked = false;         // KickOrder já emitida; ignora novos inputs/eventos
+  // Cota de eventos servidor → cliente (bytes de nome + payload): token bucket de scripting.eventOut*.
+  double outTokens = 0, outLast = -1;
   bool awaitingSpawn = false;  // SpawnMode::DevTrustFirstInput: fora da grade até o primeiro Input
 };
 
+// Mensagem compartilhada por vários destinatários (broadcast): codificada uma vez só.
+struct SharedMessage {
+  cbmp::Message msg;
+  std::vector<uint8_t> bytes;  // cbmp::encode(msg)
+};
+
+// Mensagem para um jogador. `shared` (broadcast) aponta para uma mensagem imutável única para todos os
+// destinatários, já codificada; use message() para ler.
 struct Outgoing {
   EntityId to = 0;
   cbmp::Message msg;
+  std::shared_ptr<const SharedMessage> shared;
+
+  Outgoing() = default;
+  Outgoing(EntityId t, cbmp::Message m) : to(t), msg(std::move(m)) {}
+  Outgoing(EntityId t, std::shared_ptr<const SharedMessage> m) : to(t), shared(std::move(m)) {}
+  const cbmp::Message& message() const { return shared ? shared->msg : msg; }
 };
 struct KickOrder {
   EntityId who = 0;
@@ -69,6 +89,13 @@ struct KickOrder {
 };
 
 class SnapshotBuilder;
+
+// Ganchos do World (thread da simulação; não podem bloquear). Usados pela ponte com os scripts.
+struct WorldHooks {
+  std::function<void(const PlayerSlot&)> join;                     // depois de addPlayer ocupar o slot
+  std::function<void(const PlayerSlot&, std::string_view)> leave;  // antes de removePlayer liberar o slot
+  std::function<void(const PlayerSlot&, const cbmp::Event&)> event;  // evento de cliente aceito pela cota
+};
 
 // Estado autoritativo do mundo, sem rede. Uso por uma única thread (a da simulação).
 class World {
@@ -80,8 +107,8 @@ class World {
   // Em SpawnMode::DevTrustFirstInput ignora `spawn`: o jogador fica pendente (invisível, sem Correction).
   std::optional<EntityId> addPlayer(std::string sub, std::string did, std::string name, double now,
                                     const cbmp::PlayerState& spawn = cbmp::PlayerState{});
-  // Remove o jogador; os que o viam recebem EntityLeave no próximo tick.
-  void removePlayer(EntityId id);
+  // Remove o jogador (gancho leave com `reason`); os que o viam recebem EntityLeave no próximo tick.
+  void removePlayer(EntityId id, std::string_view reason = "saiu");
   // Posicionamento autoritativo (spawn/teleporte do servidor): aplica o estado e envia Correction.
   void setState(EntityId id, const cbmp::PlayerState& s, double now);
 
@@ -93,6 +120,7 @@ class World {
   // da Correction após 30 s.
   // Com SpawnMode::DevTrustFirstInput, o primeiro input define o spawn sem validação.
   void onInput(EntityId id, const cbmp::Input& in, double now);
+  // Cota por nome (eventsPerSecond/eventsBurst); aceito → gancho `event` (o World não responde nada sozinho).
   bool onEvent(EntityId id, const cbmp::Event& ev, double now);  // false = descartado
   void onSnapshotAck(EntityId id, uint32_t tick, double now);
 
@@ -100,7 +128,24 @@ class World {
   // O chamador envia `out`, envia Kick aos de `kicks` e então chama removePlayer neles.
   void tick(double now, SnapshotBuilder& builder, std::vector<Outgoing>& out, std::vector<KickOrder>& kicks);
 
+  void setHooks(WorldHooks hooks) { hooks_ = std::move(hooks); }
+  // Evento servidor → cliente, enviado no próximo tick. Ignorado se o id não existe, já foi expulso ou (session ≠ 0)
+  // tem outra sessão. Cada jogador tem cota de bytes (scripting.eventOutKBps/eventOutBurstKB): acima dela o evento
+  // é descartado e contado em eventsOutDropped(). false = não enfileirado.
+  bool queueEvent(EntityId to, uint32_t session, cbmp::Event ev, double now);
+  // Para todos os jogadores ativos (dentro da cota de cada um), com uma única cópia do payload, codificada uma vez.
+  // Devolve quantos destinatários receberam.
+  size_t broadcastEvent(cbmp::Event ev, double now);
+  // Cada evento custa nome + payload + este overhead na cota do jogador (cabeçalho/fila; evento vazio não é grátis).
+  static constexpr size_t kEventOverheadBytes = 48;
+  // Expulsão pedida de fora (scripts): vira KickOrder no próximo tick (uma vez só). session ≠ 0 tem de bater.
+  void kick(EntityId id, std::string reason, uint32_t session = 0);
+  void kickDid(const std::string& did, const std::string& reason);  // todos os jogadores com esse did
+  uint64_t eventsOutDropped() const { return eventsOutDropped_; }
+
   uint32_t currentTick() const { return tick_; }
+  const std::vector<EntityId>& activeIds() const { return active_; }  // ordenados
+  size_t maxPlayers() const { return slots_.size() - 1; }
   size_t playerCount() const { return active_.size(); }
   const PlayerSlot* find(EntityId id) const;
 
@@ -108,7 +153,7 @@ class World {
 
  private:
   PlayerSlot* slot(EntityId id);
-  void orderKick(PlayerSlot& s, const char* reason);
+  void orderKick(PlayerSlot& s, std::string reason);
   void forget(PlayerSlot& viewer, EntityId gone);  // tira `gone` das baselines do viewer
   // Enfileira e abre a janela; byServer = spawn/setState (carência, não conta para kick).
   void sendCorrection(PlayerSlot& p, uint32_t seq, double now, bool byServer = false);
@@ -125,7 +170,11 @@ class World {
   std::vector<Outgoing> pending_;
   std::vector<KickOrder> pendingKicks_;
   std::vector<EntityId> scratch_;
+  bool takeOut(PlayerSlot& p, size_t bytes, double now);
+
   uint32_t tick_ = 0;
+  WorldHooks hooks_;
+  uint64_t eventsOutDropped_ = 0;
 };
 
 }  // namespace cbserver

@@ -1,9 +1,9 @@
 name: native
 on:
   push:
-    paths: ['proto/**', 'server/**', 'bots/**', 'CMakeLists.txt', 'CMakePresets.json', 'vcpkg.json', 'packages/contracts/test-vectors/**', '.github/workflows/native.yml']
+    paths: ['proto/**', 'server/**', 'bots/**', 'CMakeLists.txt', 'CMakePresets.json', 'vcpkg.json', 'vcpkg-overlays/**', 'vcpkg-triplets/**', 'packages/contracts/test-vectors/**', 'resources.example/**', 'tools/loadtest.py', 'docs/RESOURCES.md', '.github/workflows/native.yml']
   pull_request:
-    paths: ['proto/**', 'server/**', 'bots/**', 'CMakeLists.txt', 'CMakePresets.json', 'vcpkg.json', 'packages/contracts/test-vectors/**', '.github/workflows/native.yml']
+    paths: ['proto/**', 'server/**', 'bots/**', 'CMakeLists.txt', 'CMakePresets.json', 'vcpkg.json', 'vcpkg-overlays/**', 'vcpkg-triplets/**', 'packages/contracts/test-vectors/**', 'resources.example/**', 'tools/loadtest.py', 'docs/RESOURCES.md', '.github/workflows/native.yml']
 concurrency:
   group: native-${{ github.ref }}
   cancel-in-progress: true
@@ -14,6 +14,30 @@ jobs:
   linux:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    env:
+      CBMP_TEST_MYSQL: mysql://root:test@127.0.0.1:3306/cbtest
+    services:
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: test
+          MARIADB_DATABASE: cbtest
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+      # MySQL 8: autenticação caching_sha2_password (plugin dinâmico da libmariadb) e max_execution_time.
+      mysql8:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_DATABASE: cbtest
+        ports:
+          - 3307:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -ptest --silent"
+          --health-interval=5s --health-timeout=5s --health-retries=30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4
@@ -32,7 +56,13 @@ jobs:
           "$GITHUB_WORKSPACE/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
           echo "VCPKG_ROOT=$GITHUB_WORKSPACE/vcpkg" >> $GITHUB_ENV
       - run: cmake --preset linux-asan && cmake --build --preset linux-asan -- -k 0
+      - name: libmariadb ligada dinamicamente (LGPL)
+        run: ldd build-native/linux-asan/server/cb-server | tee /dev/stderr | grep -q 'libmariadb\.so'
       - run: ctest --test-dir build-native/linux-asan --output-on-failure
+      - name: integração MySQL 8 (caching_sha2_password; TLS sem verificação, certificado autoassinado)
+        run: 'ctest --test-dir build-native/linux-asan --output-on-failure -R "^mysql: "'
+        env:
+          CBMP_TEST_MYSQL: mysql://root:test@127.0.0.1:3307/cbtest?tls=required
       - uses: actions/cache/save@v4
         if: always()
         with:
@@ -61,6 +91,12 @@ jobs:
       - run: cmake --preset windows-ci && cmake --build --preset windows-ci
         shell: pwsh
       - run: ctest --test-dir build-native/windows-ci -C Release --output-on-failure
+        shell: pwsh
+      # Debug só do cbscript (vigia/sandbox do Lua): /Od + /RTC aumentam os quadros e mudam o desenrolar de erros do Lua;
+      # foi só em Debug que apareceu a pilha estourada pelos 200 níveis C do Lua (revisão final do sub3, I2). Os testes de
+      # tempo (p99) do cbserver ficam de fora: não fazem sentido sem otimização.
+      - run: |
+          cmake --build --preset windows-ci --config Debug --target cbscript_tests && ctest --test-dir build-native/windows-ci/server/script -C Debug --output-on-failure
         shell: pwsh
       - uses: actions/cache/save@v4
         if: always()
