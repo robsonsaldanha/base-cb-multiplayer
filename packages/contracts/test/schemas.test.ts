@@ -59,3 +59,41 @@ describe('auth do launcher', () => {
     expect(RefreshRequest.safeParse({}).success).toBe(false);
   });
 });
+
+describe('HeartbeatBody.adminUrl', () => {
+  const parse = (adminUrl: unknown) => HeartbeatBody.safeParse({ ...hb, adminUrl });
+  it('é opcional', () => {
+    expect(HeartbeatBody.parse(hb).adminUrl).toBeUndefined();
+  });
+  it('normaliza para a origem (scheme://host[:porta]), minúsculas e sem porta padrão', () => {
+    expect(HeartbeatBody.parse({ ...hb, adminUrl: 'https://Painel.Example.com' }).adminUrl).toBe('https://painel.example.com');
+    expect(HeartbeatBody.parse({ ...hb, adminUrl: 'https://painel.example.com/' }).adminUrl).toBe('https://painel.example.com');
+    expect(HeartbeatBody.parse({ ...hb, adminUrl: 'https://painel.example.com:443' }).adminUrl).toBe('https://painel.example.com');
+    expect(HeartbeatBody.parse({ ...hb, adminUrl: 'https://painel.example.com:8443/' }).adminUrl).toBe('https://painel.example.com:8443');
+    expect(HeartbeatBody.parse({ ...hb, adminUrl: 'HTTPS://203.0.113.5:30510' }).adminUrl).toBe('https://203.0.113.5:30510');
+  });
+  it('http só para loopback (127.0.0.0/8, ::1, localhost)', () => {
+    expect(HeartbeatBody.parse({ ...hb, adminUrl: 'http://127.0.0.1:30510' }).adminUrl).toBe('http://127.0.0.1:30510');
+    expect(HeartbeatBody.parse({ ...hb, adminUrl: 'http://127.8.9.10:30510' }).adminUrl).toBe('http://127.8.9.10:30510');
+    expect(HeartbeatBody.parse({ ...hb, adminUrl: 'http://[::1]:30510' }).adminUrl).toBe('http://[::1]:30510');
+    expect(HeartbeatBody.parse({ ...hb, adminUrl: 'http://localhost:30510' }).adminUrl).toBe('http://localhost:30510');
+    for (const u of ['http://painel.example.com', 'http://203.0.113.5:30510', 'http://10.0.0.1', 'http://localhost.example.com',
+      'http://127.0.0.1.nip.io', 'http://[::2]']) {
+      expect(parse(u).success, u).toBe(false);
+    }
+  });
+  it('recusa caminho, query, fragmento, credenciais, espaços e controles', () => {
+    for (const u of [
+      'https://painel.example.com/admin', 'https://painel.example.com/auth/callback', 'https://painel.example.com?x=1',
+      'https://painel.example.com/?', 'https://painel.example.com#frag', 'https://painel.example.com/#', 'https://user:pw@painel.example.com',
+      'https://user@painel.example.com', 'https://evil.com@painel.example.com', 'https://painel.example.com\@evil.com',
+      ' https://painel.example.com', 'https://painel.example.com ', 'https://painel .example.com', 'https://painel.example.com\t',
+      'https://painel.example.com\n', 'https://painel.example.com\u0000', 'https://painel.example.com/.', 'https://painel.example.com//',
+      'javascript:alert(1)', 'ftp://painel.example.com', 'https://', 'https:///x', '//painel.example.com', 'painel.example.com',
+      'https://painel.example.com:0', 'https://painel.example.com:65536', 'https://painel.exámple.com',
+      `https://${'a'.repeat(250)}.com`, 42, '',
+    ]) {
+      expect(parse(u).success, JSON.stringify(u)).toBe(false);
+    }
+  });
+});

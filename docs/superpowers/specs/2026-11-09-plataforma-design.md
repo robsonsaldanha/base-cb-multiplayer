@@ -81,7 +81,8 @@ Fora do escopo: anti-cheat em nível de kernel; voz (decidir depois); loja/monet
 | GET | `/v1/keys/public` | — | `[{kid, publicKey}]`, `publicKey` = 32 bytes raw em base64url |
 | GET | `/v1/servers` | — | lista pública (cache 5 s) |
 | GET | `/v1/servers/:id` | — | detalhe (`ServerDetail`: online → campos de conexão incl. `protocol`; offline → id/name/description/tags/locale) |
-| POST | `/v1/servers/heartbeat` | `Bearer <chave do servidor>` | anúncio do servidor |
+| POST | `/v1/servers/heartbeat` | `Bearer <chave do servidor>` | anúncio do servidor; `adminUrl` opcional = origem do painel admin (`https://host[:porta]`, http só em loopback; sem caminho/query/fragmento/credenciais; ≤ 256; normalizada; loopback só é gravada com `HUB_ALLOW_PRIVATE_SERVERS=1`; ausente apaga a anterior) |
+| GET | `/v1/auth/server-admin?serverId=srv_…` | cookie do painel | login no painel admin do servidor: sem sessão → cookie `cbmp_return` (só o serverId, Path `/v1/auth`, 10 min) e login Discord, voltando aqui; serverId inválido 400, inexistente 404, offline 503, sem `adminUrl` 409 (páginas HTML); senão ticket `aud = "<serverId>#admin"` (TTL 300 s) e **303** para `<adminUrl>/auth/callback#ticket=…`. Qualquer usuário logado recebe o ticket: o servidor decide quem é admin (`admin.admins`). 10/min por usuário, 30/min por IP; auditado no log (did, serverId, resultado) |
 | GET/POST/PATCH/DELETE | `/v1/owner/servers[...]` | sessão | painel: criar, listar, editar descrição, girar chave, apagar |
 | GET | `/v1/bans/global` | chave do servidor | `[{discordId, reason, createdAt}]`; só se o servidor tem `useGlobalBans` (senão 403 `not_opted_in`) |
 | POST/DELETE | `/v1/admin/bans/global` | sessão de admin da plataforma | gerenciar lista global |

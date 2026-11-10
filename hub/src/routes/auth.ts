@@ -1,10 +1,11 @@
 import { createHash } from 'node:crypto';
-import type { FastifyInstance, FastifyReply } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { ExchangeRequest, RefreshRequest, type TokenResponse } from '@cbmp/contracts';
 import { HttpError } from '../errors';
 import { SESSION_COOKIE, bearer, isPlatformAdmin, requireUser } from '../auth';
 import type { ClientKind, SessionTokens } from '../store';
+import { RETURN_COOKIE, RETURN_COOKIE_PATH, isServerId } from './admin-login';
 
 const OAUTH_COOKIE = 'cbmp_oauth';
 const OAUTH_COOKIE_PATH = '/v1/auth/discord';
@@ -37,13 +38,19 @@ export async function authRoutes(app: FastifyInstance) {
 
   const secure = config.publicUrl.startsWith('https://');
 
-  function finishLogin(reply: FastifyReply, userId: string, client: ClientKind, codeChallenge: string | null) {
+  function finishLogin(req: FastifyRequest, reply: FastifyReply, userId: string, client: ClientKind, codeChallenge: string | null) {
     if (client === 'panel') {
       const s = store.createSession(userId, 'panel', now());
       reply.setCookie(SESSION_COOKIE, s.access, {
         path: '/', httpOnly: true, sameSite: 'lax', secure,
         maxAge: s.accessExpiresAt - now(),
       });
+      // Volta para o login de admin de servidor só se o cookie trouxer um serverId válido (nunca uma URL).
+      const ret = req.cookies[RETURN_COOKIE];
+      if (ret !== undefined) {
+        reply.clearCookie(RETURN_COOKIE, { path: RETURN_COOKIE_PATH });
+        if (isServerId(ret)) return reply.redirect(`/v1/auth/server-admin?serverId=${encodeURIComponent(ret)}`);
+      }
       return reply.redirect('/panel');
     }
     const code = store.createLoginCode(userId, now(), codeChallenge ?? '');
@@ -76,7 +83,7 @@ export async function authRoutes(app: FastifyInstance) {
     }
     const du = await discord.getUser(await discord.exchangeCode(q.code, redirectUri));
     const user = store.upsertUserFromDiscord({ discordId: du.id, name: du.global_name ?? du.username, avatar: du.avatar }, now());
-    return finishLogin(reply, user.id, st.client, st.codeChallenge);
+    return finishLogin(req, reply, user.id, st.client, st.codeChallenge);
   });
 
   if (config.devLogin) {
@@ -84,7 +91,7 @@ export async function authRoutes(app: FastifyInstance) {
       const q = ClientQuery.extend({ discordId: z.string().regex(/^\d{1,20}$/), name: z.string().min(1).max(32) }).parse(req.query);
       const challenge = checkPkce(q);
       const user = store.upsertUserFromDiscord({ discordId: q.discordId, name: q.name, avatar: null }, now());
-      return finishLogin(reply, user.id, q.client, challenge ?? null);
+      return finishLogin(req, reply, user.id, q.client, challenge ?? null);
     });
   }
 

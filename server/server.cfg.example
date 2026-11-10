@@ -13,6 +13,7 @@
   "events": { "perSecond": 20, "burst": 40 },
   "metrics": { "token": null },
   "db": null,
+  "admin": { "publicUrl": null },
   "scripting": { "memoryLimitMB": 256, "warnMs": 50, "abortMs": 5000, "bansFile": "bans.json",
                  "eventOutKBps": 8, "eventOutBurstKB": 32 },
   "resourcesDir": "resources",

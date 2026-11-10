@@ -50,14 +50,75 @@ void getStr(const json& obj, const char* key, const std::string& path, std::stri
   out = v->get<std::string>();
 }
 
+bool isLoopbackHost(const std::string& host) {
+  if (host == "localhost" || host == "[::1]") return true;
+  static const std::regex v4(R"(^127\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$)");
+  std::smatch m;
+  if (!std::regex_match(host, m, v4)) return false;
+  for (size_t i = 1; i <= 3; ++i)
+    if (std::stoi(m[i].str()) > 255) return false;
+  return true;
+}
+
 }  // namespace
+
+std::optional<std::string> normalizeAdminOrigin(std::string_view rawView) {
+  if (rawView.empty() || rawView.size() > 256) return std::nullopt;
+  std::string raw(rawView);
+  for (char& ch : raw) {
+    const auto u = static_cast<unsigned char>(ch);
+    if (u <= 0x20 || u >= 0x7f) return std::nullopt;  // espaços, controles, não-ASCII
+    if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+  }
+  // Mesmo formato do schema TS: sem @, barra invertida, ? e #, e no máximo uma "/" final.
+  static const std::regex re(R"(^(https?)://([a-z0-9.\-\[\]:]+)/?$)");
+  std::smatch m;
+  if (!std::regex_match(raw, m, re)) return std::nullopt;
+  const std::string scheme = m[1].str();
+  const std::string authority = m[2].str();
+  std::string host, port;
+  if (authority.front() == '[') {
+    const auto close = authority.find(']');
+    if (close == std::string::npos) return std::nullopt;
+    host = authority.substr(0, close + 1);
+    const std::string inner = host.substr(1, host.size() - 2);
+    if (inner.empty() || inner.find_first_not_of("0123456789abcdef:") != std::string::npos ||
+        inner.find(':') == std::string::npos)
+      return std::nullopt;
+    const std::string rest = authority.substr(close + 1);
+    if (!rest.empty()) {
+      if (rest[0] != ':') return std::nullopt;
+      port = rest.substr(1);
+      if (port.empty()) return std::nullopt;
+    }
+  } else {
+    const auto colon = authority.find(':');
+    host = authority.substr(0, colon);
+    if (colon != std::string::npos) {
+      port = authority.substr(colon + 1);
+      if (port.empty()) return std::nullopt;
+    }
+    if (host.empty() || host.find_first_of("[]:") != std::string::npos || host.front() == '.' || host.back() == '.' ||
+        host.find("..") != std::string::npos)
+      return std::nullopt;
+  }
+  if (!port.empty()) {
+    if (port.size() > 5 || port.find_first_not_of("0123456789") != std::string::npos) return std::nullopt;
+    const int p = std::stoi(port);
+    if (p < 1 || p > 65535) return std::nullopt;
+    port = std::to_string(p);
+    if ((scheme == "https" && p == 443) || (scheme == "http" && p == 80)) port.clear();
+  }
+  if (scheme == "http" && !isLoopbackHost(host)) return std::nullopt;
+  return scheme + "://" + host + (port.empty() ? "" : ":" + port);
+}
 
 ServerConfig ServerConfig::fromJson(const json& j) {
   if (!j.is_object()) fail("(raiz)", "deve ser um objeto JSON");
   ServerConfig c;
   static const char* kKnown[] = {"name",   "description", "tags",     "locale",       "maxPlayers", "port",
                                  "hub",    "auth",        "net",      "sim",          "movement",   "events",
-                                 "metrics", "resourcesDir", "logsDir", "scripting", "db"};
+                                 "metrics", "resourcesDir", "logsDir", "scripting", "db",       "admin"};
   for (auto it = j.begin(); it != j.end(); ++it) {
     bool known = false;
     for (auto* k : kKnown) known = known || it.key() == k;
@@ -194,6 +255,19 @@ ServerConfig ServerConfig::fromJson(const json& j) {
     if (db.tls != "auto" && db.tls != "off" && db.tls != "required" && db.tls != "verify")
       fail("db.tls", "deve ser 'auto', 'off', 'required' ou 'verify'");
     c.db = std::move(db);
+  }
+  if (const json* a = sub(j, "admin", "")) {
+    // Só publicUrl por enquanto; port/bind/admins chegam com o painel (Task 8) e são ignorados aqui.
+    if (!a->is_object()) fail("admin", "deve ser um objeto como {\"publicUrl\": \"https://painel.exemplo.com\"} ou null");
+    if (const json* u = sub(*a, "publicUrl", "admin.")) {
+      if (!u->is_string()) fail("admin.publicUrl", "deve ser texto (origem https://host[:porta])");
+      auto o = normalizeAdminOrigin(u->get<std::string>());
+      if (!o)
+        fail("admin.publicUrl",
+             "deve ser uma origem https://host[:porta] (http só em loopback), sem caminho, query, fragmento ou "
+             "credenciais, até 256 caracteres");
+      c.admin.publicUrl = std::move(*o);
+    }
   }
   if (const json* m = sub(j, "metrics", "")) {
     if (const json* t = sub(*m, "token", "metrics.")) {

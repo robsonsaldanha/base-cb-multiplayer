@@ -11,6 +11,8 @@ export interface ServerRow {
 export interface StatusRow {
   serverId: string; ip: string; gamePort: number; httpPort: number; players: number; maxPlayers: number;
   version: string; protocol: number; lastHeartbeat: number; verified: boolean; verifiedAt: number;
+  /** Origem normalizada do painel admin do servidor (null = não anunciada). */
+  adminUrl: string | null;
 }
 export interface SessionTokens { access: string; accessExpiresAt: number; refresh: string | null; refreshExpiresAt: number | null }
 export interface ServerInput { name: string; description: string; tags: string[]; locale: string; useGlobalBans: boolean }
@@ -38,7 +40,7 @@ const toStatus = (r: Raw): StatusRow => ({
   serverId: r.server_id as string, ip: r.ip as string, gamePort: r.game_port as number, httpPort: r.http_port as number,
   players: r.players as number, maxPlayers: r.max_players as number, version: r.version as string,
   protocol: r.protocol as number, lastHeartbeat: r.last_heartbeat as number, verified: r.verified === 1,
-  verifiedAt: r.verified_at as number,
+  verifiedAt: r.verified_at as number, adminUrl: (r.admin_url as string | null) ?? null,
 });
 
 export class Store {
@@ -183,16 +185,19 @@ export class Store {
     return r ? toStatus(r) : null;
   }
 
-  /** Grava status e atualiza nome/descrição/tags/locale (server.cfg é a fonte da verdade). */
-  recordHeartbeat(serverId: string, hb: HeartbeatBody, ip: string, now: number): void {
+  /**
+   * Grava status e atualiza nome/descrição/tags/locale (server.cfg é a fonte da verdade).
+   * `adminUrl` já vem normalizada (origem) e filtrada pela rota; ausente apaga a anterior.
+   */
+  recordHeartbeat(serverId: string, hb: HeartbeatBody, ip: string, now: number, adminUrl: string | null = null): void {
     this.db.transaction(() => {
-      this.db.prepare(`INSERT INTO server_status (server_id, ip, game_port, http_port, players, max_players, version, protocol, last_heartbeat)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      this.db.prepare(`INSERT INTO server_status (server_id, ip, game_port, http_port, players, max_players, version, protocol, last_heartbeat, admin_url)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(server_id) DO UPDATE SET ip = excluded.ip, game_port = excluded.game_port, http_port = excluded.http_port,
           players = excluded.players, max_players = excluded.max_players, version = excluded.version,
-          protocol = excluded.protocol, last_heartbeat = excluded.last_heartbeat,
+          protocol = excluded.protocol, last_heartbeat = excluded.last_heartbeat, admin_url = excluded.admin_url,
           verified = CASE WHEN server_status.ip != excluded.ip OR server_status.http_port != excluded.http_port THEN 0 ELSE server_status.verified END`)
-        .run(serverId, ip, hb.gamePort, hb.httpPort, hb.players, hb.maxPlayers, hb.version, hb.protocol, now);
+        .run(serverId, ip, hb.gamePort, hb.httpPort, hb.players, hb.maxPlayers, hb.version, hb.protocol, now, adminUrl);
       this.db.prepare('UPDATE servers SET name = ?, description = ?, tags = ?, locale = ? WHERE id = ?')
         .run(hb.name, hb.description, JSON.stringify(hb.tags), hb.locale, serverId);
     })();

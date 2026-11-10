@@ -14,6 +14,7 @@ import { ticketRoutes } from './routes/tickets';
 import { serverRoutes } from './routes/servers';
 import { banRoutes } from './routes/bans';
 import { panelRoutes } from './routes/panel';
+import { adminLoginRoutes } from './routes/admin-login';
 
 export interface HubDeps {
   config: HubConfig;
@@ -23,6 +24,8 @@ export interface HubDeps {
   probe: ProbeFn;
   /** Relógio em segundos unix (injetável nos testes). */
   now: () => number;
+  /** Destino do log (testes capturam a auditoria); ausente = stdout conforme logLevel. */
+  logStream?: NodeJS.WritableStream;
 }
 
 declare module 'fastify' {
@@ -32,7 +35,8 @@ declare module 'fastify' {
 
 export async function buildApp(deps: HubDeps): Promise<FastifyInstance> {
   const app = Fastify({
-    logger: deps.config.logLevel === 'silent' ? false : { level: deps.config.logLevel },
+    logger: deps.logStream ? { level: 'info', stream: deps.logStream }
+      : deps.config.logLevel === 'silent' ? false : { level: deps.config.logLevel },
     trustProxy: deps.config.trustProxy,
     bodyLimit: 64 * 1024,
   });
@@ -72,6 +76,7 @@ export async function buildApp(deps: HubDeps): Promise<FastifyInstance> {
   await app.register(serverRoutes);
   await app.register(banRoutes);
   await app.register(panelRoutes);
+  await app.register(adminLoginRoutes);
   // Tasks seguintes registram rotas aqui.
   return app;
 }

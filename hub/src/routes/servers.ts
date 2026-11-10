@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { HeartbeatBody, type ServerDetail, type ServerListing } from '@cbmp/contracts';
+import { HeartbeatBody, isLoopbackHost, type ServerDetail, type ServerListing } from '@cbmp/contracts';
 import { HttpError } from '../errors';
 import { createHash } from 'node:crypto';
 import { bearer } from '../auth';
@@ -32,7 +32,13 @@ export async function serverRoutes(app: FastifyInstance) {
     const ip = normalizeIp(req.ip);
     const t = now();
     const prev = store.getStatus(server.id);
-    store.recordHeartbeat(server.id, hb, ip, t);
+    // adminUrl em loopback só serve em dev (HUB_ALLOW_PRIVATE_SERVERS); em produção é ignorada (não grava).
+    let adminUrl = hb.adminUrl ?? null;
+    if (adminUrl && isLoopbackHost(new URL(adminUrl).hostname) && !config.allowPrivateServers) {
+      req.log.warn({ serverId: server.id }, 'heartbeat: adminUrl em loopback ignorada (só em dev)');
+      adminUrl = null;
+    }
+    store.recordHeartbeat(server.id, hb, ip, t, adminUrl);
     const sameEndpoint = !!prev && prev.ip === ip && prev.httpPort === hb.httpPort;
     const failedRecently = sameEndpoint && !prev!.verified && prev!.verifiedAt > 0 && t - prev!.verifiedAt < PROBE_BACKOFF;
     if (!config.allowPrivateServers && !isPublicIp(ip)) {

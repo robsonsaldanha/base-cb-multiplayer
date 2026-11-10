@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -27,6 +28,18 @@ struct DbSettings {
   int timeoutMs = 5000;   // por consulta (100..600000)
   std::string tls = "auto";  // auto | off | required | verify
 };
+
+// admin: painel admin do servidor. Por enquanto só publicUrl (Task 7: anunciada no heartbeat como `adminUrl`);
+// porta, bind e lista de admins entram com o painel (Task 8). publicUrl é normalizada para uma ORIGEM
+// (scheme://host[:porta]): https obrigatório, exceto loopback (127.0.0.0/8, ::1, localhost) em dev.
+struct AdminSettings {
+  std::optional<std::string> publicUrl;
+};
+
+// Normaliza a origem do painel admin (mesmas regras de normalizeAdminOrigin em @cbmp/contracts): sem caminho
+// (exceto "/"), query, fragmento, credenciais, espaços/controles ou não-ASCII; ≤ 256 chars; esquema/host em
+// minúsculas, porta padrão removida. nullopt se inválida.
+std::optional<std::string> normalizeAdminOrigin(std::string_view raw);
 
 struct ServerConfig {
   std::string name = "Meu servidor";
@@ -56,6 +69,7 @@ struct ServerConfig {
   // Padrão 8 KiB/s = 64 kbps (alvo de banda por jogador da spec), rajada de 32 KiB.
   double scriptEventOutKBps = 8, scriptEventOutBurstKB = 32;
   std::optional<DbSettings> db;
+  AdminSettings admin;
 
   // Lançam std::runtime_error (pt-BR: campo + motivo).
   static ServerConfig load(const std::filesystem::path& path);

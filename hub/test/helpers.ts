@@ -33,7 +33,7 @@ export class FakeDiscord implements DiscordClient {
   }
 }
 
-export async function makeTestApp(opts: { config?: Partial<HubConfig>; probe?: ProbeFn } = {}) {
+export async function makeTestApp(opts: { config?: Partial<HubConfig>; probe?: ProbeFn; logStream?: NodeJS.WritableStream } = {}) {
   const clock = { t: T0 };
   const store = new Store(openDb(':memory:'));
   const discord = new FakeDiscord();
@@ -44,7 +44,7 @@ export async function makeTestApp(opts: { config?: Partial<HubConfig>; probe?: P
   });
   const config = testConfig(opts.config);
   const keyring = testKeyRing();
-  const app = await buildApp({ config, store, keyring, discord, probe, now: () => clock.t });
+  const app = await buildApp({ config, store, keyring, discord, probe, now: () => clock.t, logStream: opts.logStream });
   return { app, store, clock, discord, probeAnswers, keyring, config };
 }
 

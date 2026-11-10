@@ -219,3 +219,39 @@ TEST_CASE("config db section is optional, has defaults and never echoes the pass
   bad["db"] = "mysql://x";
   requireRejects(bad, "db");
 }
+
+TEST_CASE("config admin publicUrl is optional and normalized to an origin") {
+  auto none = ServerConfig::fromJson(json::object());
+  REQUIRE(!none.admin.publicUrl.has_value());
+  auto nullAdmin = ServerConfig::fromJson(json{{"admin", nullptr}});
+  REQUIRE(!nullAdmin.admin.publicUrl.has_value());
+  auto c = ServerConfig::fromJson(json{{"admin", {{"publicUrl", "https://Painel.Example.com:8443/"}}}});
+  REQUIRE(c.admin.publicUrl == "https://painel.example.com:8443");
+  REQUIRE(ServerConfig::fromJson(json{{"admin", {{"publicUrl", "https://painel.example.com:443"}}}}).admin.publicUrl ==
+          "https://painel.example.com");
+  REQUIRE(ServerConfig::fromJson(json{{"admin", {{"publicUrl", "http://127.0.0.1:30510"}}}}).admin.publicUrl ==
+          "http://127.0.0.1:30510");
+  REQUIRE(ServerConfig::fromJson(json{{"admin", {{"publicUrl", "http://[::1]:30510"}}}}).admin.publicUrl ==
+          "http://[::1]:30510");
+  REQUIRE(ServerConfig::fromJson(json{{"admin", {{"publicUrl", "http://localhost:30510"}}}}).admin.publicUrl ==
+          "http://localhost:30510");
+  REQUIRE(ServerConfig::fromJson(json{{"admin", {{"publicUrl", "https://[2001:db8::1]:8443"}}}}).admin.publicUrl ==
+          "https://[2001:db8::1]:8443");
+}
+
+TEST_CASE("config admin publicUrl rejects anything but a safe origin") {
+  for (const char* u :
+       {"http://painel.example.com", "http://203.0.113.5:30510", "http://127.0.0.1.nip.io", "http://[::2]",
+        "http://127.0.0.256", "https://painel.example.com/admin", "https://painel.example.com?x=1",
+        "https://painel.example.com#x", "https://user:pw@painel.example.com", "https://painel.example.com\\@evil.com",
+        " https://painel.example.com", "https://painel.example.com ", "https://painel.example.com\n",
+        "https://painel.example.com//", "javascript:alert(1)", "ftp://painel.example.com", "https://", "painel.example.com",
+        "https://painel.example.com:0", "https://painel.example.com:65536", "https://painel.example.com:", "https://a:b:c",
+        "https://[::1", "https://painel.ex\xc3\xa1mple.com", ""}) {
+    INFO(u);
+    requireRejects(json{{"admin", {{"publicUrl", u}}}}, "admin.publicUrl");
+  }
+  requireRejects(json{{"admin", {{"publicUrl", "https://" + std::string(250, 'a') + ".com"}}}}, "admin.publicUrl");
+  requireRejects(json{{"admin", {{"publicUrl", 42}}}}, "admin.publicUrl");
+  requireRejects(json{{"admin", "https://painel.example.com"}}, "admin");
+}

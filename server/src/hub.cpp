@@ -188,6 +188,7 @@ bool Heartbeat::sendOnce() {
                         {"protocol", info_.protocol},
                         {"tags", info_.tags},
                         {"locale", info_.locale}};
+    if (!info_.adminUrl.empty()) body["adminUrl"] = info_.adminUrl;
     httplib::Client cli(url_);
     configure(cli);
     httplib::Headers h{{"Authorization", "Bearer " + key_}};

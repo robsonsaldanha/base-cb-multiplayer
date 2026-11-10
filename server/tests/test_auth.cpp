@@ -90,3 +90,20 @@ TEST_CASE("auth StaticKeys from devPublicKey uses kid dev") {
   REQUIRE(auth.check(dev.sign("u1", "j1", kNow)));
   REQUIRE_THROWS(cbserver::StaticKeys::fromDevKey("curta"));
 }
+
+TEST_CASE("auth admin ticket is refused by game verification and game ticket by admin audience") {
+  DevSigner dev;
+  FakeKeys keys;
+  keys.k = dev.keys();
+  Authenticator game(keys, "srv_dev", [] { return kNow; });
+  auto r = game.check(dev.sign("u1", "ja", kNow, "srv_dev#admin"));
+  REQUIRE_FALSE(r);
+  REQUIRE_THAT(r.error(), ContainsSubstring("wrong_audience"));
+  // O inverso: ticket de jogo nao vale para a audiencia do painel admin.
+  auto a = cbmp::verifyTicket(dev.sign("u1", "jg", kNow), dev.keys(), "srv_dev#admin", kNow);
+  REQUIRE_FALSE(a);
+  REQUIRE(a.error() == cbmp::TicketError::WrongAudience);
+  auto ok = cbmp::verifyTicket(dev.sign("u1", "jb", kNow, "srv_dev#admin"), dev.keys(), "srv_dev#admin", kNow);
+  REQUIRE(ok);
+  REQUIRE(ok->aud == "srv_dev#admin");
+}

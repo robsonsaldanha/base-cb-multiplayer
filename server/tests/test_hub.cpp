@@ -146,6 +146,20 @@ TEST_CASE("heartbeat sends expected body and bearer header") {
   REQUIRE(hub.lastBody["tags"] == nlohmann::json::array({"rp", "hp"}));
   REQUIRE(hub.lastBody["locale"] == "pt-BR");
   REQUIRE_FALSE(hub.lastBody.dump().find("sk_") != std::string::npos);
+  REQUIRE_FALSE(hub.lastBody.contains("adminUrl"));  // sem admin.publicUrl: campo ausente
+}
+
+TEST_CASE("heartbeat sends adminUrl only when configured") {
+  FakeHub hub;
+  HeartbeatInfo info;
+  info.name = "Servidor";
+  info.version = "0.1.0";
+  info.adminUrl = "https://painel.example.com";
+  Heartbeat hb(hub.url(), "sk_x", info, [] { return 0u; }, {std::chrono::milliseconds(60), std::chrono::milliseconds(240)});
+  REQUIRE(waitFor([&] { return hub.beats >= 1; }));
+  hb.stop();
+  std::lock_guard lk(hub.m);
+  REQUIRE(hub.lastBody["adminUrl"] == "https://painel.example.com");
 }
 
 TEST_CASE("heartbeat backs off when hub is down and never throws") {

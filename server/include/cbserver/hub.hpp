@@ -53,6 +53,7 @@ struct HeartbeatInfo {
   int protocol = 1;
   std::vector<std::string> tags;
   std::string locale = "pt-BR";
+  std::string adminUrl;  // origem do painel admin (admin.publicUrl); vazio = campo ausente no heartbeat
 };
 
 // Fora da classe: o GCC não aceita `Options opt = {}` como argumento padrão quando a struct aninhada

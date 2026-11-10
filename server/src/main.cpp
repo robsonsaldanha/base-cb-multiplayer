@@ -260,6 +260,7 @@ int run(const std::string& cfgPath) {
     hi.protocol = cbmp::kProtocolVersion;
     hi.tags = cfg.tags;
     hi.locale = cfg.locale;
+    hi.adminUrl = cfg.admin.publicUrl.value_or("");
     heartbeat = std::make_unique<cbserver::Heartbeat>(
         cfg.hub->url, cfg.hub->key, std::move(hi),
         [&metrics] { return static_cast<uint32_t>(std::max<int64_t>(0, metrics.players.load())); });
