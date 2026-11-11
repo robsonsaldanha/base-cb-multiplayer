@@ -75,7 +75,8 @@ install_all() {
     [ -d "$ROOT/server/bin" ] && mv "$ROOT/server/bin" "$ROOT/server/bin.old"
     mv "$ROOT/server/bin.new" "$ROOT/server/bin"
   fi
-  [ -x "$ROOT/server/bin/cb-server" ] || die "cb-server ausente em $ROOT/server/bin (passe o pacote no primeiro deploy)"
+  HAVE_SERVER=1
+  [ -x "$ROOT/server/bin/cb-server" ] || { HAVE_SERVER=0; log "AVISO: cb-server ausente em $ROOT/server/bin (passe --server-tar); só o Hub sobe"; }
   rsync -a --delete "$S/resources/" "$ROOT/server/resources/"
 
   # --- units (com o usuário que roda o deploy)
@@ -103,7 +104,7 @@ install_all() {
   ' "$S/teste-online/server.cfg.json" "$ROOT/server/data/hub-server.json" "$ROOT/server/server.cfg"
   umask 022
   chmod 600 "$ROOT/server/server.cfg" "$ROOT/server/data/hub-server.json"
-  sudo -n systemctl restart cbmp-server-teste.service
+  if [ "$HAVE_SERVER" = 1 ]; then sudo -n systemctl restart cbmp-server-teste.service; fi
 
   # --- nginx: HTTPS se o certificado já existe; senão só o desafio ACME (rode "cert" depois)
   if sudo -n test -f "/etc/letsencrypt/live/$HOST/fullchain.pem"; then
