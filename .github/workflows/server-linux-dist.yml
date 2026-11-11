@@ -33,7 +33,7 @@ jobs:
         shell: bash
     steps:
       - run: |
-          dnf install -y zip unzip perl-IPC-Cmd perl-FindBin perl-File-Compare perl-File-Copy perl-Time-Piece             autoconf automake libtool kernel-headers pkgconf-pkg-config which
+          dnf install -y zip unzip perl perl-IPC-Cmd perl-Time-Piece             autoconf automake libtool kernel-headers pkgconf-pkg-config which
           dnf install -y epel-release && dnf install -y autoconf-archive || echo "autoconf-archive indisponível"
           /opt/python/cp312-cp312/bin/python -m pip install --quiet 'cmake>=3.29,<4' ninja
           ln -sf /opt/python/cp312-cp312/bin/cmake /usr/local/bin/cmake
