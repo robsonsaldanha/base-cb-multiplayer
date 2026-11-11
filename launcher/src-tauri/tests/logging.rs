@@ -97,6 +97,46 @@ fn data_utc() {
         utc_timestamp(UNIX_EPOCH + Duration::from_secs(951_782_400 + 86_399)),
         "2000-02-29T23:59:59Z"
     );
+    // Minutos e segundos diferentes entre si (relato do teste online: `T1756Z`/`T1705Z`, sem os minutos).
+    for (secs, want) in [
+        (1_794_419_765, "2026-11-11T17:56:05Z"),
+        (1_794_416_756, "2026-11-11T17:05:56Z"),
+        (1_794_388_023, "2026-11-11T09:07:03Z"),
+        (1_709_210_096, "2024-02-29T12:34:56Z"),
+    ] {
+        assert_eq!(utc_timestamp(UNIX_EPOCH + Duration::from_secs(secs)), want);
+    }
+}
+
+/// Toda linha gravada começa com `AAAA-MM-DDTHH:MM:SSZ` completo (data, hora, minutos e segundos).
+#[test]
+fn linha_do_arquivo_tem_hora_minuto_e_segundo() {
+    let dir = tempfile::tempdir().unwrap();
+    let logger = FileLogger::open(dir.path(), 1024 * 1024, 3).unwrap();
+    logger.log(&record(
+        log::Level::Info,
+        "cbmp_launcher_lib",
+        format_args!("Hogwarts Legacy não encontrado automaticamente"),
+    ));
+    logger.flush();
+    let all = read_all(dir.path());
+    let line = all.lines().next().expect("uma linha");
+    let ts = line.split(' ').next().unwrap();
+    let b = ts.as_bytes();
+    assert_eq!(b.len(), 20, "{line}");
+    for (i, c) in b.iter().enumerate() {
+        let want = match i {
+            4 | 7 => Some(b'-'),
+            10 => Some(b'T'),
+            13 | 16 => Some(b':'),
+            19 => Some(b'Z'),
+            _ => None,
+        };
+        match want {
+            Some(w) => assert_eq!(*c, w, "{line}"),
+            None => assert!(c.is_ascii_digit(), "{line}"),
+        }
+    }
 }
 
 fn read_all(dir: &Path) -> String {
