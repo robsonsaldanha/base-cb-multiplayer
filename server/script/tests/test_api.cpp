@@ -99,10 +99,11 @@ TEST_CASE("api: client events are decoded, emitted back as JSON and limited to c
   REQUIRE(env.hasLog("null? true"));
 
   env.event(3, "big");
-  REQUIRE(env.waitLog("big false cb.events.emit: payload"));
+  // O handler loga três linhas; espera a última antes de conferir as anteriores.
+  REQUIRE(env.waitLog("badtarget cb.events.emit: alvo inválido"));
+  REQUIRE(env.hasLog("big false cb.events.emit: payload"));
   REQUIRE(env.hasLog("4096"));
   REQUIRE(env.hasLog("fnpayload cb.events.emit:"));
-  REQUIRE(env.hasLog("badtarget cb.events.emit: alvo inválido"));
 
   env.event(9, "ghost");  // jogador 9 nunca entrou
   env.event(3, "echo", "{malformed");

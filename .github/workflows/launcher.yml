@@ -86,14 +86,16 @@ jobs:
   # binários do vcpkg que o job windows do workflow native grava (só leitura aqui; sem cache, compila as dependências).
   e2e:
     runs-on: windows-2025
-    timeout-minutes: 90
+    # Sem cache do vcpkg (primeira execução numa branch) as dependências compilam do zero (~80 min).
+    timeout-minutes: 150
     env:
-      VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.vcpkg-cache,read"
+      VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.vcpkg-cache,readwrite"
       # Mesmo commit do vcpkg do workflow native (manter os dois iguais, senão o cache não serve).
       VCPKG_COMMIT: ec48c11eae9448c8c6e7739d93e06fa2433aa95f
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/cache/restore@v4
+      - id: vcpkg-cache
+        uses: actions/cache/restore@v4
         with:
           path: .vcpkg-cache
           key: vcpkg-win-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
@@ -109,6 +111,12 @@ jobs:
         shell: pwsh
       - run: cmake --preset windows-ci && cmake --build --preset windows-ci --target cb-server
         shell: pwsh
+      # Salva o que compilou quando não havia cache exato, para a próxima execução não recompilar tudo.
+      - if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-win-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}-e2e
       - uses: actions/setup-node@v4
         with:
           node-version: 24
