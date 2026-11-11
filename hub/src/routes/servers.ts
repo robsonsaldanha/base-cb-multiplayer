@@ -90,7 +90,7 @@ export async function serverRoutes(app: FastifyInstance) {
     const body: ServerListing[] = store.listOnline(t).map(({ server, status }) => ({
       id: server.id, name: server.name, description: server.description, tags: server.tags, locale: server.locale,
       players: status.players, maxPlayers: status.maxPlayers, host: status.ip, gamePort: status.gamePort,
-      httpPort: status.httpPort, version: status.version, protocol: status.protocol,
+      httpPort: status.httpPort, version: status.version, protocol: status.protocol, featured: server.featured,
     }));
     cache = { at: t, body };
     return body;
@@ -101,7 +101,10 @@ export async function serverRoutes(app: FastifyInstance) {
     const server = store.getServer(id);
     if (!server) throw new HttpError(404, 'not_found', 'servidor não encontrado');
     const status = store.getStatus(id);
-    const base = { id: server.id, name: server.name, description: server.description, tags: server.tags, locale: server.locale };
+    const base = {
+      id: server.id, name: server.name, description: server.description, tags: server.tags, locale: server.locale,
+      featured: server.featured,
+    };
     if (!status || !serverView(server, status, now()).online) return { ...base, online: false };
     return {
       ...base, online: true, players: status.players, maxPlayers: status.maxPlayers, host: status.ip,

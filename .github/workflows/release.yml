@@ -1,0 +1,432 @@
+name: release
+# Publica um release ASSINADO que o Hub repassa ao launcher (HUB_RELEASES_REPO = este repositório):
+#   kind=launcher → tag launcher-vX.Y.Z: CBMultiplayer_X.Y.Z_x64-setup.exe + .sig (updater do Tauri, version:X.Y.Z no
+#                   comentário confiável).
+#   kind=mod      → tag mod-pN-vX.Y.Z: cbmp-mod-pN-vX.Y.Z.zip + .zip.sig (comentário confiável exato
+#                   "cbmp-mod protocol=N version=X.Y.Z sha256=<hex>") + .zip.sha256. O zip vem do artefato "cbmp-mod"
+#                   de outra execução de workflow (mod_run_id), gerado pelo build do mod (subprojeto 5).
+#
+# A chave privada só existe no secret CBMP_UPDATE_KEY (formato do Tauri; senha em CBMP_UPDATE_KEY_PASSWORD, opcional),
+# guardado como secret do ENVIRONMENT "release" (restrito à branch main, com revisores; nunca secret do repositório).
+# Isolamento da chave (o build roda código de terceiros: pacotes npm, build scripts e proc-macros de ~400 crates, e
+# qualquer um deles poderia ler o ambiente ou deixar um processo vivo no runner até o fim do job):
+#   build  (sem secrets)  testes e build do instalador SEM assinatura (createUpdaterArtifacts=false).
+#   signer (sem secrets)  compila só launcher/release-signer (crate próprio: minisign/base64/sha2/semver, Cargo.lock
+#                         próprio, --locked) num runner limpo e entrega o binário como artefato.
+#   sign   (environment release, ÚNICO job com a chave)  runner limpo, sem checkout, sem npm, sem cargo, sem ações de
+#                         terceiros: baixa o binário do assinador e o que vai ser assinado e roda só o assinador, com a
+#                         chave apenas no ambiente desse passo. Para kind=mod a proveniência é conferida aqui (bash+gh).
+#   verify (sem secrets)  confere o que foi assinado com as mesmas funções do launcher (examples/release_sign.rs).
+#   publish (sem secrets; único com contents: write)  só gh: cria a tag e o Release (nada com dry_run).
+# Recusa assinar enquanto keys/update.pub for a chave de desenvolvimento (key id BDCB478091E91629): o build confere
+# antes, e o assinador (que embute a mesma keys/update.pub) recusa de novo antes de ler a chave.
+# Todos os jobs só rodam a partir de refs/heads/main.
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: 'O que publicar'
+        required: true
+        type: choice
+        options: [launcher, mod]
+      version:
+        description: 'Versão X.Y.Z (sem "v")'
+        required: true
+        type: string
+      protocol:
+        description: 'Protocolo do mod (só kind=mod; inteiro, ex. 1)'
+        required: false
+        type: string
+        default: ''
+      mod_run_id:
+        description: 'kind=mod: id da execução que gerou o artefato "cbmp-mod" (um único .zip)'
+        required: false
+        type: string
+        default: ''
+      dry_run:
+        description: 'Ensaio: faz tudo (inclusive assinar e conferir) mas não cria a tag nem o Release'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Um release por vez (tags e versões não se atropelam).
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+# Entradas só por variável de ambiente (nunca ${{ }} dentro dos scripts).
+env:
+  KIND: ${{ inputs.kind }}
+  VERSION: ${{ inputs.version }}
+  PROTOCOL: ${{ inputs.protocol }}
+  MOD_RUN_ID: ${{ inputs.mod_run_id }}
+  DRY_RUN: ${{ inputs.dry_run }}
+  # Único workflow cujo artefato "cbmp-mod" pode ser assinado (o build do mod, subprojeto 5).
+  MOD_WORKFLOW: .github/workflows/mod.yml
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ------------------------------------------------------------------------------------------------------------ build
+  # Sem secrets. Roda código de terceiros (npm, build scripts): nada aqui pode depender de sigilo.
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.inputs.outputs.tag }}
+    steps:
+      # Antes de tudo: release só a partir da main (o environment também restringe; aqui falha mesmo sem a regra).
+      - name: Exigir a main
+        run: |
+          [[ "$GITHUB_REF" == refs/heads/main ]] || { echo "release só a partir de refs/heads/main (veio de '$GITHUB_REF')"; exit 1; }
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Conferir entradas e tag
+        id: inputs
+        # Token (só leitura) apenas neste passo; o checkout não guarda credenciais.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          num='(0|[1-9][0-9]{0,8})'
+          [[ "$VERSION" =~ ^$num\.$num\.$num$ ]] || { echo "versão inválida: '$VERSION' (esperado X.Y.Z)"; exit 1; }
+          case "$KIND" in
+            launcher)
+              [[ -z "$PROTOCOL" && -z "$MOD_RUN_ID" ]] || { echo "protocol/mod_run_id só valem para kind=mod"; exit 1; }
+              TAG="launcher-v$VERSION" ;;
+            mod)
+              [[ "$PROTOCOL" =~ ^$num$ ]] || { echo "protocol inválido: '$PROTOCOL' (inteiro, sem zeros à esquerda)"; exit 1; }
+              [[ "$MOD_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]] || { echo "mod_run_id inválido: '$MOD_RUN_ID'"; exit 1; }
+              TAG="mod-p$PROTOCOL-v$VERSION" ;;
+            *) echo "kind inválido: '$KIND'"; exit 1 ;;
+          esac
+          n=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" --jq "[.[] | select(.ref == \"refs/tags/$TAG\")] | length") \
+            || { echo "falha ao consultar as tags do repositório"; exit 1; }
+          [[ "$n" == 0 ]] || { echo "a tag $TAG já existe: versões publicadas não são substituídas"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "release: $TAG"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      # Ações de terceiros fixadas por commit.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: launcher/src-tauri -> target
+          # Release usa o próprio cache (não reaproveita o de PRs).
+          shared-key: release
+      - run: npm ci
+
+      # O `generate_context!` exige a UI compilada antes de compilar o Rust (inclusive os examples).
+      - run: npm test -w launcher/ui
+      - run: npm run build -w launcher/ui
+      - run: npm run check:dist -w launcher/ui
+
+      # Antes de qualquer build do instalador: com a chave dev em keys/update.pub nada é assinado.
+      - name: Recusar a chave de desenvolvimento
+        working-directory: launcher/src-tauri
+        run: cargo run --quiet --locked --example release_sign -- check-pubkey
+
+      # Mesmos testes do CI (inclui os do núcleo do assinador, com pares gerados no teste) antes de publicar.
+      - run: cargo test --locked
+        working-directory: launcher/src-tauri
+      - run: cargo test --locked
+        working-directory: launcher/release-signer
+
+      # ------------------------------------------------------------------------------------------- launcher
+      # SEM chave: o instalador sai sem .sig; quem assina é o job sign.
+      - name: Build do launcher (sem assinatura)
+        if: env.KIND == 'launcher'
+        run: |
+          set -euo pipefail
+          npm run tauri -w launcher/ui -- build --ci \
+            --config "{\"version\":\"$VERSION\",\"bundle\":{\"createUpdaterArtifacts\":false}}" -- --locked
+
+      - name: Conferir e separar o instalador
+        if: env.KIND == 'launcher'
+        run: |
+          set -euo pipefail
+          rel=launcher/src-tauri/target/release
+          # Tripwire: nada do perfil de teste local no binário oficial.
+          for s in '127.0.0.1:8787' 'Teste local' 'localtest' 'TesteLocal'; do
+            if grep -q -a -F "$s" "$rel/CBMultiplayer.exe"; then echo "binário oficial contém '$s'"; exit 1; fi
+          done
+          src="$rel/bundle/nsis/CB Multiplayer_${VERSION}_x64-setup.exe"
+          [[ -f "$src" ]] || { echo "build não gerou $src"; ls -la "$rel/bundle/nsis" || true; exit 1; }
+          # Sem espaço no nome (o GitHub troca espaços em nomes de asset). Só o .exe vai adiante.
+          mkdir -p unsigned
+          cp "$src" "unsigned/CBMultiplayer_${VERSION}_x64-setup.exe"
+          ls -la unsigned
+
+      - name: Entregar o instalador ao job sign
+        if: env.KIND == 'launcher'
+        uses: actions/upload-artifact@v4
+        with:
+          name: launcher-unsigned
+          path: unsigned/
+          if-no-files-found: error
+          retention-days: 1
+
+  # ----------------------------------------------------------------------------------------------------------- signer
+  # Sem secrets. Runner limpo que só compila o assinador mínimo (nada do launcher, nada de npm).
+  signer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Exigir a main
+        run: |
+          [[ "$GITHUB_REF" == refs/heads/main ]] || { echo "release só a partir de refs/heads/main (veio de '$GITHUB_REF')"; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      # Sem cache de build (nada vindo de outras execuções entra no binário que recebe a chave).
+      - name: Compilar e testar o assinador
+        working-directory: launcher/release-signer
+        run: |
+          set -euo pipefail
+          cargo test --locked --release
+          cargo build --locked --release
+          sha256sum target/release/cbmp-release-signer
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-signer
+          path: launcher/release-signer/target/release/cbmp-release-signer
+          if-no-files-found: error
+          retention-days: 1
+
+  # ------------------------------------------------------------------------------------------------------------- sign
+  # ÚNICO job com a chave. Sem checkout, sem npm, sem cargo, sem ações de terceiros: só bash, gh, as ações de artefato
+  # do próprio GitHub e o binário do assinador compilado no job signer. A chave só entra no ambiente do passo que
+  # roda o assinador.
+  sign:
+    needs: [build, signer]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Secrets de assinatura só existem neste environment (regras de proteção: só main, revisores obrigatórios).
+    environment: release
+    permissions:
+      contents: read
+      actions: read # consultar e baixar o artefato do mod de outra execução
+    outputs:
+      mod_head_sha: ${{ steps.provenance.outputs.sha }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Exigir a main
+        run: |
+          [[ "$GITHUB_REF" == refs/heads/main ]] || { echo "release só a partir de refs/heads/main (veio de '$GITHUB_REF')"; exit 1; }
+
+      - name: Conferir o secret
+        env:
+          CBMP_UPDATE_KEY: ${{ secrets.CBMP_UPDATE_KEY }}
+        run: |
+          [[ -n "${CBMP_UPDATE_KEY// /}" ]] || { echo "secret CBMP_UPDATE_KEY ausente (launcher/README.md, \"Chaves\")"; exit 1; }
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-signer
+          path: signer
+      - run: |
+          chmod +x signer/cbmp-release-signer
+          sha256sum signer/cbmp-release-signer
+
+      # ------------------------------------------------------------------------------------------- launcher
+      - name: Baixar o instalador
+        if: env.KIND == 'launcher'
+        uses: actions/download-artifact@v4
+        with:
+          name: launcher-unsigned
+          path: dist
+
+      - name: Assinar o instalador
+        if: env.KIND == 'launcher'
+        env:
+          CBMP_UPDATE_KEY: ${{ secrets.CBMP_UPDATE_KEY }}
+          CBMP_UPDATE_KEY_PASSWORD: ${{ secrets.CBMP_UPDATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          exe="dist/CBMultiplayer_${VERSION}_x64-setup.exe"
+          [[ -f "$exe" ]] || { echo "artefato sem $exe"; ls -la dist; exit 1; }
+          ./signer/cbmp-release-signer sign-launcher --installer "$exe" --version "$VERSION"
+
+      # ------------------------------------------------------------------------------------------------ mod
+      # Proveniência: só assina o artefato de uma execução confiável. Falha fechado em qualquer campo diferente.
+      - name: Conferir a execução do mod
+        id: provenance
+        if: env.KIND == 'mod'
+        run: |
+          set -euo pipefail
+          # Um campo por linha (nenhum deles pode conter quebra de linha); ausente vira "-".
+          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$MOD_RUN_ID" \
+            --jq '[.repository.full_name, .head_repository.full_name, .path, .event, .head_branch, .status, .conclusion, .head_sha] | .[] | (. // "-") | tostring') \
+            || { echo "execução $MOD_RUN_ID não encontrada neste repositório"; exit 1; }
+          mapfile -t f <<<"$run"
+          [[ ${#f[@]} -eq 8 ]] || { echo "resposta inesperada da API para a execução $MOD_RUN_ID"; exit 1; }
+          repo=${f[0]} head_repo=${f[1]} path=${f[2]} event=${f[3]} branch=${f[4]} status=${f[5]} conclusion=${f[6]} sha=${f[7]}
+          ok=1
+          [[ "$repo" == "$GITHUB_REPOSITORY" ]] || { echo "repositório da execução: '$repo'"; ok=0; }
+          [[ "$head_repo" == "$GITHUB_REPOSITORY" ]] || { echo "código da execução veio de '$head_repo' (fork?)"; ok=0; }
+          [[ "$path" == "$MOD_WORKFLOW" ]] || { echo "workflow da execução: '$path' (esperado $MOD_WORKFLOW)"; ok=0; }
+          [[ "$event" == push || "$event" == workflow_dispatch ]] || { echo "evento da execução: '$event' (só push/workflow_dispatch)"; ok=0; }
+          [[ "$branch" == main ]] || { echo "branch da execução: '$branch' (só main)"; ok=0; }
+          [[ "$status" == completed && "$conclusion" == success ]] || { echo "execução não concluída com sucesso: $status/$conclusion"; ok=0; }
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "head_sha inválido: '$sha'"; ok=0; }
+          [[ $ok == 1 ]] || { echo "recusado: o artefato da execução $MOD_RUN_ID não é de origem confiável"; exit 1; }
+          # head_branch também vale para tags: uma tag chamada "main" passaria acima. Exige que o commit esteja na
+          # branch main (ancestral ou igual à ponta de refs/heads/main). Qualquer erro de API recusa.
+          tags=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/main" --jq '[.[] | select(.ref == "refs/tags/main")] | length') \
+            || { echo "falha ao consultar tags do repositório"; exit 1; }
+          [[ "$tags" == 0 ]] || { echo "recusado: existe uma tag 'main' no repositório (ambígua com a branch); apague-a"; exit 1; }
+          main_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha) \
+            || { echo "falha ao ler refs/heads/main"; exit 1; }
+          [[ "$main_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "sha inválido para refs/heads/main: '$main_sha'"; exit 1; }
+          cmp=$(gh api "repos/$GITHUB_REPOSITORY/compare/$sha...$main_sha" --jq .status) \
+            || { echo "recusado: não foi possível comparar $sha com a main"; exit 1; }
+          [[ "$cmp" == identical || "$cmp" == ahead ]] \
+            || { echo "recusado: o commit $sha da execução não está na branch main (compare: '$cmp')"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "execução $MOD_RUN_ID confiável: $path, $event em main, commit $sha (na main: $cmp de $main_sha)"
+
+      - name: Baixar o zip do mod
+        if: env.KIND == 'mod'
+        uses: actions/download-artifact@v4
+        with:
+          name: cbmp-mod
+          path: mod-in
+          run-id: ${{ env.MOD_RUN_ID }}
+          github-token: ${{ github.token }}
+
+      - name: Assinar o mod
+        if: env.KIND == 'mod'
+        env:
+          CBMP_UPDATE_KEY: ${{ secrets.CBMP_UPDATE_KEY }}
+          CBMP_UPDATE_KEY_PASSWORD: ${{ secrets.CBMP_UPDATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          zips=(mod-in/*.zip)
+          [[ ${#zips[@]} -eq 1 ]] || { echo "o artefato cbmp-mod deve ter exatamente um .zip (tem ${#zips[@]})"; exit 1; }
+          ./signer/cbmp-release-signer sign-mod \
+            --zip "${zips[0]}" --protocol "$PROTOCOL" --version "$VERSION" --out dist
+
+      # ---------------------------------------------------------------------------------------------- saída
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-signed
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  # ----------------------------------------------------------------------------------------------------------- verify
+  # Sem secrets. Confere como o launcher confere (mesmas funções da biblioteca), antes de publicar.
+  verify:
+    needs: [build, sign]
+    runs-on: windows-2025
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Exigir a main
+        run: |
+          [[ "$GITHUB_REF" == refs/heads/main ]] || { echo "release só a partir de refs/heads/main (veio de '$GITHUB_REF')"; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: launcher/src-tauri -> target
+          shared-key: release
+          save-if: false
+      # O `generate_context!` exige a UI compilada para compilar o example.
+      - run: npm ci
+      - run: npm run build -w launcher/ui
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-signed
+          path: dist
+
+      - name: Conferir o instalador
+        if: env.KIND == 'launcher'
+        working-directory: launcher/src-tauri
+        run: |
+          set -euo pipefail
+          exe="../../dist/CBMultiplayer_${VERSION}_x64-setup.exe"
+          [[ $(ls ../../dist | wc -l) -eq 2 ]] || { echo "dist deveria ter só o instalador e o .sig"; ls -la ../../dist; exit 1; }
+          cargo run --quiet --locked --example release_sign -- verify-launcher \
+            --installer "$exe" --sig "$exe.sig" --version "$VERSION"
+
+      - name: Conferir o mod
+        if: env.KIND == 'mod'
+        working-directory: launcher/src-tauri
+        run: |
+          set -euo pipefail
+          [[ $(ls ../../dist | wc -l) -eq 3 ]] || { echo "dist deveria ter só o zip, o .sig e o .sha256"; ls -la ../../dist; exit 1; }
+          cargo run --quiet --locked --example release_sign -- verify-mod --dir ../../dist --protocol "$PROTOCOL" --version "$VERSION"
+
+  # ---------------------------------------------------------------------------------------------------------- publish
+  # Sem secrets e sem código de build: só gh. Único job com permissão de escrita.
+  publish:
+    needs: [build, sign, verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # criar a tag e o Release
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.build.outputs.tag }}
+      MOD_HEAD_SHA: ${{ needs.sign.outputs.mod_head_sha }}
+    steps:
+      - name: Exigir a main
+        run: |
+          [[ "$GITHUB_REF" == refs/heads/main ]] || { echo "release só a partir de refs/heads/main (veio de '$GITHUB_REF')"; exit 1; }
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-signed
+          path: dist
+      - name: Criar o Release
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^(launcher|mod-p[0-9]+)-v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "tag inesperada: '$TAG'"; exit 1; }
+          ls -la dist
+          # A tag pode ter surgido durante a aprovação: versões publicadas não são substituídas.
+          n=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" --jq "[.[] | select(.ref == \"refs/tags/$TAG\")] | length") \
+            || { echo "falha ao consultar as tags do repositório"; exit 1; }
+          [[ "$n" == 0 ]] || { echo "a tag $TAG já existe: versões publicadas não são substituídas"; exit 1; }
+          if [[ "$KIND" == launcher ]]; then
+            notes="CB Multiplayer $VERSION (instalador NSIS, Windows x64). Assinado para o updater do launcher."
+          else
+            notes="Mod do cliente $VERSION para o protocolo $PROTOCOL. Assinado; o launcher instala pelo Hub. Build: execução $MOD_RUN_ID, commit $MOD_HEAD_SHA."
+          fi
+          if [[ "$DRY_RUN" == true ]]; then
+            echo "dry_run: tudo conferido; nenhuma tag nem Release criados ($TAG)"
+            echo "notas: $notes"
+            exit 0
+          fi
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$TAG" \
+            --notes "$notes" --latest=false

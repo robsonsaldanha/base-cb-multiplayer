@@ -57,6 +57,27 @@ TEST_CASE("payload do vetor valido") {
   }
 }
 
+TEST_CASE("claim opcional nonce: presente so quando o ticket traz") {
+  const auto v = loadVectors();
+  const PublicKeys keys = vectorKeys(v);
+  bool sawNonce = false, sawPlain = false;
+  for (const auto& c : v["cases"]) {
+    if (c["name"] != "com_nonce" && c["name"] != "valido") continue;
+    auto r = verifyTicket(c["ticket"].get<std::string>(), keys, c["audience"].get<std::string>(), c["nowSeconds"].get<int64_t>());
+    REQUIRE(r);
+    if (c["name"] == "com_nonce") {
+      REQUIRE(r->nonce.has_value());
+      CHECK(*r->nonce == "Mr8oz8WcM8oBo0O-aJzzDj2fWBrLTFVNe5kNJotFqSQ");
+      sawNonce = true;
+    } else {
+      CHECK_FALSE(r->nonce.has_value());
+      sawPlain = true;
+    }
+  }
+  CHECK(sawNonce);
+  CHECK(sawPlain);
+}
+
 TEST_CASE("toString usa os nomes do TS") {
   CHECK(toString(TicketError::Malformed) == "malformed");
   CHECK(toString(TicketError::BadVersion) == "bad_version");

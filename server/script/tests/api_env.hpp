@@ -107,9 +107,20 @@ struct ApiEnv {
       if (lv == l && contains(m, sub)) return true;
     return false;
   }
-  bool waitLog(const std::string& sub, LogLevel l = LogLevel::Info) const {
-    return waitUntil([&] { return hasLog(sub, l); });
+  bool waitLog(const std::string& sub, LogLevel l = LogLevel::Info,
+               std::chrono::milliseconds limit = std::chrono::milliseconds(5000)) const {
+    return waitUntil([&] { return hasLog(sub, l); }, limit);
   }
+  // Para testes que fazem E/S de disco dentro de uma chamada ao Lua (ex.: cb.players.ban grava bans.json com fsync
+  // do arquivo e da pasta) e que NÃO testam a vigia. Com shortLimits() (aborto em 200 ms de tempo real) um fsync lento
+  // (ASan + disco do runner do CI) aborta a chamada; o reinício do resource é agendado pelo relógio falso do host,
+  // que não anda nestes testes, então o resource nunca volta e o waitLog estoura. Chamar antes de boot().
+  void roomyWatchdog() {
+    lim.warnAfter = std::chrono::seconds(20);
+    lim.abortAfter = std::chrono::seconds(60);
+  }
+  // Prazo de espera dos testes com E/S de disco (bem abaixo do prazo do ctest).
+  static constexpr std::chrono::milliseconds kDiskWait{60000};
   int countLog(const std::string& sub) const {
     std::lock_guard<std::mutex> lk(mu);
     int n = 0;

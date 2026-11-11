@@ -1,4 +1,5 @@
 import { isIP } from 'node:net';
+import { resolve } from 'node:path';
 
 /** Lista de proxies confiáveis (IPs/CIDRs); vazio ou 0 → desligado. Nunca aceita booleano. */
 function parseTrustProxy(raw: string | undefined): string | false {
@@ -16,6 +17,22 @@ function parseTrustProxy(raw: string | undefined): string | false {
   return items.join(',');
 }
 
+/** Inteiro decimal em [min, max]; vazio → padrão. */
+function parseIntEnv(raw: string | undefined, name: string, def: number, min: number, max: number): number {
+  const v = (raw ?? '').trim();
+  if (v === '') return def;
+  const n = /^\d{1,9}$/.test(v) ? Number(v) : NaN;
+  if (!(n >= min && n <= max)) throw new Error(`${name} deve ser um inteiro entre ${min} e ${max}: "${v}"`);
+  return n;
+}
+
+function parseDlMax(raw: string | undefined): number {
+  const v = (raw ?? '').trim();
+  if (v === '') return 32;
+  if (!/^[1-9]\d{0,4}$/.test(v)) throw new Error(`HUB_DL_MAX_CONCURRENT deve ser um inteiro entre 1 e 99999: "${v}"`);
+  return Number(v);
+}
+
 export interface HubConfig {
   port: number;
   host: string;
@@ -29,6 +46,23 @@ export interface HubConfig {
   allowPrivateServers: boolean;
   rateLimit: boolean;
   logLevel: string;
+  /** Token do GitHub (só leitura de Releases do repo privado). Vazio → rotas de update/mod/dl respondem 503. Nunca logar. */
+  githubToken: string;
+  /** `dono/repo` dos Releases (`launcher-vX.Y.Z`, `mod-pN-vX.Y.Z`). */
+  releasesRepo: string;
+  /**
+   * Só desenvolvimento: pasta local de releases (`<pasta>/<tag>/<asset>`) no lugar do GitHub (`HUB_RELEASES_DIR`,
+   * caminho absoluto; '' = desligado). Mutuamente exclusivo com `githubToken`; recusado com `NODE_ENV=production`.
+   */
+  releasesDir: string;
+  /** Downloads repassados ao mesmo tempo, todos os clientes (`HUB_DL_MAX_CONCURRENT`, padrão 32). */
+  dlMaxConcurrent: number;
+  /** Download cujo cliente não drena o socket por este tempo é derrubado (`HUB_DL_STALL_SECONDS`, padrão 30). */
+  dlStallTimeoutMs: number;
+  /** Taxa mínima de entrega em KiB/s, média da última janela, depois de uma janela de carência (`HUB_DL_MIN_KBPS`, padrão 32; 0 desliga). */
+  dlMinKBps: number;
+  /** Janela (e carência) da taxa mínima, em ms (30 s; injetável nos testes). */
+  dlRateWindowMs: number;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
@@ -48,10 +82,29 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
     allowPrivateServers: env.HUB_ALLOW_PRIVATE_SERVERS === '1',
     rateLimit: env.HUB_RATE_LIMIT !== '0',
     logLevel: env.HUB_LOG_LEVEL ?? 'info',
+    githubToken: (env.HUB_GITHUB_TOKEN ?? '').trim(),
+    releasesRepo: (env.HUB_RELEASES_REPO ?? '').trim(),
+    releasesDir: (env.HUB_RELEASES_DIR ?? '').trim() === '' ? '' : resolve((env.HUB_RELEASES_DIR ?? '').trim()),
+    dlMaxConcurrent: parseDlMax(env.HUB_DL_MAX_CONCURRENT),
+    dlStallTimeoutMs: parseIntEnv(env.HUB_DL_STALL_SECONDS, 'HUB_DL_STALL_SECONDS', 30, 1, 3600) * 1000,
+    dlMinKBps: parseIntEnv(env.HUB_DL_MIN_KBPS, 'HUB_DL_MIN_KBPS', 32, 0, 1_000_000),
+    dlRateWindowMs: 30_000,
   };
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('HUB_PORT inválida');
   if (!devLogin && (!cfg.discordClientId || !cfg.discordClientSecret)) {
     throw new Error('DISCORD_CLIENT_ID e DISCORD_CLIENT_SECRET são obrigatórios (ou HUB_DEV_LOGIN=1 para testes locais)');
+  }
+  const repoOk = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/.test(cfg.releasesRepo)
+    && cfg.releasesRepo.split('/').every((p) => p !== '.' && p !== '..');
+  if (cfg.githubToken && !repoOk) {
+    throw new Error('HUB_RELEASES_REPO (dono/repo) é obrigatório quando HUB_GITHUB_TOKEN está definido');
+  }
+  if (cfg.releasesDir) {
+    // NODE_ENV não é definido pelo deploy deste projeto: a trava que vale é o dev-login, que já prende o Hub a
+    // HUB_HOST/HUB_PUBLIC_URL locais e sem proxy (assertDevLoginSafe).
+    if (!devLogin) throw new Error('HUB_RELEASES_DIR (releases locais, só para testes) exige HUB_DEV_LOGIN=1, que prende o Hub a esta máquina');
+    if (cfg.githubToken) throw new Error('HUB_RELEASES_DIR e HUB_GITHUB_TOKEN são mutuamente exclusivos (pasta local de releases é só para testes)');
+    if ((env.NODE_ENV ?? '').trim() === 'production') throw new Error('HUB_RELEASES_DIR (releases locais, só para testes) é recusado com NODE_ENV=production');
   }
   if (devLogin) assertDevLoginSafe(cfg);
   return cfg;

@@ -1,6 +1,7 @@
 #include "cbserver/http.hpp"
 
 #include <httplib.h>
+#include <spdlog/spdlog.h>
 #include <sodium.h>
 
 #include <algorithm>
@@ -113,6 +114,29 @@ void HttpServer::start(const std::string& host, int port) {
   if (boundPort_ <= 0) throw std::runtime_error("Não foi possível abrir a porta HTTP em " + host);
   thread_ = std::thread([this] { svr_->listen_after_bind(); });
   svr_->wait_until_ready();
+}
+
+std::string HttpServer::startPublic(int port) {
+  if (thread_.joinable()) throw std::runtime_error("Servidor HTTP já iniciado");
+  // default_socket_options (SO_REUSEADDR etc.) + IPV6_V6ONLY=0. Em sockets IPv4 o setsockopt falha e é ignorado.
+  svr_->set_socket_options([](socket_t sock) {
+    httplib::default_socket_options(sock);
+    int off = 0;
+    (void)::setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<const char*>(&off), sizeof off);
+  });
+  int bound = port == 0 ? svr_->bind_to_any_port("::") : (svr_->bind_to_port("::", port) ? port : -1);
+  std::string mode = "dual-stack";
+  if (bound <= 0) {
+    spdlog::warn("HTTP: bind dual-stack (::) falhou; usando só IPv4 (0.0.0.0)");
+    svr_->set_socket_options(httplib::default_socket_options);
+    bound = port == 0 ? svr_->bind_to_any_port("0.0.0.0") : (svr_->bind_to_port("0.0.0.0", port) ? port : -1);
+    mode = "ipv4";
+  }
+  if (bound <= 0) throw std::runtime_error("Não foi possível abrir a porta HTTP (IPv4 nem IPv6)");
+  boundPort_ = bound;
+  thread_ = std::thread([this] { svr_->listen_after_bind(); });
+  svr_->wait_until_ready();
+  return mode;
 }
 
 void HttpServer::stop() {

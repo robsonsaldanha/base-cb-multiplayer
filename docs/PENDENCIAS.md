@@ -4,20 +4,6 @@ Itens levantados nas revisões que não bloquearam o merge, com o momento em que
 subprojeto (ou área) sugerido como dono. Itens resolvidos saem desta lista (o histórico fica no git e nos relatórios
 das tasks).
 
-## Antes do launcher (subprojeto 4)
-
-- **HTTP do `cb-server` só em IPv4** (`server/src/main.cpp`, bind `0.0.0.0`), enquanto o jogo (GNS) aceita IPv6 e o
-  Hub pode anunciar `host` IPv6. Fazer bind dual-stack (`::` com `IPV6_V6ONLY=0`) ou nos dois endereços. Dono: sub4.
-- **Nome do resource no manifest público** (`ResourceStore`, `server/src/manifest.cpp`): `name` só precisa ser texto
-  não vazio. O lado de scripts (`loadManifest`) já exige `A-Z a-z 0-9 . _ -` (até 64), mas um resource sem scripts com
-  nome fora disso ainda é publicado. Aplicar a mesma regra no `ResourceStore`; o launcher deve sanitizar de qualquer
-  forma. Dono: sub4.
-- **Resource de exemplo com arquivos de cliente** para o launcher testar download: `resources.example/echo` só tem
-  `server/`. Acrescentar um exemplo com `client/`/`ui/`/`files/`. Dono: sub4.
-- **`nonce` no ticket de admin**: o `state` do painel só prova que *algum* navegador começou o fluxo; um ticket
-  roubado pode ser pareado com o state do próprio atacante. O Hub deve amarrar o hash do state no ticket (claim
-  `nonce`) e o painel conferir. Mudança no Hub e no contrato. Dono: Hub.
-
 ## Antes do cliente no jogo (subprojeto 5)
 
 - **Contrato do cliente por escrito**: snapshots não confiáveis em partes; descartar tick ≤ último montado; ignorar ids
@@ -37,6 +23,26 @@ das tasks).
 - **Política de teleporte**: `setState` limpa `correctionTimes`; decidir se mantém o histórico.
 - **Comandos `admin = true` pelo chat** usam `admin.admins` (lida na subida). Falta testar com o chat do cliente real e
   decidir se admins de jogo devem ter uma lista separada da do painel. Dono: sub5.
+- **Mod real e a entrega pelo launcher** (sub4 entregou só o canal): o launcher instala o mod por `protocol` a partir
+  do Hub (`mod-pN-vX.Y.Z`, assinado). Falta o mod em si e um build que publique o zip como artefato `cbmp-mod` (um
+  único `.zip`) para o `release.yml` (`kind=mod`, `mod_run_id`) assinar e publicar. Esse build tem de ser
+  `.github/workflows/mod.yml` e o artefato usado tem de vir de um `push`/`workflow_dispatch` na `main` concluído com
+  sucesso, com o commit na `main`: o `release.yml` recusa qualquer outra execução (`MOD_WORKFLOW`, `launcher/README.md`).
+  O `mod.yml` faz checkout exatamente de `GITHUB_SHA` (sem `ref:`), não tem entradas de ref, branch ou fonte e não usa
+  `pull_request_target`. Enquanto não houver mod com
+  `protocol` compatível, o launcher fica em "Modo simular".
+- **Contrato do `connect.json` para o mod** (escrito pelo launcher em `<dados>\run\connect.json`, `launcher/README.md`):
+  `{host, port, ticket, serverId, contentDir, protocol, contentReadOnly: true}`, UTF-8, DACL só do usuário. O mod lê,
+  **apaga** o arquivo e usa o ticket uma vez (TTL de 300 s no Hub); o launcher apaga sozinho depois de 60 s se ainda
+  existir e remove sobras ao abrir. Nunca procurar o ticket em linha de comando ou variável de ambiente. `contentDir`
+  é **somente leitura** (hard links do cache verificado, compartilhados entre servidores): o mod não pode gravar nada
+  ali. Conferir `protocol` com o do mod e recusar se diferente.
+- **Pasta de dados por build** (revisão 9a, M-8): o launcher oficial usa `%LOCALAPPDATA%\CBMultiplayer` e o build
+  "Teste local" usa `%LOCALAPPDATA%\CBMultiplayer-TesteLocal` (`run\` e `mods\` inclusive). O mod não pode fixar o
+  nome da pasta: receber o caminho do `run\` do launcher (ex.: arquivo ao lado do mod instalado) ou procurar nos dois.
+- **Margem de renovação do ticket** (revisão 7, M-1): o launcher renova o ticket com mais de 240 s (TTL 300 − 60;
+  `play::TICKET_RENEW_AFTER_SECS`) antes de gravar o `connect.json`, mas o tempo entre abrir o jogo e o mod resgatar o
+  ticket não é medido. Medir com o mod real e ajustar a margem (ou renovar pelo mod).
 
 ## Servidor: resíduos do subprojeto 3 (Lua / MySQL / admin)
 
@@ -97,8 +103,70 @@ Decisões registradas e limites aceitos; o comportamento atual está documentado
   - o resumo de logins recusados da janela em curso se perde se o processo morrer sem `stop`;
   - sem teste automatizado com navegador real (fluxo verificado à mão no Chromium).
 - `kid`/`name` vindos do Hub vão para o log sem remover caracteres de controle.
+- **`cb.players.ban` grava `bans.json` com fsync na thread de scripts, dentro da janela do vigia** (revisão 9a, M-7):
+  num disco lento a gravação durável (arquivo + pasta) pode passar do `abortMs` (5 s) e o handler do resource é
+  abortado no meio (o ban fica gravado ou não, conforme o ponto do aborto). Os testes usam vigia folgada
+  (`ApiEnv::roomyWatchdog`). Corrigir movendo a gravação para fora da thread de scripts (fila + confirmação), ou
+  descontando o tempo de disco do vigia.
 
 ## Antes de abrir ao público
+
+- **Launcher (sub4)**:
+  - **Trocar a chave de assinatura dev** (key id `BDCB478091E91629`) pela de produção antes do primeiro release real
+    (`launcher/README.md`, "Chaves"); o `release.yml` recusa assinar com a dev. Efeito (revisão 9a, M-6): o build
+    "Teste local" embute a mesma `keys/update.pub`, então os releases de teste do `tools/dev-env.mjs` assinados com
+    a dev deixam de valer. Rodar `docs/TESTES-MANUAIS-SUB4.md` antes da troca, ou decidir então embutir a pública dev
+    só no perfil `local-test`.
+  - **Endereço real do Hub**: `https://hub.cbmp.invalid` é placeholder (`settings::DEFAULT_HUB_URL` e endpoint do
+    updater no `tauri.conf.json`).
+  - **Assinatura Authenticode** do instalador e do executável: exige certificado de code signing. Sem ela o SmartScreen
+    avisa na primeira execução ("Mais informações" → "Executar assim mesmo"); a integridade dos updates é garantida
+    pelo minisign de qualquer forma.
+  - **`cbmp://` registrado pelos dois builds** (revisão 9a, M-2): com o oficial e o "Teste local" instalados, o login
+    cai no que foi instalado por último. Hoje basta manter só um instalado. Separar exigiria outro esquema no build de
+    teste e o Hub aceitar os dois no `launcherLink` (e na CSP do formulário de dev).
+  - **Linux/macOS**: o launcher é só Windows x64 (o código Rust é portável onde não custa nada, mas não é testado fora
+    do Windows; localizador do jogo, ACL do `connect.json` e cofre são específicos do Windows).
+  - Rollback do launcher para uma versão antiga assinada continua impossível só enquanto `requireSignedVersion` ficar
+    ligado no `tauri.conf.json` (o comentário confiável traz a versão; o `config_guard` exige a opção).
+  - "Limpar cache" com o jogo aberto: a UI avisa para fechar o jogo, mas o launcher não acompanha o processo do jogo
+    depois de abrir; no Windows a remoção de um arquivo em uso falha (não corrompe).
+  - Conteúdo e ping ignoram o proxy do sistema (`.no_proxy()`, para a regra de endereços valer): redes que só saem por
+    proxy não pingam nem baixam conteúdo (o jogo também não conectaria). Documentado em `launcher/README.md`.
+  - Instalação do mod com disco cheio: a troca é atômica (staging + rename), mas não há teste automatizado de disco
+    cheio.
+  - **Ping: leque de portas por host** (revisão 8, R1-1): cada id da lista vira um ping, então vários servidores no
+    mesmo host com portas diferentes geram vários pacotes para ele (`ping.rs`, `Pinger::ping`). Limitado (≤ 200 ids,
+    cache de 25 s, 16 simultâneos); agrupar por host ou limitar portas por host.
+  - **NAT64 e 6to4 não são desembrulhados** em `content::ip_allowed` (revisão 8, R1-2): `64:ff9b::/96` e `2002::/16`
+    podem levar a um IPv4 privado. Exige Hub comprometido e rede NAT64; tratar os dois prefixos como o IPv4 embutido.
+  - **Erro de leitura do índice apaga o cache inteiro** (revisão 6, R1-3a): `Index::get` trata índice ilegível como
+    vazio e o `startup` remove os arquivos que não estão nele. É re-baixável, mas é uma remoção em massa silenciosa;
+    distinguir "não existe" de "não deu para ler" e não varrer no segundo caso.
+  - **Montagem por cópia sem fsync** (revisão 6, R1-2): no fallback sem hard link (`content.rs`, `mount`) os arquivos
+    copiados não passam por `sync_all` antes de gravar o registro da montagem; queda de energia pode deixar arquivo
+    truncado marcado como montado (o arquivo do cache continua verificado).
+  - **Registro do mod gravado depois da troca** (revisão 7, R1-m1): `modpkg.rs` troca a pasta do mod e só então grava
+    o registro; um crash entre os dois, somado a um Hub comprometido, permite reinstalar outra versão assinada.
+    Gravar o registro (versão mínima) antes da troca.
+  - **Confiança da pasta da Epic só na descoberta, e só na folha** (revisão 7, R1-m3): `game.rs` (`SystemTrust`) confere
+    dono/ACL do caminho quando acha o jogo, não de novo ao abrir, e não confere as pastas acima nem pontos de
+    reanálise. Só atacante local; conferir a cadeia e repetir antes de abrir.
+  - **Anti-downgrade do mod lembra só o último protocolo** (revisão 7, R1-m4): o piso de versão assinada fica no
+    registro de um protocolo só (`modpkg.rs`, `installed`); alternar de protocolo zera o piso do anterior. Exige Hub
+    comprometido; guardar o piso por protocolo.
+  - **Validade do access token pelo `Date` do Hub sem limite** (revisão 5, N1): `hub::Tokens::access_lifetime` usa o
+    `Date` da resposta sem teto; um `Date` muito errado faz o launcher renovar cedo ou tarde demais. Corrige-se sozinho
+    pelo 401 + refresh; limitar ao `expires_in` anunciado.
+  - Erro `protocol_mismatch` na tabela da UI e em `blocksPlay` (`ui/src/lib/errors.ts`), mas o Rust nunca o emite
+    (protocolo incompatível sai como `manifest_mismatch`/`mod_unavailable`): remover ou criar a checagem no launcher.
+  - **Gravações de configuração da UI sem fila** (`ui/src/lib/settings.ts`): cada uma lê, altera e grava o store;
+    `pushRecent` (depois do Jogar) concorrendo com `toggleFavorite` pode perder uma das duas. Encadear numa fila.
+  - O User-Agent (`hub.rs`, `content.rs`) usa `CARGO_PKG_VERSION` (sempre `0.1.0`), enquanto o `release.yml` só troca
+    a versão do Tauri: todo release se anuncia `CBMultiplayer/0.1.0`. Usar `app.package_info().version`.
+- **Hub: release mantido com ids de asset antigos** (revisão 3, Mn2): quando um release é excluído por `.sig`/`.sha256`
+  ilegível, `hub/src/github.ts` mantém a entrada anterior (não regride a versão), mas os ids de asset dela podem já ter
+  sido trocados no GitHub; o `/v1/dl` então falha para esse release até ele voltar a ser legível. Só disponibilidade.
 
 - **Pacote de distribuição do `cb-server`**: levar `libmariadb.so*`/`libmariadb.dll` (LGPL, ligada dinamicamente) com
   o aviso de licença, a pasta `plugins/libmariadb/` ao lado do executável (sem ela, MySQL 8 com

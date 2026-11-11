@@ -186,6 +186,7 @@ TEST_CASE("api: players come from the snapshot; kick and setPosition become comm
 
 TEST_CASE("api: ban persists to bans.json, kicks the connected player and unban removes it") {
   ApiEnv env;
+  env.roomyWatchdog();  // três gravações de bans.json (fsync) no mesmo handler; este teste não é sobre a vigia
   env.addRes("a", R"(
     cb.events.on('ban', function(p)
       cb.log.info('ban=' .. tostring(cb.players.ban('d2', 'cheat', 60)))
@@ -204,8 +205,9 @@ TEST_CASE("api: ban persists to bans.json, kicks the connected player and unban 
   env.event(1, "ban");
   // Espera a ÚLTIMA linha do handler: as anteriores já estão no log quando ela aparece (a thread de scripts escreve
   // em ordem). Esperar por uma linha do meio deixava as seguintes correrem contra o REQUIRE (falhou sob ASan no CI).
-  REQUIRE(env.waitLog("baddur cb.players.ban: duração inválida"));
+  const bool done = env.waitLog("baddur cb.players.ban: duração inválida", LogLevel::Info, ApiEnv::kDiskWait);
   INFO(env.allLogs());
+  REQUIRE(done);
   REQUIRE(env.hasLog("unban2=false"));
   REQUIRE(env.hasLog("ban=true"));
   REQUIRE(env.hasLog("perm=true"));

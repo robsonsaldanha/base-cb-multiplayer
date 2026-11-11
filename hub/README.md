@@ -16,6 +16,21 @@ Abra http://localhost:8787/panel → "Entrar como Dev". (PowerShell: `$env:HUB_D
 2. Adicione o redirect `<HUB_PUBLIC_URL>/v1/auth/discord/callback`.
 3. Copie `.env.example` para `.env`, preencha `DISCORD_CLIENT_ID`/`DISCORD_CLIENT_SECRET` e exporte as variáveis antes de `npm start -w @cbmp/hub`.
 
+## Variáveis de ambiente
+
+Veja `.env.example` para a lista completa. Updates do launcher, mod e downloads (`/v1/launcher/update/...`, `/v1/mod/latest`, `/v1/dl/...`):
+
+| Variável | Uso |
+|---|---|
+| `HUB_GITHUB_TOKEN` | token do GitHub com leitura de Releases (fine-grained, só *Contents: read* no repo privado). Vazio → as três rotas respondem `503 updates_disabled`. Nunca vai para log nem para o cliente. |
+| `HUB_RELEASES_REPO` | `dono/repo` dos Releases; obrigatório quando há token. Tags `launcher-vX.Y.Z` (instalador `*-setup.exe` + `.sig`) e `mod-pN-vX.Y.Z` (`cbmp-mod-pN-vX.Y.Z.zip` + `.sig` + `.sha256`). |
+| `HUB_RELEASES_DIR` | **só testes locais**: pasta com `<tag>/<asset>` (e `notes.txt` opcional com as notas) servida no lugar do GitHub. Exige `HUB_DEV_LOGIN=1` (Hub preso a esta máquina); mutuamente exclusivo com `HUB_GITHUB_TOKEN`; recusado com `NODE_ENV=production`. Links simbólicos/junções e nomes fora de `[A-Za-z0-9 ._()+-]` são ignorados. É o que `tools/dev-env.mjs` usa. |
+| `HUB_DL_MAX_CONCURRENT` | downloads de `/v1/dl` repassados ao mesmo tempo, somando todos os clientes (padrão 32; inteiro ≥ 1). Cada IP tem no máximo 2. |
+| `HUB_DL_STALL_SECONDS` | download cujo cliente não drena o socket por este tempo é derrubado (padrão 30; 1–3600). |
+| `HUB_DL_MIN_KBPS` | taxa mínima em KiB/s (média dos últimos 30 s, após 30 s de carência); abaixo dela o download é derrubado (padrão 32; 0 desliga). |
+
+A lista de releases fica 60 s em cache (falha: 15 s, servindo a anterior). Drafts e prereleases são ignorados. Downloads simultâneos: 2 por IP (`429 too_many_downloads`) e `HUB_DL_MAX_CONCURRENT` no total (`503 busy`); cliente parado por `HUB_DL_STALL_SECONDS` ou abaixo de `HUB_DL_MIN_KBPS` (média de 30 s, após 30 s de carência) é derrubado. Até 80 chamadas/min à API do GitHub (`503 busy`). O Hub não confere assinaturas: o launcher confere.
+
 ## Chaves de assinatura
 
 Ficam em `<HUB_DATA_DIR>/keys/<kid>.pem`. A de maior nome é a ativa. Para girar: crie um novo `.pem` com kid maior

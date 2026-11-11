@@ -7,6 +7,8 @@ import { loadOrCreateKeyRing } from './keyring';
 import { createDiscordClient } from './discord';
 import { httpProbe } from './probe';
 import { buildApp } from './app';
+import { createGitHubReleases } from './github';
+import { createLocalReleases } from './local-releases';
 
 const config = loadConfig();
 mkdirSync(config.dataDir, { recursive: true });
@@ -14,7 +16,16 @@ const store = new Store(openDb(join(config.dataDir, 'hub.sqlite')));
 const keyring = loadOrCreateKeyRing(join(config.dataDir, 'keys'));
 const discord = createDiscordClient(config.discordClientId, config.discordClientSecret);
 const now = () => Math.floor(Date.now() / 1000);
-const app = await buildApp({ config, store, keyring, discord, probe: httpProbe, now });
+// O logger do app só existe depois do buildApp; os avisos do cliente do GitHub (nunca com token) vão para ele.
+let releasesLog: { warn(obj: object, msg: string): void } | undefined;
+const releasesLogger = { warn: (o: object, m: string) => releasesLog?.warn(o, m) };
+const releases = config.githubToken
+  ? createGitHubReleases({ token: config.githubToken, repo: config.releasesRepo, logger: releasesLogger })
+  : config.releasesDir
+    ? createLocalReleases({ dir: config.releasesDir, logger: releasesLogger })
+    : undefined;
+const app = await buildApp({ config, store, keyring, discord, probe: httpProbe, now, releases });
+releasesLog = app.log;
 const PURGE_INTERVAL_MS = 10 * 60 * 1000;
 function purge(): void {
   try { store.purgeExpired(now()); } catch (err) { app.log.error(err); }
@@ -31,6 +42,7 @@ try {
   process.exit(1);
 }
 app.log.info(`Hub em ${config.publicUrl} (chave ativa ${keyring.active.kid})`);
+if (config.releasesDir) app.log.warn(`releases LOCAIS de ${config.releasesDir} (HUB_RELEASES_DIR, só para testes)`);
 
 let closing = false;
 async function shutdown(signal: string): Promise<void> {

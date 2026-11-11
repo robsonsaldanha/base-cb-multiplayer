@@ -1,0 +1,22 @@
+# Assinador do workflow de release: o ÚNICO código que recebe a chave privada (CBMP_UPDATE_KEY).
+# Crate próprio, fora do launcher, para que nenhum build script do Tauri/launcher nem pacote npm rode perto da chave.
+# Dependências mínimas e fixadas (versões exatas + Cargo.lock próprio, sempre com --locked). Não acrescente
+# dependências sem necessidade: cada uma (e seus build scripts) entra na base de confiança da chave.
+[package]
+name = "cbmp-release-signer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+publish = false
+
+# Raiz própria (não herda workspace de pastas acima).
+[workspace]
+
+[dependencies]
+minisign = "=0.10.0"
+base64 = "=0.23.1"
+sha2 = "=0.10.9"
+semver = "=1.0.28"
+
+[profile.release]
+panic = "abort"

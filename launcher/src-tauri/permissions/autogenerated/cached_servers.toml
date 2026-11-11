@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cached-servers"
+description = "Enables the cached_servers command without any pre-configured scope."
+commands.allow = ["cached_servers"]
+
+[[permission]]
+identifier = "deny-cached-servers"
+description = "Denies the cached_servers command without any pre-configured scope."
+commands.deny = ["cached_servers"]

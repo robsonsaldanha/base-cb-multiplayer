@@ -6,6 +6,7 @@ import { buildApp } from '../src/app';
 import type { KeyRing } from '../src/keyring';
 import type { DiscordClient, DiscordUser } from '../src/discord';
 import type { ProbeFn } from '../src/probe';
+import type { GitHubReleases } from '../src/github';
 
 export const T0 = 1_800_000_000;
 
@@ -13,7 +14,8 @@ export function testConfig(over: Partial<HubConfig> = {}): HubConfig {
   return {
     port: 8787, host: '127.0.0.1', publicUrl: 'http://localhost:8787', dataDir: ':memory:',
     discordClientId: 'cid', discordClientSecret: 'secret', platformAdmins: ['999'],
-    devLogin: false, trustProxy: false, allowPrivateServers: true, rateLimit: false, logLevel: 'silent', ...over,
+    devLogin: false, trustProxy: false, allowPrivateServers: true, rateLimit: false, logLevel: 'silent',
+    githubToken: '', releasesRepo: '', releasesDir: '', dlMaxConcurrent: 32, dlStallTimeoutMs: 30_000, dlMinKBps: 32, dlRateWindowMs: 30_000, ...over,
   };
 }
 
@@ -33,7 +35,7 @@ export class FakeDiscord implements DiscordClient {
   }
 }
 
-export async function makeTestApp(opts: { config?: Partial<HubConfig>; probe?: ProbeFn; logStream?: NodeJS.WritableStream } = {}) {
+export async function makeTestApp(opts: { config?: Partial<HubConfig>; probe?: ProbeFn; logStream?: NodeJS.WritableStream; releases?: GitHubReleases } = {}) {
   const clock = { t: T0 };
   const store = new Store(openDb(':memory:'));
   const discord = new FakeDiscord();
@@ -44,7 +46,7 @@ export async function makeTestApp(opts: { config?: Partial<HubConfig>; probe?: P
   });
   const config = testConfig(opts.config);
   const keyring = testKeyRing();
-  const app = await buildApp({ config, store, keyring, discord, probe, now: () => clock.t, logStream: opts.logStream });
+  const app = await buildApp({ config, store, keyring, discord, probe, now: () => clock.t, logStream: opts.logStream, releases: opts.releases });
   return { app, store, clock, discord, probeAnswers, keyring, config };
 }
 

@@ -19,13 +19,17 @@ import { normalizeIp } from '../probe';
  *
  * O Hub só IDENTIFICA: qualquer usuário logado pode receber o ticket (`aud = "<serverId>#admin"`, mesmo formato dos
  * tickets de jogo, TTL 300 s); quem decide se aquele `did` é admin é o servidor (`admin.admins`). O `state` é opaco
- * para o Hub: o painel do servidor o gera, guarda (cookie SameSite=Strict) e compara no callback (Task 8).
+ * para o Hub: o painel do servidor o gera, guarda (cookie SameSite=Strict) e compara no callback. Com `state`, o ticket
+ * leva `nonce = base64url(sha256(state))` (assinado): um ticket roubado não serve com o state de outro navegador.
  */
 
 export const SERVER_ID_RE = /^srv_[A-Za-z0-9_-]{12}$/;
 export const ADMIN_STATE_RE = /^[A-Za-z0-9_-]{16,64}$/;
 export const isServerId = (v: unknown): v is string => typeof v === 'string' && SERVER_ID_RE.test(v);
 const isAdminState = (v: unknown): v is string => typeof v === 'string' && ADMIN_STATE_RE.test(v);
+
+/** Claim `nonce` do ticket de admin: base64url(sha256(state)). Mesma conta no painel (admin_server.cpp). */
+export const adminNonce = (state: string) => createHash('sha256').update(state, 'utf8').digest('base64url');
 
 export const adminConfirmPath = (serverId: string, state: string | null) =>
   `/v1/auth/server-admin?serverId=${encodeURIComponent(serverId)}${state ? `&state=${encodeURIComponent(state)}` : ''}`;
@@ -266,6 +270,8 @@ ${state ? `<input type="hidden" name="state" value="${esc(state)}">` : ''}
     const payload: TicketPayload = {
       v: 1, kid: keyring.active.kid, sub: s.user.id, did: s.user.discordId, name: s.user.name,
       aud: `${server.id}#admin`, iat, exp: iat + TICKET_TTL_SECONDS, jti: randomUUID(),
+      // Amarra o ticket ao navegador que começou o login: o painel confere nonce == base64url(sha256(state do cookie)).
+      ...(state ? { nonce: adminNonce(state) } : {}),
     };
     const ticket = signTicket(payload, keyring.active.privateKey);
     audit(s.user, serverId, 'ticket_issued');

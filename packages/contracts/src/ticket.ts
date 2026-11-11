@@ -15,6 +15,11 @@ export interface TicketPayload {
   iat: number;
   exp: number;
   jti: string;
+  /**
+   * Só em tickets de admin emitidos com `state`: base64url(sha256(state)) (43 chars). Amarra o ticket ao navegador
+   * que começou o login no painel (o painel confere com o state do próprio cookie). Ausente nos demais tickets.
+   */
+  nonce?: string;
 }
 
 export type TicketError =
@@ -58,7 +63,8 @@ function isPayloadShape(p: unknown): p is TicketPayload {
   const o = p as Record<string, unknown>;
   return typeof o.v === 'number'
     && ['kid', 'sub', 'did', 'name', 'aud', 'jti'].every((k) => typeof o[k] === 'string')
-    && Number.isSafeInteger(o.iat) && Number.isSafeInteger(o.exp);
+    && Number.isSafeInteger(o.iat) && Number.isSafeInteger(o.exp)
+    && (!('nonce' in o) || typeof o.nonce === 'string');
 }
 
 /** v, iat e exp precisam ser literais inteiros simples no JSON (sem 1.0, sem expoente). */
@@ -83,9 +89,16 @@ function isCompactJson(text: string): boolean {
 
 const PAYLOAD_KEYS = ['v', 'kid', 'sub', 'did', 'name', 'aud', 'iat', 'exp', 'jti'] as const;
 
-/** Cada chave do payload aparece exatamente uma vez como `"<chave>":` no corpo (aspas em strings vêm escapadas). */
+/** Claims opcionais: no máximo uma vez. */
+const OPTIONAL_KEYS = ['nonce'] as const;
+
+/**
+ * Cada chave do payload aparece exatamente uma vez como `"<chave>":` no corpo e cada opcional no máximo uma vez
+ * (aspas em strings vêm escapadas).
+ */
 function noDuplicateKeys(text: string): boolean {
-  return PAYLOAD_KEYS.every((k) => text.split(`"${k}":`).length === 2);
+  return PAYLOAD_KEYS.every((k) => text.split(`"${k}":`).length === 2)
+    && OPTIONAL_KEYS.every((k) => text.split(`"${k}":`).length <= 2);
 }
 
 /**

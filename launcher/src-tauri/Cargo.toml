@@ -1,0 +1,84 @@
+[package]
+name = "cbmp-launcher"
+version = "0.1.0"
+description = "CB Multiplayer — launcher"
+edition = "2021"
+# 1.86: `remove_file` apaga arquivo somente leitura no Windows (cache e montagens copiadas são readonly).
+rust-version = "1.86"
+publish = false
+
+[lib]
+name = "cbmp_launcher_lib"
+
+[features]
+# Build de teste local (Hub em http://127.0.0.1:8787, servidores em loopback/LAN, updater no Hub local). Só por flag
+# explícita, junto com `tauri.localtest.conf.json`: `--features local-test --config tauri.localtest.conf.json`.
+# Nunca entra no padrão nem em release publicado.
+local-test = []
+
+[build-dependencies]
+tauri-build = { version = "=2.7.4", features = [] }
+
+[dependencies]
+tauri = { version = "=2.12.5", features = [] }
+tauri-plugin-deep-link = "=2.6.3"
+tauri-plugin-single-instance = { version = "=2.5.5", features = ["deep-link"] }
+tauri-plugin-updater = "=2.14.1"
+tauri-plugin-dialog = "=2.8.4"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+url = "=2.5.8"
+# Cliente do Hub: rustls com o provedor `ring` (o mesmo que o plugin updater já usa).
+reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
+tokio = { version = "=1.54.1", features = ["sync", "rt", "fs", "io-util", "time", "macros", "net"] }
+# Cancelamento do download de conteúdo.
+tokio-util = "=0.7.20"
+sha2 = "=0.10.9"
+base64 = "=0.23.1"
+getrandom = "=0.3.4"
+log = "=0.4.35"
+httpdate = "=1.0.3"
+# Cofre: Windows Credential Manager (serviço `CBMultiplayer`).
+keyring = { version = "=3.6.3", features = ["windows-native"] }
+# Mod do cliente: assinatura minisign (a mesma verificação do plugin updater), zip só com deflate, semver do Hub.
+minisign-verify = "=0.3.0"
+zip = { version = "=9.5.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+semver = "=1.0.28"
+
+[target.'cfg(windows)'.dependencies]
+# Abrir o navegador do sistema (ShellExecuteW) só a partir do Rust; nada de plugin opener/shell.
+# Também: registro (Steam), pasta conhecida LocalAppData, ACL do `connect.json` (só o usuário atual).
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+toml = "=1.2.1"
+# Hub falso dos testes.
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "test-util"] }
+# Corpo em stream do cb-server falso (queda no meio, lento, chunked).
+futures-util = { version = "=0.3.34", default-features = false }
+# Par de chaves minisign gerado no próprio teste (nunca a chave de dev nem a de release).
+minisign = "=0.10.0"
+
+# Assinatura/conferência do workflow de release: `cargo test` roda os testes dele (pares gerados no próprio teste).
+[[example]]
+name = "release_sign"
+test = true
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

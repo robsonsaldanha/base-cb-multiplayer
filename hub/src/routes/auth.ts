@@ -17,7 +17,19 @@ const ClientQuery = z.object({
   /** Só painel: volta para a confirmação de login de admin deste servidor (fica no state OAuth, não em cookie). */
   return: z.string().regex(SERVER_ID_RE).optional(),
   return_state: z.string().regex(ADMIN_STATE_RE).optional(),
+  /** Só launcher: state próprio (32 bytes em base64url), devolvido em cbmp://auth para ele conferir. */
+  state: z.string().regex(/^[A-Za-z0-9_-]{43}$/).optional(),
 });
+
+/** State do launcher para devolver no deep link; o painel não usa. */
+const clientStateOf = (q: z.infer<typeof ClientQuery>) => (q.client === 'launcher' ? q.state ?? null : null);
+
+/** Deep link do launcher; o `state` dele (se veio) vai junto. */
+function launcherLink(params: Record<string, string>, clientState: string | null): string {
+  const q = new URLSearchParams(params);
+  if (clientState) q.set('state', clientState);
+  return `cbmp://auth?${q}`;
+}
 
 /** Retorno pós-login: só no painel; o launcher ignora. */
 function returnOf(q: z.infer<typeof ClientQuery>): ReturnTo | undefined {
@@ -37,6 +49,24 @@ const escapeHtml = (v: string) => v.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', 
 const deniedPage = (reason: string) => `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><title>Login cancelado</title></head>
 <body><h1>Login cancelado no Discord</h1><p>Não foi possível concluir o login (${escapeHtml(reason)}).</p><p><a href="/panel">Tentar de novo</a></p></body></html>`;
 
+/**
+ * Hub de teste só com dev-login (sem app Discord): o "Entrar" do launcher/painel cai aqui em vez do Discord. Formulário
+ * GET para /v1/auth/dev-login que repete os parâmetros do cliente (PKCE e state do launcher; retorno do painel) e pede
+ * um Discord ID e nome fictícios. Os valores já passaram pelo zod (regex), e mesmo assim são escapados.
+ */
+function devLoginPage(q: Record<string, string | undefined>): string {
+  const hidden = Object.entries(q)
+    .filter((e): e is [string, string] => typeof e[1] === 'string')
+    .map(([k, v]) => `<input type="hidden" name="${escapeHtml(k)}" value="${escapeHtml(v)}">`).join('');
+  return `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><title>Entrar (Hub de teste)</title></head>
+<body><h1>Hub de teste: entrar sem Discord</h1>
+<p>Este Hub roda com <code>HUB_DEV_LOGIN=1</code> e sem app Discord. Escolha uma conta fictícia.</p>
+<form method="get" action="/v1/auth/dev-login">${hidden}
+<p><label>Discord ID (fictício) <input name="discordId" value="111111111111111111" pattern="[0-9]{1,20}" required></label></p>
+<p><label>Nome <input name="name" value="Dev Local" maxlength="32" required></label></p>
+<p><button type="submit">Entrar como dev</button></p></form></body></html>`;
+}
+
 const tokenResponse = (s: SessionTokens): TokenResponse => ({
   accessToken: s.access, accessExpiresAt: s.accessExpiresAt, refreshToken: s.refresh, refreshExpiresAt: s.refreshExpiresAt,
 });
@@ -47,7 +77,7 @@ export async function authRoutes(app: FastifyInstance) {
 
   const secure = config.publicUrl.startsWith('https://');
 
-  function finishLogin(reply: FastifyReply, userId: string, client: ClientKind, codeChallenge: string | null, returnTo: ReturnTo | null = null) {
+  function finishLogin(reply: FastifyReply, userId: string, client: ClientKind, codeChallenge: string | null, returnTo: ReturnTo | null = null, clientState: string | null = null) {
     if (client === 'panel') {
       const s = store.createSession(userId, 'panel', now());
       reply.setCookie(SESSION_COOKIE, s.access, {
@@ -58,13 +88,23 @@ export async function authRoutes(app: FastifyInstance) {
       return reply.redirect(returnTo ? adminConfirmPath(returnTo.serverId, returnTo.state) : '/panel');
     }
     const code = store.createLoginCode(userId, now(), codeChallenge ?? '');
-    return reply.redirect(`cbmp://auth?code=${encodeURIComponent(code)}`);
+    return reply.redirect(launcherLink({ code }, clientState));
   }
 
   app.get('/v1/auth/discord/login', async (req, reply) => {
     const q = ClientQuery.parse(req.query);
     const challenge = checkPkce(q);
-    const state = store.createOauthState(q.client, now(), challenge, returnOf(q));
+    if (config.devLogin && !config.discordClientId) {
+      returnOf(q); // mesma validação do caminho normal
+      return reply
+        // form-action vale também para o redirecionamento depois do envio (Chrome): o do launcher vai para cbmp://.
+        .header('content-security-policy', "default-src 'none'; form-action 'self' cbmp:; base-uri 'none'; frame-ancestors 'none'")
+        .header('x-frame-options', 'DENY')
+        .header('cache-control', 'no-store')
+        .type('text/html; charset=utf-8')
+        .send(devLoginPage(q));
+    }
+    const state = store.createOauthState(q.client, now(), challenge, returnOf(q), clientStateOf(q) ?? undefined);
     reply.setCookie(OAUTH_COOKIE, state, { path: OAUTH_COOKIE_PATH, httpOnly: true, sameSite: 'lax', secure, maxAge: 600 });
     const url = new URL('https://discord.com/oauth2/authorize');
     url.search = new URLSearchParams({
@@ -82,12 +122,12 @@ export async function authRoutes(app: FastifyInstance) {
     reply.clearCookie(OAUTH_COOKIE, { path: OAUTH_COOKIE_PATH });
     if (!st) throw new HttpError(400, 'bad_state', 'login expirado ou inválido, tente de novo');
     if (q.error || !q.code) {
-      if (st.client === 'launcher') return reply.redirect('cbmp://auth?error=access_denied');
+      if (st.client === 'launcher') return reply.redirect(launcherLink({ error: 'access_denied' }, st.clientState));
       return reply.status(400).type('text/html; charset=utf-8').send(deniedPage(q.error ?? 'access_denied'));
     }
     const du = await discord.getUser(await discord.exchangeCode(q.code, redirectUri));
     const user = store.upsertUserFromDiscord({ discordId: du.id, name: du.global_name ?? du.username, avatar: du.avatar }, now());
-    return finishLogin(reply, user.id, st.client, st.codeChallenge, st.returnTo);
+    return finishLogin(reply, user.id, st.client, st.codeChallenge, st.returnTo, st.clientState);
   });
 
   if (config.devLogin) {
@@ -95,7 +135,7 @@ export async function authRoutes(app: FastifyInstance) {
       const q = ClientQuery.extend({ discordId: z.string().regex(/^\d{1,20}$/), name: z.string().min(1).max(32) }).parse(req.query);
       const challenge = checkPkce(q);
       const user = store.upsertUserFromDiscord({ discordId: q.discordId, name: q.name, avatar: null }, now());
-      return finishLogin(reply, user.id, q.client, challenge ?? null, returnOf(q) ?? null);
+      return finishLogin(reply, user.id, q.client, challenge ?? null, returnOf(q) ?? null, clientStateOf(q));
     });
   }
 

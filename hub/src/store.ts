@@ -8,6 +8,8 @@ export interface UserRow { id: string; discordId: string; name: string; avatar: 
 export interface ServerRow {
   id: string; ownerId: string; name: string; description: string; tags: string[]; locale: string;
   useGlobalBans: boolean; createdAt: number;
+  /** Destaque na lista pública (só admin da plataforma liga/desliga). */
+  featured: boolean;
 }
 export interface StatusRow {
   serverId: string; ip: string; gamePort: number; httpPort: number; players: number; maxPlayers: number;
@@ -35,7 +37,7 @@ const toUser = (r: Raw): UserRow => ({ id: r.id as string, discordId: r.discord_
 const toServer = (r: Raw): ServerRow => ({
   id: r.id as string, ownerId: r.owner_id as string, name: r.name as string, description: r.description as string,
   tags: JSON.parse(r.tags as string) as string[], locale: r.locale as string, useGlobalBans: r.use_global_bans === 1,
-  createdAt: r.created_at as number,
+  createdAt: r.created_at as number, featured: r.featured === 1,
 });
 const toStatus = (r: Raw): StatusRow => ({
   serverId: r.server_id as string, ip: r.ip as string, gamePort: r.game_port as number, httpPort: r.http_port as number,
@@ -108,20 +110,22 @@ export class Store {
 
   // ---- OAuth state e códigos de login (uso único)
   /** `returnTo` (só painel): volta para a confirmação de login de admin daquele servidor; morre com o state. */
-  createOauthState(client: ClientKind, now: number, codeChallenge?: string, returnTo?: ReturnTo): string {
+  /** `clientState` (só launcher): state do próprio launcher, devolvido no deep link. */
+  createOauthState(client: ClientKind, now: number, codeChallenge?: string, returnTo?: ReturnTo, clientState?: string): string {
     const state = randomBytes(24).toString('base64url');
-    this.db.prepare('INSERT INTO oauth_states (state, client, created_at, code_challenge, return_server_id, return_state) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(state, client, now, codeChallenge ?? null, returnTo?.serverId ?? null, returnTo?.state ?? null);
+    this.db.prepare('INSERT INTO oauth_states (state, client, created_at, code_challenge, return_server_id, return_state, client_state) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(state, client, now, codeChallenge ?? null, returnTo?.serverId ?? null, returnTo?.state ?? null, clientState ?? null);
     return state;
   }
 
-  consumeOauthState(state: string, now: number): { client: ClientKind; codeChallenge: string | null; returnTo: ReturnTo | null } | null {
-    const r = this.db.prepare('DELETE FROM oauth_states WHERE state = ? RETURNING client, created_at, code_challenge, return_server_id, return_state').get(state) as Raw | undefined;
+  consumeOauthState(state: string, now: number): { client: ClientKind; codeChallenge: string | null; returnTo: ReturnTo | null; clientState: string | null } | null {
+    const r = this.db.prepare('DELETE FROM oauth_states WHERE state = ? RETURNING client, created_at, code_challenge, return_server_id, return_state, client_state').get(state) as Raw | undefined;
     if (!r || now - (r.created_at as number) > OAUTH_STATE_TTL) return null;
     const sid = (r.return_server_id as string | null) ?? null;
     return {
       client: r.client as ClientKind, codeChallenge: (r.code_challenge as string | null) ?? null,
       returnTo: sid ? { serverId: sid, state: (r.return_state as string | null) ?? null } : null,
+      clientState: (r.client_state as string | null) ?? null,
     };
   }
 
@@ -182,6 +186,12 @@ export class Store {
     return res.changes === 1 ? key : null;
   }
 
+  /** Liga/desliga o destaque (admin da plataforma); null se o servidor não existe. */
+  setFeatured(id: string, featured: boolean): ServerRow | null {
+    const res = this.db.prepare('UPDATE servers SET featured = ? WHERE id = ?').run(featured ? 1 : 0, id);
+    return res.changes === 1 ? this.getServer(id) : null;
+  }
+
   deleteServer(id: string, ownerId: string): boolean {
     return this.db.prepare('DELETE FROM servers WHERE id = ? AND owner_id = ?').run(id, ownerId).changes === 1;
   }
@@ -222,7 +232,7 @@ export class Store {
 
   listOnline(now: number): { server: ServerRow; status: StatusRow }[] {
     const rows = this.db.prepare(`SELECT s.*, st.* FROM servers s JOIN server_status st ON st.server_id = s.id
-      WHERE st.verified = 1 AND st.last_heartbeat >= ? ORDER BY st.players DESC, s.name`).all(now - ONLINE_WINDOW) as Raw[];
+      WHERE st.verified = 1 AND st.last_heartbeat >= ? ORDER BY s.featured DESC, st.players DESC, s.name`).all(now - ONLINE_WINDOW) as Raw[];
     return rows.map((r) => ({ server: toServer(r), status: toStatus(r) }));
   }
 

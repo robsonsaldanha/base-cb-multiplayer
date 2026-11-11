@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -20,6 +21,8 @@ struct TicketPayload {
   int v = 0;
   std::string kid, sub, did, name, aud, jti;
   int64_t iat = 0, exp = 0;
+  // Claim opcional dos tickets de admin emitidos com state: base64url(sha256(state)). Ausente nos demais.
+  std::optional<std::string> nonce;
 };
 
 // kid → chave pública Ed25519 (32 bytes raw).

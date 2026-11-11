@@ -110,3 +110,31 @@ TEST_CASE("metricsAllowed rules") {
   REQUIRE(!metricsAllowed("10.0.0.1", nullopt, tok));
   REQUIRE(!metricsAllowed("10.0.0.1", std::string("Bearer s3cret"), nullopt));
 }
+
+TEST_CASE("http startPublic answers /info on 127.0.0.1 and ::1") {
+  fs::path dir = fs::temp_directory_path() / ("cbhttp6_" + std::to_string(randombytes_random()));
+  fs::create_directories(dir);
+  auto store = ResourceStore::scan(dir);
+  auto cfg = ServerConfig::fromJson(nlohmann::json::object());
+  Metrics m;
+  HttpServer srv(cfg, store, m, [] { return nlohmann::json{{"serverId", "srv_t"}}; });
+  const std::string mode = srv.startPublic(0);
+  REQUIRE(srv.boundPort() > 0);
+  httplib::Client v4("127.0.0.1", srv.boundPort());
+  auto r4 = v4.Get("/info");
+  REQUIRE(r4);
+  REQUIRE(r4->status == 200);
+  if (mode == "ipv4") {
+    srv.stop();
+    SKIP("sem IPv6 loopback neste sistema (bind dual-stack indisponivel)");
+  }
+  REQUIRE(mode == "dual-stack");
+  httplib::Client v6("::1", srv.boundPort());
+  auto r6 = v6.Get("/info");
+  REQUIRE(r6);
+  REQUIRE(r6->status == 200);
+  REQUIRE(nlohmann::json::parse(r6->body)["serverId"] == "srv_t");
+  srv.stop();
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+}

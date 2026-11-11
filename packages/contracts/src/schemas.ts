@@ -150,12 +150,14 @@ export const ServerListing = z.object({
   httpPort: Port,
   version: z.string(),
   protocol: z.number().int(),
+  /** Destaque ligado por admin da plataforma (PATCH /v1/admin/servers/:id); a lista vem com os destacados primeiro. */
+  featured: z.boolean(),
 });
 export type ServerListing = z.infer<typeof ServerListing>;
 
 /** Resposta de GET /v1/servers/:id. Offline: só dados básicos; online: tudo que o launcher precisa para conectar. */
 export const ServerDetail = z.discriminatedUnion('online', [
-  ServerListing.pick({ id: true, name: true, description: true, tags: true, locale: true }).extend({ online: z.literal(false) }),
+  ServerListing.pick({ id: true, name: true, description: true, tags: true, locale: true, featured: true }).extend({ online: z.literal(false) }),
   ServerListing.extend({ online: z.literal(true) }),
 ]);
 export type ServerDetail = z.infer<typeof ServerDetail>;
@@ -184,6 +186,10 @@ export const ResourceManifest = z.object({
 });
 export type ResourceManifest = z.infer<typeof ResourceManifest>;
 
+/** Corpo de PATCH /v1/admin/servers/:id (só admin da plataforma). */
+export const AdminServerPatch = z.object({ featured: z.boolean() }).strict();
+export type AdminServerPatch = z.infer<typeof AdminServerPatch>;
+
 export const ErrorBody = z.object({ error: z.string(), message: z.string() });
 export type ErrorBody = z.infer<typeof ErrorBody>;
 
@@ -206,3 +212,27 @@ export const TokenResponse = z.object({
   refreshExpiresAt: z.number().int().nullable(),
 });
 export type TokenResponse = z.infer<typeof TokenResponse>;
+
+/**
+ * 200 de GET /v1/launcher/update/{target}/{arch}/{current_version} (Tauri v2 "dynamic update server"; 204 = sem update).
+ * `signature` é o CONTEÚDO do `.sig` (minisign), conferido pelo launcher com a chave embutida — o Hub não confere.
+ */
+export const UpdateInfo = z.object({
+  version: z.string(),
+  notes: z.string(),
+  pub_date: z.string(),
+  url: z.string().url(),
+  signature: z.string().min(1),
+});
+export type UpdateInfo = z.infer<typeof UpdateInfo>;
+
+/** 200 de GET /v1/mod/latest?protocol=N (404 `no_mod` quando não há). `signature` = conteúdo do `.sig` (minisign). */
+export const ModInfo = z.object({
+  version: z.string(),
+  protocol: z.number().int().min(0),
+  url: z.string().url(),
+  sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  size: z.number().int().min(0),
+  signature: z.string().min(1),
+});
+export type ModInfo = z.infer<typeof ModInfo>;

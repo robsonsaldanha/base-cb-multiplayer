@@ -1,0 +1,538 @@
+//! Localizar o Hogwarts Legacy: Steam (registro + `libraryfolders.vdf` + `appmanifest_990080.acf`), Epic (manifests
+//! `.item` do launcher da Epic) ou pasta escolhida pelo usuário. Escrito do zero.
+//!
+//! Tudo que vem do disco (VDF, JSON da Epic) é só lido e validado: um caminho só vira [`GameInstall`] se passar em
+//! [`validate_game_dir`] (executável + estrutura `Phoenix\Binaries\Win64`).
+
+use crate::error::{AppError, AppResult};
+use serde::Serialize;
+use std::path::{Path, PathBuf};
+
+/// AppID do Hogwarts Legacy na Steam.
+pub const STEAM_APP_ID: &str = "990080";
+/// Executável na raiz da instalação (o que a Steam/Epic abrem).
+pub const GAME_EXE: &str = "HogwartsLegacy.exe";
+/// Estrutura que confirma a pasta do jogo (e onde fica a pasta do mod).
+pub const BINARIES: [&str; 3] = ["Phoenix", "Binaries", "Win64"];
+
+const STEAM_USER_KEY: &str = r"Software\Valve\Steam";
+const STEAM_MACHINE_KEY: &str = r"SOFTWARE\WOW6432Node\Valve\Steam";
+/// Teto dos arquivos de texto lidos (VDF/ACF/`.item`): os reais têm poucos KB.
+const MAX_TEXT: u64 = 1024 * 1024;
+/// Teto de manifests da Epic olhados.
+const MAX_EPIC_ITEMS: usize = 1000;
+const MAX_VDF_DEPTH: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Hive {
+    CurrentUser,
+    LocalMachine,
+}
+
+/// Leitura de valores `REG_SZ` (simulável nos testes).
+pub trait Registry {
+    fn read_string(&self, hive: Hive, key: &str, value: &str) -> Option<String>;
+}
+
+/// Registro do Windows (`RegGetValueW`, só leitura). Fora do Windows não acha nada.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemRegistry;
+
+impl Registry for SystemRegistry {
+    #[cfg(windows)]
+    fn read_string(&self, hive: Hive, key: &str, value: &str) -> Option<String> {
+        use std::os::windows::ffi::OsStringExt;
+        use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+        use windows_sys::Win32::System::Registry::{
+            RegGetValueW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ,
+        };
+        let root = match hive {
+            Hive::CurrentUser => HKEY_CURRENT_USER,
+            Hive::LocalMachine => HKEY_LOCAL_MACHINE,
+        };
+        let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+        let (k, v) = (wide(key), wide(value));
+        let mut len: u32 = 0;
+        // SAFETY: strings terminadas em zero vivas durante a chamada; primeira chamada só mede (buffer nulo).
+        let r = unsafe {
+            RegGetValueW(
+                root,
+                k.as_ptr(),
+                v.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut len,
+            )
+        };
+        if r != ERROR_SUCCESS || len == 0 || len > 64 * 1024 {
+            return None;
+        }
+        let mut buf = vec![0u16; (len as usize).div_ceil(2)];
+        // SAFETY: `buf` tem `len` bytes; a API escreve no máximo isso (e devolve erro se mudou de tamanho).
+        let r = unsafe {
+            RegGetValueW(
+                root,
+                k.as_ptr(),
+                v.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if r != ERROR_SUCCESS {
+            return None;
+        }
+        let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        let s = std::ffi::OsString::from_wide(&buf[..n]);
+        s.into_string().ok().filter(|s| !s.trim().is_empty())
+    }
+
+    #[cfg(not(windows))]
+    fn read_string(&self, _hive: Hive, _key: &str, _value: &str) -> Option<String> {
+        None
+    }
+}
+
+/// De onde a instalação veio (a UI mostra; o modo de abrir é o mesmo).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Store {
+    Steam,
+    Epic,
+    Manual,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameInstall {
+    pub dir: PathBuf,
+    pub exe: PathBuf,
+    pub store: Store,
+}
+
+/// Pastas fora do registro onde procurar (injetáveis nos testes).
+#[derive(Debug, Clone)]
+pub struct Roots {
+    /// `C:\ProgramData\Epic\EpicGamesLauncher\Data\Manifests`.
+    pub epic_manifests: PathBuf,
+}
+
+impl Roots {
+    /// Pastas reais do sistema.
+    pub fn system() -> Self {
+        // Pasta conhecida pela API (não pela variável de ambiente).
+        #[cfg(windows)]
+        let known = crate::paths::program_data();
+        #[cfg(not(windows))]
+        let known: Option<PathBuf> = None;
+        let program_data = known.unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        Self {
+            epic_manifests: program_data
+                .join("Epic")
+                .join("EpicGamesLauncher")
+                .join("Data")
+                .join("Manifests"),
+        }
+    }
+}
+
+fn game_invalid() -> AppError {
+    AppError::new(
+        "game_invalid",
+        "Esta pasta não é do Hogwarts Legacy: faltam HogwartsLegacy.exe e Phoenix\\Binaries\\Win64.",
+    )
+}
+
+/// Erro de quando nenhuma instalação foi achada (a UI oferece o seletor de pasta).
+pub fn game_not_found() -> AppError {
+    AppError::new(
+        "game_not_found",
+        "Hogwarts Legacy não encontrado. Escolha a pasta do jogo em Configurações.",
+    )
+}
+
+/// Confere que `dir` é a pasta do jogo: caminho completo, `HogwartsLegacy.exe` (arquivo) e `Phoenix\Binaries\Win64`.
+pub fn validate_game_dir(dir: &Path) -> AppResult<GameInstall> {
+    if !dir.is_absolute() {
+        return Err(game_invalid());
+    }
+    let exe = dir.join(GAME_EXE);
+    let bins = BINARIES.iter().fold(dir.to_path_buf(), |p, s| p.join(s));
+    if !exe.is_file() || !bins.is_dir() {
+        return Err(game_invalid());
+    }
+    Ok(GameInstall {
+        dir: dir.to_path_buf(),
+        exe,
+        store: Store::Manual,
+    })
+}
+
+/// Procura na Steam e depois na Epic; `None` se nada válido for achado.
+pub fn locate(reg: &dyn Registry, roots: &Roots) -> Option<GameInstall> {
+    locate_with(reg, roots, &SystemTrust)
+}
+
+/// Como [`locate`], com a verificação de dono/permissões injetável (testes).
+pub fn locate_with(reg: &dyn Registry, roots: &Roots, trust: &dyn Trust) -> Option<GameInstall> {
+    locate_steam(reg)
+        .or_else(|| locate_epic(&roots.epic_manifests, trust))
+        .inspect(|g| log::info!("Hogwarts Legacy encontrado ({:?})", g.store))
+}
+
+/// Se um caminho achado automaticamente é confiável: dono e quem pode escrever nele.
+///
+/// `%ProgramData%` deixa qualquer usuário local criar arquivos e pastas, então um `.item` da Epic (e a pasta para
+/// onde ele aponta) podem ter sido plantados por outra conta do PC para o launcher abrir o executável dela.
+pub trait Trust {
+    fn trusted(&self, path: &Path) -> bool;
+}
+
+/// Regra real: dono SYSTEM, Administradores, TrustedInstaller ou o usuário atual, e nenhuma outra conta com direito
+/// de escrita (ver [`crate::launch::acl::trusted`]). Fora do Windows aceita tudo.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemTrust;
+
+impl Trust for SystemTrust {
+    #[cfg(windows)]
+    fn trusted(&self, path: &Path) -> bool {
+        use crate::launch::acl;
+        let ok = acl::current_user_sid()
+            .and_then(|me| acl::read_security(path).map(|sec| acl::trusted(&sec, &me)))
+            .unwrap_or(false);
+        if !ok {
+            log::warn!("caminho com dono ou permissões não confiáveis ignorado");
+        }
+        ok
+    }
+
+    #[cfg(not(windows))]
+    fn trusted(&self, _path: &Path) -> bool {
+        true
+    }
+}
+
+fn with_store(g: GameInstall, store: Store) -> GameInstall {
+    GameInstall { store, ..g }
+}
+
+fn read_text(path: &Path) -> Option<String> {
+    let md = std::fs::metadata(path).ok()?;
+    if !md.is_file() || md.len() > MAX_TEXT {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// O Steam grava `SteamPath` como `c:/program files (x86)/steam`.
+fn native_path(s: &str) -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(s.trim().replace('/', "\\"))
+    } else {
+        PathBuf::from(s.trim())
+    }
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    if cfg!(windows) {
+        let n = |p: &Path| {
+            p.to_string_lossy()
+                .trim_end_matches(['\\', '/'])
+                .to_lowercase()
+        };
+        n(a) == n(b)
+    } else {
+        a == b
+    }
+}
+
+fn locate_steam(reg: &dyn Registry) -> Option<GameInstall> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for (hive, key, value) in [
+        (Hive::CurrentUser, STEAM_USER_KEY, "SteamPath"),
+        (Hive::LocalMachine, STEAM_MACHINE_KEY, "InstallPath"),
+    ] {
+        if let Some(p) = reg.read_string(hive, key, value) {
+            let p = native_path(&p);
+            if p.is_absolute() && !roots.iter().any(|r| same_path(r, &p)) {
+                roots.push(p);
+            }
+        }
+    }
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        for lib in steam_libraries(&root) {
+            if seen.iter().any(|s| same_path(s, &lib)) {
+                continue;
+            }
+            seen.push(lib.clone());
+            if let Some(g) = steam_game_in(&lib) {
+                return Some(g);
+            }
+        }
+    }
+    None
+}
+
+/// Bibliotecas da Steam: a própria pasta do Steam e as de `steamapps\libraryfolders.vdf` (formato novo com
+/// `"path"` e antigo com `"1" "D:\\..."`), sem repetir.
+pub fn steam_libraries(steam_root: &Path) -> Vec<PathBuf> {
+    let mut libs = vec![steam_root.to_path_buf()];
+    let Some(text) = read_text(&steam_root.join("steamapps").join("libraryfolders.vdf")) else {
+        return libs;
+    };
+    let Some(vdf) = parse_vdf(&text) else {
+        return libs;
+    };
+    let Some(Vdf::Obj(top)) = vdf_child(&vdf, "libraryfolders") else {
+        return libs;
+    };
+    for (key, v) in top {
+        if !key.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let path = match v {
+            Vdf::Str(s) => Some(s.as_str()),
+            Vdf::Obj(_) => match vdf_child(v, "path") {
+                Some(Vdf::Str(s)) => Some(s.as_str()),
+                _ => None,
+            },
+        };
+        if let Some(p) = path.map(native_path).filter(|p| p.is_absolute()) {
+            if !libs.iter().any(|l| same_path(l, &p)) {
+                libs.push(p);
+            }
+        }
+    }
+    libs
+}
+
+fn steam_game_in(lib: &Path) -> Option<GameInstall> {
+    let apps = lib.join("steamapps");
+    let text = read_text(&apps.join(format!("appmanifest_{STEAM_APP_ID}.acf")))?;
+    let vdf = parse_vdf(&text)?;
+    let dir = vdf_get(&vdf, &["AppState", "installdir"])?;
+    // Um nome de pasta só, dentro de `common`.
+    let ok = !dir.is_empty()
+        && dir != "."
+        && dir != ".."
+        && !dir.contains(['/', '\\', ':'])
+        && !dir.chars().any(char::is_control);
+    if !ok {
+        return None;
+    }
+    validate_game_dir(&apps.join("common").join(dir))
+        .ok()
+        .map(|g| with_store(g, Store::Steam))
+}
+
+fn locate_epic(manifests: &Path, trust: &dyn Trust) -> Option<GameInstall> {
+    let rd = std::fs::read_dir(manifests).ok()?;
+    let mut items: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("item"))
+        })
+        .take(MAX_EPIC_ITEMS)
+        .collect();
+    items.sort();
+    for item in items {
+        if !trust.trusted(&item) {
+            continue;
+        }
+        let Some(text) = read_text(&item) else {
+            continue;
+        };
+        let Ok(serde_json::Value::Object(v)) = serde_json::from_str::<serde_json::Value>(&text)
+        else {
+            continue;
+        };
+        let is_hl = ["DisplayName", "AppName"].iter().any(|k| {
+            v.get(*k)
+                .and_then(|x| x.as_str())
+                .is_some_and(is_hogwarts_name)
+        });
+        if !is_hl {
+            continue;
+        }
+        let Some(loc) = v.get("InstallLocation").and_then(|x| x.as_str()) else {
+            continue;
+        };
+        if let Ok(g) = validate_game_dir(&native_path(loc)) {
+            // A pasta do jogo, o executável e a pasta onde o mod é instalado (e o jogo carrega DLLs) também.
+            let bins = BINARIES.iter().fold(g.dir.clone(), |p, s| p.join(s));
+            if [&g.dir, &g.exe, &bins].iter().all(|p| trust.trusted(p)) {
+                return Some(with_store(g, Store::Epic));
+            }
+        }
+    }
+    None
+}
+
+/// "Hogwarts Legacy" ignorando caixa, espaços e pontuação.
+fn is_hogwarts_name(s: &str) -> bool {
+    let n: String = s
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    n == "hogwartslegacy"
+}
+
+// ----- VDF (KeyValues do Valve, só texto) -----
+
+/// Valor de um VDF: texto ou objeto (lista de pares, na ordem do arquivo).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Vdf {
+    Str(String),
+    Obj(Vec<(String, Vdf)>),
+}
+
+enum Tok {
+    Str(String),
+    Open,
+    Close,
+}
+
+fn tokenize(text: &str) -> Option<Vec<Tok>> {
+    let mut out = Vec::new();
+    let mut it = text.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '{' => out.push(Tok::Open),
+            '}' => out.push(Tok::Close),
+            '"' => {
+                let mut s = String::new();
+                loop {
+                    match it.next()? {
+                        '"' => break,
+                        '\\' => match it.next()? {
+                            'n' => s.push('\n'),
+                            't' => s.push('\t'),
+                            other => s.push(other),
+                        },
+                        ch => s.push(ch),
+                    }
+                }
+                out.push(Tok::Str(s));
+            }
+            '/' if it.peek() == Some(&'/') => {
+                for ch in it.by_ref() {
+                    if ch == '\n' {
+                        break;
+                    }
+                }
+            }
+            c if c.is_whitespace() => {}
+            // Token sem aspas (raro): até espaço ou chave.
+            _ => {
+                let mut s = String::from(c);
+                while let Some(&n) = it.peek() {
+                    if n.is_whitespace() || n == '{' || n == '}' || n == '"' {
+                        break;
+                    }
+                    s.push(n);
+                    it.next();
+                }
+                out.push(Tok::Str(s));
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Interpreta um arquivo VDF inteiro como objeto raiz. Texto malformado → `None` (nunca pânico).
+pub fn parse_vdf(text: &str) -> Option<Vdf> {
+    let toks = tokenize(text)?;
+    let mut pos = 0;
+    let obj = parse_pairs(&toks, &mut pos, 0)?;
+    if pos != toks.len() {
+        return None;
+    }
+    Some(Vdf::Obj(obj))
+}
+
+fn parse_pairs(toks: &[Tok], pos: &mut usize, depth: usize) -> Option<Vec<(String, Vdf)>> {
+    if depth > MAX_VDF_DEPTH {
+        return None;
+    }
+    let mut out = Vec::new();
+    while *pos < toks.len() {
+        let key = match &toks[*pos] {
+            Tok::Str(s) => s.clone(),
+            Tok::Close => return (depth > 0).then_some(out),
+            Tok::Open => return None,
+        };
+        *pos += 1;
+        match toks.get(*pos)? {
+            Tok::Str(v) => {
+                out.push((key, Vdf::Str(v.clone())));
+                *pos += 1;
+            }
+            Tok::Open => {
+                *pos += 1;
+                let inner = parse_pairs(toks, pos, depth + 1)?;
+                match toks.get(*pos)? {
+                    Tok::Close => *pos += 1,
+                    _ => return None,
+                }
+                out.push((key, Vdf::Obj(inner)));
+            }
+            Tok::Close => return None,
+        }
+    }
+    (depth == 0).then_some(out)
+}
+
+fn vdf_child<'a>(v: &'a Vdf, key: &str) -> Option<&'a Vdf> {
+    match v {
+        Vdf::Obj(pairs) => pairs
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| v),
+        Vdf::Str(_) => None,
+    }
+}
+
+/// Texto no caminho de chaves (sem diferenciar maiúsculas, como o Steam).
+pub fn vdf_get(v: &Vdf, keys: &[&str]) -> Option<String> {
+    let mut cur = v;
+    for k in keys {
+        cur = vdf_child(cur, k)?;
+    }
+    match cur {
+        Vdf::Str(s) => Some(s.clone()),
+        Vdf::Obj(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nome_do_jogo_tolerante() {
+        for ok in [
+            "Hogwarts Legacy",
+            "HOGWARTS LEGACY",
+            "Hogwarts-Legacy",
+            "hogwartslegacy",
+        ] {
+            assert!(is_hogwarts_name(ok), "{ok}");
+        }
+        for bad in ["Hogwarts", "Hogwarts Legacy 2", ""] {
+            assert!(!is_hogwarts_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn vdf_profundo_demais_e_recusado() {
+        let deep = "\"a\" {".repeat(40) + &"}".repeat(40);
+        assert_eq!(parse_vdf(&deep), None);
+    }
+}

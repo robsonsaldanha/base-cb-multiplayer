@@ -14,6 +14,7 @@
 #include <mutex>
 #include <map>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -80,6 +81,11 @@ std::array<unsigned char, crypto_hash_sha256_BYTES> sha256(std::string_view s) {
 std::string hashKey(std::string_view s) {
   const auto h = sha256(s);
   return std::string(reinterpret_cast<const char*>(h.data()), h.size());
+}
+// Claim `nonce` do ticket de admin: base64url(sha256(state)) — mesma conta do Hub (adminNonce em admin-login.ts).
+std::string nonceOf(std::string_view state) {
+  const auto h = sha256(state);
+  return cbmp::base64urlEncode(std::span<const uint8_t>(h.data(), h.size()));
 }
 // Tempo constante, inclusive para tamanhos diferentes (compara os hashes).
 bool ctEqual(std::string_view a, std::string_view b) {
@@ -713,6 +719,10 @@ struct AdminServer::Impl {
       if (r.error() == cbmp::TicketError::UnknownKid) be.keys->requestRefresh();
       return fail(401, "bad_ticket", "ticket inválido (" + std::string(cbmp::toString(r.error())) + ")");
     }
+    // nonce: o Hub assina base64url(sha256(state)) no ticket; tem que bater com o state DESTE navegador (cookie, já
+    // conferido acima). Sem isso, um ticket roubado entraria pareado com o state do próprio atacante.
+    if (!r->nonce || !ctEqual(*r->nonce, nonceOf(st)))
+      return fail(401, "bad_nonce", "ticket não pertence a este login (nonce); comece de novo", r->did);
     switch (consumeJti(r->jti, r->exp, now)) {
       case JtiResult::Replay:
         return fail(401, "replay", "ticket já usado; entre de novo", r->did);

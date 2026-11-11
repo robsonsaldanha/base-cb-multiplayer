@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { ExchangeRequest, HeartbeatBody, normalizeAdminOrigin, RefreshRequest, ResourceManifest, ServerDetail, TokenResponse } from '../src/index';
+import { ExchangeRequest, HeartbeatBody, normalizeAdminOrigin, RefreshRequest, ResourceManifest, ServerDetail, ServerListing, TokenResponse } from '../src/index';
 
 const hb = { name: 'Castelo Bruxo', players: 10, maxPlayers: 512, gamePort: 30500, httpPort: 30500, version: '0.1.0', protocol: 1 };
 
@@ -34,7 +34,7 @@ describe('HeartbeatBody.name', () => {
 });
 
 describe('ServerDetail', () => {
-  const base = { id: 'srv_x', name: 'Castelo', description: '', tags: ['rp'], locale: 'pt-BR' };
+  const base = { id: 'srv_x', name: 'Castelo', description: '', tags: ['rp'], locale: 'pt-BR', featured: false };
   it('offline: só campos básicos', () => {
     expect(ServerDetail.parse({ ...base, online: false })).toEqual({ ...base, online: false });
   });
@@ -43,6 +43,22 @@ describe('ServerDetail', () => {
     expect(ServerDetail.parse(full)).toEqual(full);
     const { protocol: _p, ...semProtocol } = full;
     expect(ServerDetail.safeParse(semProtocol).success).toBe(false);
+  });
+  it('featured é obrigatório (offline e online)', () => {
+    const { featured: _f, ...semFeatured } = base;
+    expect(ServerDetail.safeParse({ ...semFeatured, online: false }).success).toBe(false);
+    expect(ServerDetail.parse({ ...base, featured: true, online: false }).featured).toBe(true);
+  });
+});
+
+describe('ServerListing', () => {
+  const listing = { id: 'srv_x', name: 'Castelo', description: '', tags: [], locale: 'pt-BR', players: 1, maxPlayers: 10,
+    host: '203.0.113.7', gamePort: 30500, httpPort: 30500, version: '0.1.0', protocol: 1, featured: true };
+  it('traz featured (booleano obrigatório)', () => {
+    expect(ServerListing.parse(listing)).toEqual(listing);
+    const { featured: _f, ...semFeatured } = listing;
+    expect(ServerListing.safeParse(semFeatured).success).toBe(false);
+    expect(ServerListing.safeParse({ ...listing, featured: 1 }).success).toBe(false);
   });
 });
 

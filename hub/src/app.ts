@@ -7,6 +7,7 @@ import type { Store, UserRow } from './store';
 import type { KeyRing } from './keyring';
 import type { DiscordClient } from './discord';
 import type { ProbeFn } from './probe';
+import type { GitHubReleases } from './github';
 import { HttpError } from './errors';
 import { authRoutes } from './routes/auth';
 import { ownerRoutes } from './routes/owner';
@@ -15,6 +16,8 @@ import { serverRoutes } from './routes/servers';
 import { banRoutes } from './routes/bans';
 import { panelRoutes } from './routes/panel';
 import { adminLoginRoutes } from './routes/admin-login';
+import { adminServerRoutes } from './routes/admin-servers';
+import { newDownloadSlots, releaseRoutes, type DownloadSlots } from './routes/releases';
 
 export interface HubDeps {
   config: HubConfig;
@@ -22,6 +25,8 @@ export interface HubDeps {
   keyring: KeyRing;
   discord: DiscordClient;
   probe: ProbeFn;
+  /** Releases do GitHub (updates do launcher, mod, downloads); ausente ou sem token → 503 updates_disabled. */
+  releases?: GitHubReleases;
   /** Relógio em segundos unix (injetável nos testes). */
   now: () => number;
   /** Destino do log (testes capturam a auditoria); ausente = stdout conforme logLevel. */
@@ -29,7 +34,7 @@ export interface HubDeps {
 }
 
 declare module 'fastify' {
-  interface FastifyInstance { deps: HubDeps }
+  interface FastifyInstance { deps: HubDeps; downloads: DownloadSlots }
   interface FastifyRequest { cachedUser?: UserRow | null }
 }
 
@@ -41,6 +46,7 @@ export async function buildApp(deps: HubDeps): Promise<FastifyInstance> {
     bodyLimit: 64 * 1024,
   });
   app.decorate('deps', deps);
+  app.decorate('downloads', newDownloadSlots());
   app.decorateRequest('cachedUser', undefined);
   await app.register(cookie);
   await app.register(rateLimit, {
@@ -77,6 +83,8 @@ export async function buildApp(deps: HubDeps): Promise<FastifyInstance> {
   await app.register(banRoutes);
   await app.register(panelRoutes);
   await app.register(adminLoginRoutes);
+  await app.register(adminServerRoutes);
+  await app.register(releaseRoutes);
   // Tasks seguintes registram rotas aqui.
   return app;
 }

@@ -2,6 +2,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <fstream>
+#include <set>
 
 #include "cbserver/manifest.hpp"
 
@@ -171,4 +172,51 @@ TEST_CASE("manifest protocol comes from argument and json is stable") {
   auto s = ResourceStore::scan(t.p);
   REQUIRE(s.manifestJson("srv_a", 1) == s.manifestJson("srv_a", 1));
   REQUIRE(s.manifestJson("srv_a", 7)["protocol"] == 7);
+}
+
+TEST_CASE("manifest rejects resource name outside [A-Za-z0-9._-]{1,64}") {
+  const std::vector<std::string> bads = {"a b", "a/b", "..", ".", "a:b", std::string(65, 'a'), "aÃ§"};
+  for (const std::string& bad : bads) {
+    TmpDir t;
+    makeRes(t.p);
+    nlohmann::json meta = {{"name", bad}, {"version", "1"}};
+    put(t.p / "res1/resource.json", meta.dump());
+    try {
+      (void)ResourceStore::scan(t.p);
+      FAIL("deveria lancar para nome: " + bad);
+    } catch (const std::runtime_error& e) {
+      REQUIRE(std::string(e.what()).find("res1") != std::string::npos);
+    }
+  }
+  TmpDir ok;
+  makeRes(ok.p);
+  put(ok.p / "res1/resource.json", nlohmann::json{{"name", std::string(64, 'a')}, {"version", "1"}}.dump());
+  REQUIRE_NOTHROW(ResourceStore::scan(ok.p));
+}
+
+TEST_CASE("example hello-client publishes five client files") {
+  auto j = ResourceStore::scan(fs::path(CBMP_EXAMPLE_RESOURCES)).manifestJson("srv_a", 1);
+  const nlohmann::json* hello = nullptr;
+  for (auto& r : j["resources"])
+    if (r["name"] == "hello-client") hello = &r;
+  REQUIRE(hello != nullptr);
+  std::set<std::string> paths;
+  uint64_t total = 0;
+  for (auto& f : (*hello)["files"]) {
+    paths.insert(f["path"].get<std::string>());
+    REQUIRE(f["size"].get<uint64_t>() > 0);
+    REQUIRE(f["sha256"].get<std::string>().size() == 64);
+    total += f["size"].get<uint64_t>();
+    auto p = fs::path(CBMP_EXAMPLE_RESOURCES) / "hello-client" / f["path"].get<std::string>();
+    std::ifstream in(p, std::ios::binary);
+    std::string content((std::istreambuf_iterator<char>(in)), {});
+    REQUIRE(sha(content) == f["sha256"].get<std::string>());
+  }
+  REQUIRE(paths == std::set<std::string>{"client/main.lua", "files/logo.png", "ui/app.js", "ui/index.html",
+                                         "ui/style.css"});
+  uint64_t all = 0;
+  for (auto& r : j["resources"])
+    for (auto& f : r["files"]) all += f["size"].get<uint64_t>();
+  REQUIRE(j["totalSize"] == all);
+  REQUIRE(all >= total);
 }

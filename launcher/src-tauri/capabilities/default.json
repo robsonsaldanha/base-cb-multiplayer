@@ -1,0 +1,25 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Janela principal: só ouvir eventos do Rust e os comandos do app. Sem core:default, fs/shell/http/opener/dialog.",
+  "windows": ["main"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-get-settings",
+    "allow-set-settings",
+    "allow-app-version",
+    "allow-login",
+    "allow-logout",
+    "allow-me",
+    "allow-pick-game-dir",
+    "allow-play",
+    "allow-cancel-play",
+    "allow-clear-cache",
+    "allow-check-update",
+    "allow-install-update",
+    "allow-list-servers",
+    "allow-cached-servers",
+    "allow-ping-servers"
+  ]
+}

@@ -19,6 +19,10 @@ constexpr bool safeSegment(std::string_view s) noexcept {
   return true;
 }
 
+// Nome de resource: 1 a 64 caracteres [A-Za-z0-9._-], diferente de "." e "..". Regra única do manifest público
+// (ResourceStore) e do resource.json de scripts (loadManifest).
+constexpr bool validResourceName(std::string_view s) noexcept { return s.size() <= 64 && safeSegment(s); }
+
 // ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ sem segmentos "." ou "..": relativo, sem barra inicial/final, sem "//",
 // sem "\\", sem ":" (letra de unidade).
 constexpr bool safeRelPath(std::string_view rel) noexcept {
