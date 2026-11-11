@@ -7,6 +7,10 @@ fictícia do Hub de teste).
 
 Leva uns 30 minutos (mais uns 10 se for preciso gerar os builds de teste no passo 2).
 
+> **Outro PC** (sem repositório, Rust, Visual Studio nem a chave dev; por exemplo, o PC de casa com o Hogwarts Legacy):
+> use o kit pronto e o roteiro `docs/TESTES-EM-CASA-SUB4.md`. O kit é gerado aqui, depois do passo 2, com
+> `node tools/make-test-kit.mjs` (grava `dist\cbmp-kit-teste-sub4.zip`).
+
 Cada passo diz o que fazer, o que deve acontecer (**Esperado**) e o que mandar se der errado (**Se falhar**). Em
 qualquer falha, mande também:
 

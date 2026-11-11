@@ -86,6 +86,16 @@ node tools/dev-env.mjs --help
   fictícia). Com `DISCORD_CLIENT_ID` e `DISCORD_CLIENT_SECRET` de um app de **teste** nas variáveis de ambiente do
   terminal (nunca em arquivo), o login vai ao Discord.
 - O passo a passo completo dos testes manuais está em `docs/TESTES-MANUAIS-SUB4.md`.
+- **Kit para testar em outro PC** (sem Git/Rust/Visual Studio/chave): `node tools/make-test-kit.mjs` gera
+  `dist\cbmp-kit-teste-sub4.zip` com o Hub (dependências já instaladas), `packages/contracts`, o `dev-env`, o
+  `cb-server` com as DLLs e o runtime do VC++ ao lado, o `hello-client`, a chave **pública** e os releases de
+  teste prontos. Recusa empacotar releases de outro código do launcher (carimbo) ou `cb-server` mais velho que o
+  código, confere as assinaturas com `keys/update.pub` e varre o kit atrás de chave privada, token, `.env` e dados
+  do Hub. Dentro do kit (há `kit.json` na raiz) o `dev-env` entra em **modo kit**: usa `releases\` e
+  `bin\cb-server\` como estão, nunca compila nem procura a chave (`--build-releases`/`--key`/`--force` são
+  recusados), guarda os dados em `<kit>\dados` e confere o sha256 de cada arquivo antes de subir. `tools/kit-smoke.mjs`
+  (`CONFERIR.cmd` no kit) confere por HTTP o Hub, o destaque, o update 0.1.0 → 0.1.1 e o mod (assinaturas) e o
+  manifest do `cb-server`. Roteiro: `docs/TESTES-EM-CASA-SUB4.md` (vai no kit como `LEIA-ME.md`).
 
 O launcher em `tauri dev` (debug) também aceita o Hub local: `CBMP_HUB_URL=http://127.0.0.1:8787` (e
 `CBMP_DATA_DIR` para outra pasta de dados).

@@ -15,3 +15,7 @@ CMakeUserPresets.json
 target/
 launcher/src-tauri/gen/
 *.key
+
+# kit de teste (tools/make-test-kit.mjs): nunca na raiz do repositório
+/kit.json
+/dados/

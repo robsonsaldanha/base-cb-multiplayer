@@ -5,7 +5,8 @@
   "workspaces": ["packages/*", "hub", "launcher/ui"],
   "engines": { "node": ">=22" },
   "scripts": {
-    "test": "npm test --workspaces --if-present",
+    "test": "npm test --workspaces --if-present && npm run test:tools",
+    "test:tools": "node --test \"tools/test/*.test.mjs\"",
     "typecheck": "npm run typecheck --workspaces --if-present"
   }
 }

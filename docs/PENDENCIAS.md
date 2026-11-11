@@ -43,6 +43,14 @@ das tasks).
 - **Margem de renovação do ticket** (revisão 7, M-1): o launcher renova o ticket com mais de 240 s (TTL 300 − 60;
   `play::TICKET_RENEW_AFTER_SECS`) antes de gravar o `connect.json`, mas o tempo entre abrir o jogo e o mod resgatar o
   ticket não é medido. Medir com o mod real e ajustar a margem (ou renovar pelo mod).
+- **Mod na pasta do jogo sem administrador** (kit de teste em casa): o launcher roda sem elevação e grava o mod em
+  `<jogo>\Phoenix\Binaries\Win64\cbmp`. Na Steam a biblioteca costuma permitir; na **Epic** (`C:\Program Files\Epic
+  Games`) o usuário comum em geral não pode gravar e o `play` para em `permission_denied`. Decidir no subprojeto 5
+  (ex.: elevação só para instalar o mod, pasta do mod fora do jogo com o loader apontando para ela). O resultado do
+  passo 12 de `docs/TESTES-EM-CASA-SUB4.md` diz o que acontece numa instalação real.
+- **Abrir `HogwartsLegacy.exe` direto** (sem argumentos): na Steam o jogo costuma se reabrir pela Steam; na Epic pode
+  exigir os parâmetros de autenticação que o launcher da Epic passa. Conferir no subprojeto 5 (passo 12 do roteiro
+  em casa).
 
 ## Servidor: resíduos do subprojeto 3 (Lua / MySQL / admin)
 
@@ -115,7 +123,7 @@ Decisões registradas e limites aceitos; o comportamento atual está documentado
   - **Trocar a chave de assinatura dev** (key id `BDCB478091E91629`) pela de produção antes do primeiro release real
     (`launcher/README.md`, "Chaves"); o `release.yml` recusa assinar com a dev. Efeito (revisão 9a, M-6): o build
     "Teste local" embute a mesma `keys/update.pub`, então os releases de teste do `tools/dev-env.mjs` assinados com
-    a dev deixam de valer. Rodar `docs/TESTES-MANUAIS-SUB4.md` antes da troca, ou decidir então embutir a pública dev
+    a dev deixam de valer. Rodar `docs/TESTES-MANUAIS-SUB4.md` (ou `docs/TESTES-EM-CASA-SUB4.md`, com o kit) antes da troca, ou decidir então embutir a pública dev
     só no perfil `local-test`.
   - **Endereço real do Hub**: `https://hub.cbmp.invalid` é placeholder (`settings::DEFAULT_HUB_URL` e endpoint do
     updater no `tauri.conf.json`).
