@@ -19,8 +19,9 @@ const STEAM_USER_KEY: &str = r"Software\Valve\Steam";
 const STEAM_MACHINE_KEY: &str = r"SOFTWARE\WOW6432Node\Valve\Steam";
 /// Teto dos arquivos de texto lidos (VDF/ACF/`.item`): os reais têm poucos KB.
 const MAX_TEXT: u64 = 1024 * 1024;
-/// Teto de manifests da Epic olhados.
-const MAX_EPIC_ITEMS: usize = 1000;
+/// Teto de manifests da Epic olhados. Passou disso, nenhuma pasta não confiável é sugerida (alguém pode ter enchido a
+/// pasta de manifests para esconder o verdadeiro).
+pub const MAX_EPIC_ITEMS: usize = 1000;
 const MAX_VDF_DEPTH: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -170,22 +171,124 @@ pub fn validate_game_dir(dir: &Path) -> AppResult<GameInstall> {
     })
 }
 
-/// Procura na Steam e depois na Epic; `None` se nada válido for achado.
+/// Qual verificação de confiança falhou num caminho achado pelo manifest da Epic (vai para o log).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TrustCheck {
+    /// O arquivo `.item` em `%ProgramData%\Epic\EpicGamesLauncher\Data\Manifests`.
+    Manifest,
+    /// A pasta do jogo.
+    GameDir,
+    /// `HogwartsLegacy.exe`.
+    Exe,
+    /// `Phoenix\Binaries\Win64` (onde o mod é instalado e o jogo carrega DLLs).
+    Binaries,
+}
+
+impl TrustCheck {
+    /// Nome no log.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Manifest => "manifest",
+            Self::GameDir => "pasta do jogo",
+            Self::Exe => "executável",
+            Self::Binaries => "Phoenix\\Binaries\\Win64",
+        }
+    }
+}
+
+fn labels(failed: &[TrustCheck]) -> String {
+    failed
+        .iter()
+        .map(|f| f.label())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Pasta válida do Hogwarts Legacy achada automaticamente (manifest da Epic) que **não** passou na verificação de
+/// dono/permissões: outra conta do PC poderia tê-la plantado ou poderia alterá-la. Nunca é usada sozinha; a UI
+/// mostra como sugestão e só vira `gameDir` depois de o usuário confirmar (`commands::use_detected_game`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameCandidate {
+    pub dir: PathBuf,
+    pub store: Store,
+    /// Verificações que falharam (só para o log; a UI não recebe).
+    #[serde(skip)]
+    pub failed: Vec<TrustCheck>,
+}
+
+/// Resultado da procura automática.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Detection {
+    /// Instalação confiável: usada direto, como sempre.
+    Trusted(GameInstall),
+    /// Exatamente uma pasta achada, mas não confiável: só com confirmação do usuário.
+    Candidate(GameCandidate),
+    /// Mais de uma pasta não confiável (ou manifests demais para olhar todos): qualquer uma pode ter sido plantada, então
+    /// nenhuma é sugerida; o usuário escolhe a pasta pelo seletor. `candidates` = pastas distintas vistas.
+    Ambiguous {
+        candidates: usize,
+        flooded: bool,
+    },
+    NotFound,
+}
+
+/// Procura na Steam e depois na Epic; `None` se nada válido **e confiável** for achado (ver [`detect`]).
 pub fn locate(reg: &dyn Registry, roots: &Roots) -> Option<GameInstall> {
     locate_with(reg, roots, &SystemTrust)
 }
 
 /// Como [`locate`], com a verificação de dono/permissões injetável (testes).
 pub fn locate_with(reg: &dyn Registry, roots: &Roots, trust: &dyn Trust) -> Option<GameInstall> {
-    locate_steam(reg)
-        .or_else(|| locate_epic(&roots.epic_manifests, trust))
-        .inspect(|g| log::info!("Hogwarts Legacy encontrado ({:?})", g.store))
+    match detect_with(reg, roots, trust) {
+        Detection::Trusted(g) => Some(g),
+        Detection::Candidate(_) | Detection::Ambiguous { .. } | Detection::NotFound => None,
+    }
+}
+
+/// Procura na Steam e depois na Epic: instalação confiável, uma candidata (Epic não confiável), várias (ambíguo) ou
+/// nada.
+pub fn detect(reg: &dyn Registry, roots: &Roots) -> Detection {
+    detect_with(reg, roots, &SystemTrust)
+}
+
+/// Como [`detect`], com a verificação de dono/permissões injetável (testes).
+pub fn detect_with(reg: &dyn Registry, roots: &Roots, trust: &dyn Trust) -> Detection {
+    let d = match locate_steam(reg) {
+        Some(g) => Detection::Trusted(g),
+        None => locate_epic(&roots.epic_manifests, trust),
+    };
+    match &d {
+        Detection::Trusted(g) => log::info!("Hogwarts Legacy encontrado ({:?})", g.store),
+        Detection::Candidate(c) => log::info!(
+            "Hogwarts Legacy achado ({:?}) em {}, mas não usado sozinho (não confiável: {}); aguardando confirmação",
+            c.store,
+            c.dir.display(),
+            labels(&c.failed)
+        ),
+        Detection::Ambiguous {
+            candidates,
+            flooded,
+        } => log::warn!(
+            "Hogwarts Legacy ambíguo nos manifests da Epic ({candidates} pastas não confiáveis distintas{}); nenhuma \
+             sugerida, o usuário precisa escolher a pasta",
+            if *flooded {
+                ", manifests demais para olhar todos"
+            } else {
+                ""
+            }
+        ),
+        Detection::NotFound => {}
+    }
+    d
 }
 
 /// Se um caminho achado automaticamente é confiável: dono e quem pode escrever nele.
 ///
 /// `%ProgramData%` deixa qualquer usuário local criar arquivos e pastas, então um `.item` da Epic (e a pasta para
 /// onde ele aponta) podem ter sido plantados por outra conta do PC para o launcher abrir o executável dela.
+/// Na prática o launcher da Epic também deixa manifests e pasta do jogo graváveis por outras contas, por isso o que
+/// falha aqui vira [`GameCandidate`] (sugestão que o usuário confirma), nunca instalação usada sozinha.
 pub trait Trust {
     fn trusted(&self, path: &Path) -> bool;
 }
@@ -199,13 +302,16 @@ impl Trust for SystemTrust {
     #[cfg(windows)]
     fn trusted(&self, path: &Path) -> bool {
         use crate::launch::acl;
-        let ok = acl::current_user_sid()
-            .and_then(|me| acl::read_security(path).map(|sec| acl::trusted(&sec, &me)))
-            .unwrap_or(false);
-        if !ok {
-            log::warn!("caminho com dono ou permissões não confiáveis ignorado");
+        match acl::current_user_sid().and_then(|me| acl::read_security(path).map(|sec| (sec, me))) {
+            Ok((sec, me)) => acl::trusted(&sec, &me),
+            Err(e) => {
+                log::warn!(
+                    "permissões ilegíveis num caminho achado automaticamente ({})",
+                    e.code
+                );
+                false
+            }
         }
-        ok
     }
 
     #[cfg(not(windows))]
@@ -218,13 +324,39 @@ fn with_store(g: GameInstall, store: Store) -> GameInstall {
     GameInstall { store, ..g }
 }
 
+/// Lê um arquivo de texto de até [`MAX_TEXT`]. Abre uma vez e limita a leitura pelo próprio handle: trocar o arquivo
+/// por um enorme depois da checagem de tamanho não faz o launcher ler tudo.
 fn read_text(path: &Path) -> Option<String> {
-    let md = std::fs::metadata(path).ok()?;
+    use std::io::Read;
+    let f = std::fs::File::open(path).ok()?;
+    let md = f.metadata().ok()?;
     if !md.is_file() || md.len() > MAX_TEXT {
         return None;
     }
-    let bytes = std::fs::read(path).ok()?;
+    let mut bytes = Vec::new();
+    f.take(MAX_TEXT + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_TEXT {
+        return None;
+    }
     Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Caractere que não deve aparecer num caminho mostrado ao usuário: controle, ou formatação/direção do Unicode (ex.
+/// U+202E), que faz um caminho parecer outro na tela.
+fn deceptive_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+        )
 }
 
 /// O Steam grava `SteamPath` como `c:/program files (x86)/steam`.
@@ -236,7 +368,8 @@ fn native_path(s: &str) -> PathBuf {
     }
 }
 
-fn same_path(a: &Path, b: &Path) -> bool {
+/// Mesmo caminho (no Windows sem diferenciar maiúsculas nem barra no fim).
+pub fn same_path(a: &Path, b: &Path) -> bool {
     if cfg!(windows) {
         let n = |p: &Path| {
             p.to_string_lossy()
@@ -329,8 +462,14 @@ fn steam_game_in(lib: &Path) -> Option<GameInstall> {
         .map(|g| with_store(g, Store::Steam))
 }
 
-fn locate_epic(manifests: &Path, trust: &dyn Trust) -> Option<GameInstall> {
-    let rd = std::fs::read_dir(manifests).ok()?;
+/// Manifests da Epic. O primeiro confiável (em ordem de nome) vence. Sem nenhum confiável, as pastas válidas mas não
+/// confiáveis são juntadas sem repetir: **uma** vira candidata; duas ou mais, ou mais de [`MAX_EPIC_ITEMS`] manifests,
+/// viram [`Detection::Ambiguous`] (outra conta pode ter plantado um `.item` para tomar o lugar do verdadeiro, então
+/// nenhuma é sugerida). O texto de um `.item` não confiável é só lido (até [`MAX_TEXT`]) e interpretado como JSON.
+fn locate_epic(manifests: &Path, trust: &dyn Trust) -> Detection {
+    let Ok(rd) = std::fs::read_dir(manifests) else {
+        return Detection::NotFound;
+    };
     let mut items: Vec<PathBuf> = rd
         .flatten()
         .map(|e| e.path())
@@ -338,40 +477,77 @@ fn locate_epic(manifests: &Path, trust: &dyn Trust) -> Option<GameInstall> {
             p.extension()
                 .is_some_and(|e| e.eq_ignore_ascii_case("item"))
         })
-        .take(MAX_EPIC_ITEMS)
+        .take(MAX_EPIC_ITEMS + 1)
         .collect();
+    let flooded = items.len() > MAX_EPIC_ITEMS;
+    items.truncate(MAX_EPIC_ITEMS);
     items.sort();
+    let mut candidates: Vec<GameCandidate> = Vec::new();
     for item in items {
-        if !trust.trusted(&item) {
+        let Some(g) = epic_item_game(&item) else {
             continue;
+        };
+        // O manifest, a pasta do jogo, o executável e a pasta onde o mod é instalado (e o jogo carrega DLLs).
+        let bins = BINARIES.iter().fold(g.dir.clone(), |p, s| p.join(s));
+        let failed: Vec<TrustCheck> = [
+            (TrustCheck::Manifest, item.as_path()),
+            (TrustCheck::GameDir, g.dir.as_path()),
+            (TrustCheck::Exe, g.exe.as_path()),
+            (TrustCheck::Binaries, bins.as_path()),
+        ]
+        .into_iter()
+        .filter(|(_, p)| !trust.trusted(p))
+        .map(|(c, _)| c)
+        .collect();
+        if failed.is_empty() {
+            return Detection::Trusted(with_store(g, Store::Epic));
         }
-        let Some(text) = read_text(&item) else {
-            continue;
-        };
-        let Ok(serde_json::Value::Object(v)) = serde_json::from_str::<serde_json::Value>(&text)
-        else {
-            continue;
-        };
-        let is_hl = ["DisplayName", "AppName"].iter().any(|k| {
-            v.get(*k)
-                .and_then(|x| x.as_str())
-                .is_some_and(is_hogwarts_name)
-        });
-        if !is_hl {
-            continue;
-        }
-        let Some(loc) = v.get("InstallLocation").and_then(|x| x.as_str()) else {
-            continue;
-        };
-        if let Ok(g) = validate_game_dir(&native_path(loc)) {
-            // A pasta do jogo, o executável e a pasta onde o mod é instalado (e o jogo carrega DLLs) também.
-            let bins = BINARIES.iter().fold(g.dir.clone(), |p, s| p.join(s));
-            if [&g.dir, &g.exe, &bins].iter().all(|p| trust.trusted(p)) {
-                return Some(with_store(g, Store::Epic));
-            }
+        log::warn!(
+            "manifest da Epic {} (Hogwarts Legacy) com dono ou permissões não confiáveis em: {}",
+            item.file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+            labels(&failed)
+        );
+        if !candidates.iter().any(|c| same_path(&c.dir, &g.dir)) {
+            candidates.push(GameCandidate {
+                dir: g.dir,
+                store: Store::Epic,
+                failed,
+            });
         }
     }
-    None
+    match (candidates.len(), flooded) {
+        (0, false) => Detection::NotFound,
+        (1, false) => Detection::Candidate(candidates.remove(0)),
+        (n, flooded) => Detection::Ambiguous {
+            candidates: n,
+            flooded,
+        },
+    }
+}
+
+/// Instalação para onde um `.item` da Epic aponta, se ele é do Hogwarts Legacy e a pasta passa em
+/// [`validate_game_dir`]. Sem verificação de confiança (feita por quem chama).
+fn epic_item_game(item: &Path) -> Option<GameInstall> {
+    let text = read_text(item)?;
+    let serde_json::Value::Object(v) = serde_json::from_str::<serde_json::Value>(&text).ok()?
+    else {
+        return None;
+    };
+    let is_hl = ["DisplayName", "AppName"].iter().any(|k| {
+        v.get(*k)
+            .and_then(|x| x.as_str())
+            .is_some_and(is_hogwarts_name)
+    });
+    if !is_hl {
+        return None;
+    }
+    let loc = v.get("InstallLocation").and_then(|x| x.as_str())?;
+    // Caminho que vai ser mostrado ao usuário: nada de caracteres que o disfarcem.
+    if loc.chars().any(deceptive_char) {
+        return None;
+    }
+    validate_game_dir(&native_path(loc)).ok()
 }
 
 /// "Hogwarts Legacy" ignorando caixa, espaços e pontuação.

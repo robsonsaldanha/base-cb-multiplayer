@@ -39,6 +39,9 @@ export const ERROR_TEXT: Readonly<Record<string, string>> = {
   // Jogo e mod
   game_not_found: "Hogwarts Legacy não encontrado. Escolha a pasta do jogo.",
   game_invalid: "A pasta escolhida não é do Hogwarts Legacy.",
+  game_candidate_changed: "A pasta sugerida não foi encontrada de novo. Escolha a pasta do jogo.",
+  game_ambiguous: "Mais de uma pasta parece ser do Hogwarts Legacy. Escolha a pasta do jogo.",
+  game_confirm_open: "Já existe uma confirmação da pasta do jogo aberta.",
   launch_failed: "Não foi possível abrir o jogo.",
   mod_unavailable: "Ainda não há mod publicado para a versão deste servidor.",
   mod_invalid: "O pacote do mod é inválido e foi recusado.",

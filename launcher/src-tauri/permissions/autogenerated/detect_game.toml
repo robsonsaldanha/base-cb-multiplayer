@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-detect-game"
+description = "Enables the detect_game command without any pre-configured scope."
+commands.allow = ["detect_game"]
+
+[[permission]]
+identifier = "deny-detect-game"
+description = "Denies the detect_game command without any pre-configured scope."
+commands.deny = ["detect_game"]

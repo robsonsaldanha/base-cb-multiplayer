@@ -167,6 +167,20 @@ Decisões registradas e limites aceitos; o comportamento atual está documentado
   - **Confiança da pasta da Epic só na descoberta, e só na folha** (revisão 7, R1-m3): `game.rs` (`SystemTrust`) confere
     dono/ACL do caminho quando acha o jogo, não de novo ao abrir, e não confere as pastas acima nem pontos de
     reanálise. Só atacante local; conferir a cadeia e repetir antes de abrir.
+  - **Epic com manifest/pasta graváveis por outras contas** (teste online, launcher 0.1.2/0.1.3): numa instalação real a
+    detecção da Epic falhava sempre (3 avisos "dono ou permissões não confiáveis" no log do testador). Agora o que
+    falha na verificação vira **sugestão** (`game::Detection::Candidate`): nunca usada sozinha; a UI mostra "Encontramos
+    o Hogwarts Legacy em … (Epic Games). Usar esta pasta?" e o Rust procura de novo, só aceita a pasta que ele mesmo
+    achou, confirma num diálogo nativo e grava como o seletor (`commands::adopt_detected`). Depois disso a pasta vale
+    como escolhida à mão: `launch`/`modpkg` não conferem dono/ACL (nem para pasta manual), então outra conta do PC que
+    possa gravar na pasta da Epic ainda pode trocar o executável ou o mod depois da confirmação. Falta confirmar numa
+    Epic real quais verificações falham (o log diz: manifest, pasta do jogo, executável, Binaries). A Steam não
+    tem verificação de dono/ACL nenhuma (biblioteca fora de `Program Files` costuma ser gravável por Usuários).
+    Desde a 0.1.3 só há sugestão quando existe **uma** pasta não confiável distinta; com duas ou mais, ou com mais de
+    1000 manifests, nenhuma é sugerida (`Detection::Ambiguous`) e o texto não atribui a pasta à Epic. Fica: com um
+    `.item` plantado e a Epic real ausente, a pasta plantada é a única e é sugerida (o usuário vê o caminho completo e
+    o aviso de que ninguém verificou a pasta). Ideia mais forte, não feita sem uma Epic real para medir: recusar
+    `.item` cujo dono é outra conta comum (os da Epic devem ser do SYSTEM/Administradores).
   - **Anti-downgrade do mod lembra só o último protocolo** (revisão 7, R1-m4): o piso de versão assinada fica no
     registro de um protocolo só (`modpkg.rs`, `installed`); alternar de protocolo zera o piso do anterior. Exige Hub
     comprometido; guardar o piso por protocolo.
@@ -177,8 +191,9 @@ Decisões registradas e limites aceitos; o comportamento atual está documentado
     (protocolo incompatível sai como `manifest_mismatch`/`mod_unavailable`): remover ou criar a checagem no launcher.
   - **Gravações de configuração da UI sem fila** (`ui/src/lib/settings.ts`): cada uma lê, altera e grava o store;
     `pushRecent` (depois do Jogar) concorrendo com `toggleFavorite` pode perder uma das duas. Encadear numa fila.
-  - O User-Agent (`hub.rs`, `content.rs`) usa `CARGO_PKG_VERSION` (sempre `0.1.0`), enquanto o `release.yml` só troca
-    a versão do Tauri: todo release se anuncia `CBMultiplayer/0.1.0`. Usar `app.package_info().version`.
+  - O User-Agent (`hub.rs`, `content.rs`) usa `CARGO_PKG_VERSION` (a base do `Cargo.toml`, hoje `0.1.3`), enquanto o
+    `release.yml` e os scripts de teste só trocam a versão do Tauri: os builds 0.1.0/0.1.1 de teste se anunciavam com a
+    base da época. Usar `app.package_info().version`.
 - **Hub: release mantido com ids de asset antigos** (revisão 3, Mn2): quando um release é excluído por `.sig`/`.sha256`
   ilegível, `hub/src/github.ts` mantém a entrada anterior (não regride a versão), mas os ids de asset dela podem já ter
   sido trocados no GitHub; o `/v1/dl` então falha para esse release até ele voltar a ser legível. Só disponibilidade.

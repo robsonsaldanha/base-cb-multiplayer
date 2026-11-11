@@ -3,7 +3,7 @@
 use crate::auth::{self, Auth};
 use crate::content::{ContentStore, Limits, Progress};
 use crate::error::{AppError, AppResult};
-use crate::game::{self, GameInstall};
+use crate::game::{self, Detection, GameCandidate, GameInstall};
 use crate::hub::ServerListing;
 use crate::launch::{LaunchOutcome, CONNECT_TTL};
 use crate::modpkg::ModInstaller;
@@ -15,7 +15,7 @@ use crate::settings::{validate_game_dir, Settings, SettingsUpdate};
 use crate::update::{self, UpdateStatus};
 use serde::Serialize;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -222,19 +222,185 @@ pub async fn clear_cache(
 
 // ----- jogo -----
 
-/// Pasta do jogo: a das configurações se ainda for válida; senão procura na Steam/Epic e grava o que achar.
-pub fn resolve_game(state: &AppState) -> Option<GameInstall> {
+/// Procura real (registro e pastas do sistema, dono/permissões pelo Windows).
+pub fn system_detect() -> Detection {
+    game::detect(&game::SystemRegistry, &game::Roots::system())
+}
+
+/// Pasta do jogo: a das configurações se ainda for válida; senão procura na Steam/Epic e grava o que achar **de
+/// confiável**. Uma candidata não confiável é devolvida, mas nunca gravada nem usada (só com [`adopt_detected`]).
+pub fn resolve_game_with(state: &AppState, detect: impl FnOnce() -> Detection) -> Detection {
     if let Some(dir) = state.get_settings().game_dir {
         if let Ok(g) = game::validate_game_dir(&dir) {
-            return Some(g);
+            return Detection::Trusted(g);
         }
         log::warn!("pasta do jogo configurada não é mais válida; procurando de novo");
     }
-    let found = game::locate(&game::SystemRegistry, &game::Roots::system())?;
-    if let Err(e) = state.set_game_dir(Some(found.dir.clone())) {
-        log::warn!("pasta do jogo encontrada, mas não gravada: {}", e.code);
+    let found = detect();
+    if let Detection::Trusted(g) = &found {
+        if let Err(e) = state.set_game_dir(Some(g.dir.clone())) {
+            log::warn!("pasta do jogo encontrada, mas não gravada: {}", e.code);
+        }
     }
-    Some(found)
+    found
+}
+
+/// [`resolve_game_with`] com a procura real; só a instalação utilizável.
+pub fn resolve_game(state: &AppState) -> Option<GameInstall> {
+    match resolve_game_with(state, system_detect) {
+        Detection::Trusted(g) => Some(g),
+        Detection::Candidate(_) | Detection::Ambiguous { .. } | Detection::NotFound => None,
+    }
+}
+
+/// Resposta de [`detect_game`]: configurações atuais (com `gameDir` gravado se uma instalação confiável foi achada
+/// agora) e, sem pasta utilizável, a **única** pasta não confiável achada para a UI sugerir. `ambiguous`: mais de uma
+/// (nenhuma é sugerida; a UI pede o seletor).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameDetection {
+    pub settings: Settings,
+    pub candidate: Option<GameCandidate>,
+    pub ambiguous: bool,
+}
+
+/// Pasta do jogo atual ou procura de novo (como no Jogar). Nunca grava uma candidata não confiável.
+pub fn detect_game_with(state: &AppState, detect: impl FnOnce() -> Detection) -> GameDetection {
+    let (candidate, ambiguous) = match resolve_game_with(state, detect) {
+        Detection::Candidate(c) => (Some(c), false),
+        Detection::Ambiguous { .. } => (None, true),
+        Detection::Trusted(_) | Detection::NotFound => (None, false),
+    };
+    GameDetection {
+        settings: state.get_settings(),
+        candidate,
+        ambiguous,
+    }
+}
+
+fn candidate_changed() -> AppError {
+    AppError::new(
+        "game_candidate_changed",
+        "A pasta sugerida não foi encontrada de novo. Procure outra vez ou escolha a pasta do jogo.",
+    )
+}
+
+fn game_ambiguous() -> AppError {
+    AppError::new(
+        "game_ambiguous",
+        "Mais de uma pasta parece ser do Hogwarts Legacy. Escolha a pasta do jogo.",
+    )
+}
+
+/// Confirmação da sugestão: `shown` é a pasta que a UI mostrou; `detection` é uma procura **nova** feita pelo Rust.
+/// Só aceita se a procura achou de novo exatamente essa pasta como **única** candidata não confiável (a UI não escolhe
+/// caminho nenhum; instalação confiável o Rust já grava sozinho, então não passa por aqui). Depois `confirm` (diálogo
+/// nativo, fora do alcance da UI); recusado → nada muda. Por fim, o mesmo caminho do seletor de pasta:
+/// [`game::validate_game_dir`] e [`AppState::set_game_dir`].
+pub fn adopt_detected(
+    state: &AppState,
+    shown: &Path,
+    detection: Detection,
+    confirm: impl FnOnce(&GameCandidate) -> bool,
+) -> AppResult<Settings> {
+    let c = match detection {
+        Detection::Candidate(c) if game::same_path(&c.dir, shown) => c,
+        Detection::Ambiguous { .. } => return Err(game_ambiguous()),
+        _ => return Err(candidate_changed()),
+    };
+    if !confirm(&c) {
+        return Ok(state.get_settings());
+    }
+    log::info!(
+        "pasta do jogo sugerida ({:?}) confirmada pelo usuário",
+        c.store
+    );
+    let g = game::validate_game_dir(&c.dir)?;
+    state.set_game_dir(Some(g.dir))
+}
+
+/// Uma confirmação nativa por vez: a UI não consegue empilhar diálogos para cansar o usuário.
+#[derive(Debug, Default)]
+pub struct ConfirmGate(std::sync::atomic::AtomicBool);
+
+/// Confirmação aberta; solta a trava ao sair de escopo.
+pub struct ConfirmTicket<'a>(&'a ConfirmGate);
+
+impl ConfirmGate {
+    pub const fn new() -> Self {
+        Self(std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// `game_confirm_open` se já houver uma confirmação aberta.
+    pub fn try_begin(&self) -> AppResult<ConfirmTicket<'_>> {
+        use std::sync::atomic::Ordering;
+        if self.0.swap(true, Ordering::AcqRel) {
+            return Err(AppError::new(
+                "game_confirm_open",
+                "Já existe uma confirmação da pasta do jogo aberta.",
+            ));
+        }
+        Ok(ConfirmTicket(self))
+    }
+}
+
+impl Drop for ConfirmTicket<'_> {
+    fn drop(&mut self) {
+        self.0 .0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+static GAME_CONFIRM: ConfirmGate = ConfirmGate::new();
+
+/// Pasta do jogo atual ou a sugestão (ver [`GameDetection`]). Registro/disco fora do executor assíncrono.
+#[tauri::command]
+pub async fn detect_game(app: AppHandle) -> AppResult<GameDetection> {
+    tokio::task::spawn_blocking(move || detect_game_with(&app.state::<AppState>(), system_detect))
+        .await
+        .map_err(|_| AppError::new("internal_error", "Falha interna ao procurar o jogo."))
+}
+
+/// "Usar esta pasta" na sugestão: procura de novo, confere que achou só `dir`, pede confirmação no diálogo nativo e
+/// grava como o seletor de pasta. Recusar no diálogo devolve as configurações sem mudança.
+#[tauri::command]
+pub async fn use_detected_game(app: AppHandle, dir: String) -> AppResult<Settings> {
+    let _open = GAME_CONFIRM.try_begin()?;
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        adopt_detected(&state, Path::new(&dir), system_detect(), |c| {
+            confirm_candidate_dialog(&app, c)
+        })
+    })
+    .await
+    .map_err(|_| AppError::new("internal_error", "Falha interna ao gravar a pasta do jogo."))?
+}
+
+/// Texto do diálogo nativo: não atribui a pasta a ninguém (o `.item` que a indicou pode ter sido plantado).
+pub fn confirm_text(c: &GameCandidate) -> String {
+    format!(
+        "O launcher encontrou uma pasta que parece ser do Hogwarts Legacy:\n\n{}\n\nO launcher não conseguiu verificar \
+         quem controla esta pasta: outra conta deste computador pode tê-la criado ou alterado.\n\nUse esta pasta só se \
+         foi nela que você instalou o jogo. Se não tiver certeza, cancele e use \"Escolher pasta do jogo\".",
+        c.dir.display()
+    )
+}
+
+/// Diálogo nativo (bloqueia esta thread, nunca a principal): a UI não consegue responder por ele.
+fn confirm_candidate_dialog(app: &AppHandle, c: &GameCandidate) -> bool {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    let mut dialog = app
+        .dialog()
+        .message(confirm_text(c))
+        .title("Pasta do Hogwarts Legacy")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Usar esta pasta".into(),
+            "Cancelar".into(),
+        ));
+    if let Some(w) = app.get_webview_window("main") {
+        dialog = dialog.parent(&w);
+    }
+    dialog.blocking_show()
 }
 
 /// Seletor de pasta (plugin dialog, chamado só daqui) → valida que é o Hogwarts Legacy → grava `gameDir`.

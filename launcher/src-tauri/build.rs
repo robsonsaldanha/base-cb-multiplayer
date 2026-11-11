@@ -9,6 +9,8 @@ fn main() {
         "logout",
         "me",
         "pick_game_dir",
+        "detect_game",
+        "use_detected_game",
         "play",
         "cancel_play",
         "clear_cache",

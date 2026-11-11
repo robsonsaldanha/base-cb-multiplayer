@@ -1,6 +1,7 @@
 <script lang="ts">
   // Resultado do Jogar: "Pronto para abrir" (modo simular, conexão sem o ticket), jogo aberto, ou erro por código.
   import { pickGameDir } from "../lib/api";
+  import GameSuggestion from "./GameSuggestion.svelte";
   import { describeError } from "../lib/errors";
   import { dismissPlay, playState } from "../lib/play";
   import { notify } from "../lib/notice";
@@ -63,6 +64,9 @@
       <button type="button" onclick={dismissPlay}>Fechar</button>
     </div>
   </section>
+  {#if needsGame}
+    <GameSuggestion />
+  {/if}
 {/if}
 
 <style>

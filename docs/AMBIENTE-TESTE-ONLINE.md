@@ -9,7 +9,7 @@ pela internet. Guia do testador: [`TESTE-ONLINE.md`](TESTE-ONLINE.md).
 | Hub | `https://cbmultiplayer.cntoficial.com.br` (Cloudflare → nginx da VPS → `127.0.0.1:8787`) |
 | Servidor de jogo | `cb-server` em `143.95.209.35:30500` (UDP do jogo + TCP/HTTP de `/info`, manifest e arquivos), conteúdo `hello-client`, sem banco |
 | Launcher | build `--features online-test` + `launcher/src-tauri/tauri.onlinetest.conf.json` ("CB Multiplayer (Teste)", identificador `br.com.castelobruxo.cbmp.teste`, pasta `%LOCALAPPDATA%\CBMultiplayer-Teste`) |
-| Releases | pasta local do Hub (`HUB_STAGING=1` + `HUB_RELEASES_DIR`): launcher 0.1.0/0.1.1 e mod `mod-p1-v0.1.0`, assinados **nesta máquina** com a chave dev |
+| Releases | pasta local do Hub (`HUB_STAGING=1` + `HUB_RELEASES_DIR`): launcher 0.1.0/0.1.1/0.1.2/0.1.3 e mod `mod-p1-v0.1.0`, assinados **nesta máquina** com a chave dev |
 | Login | app Discord do dono (o secret só existe na VPS, num arquivo que o dono cria) |
 
 O nome do Hub passa pelo proxy da Cloudflare (HTTPS). **UDP não passa pelo proxy da Cloudflare**, por isso o servidor
@@ -36,7 +36,7 @@ endereçado por hash e conferido no launcher (`content.rs`), e `143.95.209.35` �
     data/           cbmp-server 700: bans.json
     logs/           cbmp-server 700: server.log, audit-*.jsonl, anticheat-*.jsonl
     resources/      hello-client
-  download/         CB-Multiplayer-Teste-setup.exe (+ .sha256): https://cbmultiplayer.cntoficial.com.br/CB-Multiplayer-Teste-setup.exe
+  download/         CB-Multiplayer-Teste-setup.exe (+ .sha256), sempre a versão mais nova: https://cbmultiplayer.cntoficial.com.br/CB-Multiplayer-Teste-setup.exe
   acme/             webroot do certbot (renovação)
   deploy/           cópia dos arquivos de tools/teste-online/, COMMIT (repositório) e SERVER (commit + sha256 do cb-server)
 /etc/cbmp-teste/discord.env   app Discord (criado pelo DONO; root:root 600) — opcional para o Hub subir
@@ -129,8 +129,15 @@ node tools/teste-online.mjs --check
 ```
 
 - Só o Hub mudou: `--deploy --no-releases` (sem `--server-tar` o `cb-server` instalado continua).
-- Nova versão do launcher para os testadores: suba a versão em `LAUNCHER_VERSIONS` de `tools/teste-online.mjs`
-  (ex. `0.1.2`), `--build-releases`, `--deploy`. O launcher instalado oferece a atualização sozinho.
+- Nova versão do launcher para os testadores: acrescente a versão no fim de `LAUNCHER_VERSIONS` de
+  `tools/teste-online.mjs` (e a mesma versão em `Cargo.toml`, `tauri.conf.json` e `launcher/ui/package.json`),
+  `--build-releases`, `--deploy`, `--check`. Só a última versão é (re)gerada quando o código muda; as anteriores ficam
+  como foram publicadas: o sha256 de cada instalador já publicado fica em `PUBLISHED` (acrescente a versão que deixou
+  de ser a última), e o `--build-releases` **falha** se uma delas faltar na pasta local ou tiver outro sha256 (copie da
+  VPS em vez de gerar outra com o código atual; `--force` refaz todas, só para recomeçar o histórico). O instalador do
+  download passa a ser o da última. O launcher instalado oferece a atualização sozinho, e o `--check` confere que cada
+  versão anterior recebe a última, que a última recebe 204, que o instalador do download é o mesmo pacote do update e
+  que os instaladores antigos da VPS têm o sha256 de `PUBLISHED`.
 - O deploy roda `tools/teste-online/remote-install.sh install` na VPS:
   - cria os usuários de serviço (se faltarem) e acerta donos e modos;
   - `npm ci --omit=dev --ignore-scripts` do Hub com um `package-lock.json` gerado do lock do repositório (mesmas
