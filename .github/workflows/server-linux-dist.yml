@@ -39,7 +39,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends ninja-build cmake zip unzip patchelf autoconf-archive pkg-config linux-libc-dev
           git config --global --add safe.directory '*'
-          g++ --version && cmake --version && ldd --version | head -1
+          g++ --version; cmake --version; ldd --version || true
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4
         with:
