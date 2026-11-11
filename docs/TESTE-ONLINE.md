@@ -29,16 +29,18 @@ mas não é obrigatório.
 
 ## 2. Atualização automática
 
-Assim que abre, o launcher procura atualização. Este teste começa na versão **0.1.0** de propósito: existe a **0.1.1**.
+Assim que abre, o launcher procura atualização. A versão atual é a **0.1.2** (corrige a detecção do jogo na Epic).
+O instalador do passo 1 já é a 0.1.2; quem instalou antes (0.1.0 ou 0.1.1) recebe a 0.1.2 por aqui.
 
-1. No menu lateral aparece **Atualização 0.1.1 disponível**. Clique nele (ou **Configurações** → **Procurar
-   atualização**).
-2. Aparece "Versão 0.1.1 disponível." com a nota "Versão de teste 0.1.1 do launcher CB Multiplayer (Teste)".
+1. Se você está numa versão anterior: no menu lateral aparece **Atualização 0.1.2 disponível**. Clique nele (ou
+   **Configurações** → **Procurar atualização**).
+2. Aparece "Versão 0.1.2 disponível." com a nota "Versão de teste 0.1.2 do launcher CB Multiplayer (Teste)".
 3. Clique em **Instalar atualização**.
 
 **Esperado**: "Baixando e conferindo a atualização…"; o instalador roda sozinho (sem perguntas e sem SmartScreen) e o
-launcher reabre. Em **Configurações** → **Versão** aparece **v0.1.1**, e **Procurar atualização** diz "Você já está
-na versão mais recente."
+launcher reabre. Em **Configurações** → **Versão** aparece **v0.1.2**, e **Procurar atualização** diz "Você já está
+na versão mais recente." Se você instalou direto a 0.1.2, só confira a versão e o "Você já está na versão mais
+recente."
 
 ## 3. Entrar com o Discord
 
@@ -80,8 +82,22 @@ pare aqui.
 ## 6. Pasta do jogo (só se você tem o Hogwarts Legacy)
 
 Em **Configurações**, a **Pasta do jogo** deve aparecer sozinha (Steam ou Epic). O launcher só **lê** o registro e os
-arquivos da Steam/Epic; não grava nada na pasta do jogo. Se aparecer "Não encontrada", use **Escolher pasta do jogo**
-e anote no resultado que a detecção falhou.
+arquivos da Steam/Epic; não grava nada na pasta do jogo.
+
+**Epic Games**: a Epic deixa a pasta do jogo (ou o registro dela) alterável por outras contas do computador, então o
+launcher não usa essa pasta sem você confirmar. Em **Configurações** → **Pasta do jogo** aparece:
+
+> Encontramos o Hogwarts Legacy em `C:\Program Files\Epic Games\HogwartsLegacy` (Epic Games). Usar esta pasta?
+
+1. Confira se o caminho é mesmo a sua instalação e clique em **Usar esta pasta**.
+2. O Windows mostra a janela **"Pasta do Hogwarts Legacy"** repetindo o caminho. Clique em **Usar esta pasta**
+   (**Cancelar** não muda nada e a sugestão continua lá).
+
+**Esperado**: a **Pasta do jogo** passa a mostrar o caminho e a sugestão some. A mesma sugestão aparece se você
+apertar **Jogar** com o Modo simular desligado antes de confirmar.
+
+Se aparecer "Não encontrada" e nenhuma sugestão, use **Escolher pasta do jogo** e anote no resultado que a detecção
+falhou (o log diz qual verificação falhou).
 
 ## 7. Resultados
 
@@ -90,11 +106,11 @@ Copie a tabela, marque **OK** ou **FALHOU** e mande junto com o log (passo 8):
 | Passo | Resultado | Observação |
 |---|---|---|
 | 1. Instalar (SmartScreen, instalador, janela) | | |
-| 2. Atualização 0.1.0 → 0.1.1 | | |
+| 2. Atualização para 0.1.2 (ou já instalado na 0.1.2) | | |
 | 3. Login com Discord (e continua logado ao reabrir) | | |
 | 4. Lista, destaque, ping, filtros, favoritos | | |
 | 5. Jogar (modo simular): painel "Pronto para abrir" e pasta `hello-client` | | |
-| 6. Pasta do jogo encontrada sozinha (Steam/Epic?) | | |
+| 6. Pasta do jogo encontrada (Steam sozinha / Epic com "Usar esta pasta"?) | | |
 
 Diga também: versão do Windows, se é Steam ou Epic (ou sem o jogo), e o que achou estranho ou confuso.
 

@@ -1,6 +1,6 @@
 [package]
 name = "cbmp-launcher"
-version = "0.1.0"
+version = "0.1.2"
 description = "CB Multiplayer — launcher"
 edition = "2021"
 # 1.86: `remove_file` apaga arquivo somente leitura no Windows (cache e montagens copiadas são readonly).

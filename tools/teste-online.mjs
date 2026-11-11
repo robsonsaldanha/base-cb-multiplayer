@@ -2,9 +2,11 @@
 // Ambiente de TESTE ONLINE do CB Multiplayer (Hub https://cbmultiplayer.cntoficial.com.br + cb-server na VPS).
 // Ops em docs/AMBIENTE-TESTE-ONLINE.md; guia do testador em docs/TESTE-ONLINE.md.
 //
-//   node tools/teste-online.mjs --build-releases   launcher "CB Multiplayer (Teste)" 0.1.0 e 0.1.1 + mod de teste
-//                                                  mod-p1-v0.1.0, assinados com a chave dev (LOCAL; a chave nunca
-//                                                  sai desta máquina). Copia o instalador 0.1.0 para
+//   node tools/teste-online.mjs --build-releases   launcher "CB Multiplayer (Teste)" 0.1.0, 0.1.1 e 0.1.2 + mod de
+//                                                  teste mod-p1-v0.1.0, assinados com a chave dev (LOCAL; a chave
+//                                                  nunca sai desta máquina). Versões antigas já geradas ficam como
+//                                                  estão (histórico congelado); só a mais nova é refeita quando o
+//                                                  código muda. Copia o instalador da mais nova para
 //                                                  dist/CB-Multiplayer-Teste-setup.exe (o que os testadores baixam).
 //   node tools/teste-online.mjs --deploy           empacota Hub (bundle esbuild), hello-client, releases assinadas e
 //                                                  (opcional) o cb-server Linux, envia por scp e instala na VPS
@@ -20,7 +22,7 @@
 //         --dir <pasta>  trabalho local (padrão %TEMP%\cbmp-teste-online; releases em <pasta>\releases)
 //         --key <arquivo> chave privada dev (padrão %USERPROFILE%\.cbmp-devkeys\update.key; ou CBMP_DEV_KEY).
 //                         Lida só para assinar; nunca copiada, enviada ou impressa. Recusada dentro do repositório.
-//         --force        refaz releases que já existem
+//         --force        refaz releases que já existem (inclusive as antigas, com o código atual)
 //         --no-releases  --deploy sem mexer nas releases da VPS
 
 import { spawnSync } from 'node:child_process';
@@ -40,8 +42,11 @@ const GAME_PORT = 30500;
 const ROOT = '/var/www/html_cbmultiplayer';
 const SERVER_NAME = 'CB Multiplayer – Servidor de teste';
 const PRODUCT = 'CB Multiplayer (Teste)';
-const LAUNCHER_VERSIONS = ['0.1.0', '0.1.1'];
-const INSTALLER_VERSION = '0.1.0';
+// Em ordem. A última é a atual (refeita quando o código muda); as anteriores são histórico já publicado.
+const LAUNCHER_VERSIONS = ['0.1.0', '0.1.1', '0.1.2'];
+const LATEST_VERSION = LAUNCHER_VERSIONS.at(-1);
+// O instalador oferecido para download é sempre o da versão mais nova.
+const INSTALLER_VERSION = LATEST_VERSION;
 const MOD_PROTOCOL = 1;
 const MOD_VERSION = '0.1.0';
 const OVERLAY = join(REPO, 'launcher', 'src-tauri', 'tauri.onlinetest.conf.json');
@@ -115,6 +120,11 @@ function buildLauncher(rel, key, version, stamp, o) {
   const built = existsSync(join(out, exe)) && existsSync(join(out, `${exe}.sig`));
   if (!o.force && built && existsSync(stampFile) && readFileSync(stampFile, 'utf8').trim() === stamp) {
     log(`${tag}: já existe e o código do launcher não mudou`);
+    return;
+  }
+  // Versão antiga já publicada: não é refeita com o código novo (quem está nela recebe a mais nova pelo update).
+  if (!o.force && built && version !== LATEST_VERSION) {
+    log(`${tag}: versão anterior já gerada, mantida como está`);
     return;
   }
   const bundle = join(REPO, 'launcher', 'src-tauri', 'target', 'release', 'bundle', 'nsis');
@@ -295,18 +305,26 @@ async function check() {
     must(createHash('sha256').update(d.buf).digest('hex') === m.sha256, 'sha256 do zip difere');
     return `v${m.version}, ${d.buf.length} bytes`;
   });
-  await step(`update do launcher: ${INSTALLER_VERSION} → mais nova`, async () => {
-    const r = await get(`${HUB}/v1/launcher/update/windows/x86_64/${INSTALLER_VERSION}`);
-    must(r.status === 200, `HTTP ${r.status}`);
-    const u = r.json();
-    must(u.url.startsWith(`${HUB}/v1/dl/`) && u.signature, 'sem url/assinatura');
-    const comment = trustedComment(u.signature);
-    must(comment.split('\t').includes(`version:${u.version}`), `assinatura sem version:${u.version}`);
-    const d = await get(u.url, { timeout: 180000 });
-    must(d.status === 200 && d.buf.length > 1_000_000, `download HTTP ${d.status} (${d.buf.length} bytes)`);
-    const last = await get(`${HUB}/v1/launcher/update/windows/x86_64/${u.version}`);
+  let latestSha;
+  for (const from of LAUNCHER_VERSIONS.slice(0, -1)) {
+    await step(`update do launcher: ${from} → ${LATEST_VERSION}`, async () => {
+      const r = await get(`${HUB}/v1/launcher/update/windows/x86_64/${from}`);
+      must(r.status === 200, `HTTP ${r.status}`);
+      const u = r.json();
+      must(u.version === LATEST_VERSION, `oferece ${u.version}, esperado ${LATEST_VERSION}`);
+      must(u.url.startsWith(`${HUB}/v1/dl/launcher-v${LATEST_VERSION}/`) && u.signature, `url ${u.url} / sem assinatura`);
+      const comment = trustedComment(u.signature);
+      must(comment.split('	').includes(`version:${LATEST_VERSION}`), `assinatura sem version:${LATEST_VERSION}`);
+      if (latestSha) return 'mesmo pacote';
+      const d = await get(u.url, { timeout: 180000 });
+      must(d.status === 200 && d.buf.length > 1_000_000, `download HTTP ${d.status} (${d.buf.length} bytes)`);
+      latestSha = createHash('sha256').update(d.buf).digest('hex');
+      return `${d.buf.length} bytes, sha256 ${latestSha.slice(0, 16)}…`;
+    });
+  }
+  await step(`update do launcher: ${LATEST_VERSION} já é a mais nova (204)`, async () => {
+    const last = await get(`${HUB}/v1/launcher/update/windows/x86_64/${LATEST_VERSION}`);
     must(last.status === 204, `na versão mais nova devia ser 204, veio ${last.status}`);
-    return `oferece ${u.version} (${d.buf.length} bytes)`;
   });
   await step('login: redireciona para o Discord com o redirect certo (ou 503 sem app Discord)', async () => {
     const r = await get(`${HUB}/v1/auth/discord/login?client=panel`, { redirect: 'manual' });
@@ -327,7 +345,9 @@ async function check() {
     const s = await get(`${HUB}/CB-Multiplayer-Teste-setup.exe.sha256`);
     const sha = createHash('sha256').update(r.buf).digest('hex');
     must(s.status === 200 && s.text.startsWith(sha), 'sha256 publicado difere');
-    return `${r.buf.length} bytes, sha256 ${sha.slice(0, 16)}…`;
+    // O instalador do download é o mesmo pacote do update mais novo.
+    must(!latestSha || sha === latestSha, `instalador não é o ${INSTALLER_VERSION} do update`);
+    return `${INSTALLER_VERSION}, ${r.buf.length} bytes, sha256 ${sha.slice(0, 16)}…`;
   });
   await step('dev-login desligado no host público', async () => {
     const r = await get(`${HUB}/v1/auth/dev-login?client=panel&discordId=1&name=x`, { redirect: 'manual' });
