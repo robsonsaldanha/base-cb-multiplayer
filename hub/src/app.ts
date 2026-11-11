@@ -1,4 +1,4 @@
-import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
+import Fastify, { type FastifyError, type FastifyInstance, type FastifyRequest } from 'fastify';
 import cookie from '@fastify/cookie';
 import rateLimit from '@fastify/rate-limit';
 import { ZodError } from 'zod';
@@ -38,10 +38,22 @@ declare module 'fastify' {
   interface FastifyRequest { cachedUser?: UserRow | null }
 }
 
+/** URL para log: em /v1/auth/* a query (code/state do OAuth, PKCE, ids) nunca vai para o log. */
+export function redactUrl(url: string): string {
+  const q = url.indexOf('?');
+  if (q < 0 || !url.startsWith('/v1/auth/')) return url;
+  return `${url.slice(0, q)}?[redigido]`;
+}
+
+/** Serializador do pedido no log (o padrão do Fastify grava a URL inteira, com a query). */
+function logReq(req: FastifyRequest) {
+  return { method: req.method, url: redactUrl(req.url), host: req.headers.host, remoteAddress: req.ip, remotePort: req.socket?.remotePort };
+}
+
 export async function buildApp(deps: HubDeps): Promise<FastifyInstance> {
   const app = Fastify({
-    logger: deps.logStream ? { level: deps.config.logLevel === 'silent' ? 'info' : deps.config.logLevel, stream: deps.logStream }
-      : deps.config.logLevel === 'silent' ? false : { level: deps.config.logLevel },
+    logger: deps.logStream ? { level: deps.config.logLevel === 'silent' ? 'info' : deps.config.logLevel, stream: deps.logStream, serializers: { req: logReq } }
+      : deps.config.logLevel === 'silent' ? false : { level: deps.config.logLevel, serializers: { req: logReq } },
     trustProxy: deps.config.trustProxy,
     bodyLimit: 64 * 1024,
   });
@@ -75,7 +87,8 @@ export async function buildApp(deps: HubDeps): Promise<FastifyInstance> {
   });
   app.setNotFoundHandler((_req, reply) => reply.status(404).send({ error: 'not_found', message: 'rota não encontrada' }));
 
-  app.get('/health', async () => ({ ok: true }));
+  // Hub de teste (HUB_STAGING) se identifica no /health, para monitoração notar um staging fora do lugar.
+  app.get('/health', async () => (deps.config.staging ? { ok: true, staging: true } : { ok: true }));
   await app.register(authRoutes);
   await app.register(ownerRoutes);
   await app.register(ticketRoutes);

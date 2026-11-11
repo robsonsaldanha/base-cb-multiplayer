@@ -25,27 +25,34 @@ endereçado por hash e conferido no launcher (`content.rs`), e `143.95.209.35` �
 ## Layout na VPS
 
 ```
-/var/www/html_cbmultiplayer/            dono: usuário do deploy
-  hub/              main.mjs + cli.mjs (bundle esbuild do hub/), package.json, node_modules/ (better-sqlite3)
+/var/www/html_cbmultiplayer/            dono: usuário do deploy (código só leitura para os serviços)
+  hub/              main.mjs + cli.mjs (bundle esbuild do hub/), package.json + package-lock.json, node_modules/
   hub.env           configuração do Hub (sem segredos; fonte: tools/teste-online/hub.env)
-  hub-data/         hub.sqlite + keys/ (chaves de assinatura dos tickets)            modo 700
+  hub-data/         cbmp-hub 700: hub.sqlite, keys/ (chaves dos tickets), test-server.json ({serverId, key}, 600)
   releases/         <tag>/<asset> servidos por /v1/launcher/update, /v1/mod/latest e /v1/dl
   server/
     bin/            cb-server + libmariadb.so* + plugins/ (pacote do workflow server-linux-dist); bin.old = anterior
-    server.cfg      gerado no deploy (contém a chave do servidor no Hub)                modo 600
-    data/           hub-server.json ({serverId, key}, modo 600), bans.json              modo 700
-    logs/           server.log, audit-*.jsonl, anticheat-*.jsonl
+    server.cfg      cbmp-server 600: gerado no deploy (contém a chave do servidor no Hub)
+    data/           cbmp-server 700: bans.json
+    logs/           cbmp-server 700: server.log, audit-*.jsonl, anticheat-*.jsonl
     resources/      hello-client
   download/         CB-Multiplayer-Teste-setup.exe (+ .sha256): https://cbmultiplayer.cntoficial.com.br/CB-Multiplayer-Teste-setup.exe
   acme/             webroot do certbot (renovação)
-  deploy/           cópia dos arquivos de tools/teste-online/ + COMMIT do último deploy
+  deploy/           cópia dos arquivos de tools/teste-online/, COMMIT (repositório) e SERVER (commit + sha256 do cb-server)
 /etc/cbmp-teste/discord.env   app Discord (criado pelo DONO; root:root 600) — opcional para o Hub subir
 ```
 
 Fora da pasta, só isto pertence ao ambiente:
 
-- `/etc/systemd/system/cbmp-hub-teste.service` e `cbmp-server-teste.service` (`User=` o usuário do deploy,
-  `Restart=on-failure`, `MemoryMax` 300M/400M, `ProtectSystem=strict`, escrita só em `hub-data/` e `server/{data,logs}`);
+- usuários de sistema `cbmp-hub` e `cbmp-server` (`useradd --system`, sem shell, sem home, sem sudo), um por serviço:
+  o `cb-server` não lê `hub-data` (chaves do Hub) e nenhum dos dois lê `/etc/cbmp-teste`;
+- `/etc/systemd/system/cbmp-hub-teste.service` e `cbmp-server-teste.service`: `Restart=on-failure`, `MemoryMax`
+  300M/400M, `UMask=0077` e sandbox (`TemporaryFileSystem=/var/www:ro` com `BindReadOnlyPaths` só do próprio código: os
+  outros projetos de `/var/www` nem aparecem; `InaccessiblePaths=/etc/cbmp-teste`; `ProtectSystem=strict`,
+  `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `PrivateUsers`, `ProtectProc=invisible`, `ProtectKernel*`,
+  `ProtectControlGroups`, `RestrictAddressFamilies`, `RestrictNamespaces`, `LockPersonality`,
+  `CapabilityBoundingSet=` vazio, `SystemCallFilter=@system-service` menos privilegiados; `MemoryDenyWriteExecute` só
+  no `cb-server`, porque o JIT do Node precisa de páginas W+X). Nota do `systemd-analyze security`: veja o relatório;
 - `/etc/nginx/sites-available/cbmultiplayer.cntoficial.com.br` + link em `sites-enabled/`;
 - certificado Let's Encrypt `cbmultiplayer.cntoficial.com.br` (`certbot --webroot`, renovação pelo `certbot.timer` da
   VPS com `--deploy-hook "systemctl reload nginx"`);
@@ -104,13 +111,16 @@ O `cb-server` usa o OpenSSL estático do vcpkg; a unit aponta `SSL_CERT_FILE`/`S
 Tudo pela máquina de desenvolvimento (Windows, Git Bash ou PowerShell), com chave SSH já autorizada na VPS:
 
 ```bash
-export CBMP_TESTE_SSH='<usuario>@143.95.209.35'      # porta 22022 (CBMP_TESTE_SSH_PORT muda)
+export CBMP_TESTE_SSH='<usuario>@143.95.209.35'
+export CBMP_TESTE_SSH_PORT='<porta-ssh>'              # padrão 22
 # 1) releases assinadas (local; a chave dev nunca sai desta máquina) + dist/CB-Multiplayer-Teste-setup.exe
 node tools/teste-online.mjs --build-releases
-# 2) cb-server Linux do CI (último run verde do workflow server-linux-dist)
+# 2) cb-server Linux do CI (último run verde do workflow server-linux-dist). O resumo do run mostra o commit e o
+#    sha256 do pacote; os dois são conferidos aqui e de novo na VPS antes de instalar.
 gh run download <run-id> -n cb-server-linux-x64 -D "$TEMP/cbmp-srv"
 # 3) envia e instala (Hub, hello-client, releases, cb-server, units, nginx)
-node tools/teste-online.mjs --deploy --server-tar "$TEMP/cbmp-srv/cb-server-linux-x64.tar.gz"
+node tools/teste-online.mjs --deploy --server-tar "$TEMP/cbmp-srv/cb-server-linux-x64.tar.gz" \
+  --server-sha256 <sha256 do resumo> --server-commit <commit do resumo>
 # primeira vez apenas: certificado e firewall
 node tools/teste-online.mjs --cert
 node tools/teste-online.mjs --firewall
@@ -121,23 +131,31 @@ node tools/teste-online.mjs --check
 - Só o Hub mudou: `--deploy --no-releases` (sem `--server-tar` o `cb-server` instalado continua).
 - Nova versão do launcher para os testadores: suba a versão em `LAUNCHER_VERSIONS` de `tools/teste-online.mjs`
   (ex. `0.1.2`), `--build-releases`, `--deploy`. O launcher instalado oferece a atualização sozinho.
-- O deploy roda `tools/teste-online/remote-install.sh install` na VPS: copia os arquivos, `npm install --omit=dev` do
-  Hub, troca o `cb-server` (o anterior fica em `bin.old`), instala as units, reinicia os dois serviços, cadastra o
-  servidor (`ensure-server`), gera o `server.cfg` e aplica o site nginx (sempre com `nginx -t` antes do reload; recusa
-  se outro site já usar o nome).
+- O deploy roda `tools/teste-online/remote-install.sh install` na VPS:
+  - cria os usuários de serviço (se faltarem) e acerta donos e modos;
+  - `npm ci --omit=dev --ignore-scripts` do Hub com um `package-lock.json` gerado do lock do repositório (mesmas
+    versões e hashes; nenhum script de pacote roda; o binário nativo do better-sqlite3 já vem no pacote);
+  - confere sha256 e commit do pacote do `cb-server` antes de extrair (nada do pacote roda como o usuário do deploy) e
+    troca o binário (o anterior fica em `bin.old`; se o novo não sobe, volta sozinho para o anterior);
+  - instala as units, reinicia os serviços, cadastra o servidor (`ensure-server`, rodado como `cbmp-hub`), gera o
+    `server.cfg` (só do `cbmp-server`);
+  - aplica o site nginx: recusa se outro site usa o nome; faz backup, `nginx -t` e, se falhar, restaura o arquivo e o
+    link anteriores (ou remove na primeira instalação) e não recarrega. Teste: `tools/test/teste-online-nginx.test.mjs`
+    (precisa de links simbólicos; no Windows é pulado, roda no Linux).
 
 ## Logs e estado
 
 ```bash
-ssh -p 22022 <usuario>@143.95.209.35
+ssh -p <porta-ssh> <usuario>@143.95.209.35
 journalctl -u cbmp-hub-teste -n 200 --no-pager         # Hub (JSON do pino; nunca tokens/segredos)
 journalctl -u cbmp-server-teste -n 200 --no-pager      # cb-server (também em server/logs/server.log)
 bash /var/www/html_cbmultiplayer/deploy/remote-install.sh status
 sudo systemctl restart cbmp-hub-teste cbmp-server-teste
 ```
 
-O Hub em `HUB_LOG_LEVEL=info` registra cada pedido (método, URL, IP real). A URL do callback do Discord traz o
-`code` OAuth (uso único, já consumido na hora); se isso incomodar, use `HUB_LOG_LEVEL=warn` em `hub.env`.
+O Hub em `HUB_LOG_LEVEL=info` registra cada pedido (método, URL, IP real). Em `/v1/auth/*` a query é trocada por
+`?[redigido]` no log (o `code`/`state` do OAuth nunca é gravado). O journal guarda os IPs dos testadores (dado
+pessoal) pelo tempo de retenção do journald da VPS; apague o histórico do serviço ao fim dos testes se precisar.
 
 ## Login com Discord (dono)
 
@@ -156,13 +174,15 @@ O Hub em `HUB_LOG_LEVEL=info` registra cada pedido (método, URL, IP real). A UR
    ```
 
    Opcional: para usar a rota de destaque como admin da plataforma, acrescente `HUB_PLATFORM_ADMINS=<seu Discord ID>`
-   no mesmo arquivo.
+   no mesmo arquivo. O arquivo é lido pelo systemd (como root) antes de iniciar o Hub; o processo do Hub não enxerga
+   `/etc/cbmp-teste`. Sem o arquivo o Hub sobe normalmente.
 5. Confira: `node tools/teste-online.mjs --check` (o passo de login passa a mostrar o `client_id`).
 
 ## Parar e remover
 
 - Parar: `sudo systemctl stop cbmp-server-teste cbmp-hub-teste` (e `disable` para não voltar no boot).
-- Remover tudo (units, site nginx, certificado, regras do ufw e a pasta inteira, inclusive o banco do Hub de teste):
+- Remover tudo (units, site nginx, certificado, as regras do ufw com o comentário `CB Multiplayer teste`, a pasta
+  inteira, inclusive o banco do Hub de teste, e os usuários `cbmp-hub`/`cbmp-server`):
 
   ```bash
   bash /var/www/html_cbmultiplayer/deploy/remote-install.sh uninstall --yes
@@ -176,7 +196,7 @@ O Hub em `HUB_LOG_LEVEL=info` registra cada pedido (método, URL, IP real). A UR
 - O e2e do launcher (`launcher/src-tauri/tests/e2e.rs`) usa dev-login e não roda contra este Hub (dev-login nunca é
   ligado aqui). O `--check` cobre o mesmo caminho sem login: Hub, lista, servidor online, `/info`, manifest, download
   e hash de cada arquivo, mod, update e redirect do login.
-- Os dois builds (oficial/"Teste local"/"Teste") registram o esquema `cbmp://`: com mais de um instalado, o login cai
+- Os três builds (oficial/"Teste local"/"Teste") registram o esquema `cbmp://`: com mais de um instalado, o login cai
   no último instalado.
 - Releases de teste assinadas com a chave **dev**: quando o par de produção entrar em `keys/update.pub`, o launcher de
   teste também passa a recusar essas releases (gere um par de teste ou embuta a pública dev só neste perfil).

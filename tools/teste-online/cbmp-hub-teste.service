@@ -1,5 +1,8 @@
 # CB Multiplayer: Hub do ambiente de TESTE online (https://cbmultiplayer.cntoficial.com.br, atrás do nginx).
-# Instalado por tools/teste-online/remote-install.sh (@USER@ = usuário que roda o deploy). docs/AMBIENTE-TESTE-ONLINE.md
+# Instalado por tools/teste-online/remote-install.sh. docs/AMBIENTE-TESTE-ONLINE.md
+# Roda como o usuário de sistema `cbmp-hub` (sem shell, sem sudo). Só enxerga, de /var/www, o próprio código e as
+# releases (leitura) e hub-data (escrita). /etc/cbmp-teste é lido pelo systemd (EnvironmentFile) antes de entrar no
+# sandbox e fica invisível para o processo.
 [Unit]
 Description=CB Multiplayer - Hub de teste (cbmultiplayer.cntoficial.com.br)
 After=network-online.target
@@ -7,8 +10,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=@USER@
-Group=@USER@
+User=cbmp-hub
+Group=cbmp-hub
 WorkingDirectory=/var/www/html_cbmultiplayer/hub
 EnvironmentFile=/var/www/html_cbmultiplayer/hub.env
 # App Discord (DISCORD_CLIENT_ID/DISCORD_CLIENT_SECRET, opcional HUB_PLATFORM_ADMINS): arquivo criado pelo dono,
@@ -19,11 +22,40 @@ Restart=on-failure
 RestartSec=5
 MemoryMax=300M
 TasksMax=128
-NoNewPrivileges=true
-PrivateTmp=true
+UMask=0077
+
+# --- sandbox
+TemporaryFileSystem=/var/www:ro
+BindReadOnlyPaths=/var/www/html_cbmultiplayer/hub /var/www/html_cbmultiplayer/releases
+BindPaths=/var/www/html_cbmultiplayer/hub-data
+InaccessiblePaths=-/etc/cbmp-teste
+NoNewPrivileges=yes
 ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/www/html_cbmultiplayer/hub-data
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @reboot @swap @obsolete @cpu-emulation @debug @raw-io
+SystemCallErrorNumber=EPERM
+# Node/V8 precisa de páginas W+X (JIT): MemoryDenyWriteExecute quebra o Hub.
 
 [Install]
 WantedBy=multi-user.target

@@ -19,9 +19,25 @@ pub const ONLINE_TEST: bool = cfg!(feature = "online-test");
 #[cfg(all(feature = "local-test", feature = "online-test"))]
 compile_error!("as features `local-test` e `online-test` são mutuamente exclusivas");
 
+/// Regra única de quando a rede fica relaxada: só em debug ou no teste local. **Nunca** no release oficial nem no
+/// de teste online (público). `tests/config_guard.rs` confere a tabela inteira.
+pub const fn relaxed_network_for(debug: bool, local_test: bool, online_test: bool) -> bool {
+    let _ = online_test; // o teste online segue as regras do oficial
+    debug || local_test
+}
+
 /// Regras de rede relaxadas: `http://` de loopback para o Hub e o navegador, servidores de jogo em loopback e redes
-/// privadas. Debug ou teste local; nunca no release oficial.
-pub const RELAXED_NETWORK: bool = cfg!(debug_assertions) || LOCAL_TEST;
+/// privadas. Debug ou teste local; nunca no release oficial nem no teste online.
+pub const RELAXED_NETWORK: bool =
+    relaxed_network_for(cfg!(debug_assertions), LOCAL_TEST, ONLINE_TEST);
+
+// Trava em tempo de compilação: o release do teste online (o exe dos testadores) nunca relaxa a rede. Se alguém mudar
+// a regra, o build release com `--features online-test` (CI `launcher` e tools/teste-online.mjs) deixa de compilar.
+#[cfg(all(feature = "online-test", not(debug_assertions)))]
+const _: () = assert!(
+    !RELAXED_NETWORK,
+    "o build de teste online não pode relaxar as regras de rede"
+);
 
 /// Hub do build de teste local (o Hub de `tools/dev-env.mjs`; IPv4 literal, como o `cb-server` usa).
 pub const LOCAL_TEST_HUB_URL: &str = "http://127.0.0.1:8787";
@@ -35,12 +51,5 @@ mod tests {
     fn testes_rodam_com_regras_relaxadas() {
         // `cargo test` é debug: as regras relaxadas valem com ou sem a feature.
         const { assert!(super::RELAXED_NETWORK) };
-    }
-
-    #[test]
-    fn teste_online_nao_relaxa_a_rede_no_release() {
-        // O teste online usa as regras do oficial: só o debug (`cargo test`) relaxa.
-        assert_eq!(super::RELAXED_NETWORK, cfg!(debug_assertions) || super::LOCAL_TEST);
-        assert!(super::ONLINE_TEST_HUB_URL.starts_with("https://"));
     }
 }

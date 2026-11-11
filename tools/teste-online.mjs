@@ -13,8 +13,10 @@
 //   node tools/teste-online.mjs --status           estado dos serviços na VPS
 //   node tools/teste-online.mjs --check            valida pela internet (Hub, lista, conteúdo, mod, update, login)
 //
-// Opções: --ssh <usuario@host> (ou CBMP_TESTE_SSH; porta 22022 ou CBMP_TESTE_SSH_PORT)
+// Opções: --ssh <usuario@host> (ou CBMP_TESTE_SSH; porta em CBMP_TESTE_SSH_PORT, padrão 22)
 //         --server-tar <cb-server-linux-x64.tar.gz>  pacote do workflow server-linux-dist (gh run download ...)
+//         --server-sha256 <hex> --server-commit <sha>  obrigatórios com --server-tar: sha256 e commit do resumo do run;
+//                        conferidos aqui e de novo na VPS antes de instalar
 //         --dir <pasta>  trabalho local (padrão %TEMP%\cbmp-teste-online; releases em <pasta>\releases)
 //         --key <arquivo> chave privada dev (padrão %USERPROFILE%\.cbmp-devkeys\update.key; ou CBMP_DEV_KEY).
 //                         Lida só para assinar; nunca copiada, enviada ou impressa. Recusada dentro do repositório.
@@ -28,6 +30,7 @@ import { homedir, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { sourceStamp } from './lib/source-stamp.mjs';
+import { hubLockfile } from './lib/hub-lockfile.mjs';
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const HOST = 'cbmultiplayer.cntoficial.com.br';
@@ -56,6 +59,8 @@ function parseArgs(argv) {
         o.cmd = a.slice(2); break;
       case '--ssh': o.ssh = val(); break;
       case '--server-tar': o.serverTar = resolve(val()); break;
+      case '--server-sha256': o.serverSha = val().toLowerCase(); break;
+      case '--server-commit': o.serverCommit = val().toLowerCase(); break;
       case '--dir': o.dir = val(); break;
       case '--key': o.key = val(); break;
       case '--force': o.force = true; break;
@@ -155,7 +160,7 @@ function buildReleases(o) {
 function sshTarget(o) {
   const t = o.ssh ?? process.env.CBMP_TESTE_SSH;
   if (!t || !/^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+$/.test(t)) fail('informe --ssh usuario@host (ou CBMP_TESTE_SSH)');
-  return { target: t, port: process.env.CBMP_TESTE_SSH_PORT ?? '22022' };
+  return { target: t, port: process.env.CBMP_TESTE_SSH_PORT ?? '22' };
 }
 
 function ssh(o, command, opts = {}) {
@@ -172,10 +177,11 @@ function deploy(o) {
   run(process.execPath, [esbuild, 'hub/src/main.ts', 'hub/src/cli.ts', '--bundle', '--platform=node', '--format=esm', '--target=node22',
     '--external:better-sqlite3', `--outdir=${join(stage, 'hub')}`, '--out-extension:.js=.mjs', '--log-level=warning',
     "--banner:js=import { createRequire as __cbmpRequire } from 'node:module'; const require = __cbmpRequire(import.meta.url);"], { cwd: REPO });
-  const sqliteVersion = JSON.parse(readFileSync(join(REPO, 'node_modules', 'better-sqlite3', 'package.json'), 'utf8')).version;
-  writeFileSync(join(stage, 'hub', 'package.json'), JSON.stringify({
-    name: 'cbmp-hub-teste', private: true, type: 'module', dependencies: { 'better-sqlite3': sqliteVersion },
-  }, null, 2) + '\n');
+  // Mesmas versões e hashes de integridade do package-lock do repositório; na VPS, npm ci --ignore-scripts.
+  let hubPkg;
+  try { hubPkg = hubLockfile(JSON.parse(readFileSync(join(REPO, 'package-lock.json'), 'utf8'))); } catch (e) { fail(e.message); }
+  writeFileSync(join(stage, 'hub', 'package.json'), JSON.stringify(hubPkg.pkg, null, 2) + '\n');
+  writeFileSync(join(stage, 'hub', 'package-lock.json'), JSON.stringify(hubPkg.lock, null, 2) + '\n');
   copyFileSync(join(REPO, 'tools', 'teste-online', 'hub.env'), join(stage, 'hub.env'));
   cpSync(join(REPO, 'tools', 'teste-online'), join(stage, 'teste-online'), { recursive: true });
   cpSync(join(REPO, 'resources.example', 'hello-client'), join(stage, 'resources', 'hello-client'), { recursive: true });
@@ -192,7 +198,18 @@ function deploy(o) {
   }
   if (o.serverTar) {
     if (!existsSync(o.serverTar)) fail(`pacote do cb-server não encontrado: ${o.serverTar}`);
+    if (!/^[0-9a-f]{64}$/.test(o.serverSha ?? '')) fail('--server-sha256 <hex> (resumo do run server-linux-dist) é obrigatório com --server-tar');
+    if (!/^[0-9a-f]{40}$/.test(o.serverCommit ?? '')) fail('--server-commit <sha de 40 dígitos> é obrigatório com --server-tar');
+    const got = createHash('sha256').update(readFileSync(o.serverTar)).digest('hex');
+    if (got !== o.serverSha) fail(`sha256 do pacote não confere: esperado ${o.serverSha}, arquivo ${got}`);
     copyFileSync(o.serverTar, join(stage, 'cb-server-linux-x64.tar.gz'));
+    // tar do Windows: caminho relativo (o "C:" de um absoluto viraria host remoto).
+    const c = spawnSync('tar', ['-xzOf', 'cb-server-linux-x64.tar.gz', 'cb-server-linux-x64/COMMIT'], { cwd: stage, encoding: 'utf8' });
+    const inner = (c.stdout ?? '').trim();
+    if (inner !== o.serverCommit) fail(`COMMIT de dentro do pacote (${inner || '?'}) difere de --server-commit ${o.serverCommit}`);
+    writeFileSync(join(stage, 'SERVER_SHA256'), `${o.serverSha}\n`);
+    writeFileSync(join(stage, 'SERVER_COMMIT'), `${o.serverCommit}\n`);
+    log(`cb-server: commit ${o.serverCommit} e sha256 ${o.serverSha} conferidos`);
   }
   const commit = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: REPO, encoding: 'utf8' }).stdout.trim();
   writeFileSync(join(stage, 'COMMIT'), `${commit}\n`);

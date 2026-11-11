@@ -3,6 +3,8 @@ import { loadConfig } from '../src/config';
 import { openDb } from '../src/db';
 import { Store } from '../src/store';
 import { ensureSystemServer, SYSTEM_DISCORD_ID } from '../src/admin-tool';
+import { PassThrough } from 'node:stream';
+import { redactUrl } from '../src/app';
 import { makeTestApp, T0 } from './helpers';
 
 const stg = { HUB_STAGING: '1', HUB_PUBLIC_URL: 'https://teste.exemplo.com.br', HUB_TRUST_PROXY: '127.0.0.1' };
@@ -53,7 +55,7 @@ describe('login sem app Discord configurado', () => {
   });
   it('o resto do Hub funciona sem o app Discord', async () => {
     const { app } = await makeTestApp({ config: { staging: true, discordClientId: '', discordClientSecret: '' } });
-    expect((await app.inject({ method: 'GET', url: '/health' })).json()).toEqual({ ok: true });
+    expect((await app.inject({ method: 'GET', url: '/health' })).json()).toEqual({ ok: true, staging: true });
     expect((await app.inject({ method: 'GET', url: '/v1/servers' })).statusCode).toBe(200);
   });
 });
@@ -88,5 +90,24 @@ describe('ensureSystemServer (cli ensure-server)', () => {
   it('nome inválido é recusado', () => {
     const store = new Store(openDb(':memory:'));
     expect(() => ensureSystemServer(store, { ...input, name: 'x' }, T0)).toThrow();
+  });
+});
+
+describe('log sem query de /v1/auth', () => {
+  it('redactUrl só mexe em /v1/auth/* com query', () => {
+    expect(redactUrl('/v1/auth/discord/callback?code=abc&state=xyz')).toBe('/v1/auth/discord/callback?[redigido]');
+    expect(redactUrl('/v1/auth/discord/login')).toBe('/v1/auth/discord/login');
+    expect(redactUrl('/v1/servers?x=1')).toBe('/v1/servers?x=1');
+  });
+  it('o callback do Discord não grava code/state no log', async () => {
+    const lines: string[] = [];
+    const logStream = new PassThrough();
+    logStream.on('data', (b: Buffer) => lines.push(b.toString('utf8')));
+    const { app } = await makeTestApp({ logStream, config: { logLevel: 'info' } });
+    await app.inject({ method: 'GET', url: '/v1/auth/discord/callback?code=SEGREDO123&state=ESTADO456' });
+    const all = lines.join('');
+    expect(all).toContain('/v1/auth/discord/callback?[redigido]');
+    expect(all).not.toContain('SEGREDO123');
+    expect(all).not.toContain('ESTADO456');
   });
 });

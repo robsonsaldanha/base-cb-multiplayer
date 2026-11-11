@@ -50,7 +50,8 @@ na versão mais recente."
 **Esperado**: o launcher mostra a lista de servidores com o seu nome do Discord e o botão **Sair**. Feche e abra o
 launcher: continua logado.
 
-Se a página disser **"login com Discord ainda não configurado neste Hub"**, o login ainda não foi ligado: avise e
+Se o navegador mostrar um texto técnico com `login_unavailable` e "login com Discord ainda não configurado neste
+Hub", o login ainda não foi ligado: avise e
 pare aqui.
 
 ## 4. Lista de servidores

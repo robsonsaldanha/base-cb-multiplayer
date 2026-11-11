@@ -781,6 +781,44 @@ fn overlay_de_teste_online_so_muda_o_permitido_e_segue_as_regras_do_oficial() {
 }
 
 #[test]
+fn regra_de_rede_relaxada_por_perfil() {
+    use cbmp_launcher_lib::profile::{
+        relaxed_network_for, LOCAL_TEST, ONLINE_TEST, RELAXED_NETWORK,
+    };
+    // Release: oficial e teste online (público) SEMPRE estritos; só o teste local relaxa.
+    assert!(
+        !relaxed_network_for(false, false, false),
+        "release oficial relaxado"
+    );
+    assert!(
+        !relaxed_network_for(false, false, true),
+        "release do teste online relaxado"
+    );
+    assert!(
+        relaxed_network_for(false, true, false),
+        "teste local deve aceitar loopback/LAN"
+    );
+    // Debug (cargo test / tauri dev) relaxa em qualquer perfil.
+    assert!(relaxed_network_for(true, false, false));
+    assert!(relaxed_network_for(true, false, true));
+    // A constante usada pelo app vem da regra (não de uma conta paralela).
+    assert_eq!(
+        RELAXED_NETWORK,
+        relaxed_network_for(cfg!(debug_assertions), LOCAL_TEST, ONLINE_TEST)
+    );
+    // E o código-fonte não tem outra definição escondida.
+    let src: String = read(&root().join("src/profile.rs"))
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(
+        src.contains("pubconstRELAXED_NETWORK:bool=relaxed_network_for(cfg!(debug_assertions),LOCAL_TEST,ONLINE_TEST);"),
+        "RELAXED_NETWORK precisa vir de relaxed_network_for"
+    );
+    assert_eq!(src.matches("RELAXED_NETWORK:bool").count(), 1);
+}
+
+#[test]
 fn feature_local_test_so_por_flag_explicita() {
     let manifest: toml::Table = toml::from_str(&read(&root().join("Cargo.toml"))).unwrap();
     let features = manifest["features"].as_table().expect("[features]");
