@@ -122,7 +122,8 @@ o de produção). Os dados dele são digitados só na janela do terminal, nunca 
 1. Em `C:\cbmp-kit\cbmp-kit-teste-sub4`, dê dois cliques em **`INICIAR.cmd`**. Abre uma janela preta: **deixe-a
    aberta durante todo o teste** (fechá-la desliga o Hub e o servidor).
 2. Se aparecer **"O Firewall do Windows Defender bloqueou alguns recursos deste aplicativo"** (para `cb-server.exe`
-   ou `node.exe`): pode clicar **Cancelar**. Tudo roda dentro do próprio PC e o firewall não bloqueia isso.
+   ou `node.exe`): clique **Cancelar** (recomendado). O teste todo acontece dentro do próprio PC, que o firewall
+   não bloqueia; "Cancelar" só impede que outros PCs da rede alcancem a porta 30500 do `cb-server`.
 
 **Esperado** (em até 1 minuto), na janela preta:
 
@@ -455,7 +456,10 @@ deixe o modo simular marcado.)
   local de teste, com a chave de **desenvolvimento**.
 - **Assinatura Authenticode** do instalador (por isso o SmartScreen avisa) e o instalador **oficial** "CB
   Multiplayer": este é o build "Teste local", que só conversa com `127.0.0.1:8787` e usa outra pasta de dados.
-- **Outros jogadores / outro PC**: o servidor de teste só aceita conexões deste PC.
+- **Outros jogadores / outro PC**: o Hub de teste só aceita conexões deste PC e anuncia o servidor como
+  `127.0.0.1`, então nenhum outro PC consegue entrar (o `cb-server` escuta em todas as interfaces na porta 30500,
+  mas sem o Hub não há como conseguir um ticket; deixando o firewall bloqueado, como no passo 4, nem a porta fica
+  acessível de fora).
 
 ---
 
