@@ -3,6 +3,7 @@
   import { onMount } from "svelte";
   import { appVersion, checkUpdate, clearCache, installUpdate, pickGameDir, toApiError } from "../lib/api";
   import { describeError, type ErrorView } from "../lib/errors";
+  import GameSuggestion from "../components/GameSuggestion.svelte";
   import { settings, updateSettings } from "../lib/settings";
   import { updateInfo } from "../lib/update";
 
@@ -100,6 +101,7 @@
     <h2 id="s-game">Pasta do jogo</h2>
     <p class="path">{$settings?.gameDir ?? "Não encontrada"}</p>
     <p class="hint">O launcher procura o Hogwarts Legacy na Steam e na Epic. Se não achar, escolha a pasta.</p>
+    <GameSuggestion />
     <button type="button" disabled={busy === "pick"} onclick={pick}>Escolher pasta do jogo</button>
   </section>
 

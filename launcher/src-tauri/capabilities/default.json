@@ -13,6 +13,8 @@
     "allow-logout",
     "allow-me",
     "allow-pick-game-dir",
+    "allow-detect-game",
+    "allow-use-detected-game",
     "allow-play",
     "allow-cancel-play",
     "allow-clear-cache",

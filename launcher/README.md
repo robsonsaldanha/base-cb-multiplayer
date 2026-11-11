@@ -266,7 +266,12 @@ O instalador NSIS é por usuário (sem administrador). Ele **não** tem assinatu
   `game_invalid`). Como qualquer usuário local cria arquivos em `%ProgramData%`, um resultado da Epic só vale se o
   `.item`, a pasta do jogo, o executável e `Phoenix\Binaries\Win64` tiverem dono SYSTEM, Administradores,
   TrustedInstaller ou o usuário atual e nenhuma outra conta com direito de escrita (dono e DACL lidos com
-  `GetNamedSecurityInfoW`).
+  `GetNamedSecurityInfoW`) para ser usado sozinho. O launcher da Epic costuma deixar esses caminhos graváveis por
+  outras contas: um resultado válido que falha nessa regra vira **sugestão** (`game::Detection::Candidate`; o log diz
+  qual verificação falhou: manifest, pasta do jogo, executável ou Binaries). `detect_game` devolve a sugestão sem
+  gravá-la; `use_detected_game(dir)` procura de novo, só aceita se achou exatamente `dir`, pede confirmação num
+  diálogo nativo (fora do alcance da UI) e grava pelo mesmo caminho do seletor (`validate_game_dir` +
+  `set_game_dir`). A UI nunca define `gameDir`.
 - **Mod**: `GET /v1/mod/latest?protocol=N` → zip baixado do próprio Hub (3 tentativas), tamanho e sha256 conferidos,
   assinatura minisign com a mesma chave do updater. O comentário confiável da assinatura tem de ser exatamente
   `cbmp-mod protocol=<N> version=<X.Y.Z> sha256=<hex>` e bater com o protocolo pedido, a versão anunciada e o zip

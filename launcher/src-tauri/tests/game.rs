@@ -352,9 +352,317 @@ fn confianca_real_pelo_dono_e_pela_dacl() {
     icacls(&game_dir, &["/grant", "*S-1-1-0:(W)"]);
     assert!(!game::SystemTrust.trusted(&game_dir));
     assert_eq!(locate(&FakeRegistry::default(), &roots), None);
+    // ... mas vira sugestão para o usuário confirmar, dizendo o que falhou.
+    assert_eq!(
+        game::detect(&FakeRegistry::default(), &roots),
+        game::Detection::Candidate(game::GameCandidate {
+            dir: game_dir.clone(),
+            store: Store::Epic,
+            failed: vec![game::TrustCheck::GameDir],
+        })
+    );
     icacls(&game_dir, &["/remove:g", "*S-1-1-0"]);
     assert!(game::SystemTrust.trusted(&game_dir));
     // Idem no próprio `.item`.
     icacls(&item, &["/grant", "*S-1-5-32-545:(M)"]);
     assert_eq!(locate(&FakeRegistry::default(), &roots), None);
+    assert!(matches!(
+        game::detect(&FakeRegistry::default(), &roots),
+        game::Detection::Candidate(c) if c.failed == vec![game::TrustCheck::Manifest] && c.dir == game_dir
+    ));
+}
+
+// ----- Epic não confiável vira sugestão (nunca usada sozinha) -----
+
+use cbmp_launcher_lib::commands::{adopt_detected, detect_game_with, AppState};
+use game::{Detection, GameCandidate, TrustCheck};
+use std::cell::Cell;
+
+fn candidate(dir: &Path, failed: Vec<TrustCheck>) -> Detection {
+    Detection::Candidate(GameCandidate {
+        dir: dir.to_path_buf(),
+        store: Store::Epic,
+        failed,
+    })
+}
+
+#[test]
+fn deteccao_epic_confiavel_e_usada_direto() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (roots, _, game_dir) = epic_setup(tmp.path());
+    match game::detect_with(&FakeRegistry::default(), &roots, &Distrust(vec![])) {
+        Detection::Trusted(g) => assert_eq!((g.store, g.dir), (Store::Epic, game_dir)),
+        other => panic!("esperava instalação confiável: {other:?}"),
+    }
+}
+
+#[test]
+fn deteccao_epic_manifest_nao_confiavel_vira_candidata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (roots, item, game_dir) = epic_setup(tmp.path());
+    let reg = FakeRegistry::default();
+    let d = game::detect_with(&reg, &roots, &Distrust(vec![item.clone()]));
+    assert_eq!(d, candidate(&game_dir, vec![TrustCheck::Manifest]));
+    // E nunca vira instalação utilizável sozinha.
+    assert_eq!(game::locate_with(&reg, &roots, &Distrust(vec![item])), None);
+}
+
+#[test]
+fn deteccao_epic_pasta_nao_confiavel_vira_candidata_com_as_verificacoes_que_falharam() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (roots, item, game_dir) = epic_setup(tmp.path());
+    let exe = game_dir.join("HogwartsLegacy.exe");
+    let bins = game_dir.join("Phoenix").join("Binaries").join("Win64");
+    let reg = FakeRegistry::default();
+    for (distrust, failed) in [
+        (vec![game_dir.clone()], vec![TrustCheck::GameDir]),
+        (vec![exe.clone()], vec![TrustCheck::Exe]),
+        (vec![bins.clone()], vec![TrustCheck::Binaries]),
+        // Caso real provável da Epic: tudo gravável pelo grupo Usuários.
+        (
+            vec![item, game_dir.clone(), exe, bins],
+            vec![
+                TrustCheck::Manifest,
+                TrustCheck::GameDir,
+                TrustCheck::Exe,
+                TrustCheck::Binaries,
+            ],
+        ),
+    ] {
+        assert_eq!(
+            game::detect_with(&reg, &roots, &Distrust(distrust)),
+            candidate(&game_dir, failed)
+        );
+        assert_eq!(
+            game::locate_with(&reg, &roots, &Distrust(vec![game_dir.clone()])),
+            None
+        );
+    }
+}
+
+#[test]
+fn deteccao_epic_confiavel_vence_candidata_anterior() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manifests = tmp.path().join("Manifests");
+    let plantado = tmp.path().join("plantado").join("HL");
+    let real = tmp.path().join("Epic Games").join("HogwartsLegacy");
+    fake_game(&plantado);
+    fake_game(&real);
+    // `A.item` vem antes na ordem, mas não é confiável.
+    write_item(
+        &manifests,
+        "A.item",
+        serde_json::json!({ "DisplayName": "Hogwarts Legacy", "InstallLocation": plantado }),
+    );
+    write_item(
+        &manifests,
+        "B.item",
+        serde_json::json!({ "DisplayName": "Hogwarts Legacy", "InstallLocation": real }),
+    );
+    let roots = Roots {
+        epic_manifests: manifests.clone(),
+    };
+    let d = game::detect_with(
+        &FakeRegistry::default(),
+        &roots,
+        &Distrust(vec![manifests.join("A.item")]),
+    );
+    assert!(
+        matches!(&d, Detection::Trusted(g) if g.dir == real),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn deteccao_sem_instalacao_e_not_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reg = FakeRegistry::default();
+    assert_eq!(
+        game::detect_with(&reg, &no_epic(tmp.path()), &Distrust(vec![])),
+        Detection::NotFound
+    );
+    // Manifest não confiável de outro jogo, e um do Hogwarts Legacy apontando para pasta incompleta: nada.
+    let manifests = tmp.path().join("Manifests");
+    write_item(
+        &manifests,
+        "outro.item",
+        serde_json::json!({ "DisplayName": "Outro Jogo", "InstallLocation": tmp.path() }),
+    );
+    write_item(
+        &manifests,
+        "hl.item",
+        serde_json::json!({ "DisplayName": "Hogwarts Legacy", "InstallLocation": tmp.path().join("vazio") }),
+    );
+    let roots = Roots {
+        epic_manifests: manifests.clone(),
+    };
+    let all = Distrust(vec![
+        manifests.join("outro.item"),
+        manifests.join("hl.item"),
+    ]);
+    assert_eq!(game::detect_with(&reg, &roots, &all), Detection::NotFound);
+}
+
+#[test]
+fn candidata_para_a_ui_so_tem_pasta_e_loja() {
+    let v = serde_json::to_value(GameCandidate {
+        dir: PathBuf::from("D:\\Epic Games\\HogwartsLegacy"),
+        store: Store::Epic,
+        failed: vec![TrustCheck::Manifest],
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({ "dir": "D:\\Epic Games\\HogwartsLegacy", "store": "epic" })
+    );
+}
+
+// ----- comandos: detectar e confirmar a sugestão -----
+
+fn state(tmp: &Path) -> AppState {
+    AppState::load(tmp.join("dados").join("settings.json"))
+}
+
+#[test]
+fn detect_game_sugere_candidata_sem_gravar_e_grava_a_confiavel() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (roots, item, game_dir) = epic_setup(tmp.path());
+    let st = state(tmp.path());
+    let reg = FakeRegistry::default();
+
+    let r = detect_game_with(&st, || {
+        game::detect_with(&reg, &roots, &Distrust(vec![item.clone()]))
+    });
+    assert_eq!(r.candidate.map(|c| c.dir), Some(game_dir.clone()));
+    assert_eq!(
+        r.settings.game_dir, None,
+        "candidata nunca é gravada sozinha"
+    );
+    assert_eq!(st.get_settings().game_dir, None);
+
+    let r = detect_game_with(&st, || game::detect_with(&reg, &roots, &Distrust(vec![])));
+    assert_eq!(r.candidate, None);
+    assert_eq!(r.settings.game_dir, Some(game_dir.clone()));
+    // Com pasta válida gravada, não procura de novo.
+    let r = detect_game_with(&st, || panic!("não devia procurar"));
+    assert_eq!(r.settings.game_dir, Some(game_dir));
+}
+
+#[test]
+fn confirmar_candidata_grava_como_o_seletor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, _, game_dir) = epic_setup(tmp.path());
+    let st = state(tmp.path());
+    let asked = Cell::new(0);
+    let s = adopt_detected(
+        &st,
+        &game_dir,
+        candidate(&game_dir, vec![TrustCheck::Manifest]),
+        |c| {
+            asked.set(asked.get() + 1);
+            assert_eq!(c.dir, game_dir);
+            true
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        asked.get(),
+        1,
+        "diálogo nativo sempre aparece para a candidata"
+    );
+    assert_eq!(s.game_dir, Some(game_dir.clone()));
+    assert_eq!(st.get_settings().game_dir, Some(game_dir.clone()));
+    // Gravado no arquivo, e o Jogar usa a pasta como uma escolhida à mão.
+    let saved = cbmp_launcher_lib::settings::Settings::load(
+        &tmp.path().join("dados").join("settings.json"),
+    )
+    .unwrap();
+    assert_eq!(saved.game_dir, Some(game_dir.clone()));
+    let g = cbmp_launcher_lib::commands::resolve_game(&st).unwrap();
+    assert_eq!((g.store, g.dir), (Store::Manual, game_dir));
+}
+
+#[test]
+fn recusar_no_dialogo_nao_muda_nada() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, _, game_dir) = epic_setup(tmp.path());
+    let st = state(tmp.path());
+    let s = adopt_detected(&st, &game_dir, candidate(&game_dir, vec![]), |_| false).unwrap();
+    assert_eq!(s.game_dir, None);
+    assert_eq!(st.get_settings().game_dir, None);
+}
+
+#[test]
+fn confirmacao_so_aceita_a_pasta_que_a_procura_achou() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, _, game_dir) = epic_setup(tmp.path());
+    // Outra pasta válida do jogo, que a UI tentaria impor.
+    let outra = tmp.path().join("Outra").join("HL");
+    fake_game(&outra);
+    let st = state(tmp.path());
+    let never = |_: &GameCandidate| -> bool { panic!("diálogo não pode abrir") };
+    for (shown, detection) in [
+        // UI pede uma pasta diferente da achada.
+        (
+            outra.clone(),
+            candidate(&game_dir, vec![TrustCheck::Manifest]),
+        ),
+        // A procura nova já não acha nada.
+        (game_dir.clone(), Detection::NotFound),
+        // A procura nova acha outra pasta (instalação confiável diferente).
+        (
+            game_dir.clone(),
+            Detection::Trusted(validate_game_dir(&outra).unwrap()),
+        ),
+        // Caminho relativo / vazio.
+        (PathBuf::from(""), candidate(&game_dir, vec![])),
+        (
+            PathBuf::from("HogwartsLegacy"),
+            candidate(&game_dir, vec![]),
+        ),
+    ] {
+        let e = adopt_detected(&st, &shown, detection, never).unwrap_err();
+        assert_eq!(e.code, "game_candidate_changed", "{}", shown.display());
+        assert_eq!(st.get_settings().game_dir, None);
+    }
+}
+
+#[test]
+fn confirmacao_revalida_a_pasta() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, _, game_dir) = epic_setup(tmp.path());
+    let st = state(tmp.path());
+    // A pasta deixou de ser o jogo entre a procura e a gravação.
+    std::fs::remove_file(game_dir.join("HogwartsLegacy.exe")).unwrap();
+    let e = adopt_detected(&st, &game_dir, candidate(&game_dir, vec![]), |_| true).unwrap_err();
+    assert_eq!(e.code, "game_invalid");
+    assert_eq!(st.get_settings().game_dir, None);
+}
+
+#[test]
+fn confirmacao_de_instalacao_confiavel_grava_sem_dialogo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, _, game_dir) = epic_setup(tmp.path());
+    let st = state(tmp.path());
+    let g = validate_game_dir(&game_dir).unwrap();
+    let s = adopt_detected(&st, &game_dir, Detection::Trusted(g), |_| {
+        panic!("instalação confiável não precisa do diálogo")
+    })
+    .unwrap();
+    assert_eq!(s.game_dir, Some(game_dir));
+}
+
+#[cfg(windows)]
+#[test]
+fn confirmacao_compara_caminho_sem_diferenciar_maiusculas() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, _, game_dir) = epic_setup(tmp.path());
+    let st = state(tmp.path());
+    let shown = PathBuf::from(format!(
+        "{}\\",
+        game_dir.display().to_string().to_uppercase()
+    ));
+    let s = adopt_detected(&st, &shown, candidate(&game_dir, vec![]), |_| true).unwrap();
+    // Grava o caminho achado pelo Rust, não o texto da UI.
+    assert_eq!(s.game_dir, Some(game_dir));
 }

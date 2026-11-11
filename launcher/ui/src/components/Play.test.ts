@@ -203,6 +203,29 @@ describe("Jogar", () => {
     await vi.waitFor(() => expect(b.calls("pick_game_dir")).toHaveLength(1));
   });
 
+  it("jogo não encontrado com instalação da Epic não confiável: sugere a pasta e confirma pelo Rust", async () => {
+    const EPIC = "C:\Program Files\Epic Games\HogwartsLegacy";
+    const { b } = setup({
+      play: () => {
+        throw { code: "game_not_found", message: "Hogwarts Legacy não encontrado." };
+      },
+      detect_game: () => ({ settings: baseSettings, candidate: { dir: EPIC, store: "epic" } }),
+      use_detected_game: () => ({ ...baseSettings, gameDir: EPIC }),
+    });
+    render(App);
+    await clickPlay("Castelo Bruxo RP");
+    const group = await screen.findByRole("group", { name: "Pasta do jogo encontrada" });
+    expect(group).toHaveTextContent(`Encontramos o Hogwarts Legacy em ${EPIC} (Epic Games). Usar esta pasta?`);
+    // O seletor manual continua lá.
+    expect(screen.getByRole("button", { name: "Escolher pasta do jogo" })).toBeInTheDocument();
+    await fireEvent.click(within(group).getByRole("button", { name: "Usar esta pasta" }));
+    await vi.waitFor(() => expect(b.calls("use_detected_game")).toEqual([{ dir: EPIC }]));
+    await vi.waitFor(() =>
+      expect(screen.queryByRole("group", { name: "Pasta do jogo encontrada" })).not.toBeInTheDocument(),
+    );
+    expect(b.calls("set_settings")).toHaveLength(0);
+  });
+
   it("sessão expirada volta ao login", async () => {
     setup({
       play: () => {

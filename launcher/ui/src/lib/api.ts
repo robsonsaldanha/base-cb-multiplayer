@@ -175,6 +175,26 @@ export function onProgress(cb: (p: Progress) => void): Promise<UnlistenFn> {
 
 /** Seletor de pasta do Rust; valida que é o Hogwarts Legacy e grava `gameDir`. Cancelar devolve o atual. */
 export const pickGameDir = (): Promise<Settings> => call("pick_game_dir");
+
+/** Espelha `game::GameCandidate`: pasta do jogo achada automaticamente, mas que só vale com confirmação. */
+export interface GameCandidate {
+  dir: string;
+  store: "steam" | "epic" | "manual";
+}
+
+/** Espelha `commands::GameDetection`. */
+export interface GameDetection {
+  settings: Settings;
+  candidate: GameCandidate | null;
+}
+
+/** Pasta atual ou procura de novo (Steam/Epic). Uma pasta não confiável volta só como `candidate`, sem ser gravada. */
+export const detectGame = (): Promise<GameDetection> => call("detect_game");
+/**
+ * "Usar esta pasta": o Rust procura de novo, só aceita se achar exatamente `dir`, pede confirmação no diálogo do
+ * Windows e grava como o seletor. Cancelar no diálogo devolve as configurações sem mudança.
+ */
+export const useDetectedGame = (dir: string): Promise<Settings> => call("use_detected_game", { dir });
 export const clearCache = (): Promise<void> => call("clear_cache");
 
 /** Espelha `update::UpdateStatus`. */

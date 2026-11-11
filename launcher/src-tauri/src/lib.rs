@@ -88,7 +88,8 @@ pub fn run() {
                 let _ = tokio::task::spawn_blocking(move || {
                     let state = h.state::<AppState>();
                     if state.get_settings().game_dir.is_none()
-                        && commands::resolve_game(&state).is_none()
+                        && commands::resolve_game_with(&state, commands::system_detect)
+                            == game::Detection::NotFound
                     {
                         log::info!("Hogwarts Legacy não encontrado automaticamente");
                     }
@@ -119,6 +120,8 @@ pub fn run() {
             commands::logout,
             commands::me,
             commands::pick_game_dir,
+            commands::detect_game,
+            commands::use_detected_game,
             commands::play,
             commands::cancel_play,
             commands::clear_cache,
