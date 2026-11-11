@@ -2,12 +2,12 @@
 // Ambiente de TESTE ONLINE do CB Multiplayer (Hub https://cbmultiplayer.cntoficial.com.br + cb-server na VPS).
 // Ops em docs/AMBIENTE-TESTE-ONLINE.md; guia do testador em docs/TESTE-ONLINE.md.
 //
-//   node tools/teste-online.mjs --build-releases   launcher "CB Multiplayer (Teste)" 0.1.0, 0.1.1 e 0.1.2 + mod de
-//                                                  teste mod-p1-v0.1.0, assinados com a chave dev (LOCAL; a chave
-//                                                  nunca sai desta máquina). Versões antigas já geradas ficam como
-//                                                  estão (histórico congelado); só a mais nova é refeita quando o
-//                                                  código muda. Copia o instalador da mais nova para
-//                                                  dist/CB-Multiplayer-Teste-setup.exe (o que os testadores baixam).
+//   node tools/teste-online.mjs --build-releases   launcher "CB Multiplayer (Teste)" 0.1.0 … 0.1.3 + mod de teste
+//                                                  mod-p1-v0.1.0, assinados com a chave dev (LOCAL; a chave nunca
+//                                                  sai desta máquina). Versões antigas ficam como foram publicadas
+//                                                  (sha256 fixado em PUBLISHED; faltando ou diferente = erro); só a
+//                                                  mais nova é refeita quando o código muda. Copia o instalador da
+//                                                  mais nova para dist/CB-Multiplayer-Teste-setup.exe (o download).
 //   node tools/teste-online.mjs --deploy           empacota Hub (bundle esbuild), hello-client, releases assinadas e
 //                                                  (opcional) o cb-server Linux, envia por scp e instala na VPS
 //   node tools/teste-online.mjs --cert             emite o certificado (certbot --webroot) e liga o HTTPS (1ª vez)
@@ -22,7 +22,8 @@
 //         --dir <pasta>  trabalho local (padrão %TEMP%\cbmp-teste-online; releases em <pasta>\releases)
 //         --key <arquivo> chave privada dev (padrão %USERPROFILE%\.cbmp-devkeys\update.key; ou CBMP_DEV_KEY).
 //                         Lida só para assinar; nunca copiada, enviada ou impressa. Recusada dentro do repositório.
-//         --force        refaz releases que já existem (inclusive as antigas, com o código atual)
+//         --force        refaz releases que já existem (inclusive as antigas, com o código atual: só para recomeçar
+//                        o histórico do zero; o --check passa a falhar até PUBLISHED ser atualizado)
 //         --no-releases  --deploy sem mexer nas releases da VPS
 
 import { spawnSync } from 'node:child_process';
@@ -43,10 +44,18 @@ const ROOT = '/var/www/html_cbmultiplayer';
 const SERVER_NAME = 'CB Multiplayer – Servidor de teste';
 const PRODUCT = 'CB Multiplayer (Teste)';
 // Em ordem. A última é a atual (refeita quando o código muda); as anteriores são histórico já publicado.
-const LAUNCHER_VERSIONS = ['0.1.0', '0.1.1', '0.1.2'];
+const LAUNCHER_VERSIONS = ['0.1.0', '0.1.1', '0.1.2', '0.1.3'];
 const LATEST_VERSION = LAUNCHER_VERSIONS.at(-1);
 // O instalador oferecido para download é sempre o da versão mais nova.
 const INSTALLER_VERSION = LATEST_VERSION;
+// sha256 dos instaladores já publicados para os testadores: nunca mudam. O --build-releases recusa um release antigo
+// ausente ou diferente, e o --check confere os da VPS. Ao publicar uma versão nova, a anterior entra aqui.
+const PUBLISHED = {
+  '0.1.0': 'b541e1415e70b37218ed9d243143a36bc8156d4d1d65467a40b86f7434f70528',
+  '0.1.1': '1376e4c916b3493e64f6d57f5c4b650e28b87e6c28d95c5e2d6ecd097466592b',
+  '0.1.2': '3679d8438a8f1596a853913f798e76407d9d114bacc3ae81a82c0b85dcee56ce',
+};
+const sha256File = (f) => createHash('sha256').update(readFileSync(f)).digest('hex');
 const MOD_PROTOCOL = 1;
 const MOD_VERSION = '0.1.0';
 const OVERLAY = join(REPO, 'launcher', 'src-tauri', 'tauri.onlinetest.conf.json');
@@ -122,9 +131,12 @@ function buildLauncher(rel, key, version, stamp, o) {
     log(`${tag}: já existe e o código do launcher não mudou`);
     return;
   }
-  // Versão antiga já publicada: não é refeita com o código novo (quem está nela recebe a mais nova pelo update).
-  if (!o.force && built && version !== LATEST_VERSION) {
-    log(`${tag}: versão anterior já gerada, mantida como está`);
+  // Versão antiga já publicada: nunca é refeita com o código novo (quem está nela recebe a mais nova pelo update).
+  if (!o.force && version !== LATEST_VERSION) {
+    if (!built) fail(`${tag} não está em ${rel}: copie o release publicado (VPS ${ROOT}/releases/${tag}) em vez de gerar outro com o código atual (ou --force)`);
+    const sha = sha256File(join(out, exe));
+    if (PUBLISHED[version] && sha !== PUBLISHED[version]) fail(`${tag}: sha256 ${sha} difere do publicado ${PUBLISHED[version]}`);
+    log(`${tag}: versão anterior mantida como foi publicada (sha256 ${sha.slice(0, 16)}…)`);
     return;
   }
   const bundle = join(REPO, 'launcher', 'src-tauri', 'target', 'release', 'bundle', 'nsis');
@@ -314,12 +326,21 @@ async function check() {
       must(u.version === LATEST_VERSION, `oferece ${u.version}, esperado ${LATEST_VERSION}`);
       must(u.url.startsWith(`${HUB}/v1/dl/launcher-v${LATEST_VERSION}/`) && u.signature, `url ${u.url} / sem assinatura`);
       const comment = trustedComment(u.signature);
-      must(comment.split('	').includes(`version:${LATEST_VERSION}`), `assinatura sem version:${LATEST_VERSION}`);
+      must(comment.split('\t').includes(`version:${LATEST_VERSION}`), `assinatura sem version:${LATEST_VERSION}`);
       if (latestSha) return 'mesmo pacote';
       const d = await get(u.url, { timeout: 180000 });
       must(d.status === 200 && d.buf.length > 1_000_000, `download HTTP ${d.status} (${d.buf.length} bytes)`);
       latestSha = createHash('sha256').update(d.buf).digest('hex');
       return `${d.buf.length} bytes, sha256 ${latestSha.slice(0, 16)}…`;
+    });
+  }
+  for (const [v, want] of Object.entries(PUBLISHED)) {
+    await step(`release antigo ${v} na VPS sem mudança (sha256)`, async () => {
+      const d = await get(`${HUB}/v1/dl/launcher-v${v}/${encodeURIComponent(`${PRODUCT}_${v}_x64-setup.exe`)}`, { timeout: 180000 });
+      must(d.status === 200, `HTTP ${d.status}`);
+      const sha = createHash('sha256').update(d.buf).digest('hex');
+      must(sha === want, `sha256 ${sha} difere do publicado ${want}`);
+      return `sha256 ${sha.slice(0, 16)}…`;
     });
   }
   await step(`update do launcher: ${LATEST_VERSION} já é a mais nova (204)`, async () => {

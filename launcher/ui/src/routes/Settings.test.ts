@@ -43,10 +43,10 @@ describe("Configurações", () => {
     expect(b.calls("set_settings")).toHaveLength(0);
   });
 
-  const EPIC = "C:\Program Files\Epic Games\HogwartsLegacy";
-  const epic = () => ({ settings: baseSettings, candidate: { dir: EPIC, store: "epic" } });
+  const EPIC = "C:\\Program Files\\Epic Games\\HogwartsLegacy";
+  const epic = () => ({ settings: baseSettings, candidate: { dir: EPIC, store: "epic" }, ambiguous: false });
 
-  it("sugestão da Epic: mostra a pasta e só grava pela confirmação do Rust", async () => {
+  it("sugestão: mostra a pasta sem dizer de onde veio e só grava pela confirmação do Rust", async () => {
     const { b } = setup({
       detect_game: epic,
       use_detected_game: () => ({ ...baseSettings, gameDir: EPIC }),
@@ -54,7 +54,13 @@ describe("Configurações", () => {
     await loadSettings();
     render(Settings);
     const group = await screen.findByRole("group", { name: "Pasta do jogo encontrada" });
-    expect(group).toHaveTextContent(`Encontramos o Hogwarts Legacy em ${EPIC} (Epic Games). Usar esta pasta?`);
+    expect(group).toHaveTextContent("O launcher encontrou uma pasta que parece ser do Hogwarts Legacy:");
+    // Caminho completo do Windows, com as barras.
+    expect(within(group).getByText(EPIC)).toBeInTheDocument();
+    expect(EPIC).toContain("\\Epic Games\\");
+    expect(group).toHaveTextContent(/não conseguiu verificar quem controla esta pasta/);
+    expect(group).toHaveTextContent(/só se foi nela que você instalou o jogo/);
+    expect(group).not.toHaveTextContent(/\(Epic Games\)|encontrada pela/);
     expect(screen.getByText("Não encontrada")).toBeInTheDocument();
     await fireEvent.click(within(group).getByRole("button", { name: "Usar esta pasta" }));
     // A UI só repete a pasta que o Rust achou; quem grava é o Rust (nunca set_settings).
@@ -75,34 +81,50 @@ describe("Configurações", () => {
     expect(screen.getByText("Não encontrada")).toBeInTheDocument();
   });
 
-  it("pasta sugerida que mudou: avisa e some", async () => {
-    setup({
-      detect_game: epic,
-      use_detected_game: () => {
-        throw { code: "game_candidate_changed", message: "A pasta sugerida não foi encontrada de novo." };
-      },
-    });
-    await loadSettings();
-    render(Settings);
-    await fireEvent.click(await screen.findByRole("button", { name: "Usar esta pasta" }));
-    await vi.waitFor(() => expect(get(notice)?.code).toBe("game_candidate_changed"));
-    expect(screen.queryByRole("group", { name: "Pasta do jogo encontrada" })).not.toBeInTheDocument();
+  it("pasta sugerida que mudou ou ficou ambígua: avisa e some", async () => {
+    for (const code of ["game_candidate_changed", "game_ambiguous"]) {
+      notice.set(null);
+      setup({
+        detect_game: epic,
+        use_detected_game: () => {
+          throw { code, message: "x" };
+        },
+      });
+      await loadSettings();
+      const r = render(Settings);
+      await fireEvent.click(await screen.findByRole("button", { name: "Usar esta pasta" }));
+      await vi.waitFor(() => expect(get(notice)?.code).toBe(code));
+      expect(screen.queryByRole("group", { name: "Pasta do jogo encontrada" })).not.toBeInTheDocument();
+      r.unmount();
+    }
   });
 
-  it("sem candidata ou com pasta já configurada: nenhuma sugestão", async () => {
-    const { b } = setup({ detect_game: () => ({ settings: baseSettings, candidate: null }) });
+  it("várias pastas: nenhuma sugestão, pede o seletor", async () => {
+    const { b } = setup({ detect_game: () => ({ settings: baseSettings, candidate: null, ambiguous: true }) });
+    await loadSettings();
+    render(Settings);
+    expect(await screen.findByText(/Mais de uma pasta parece ser do Hogwarts Legacy/)).toBeInTheDocument();
+    expect(screen.queryByRole("group", { name: "Pasta do jogo encontrada" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Usar esta pasta" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Escolher pasta do jogo" })).toBeInTheDocument();
+    expect(b.calls("use_detected_game")).toHaveLength(0);
+  });
+
+  it("sem candidata: nenhuma sugestão; pasta configurada que não vale mais: sugestão aparece", async () => {
+    const { b } = setup({ detect_game: () => ({ settings: baseSettings, candidate: null, ambiguous: false }) });
     await loadSettings();
     const r = render(Settings);
     await vi.waitFor(() => expect(b.calls("detect_game")).toHaveLength(1));
     expect(screen.queryByRole("group", { name: "Pasta do jogo encontrada" })).not.toBeInTheDocument();
     r.unmount();
 
-    const configured = { ...baseSettings, gameDir: "D:\Steam\Hogwarts Legacy" };
-    setup({ detect_game: () => ({ settings: configured, candidate: { dir: EPIC, store: "epic" } }) });
+    // O Rust só devolve candidata quando a pasta configurada deixou de ser válida: a sugestão aparece mesmo assim.
+    const stale = { ...baseSettings, gameDir: "D:\\Steam\\Hogwarts Legacy" };
+    setup({ detect_game: () => ({ settings: stale, candidate: { dir: EPIC, store: "epic" }, ambiguous: false }) });
     await loadSettings();
     render(Settings);
-    expect(await screen.findByText("D:\Steam\Hogwarts Legacy")).toBeInTheDocument();
-    expect(screen.queryByRole("group", { name: "Pasta do jogo encontrada" })).not.toBeInTheDocument();
+    expect(await screen.findByText("D:\\Steam\\Hogwarts Legacy")).toBeInTheDocument();
+    expect(await screen.findByRole("group", { name: "Pasta do jogo encontrada" })).toBeInTheDocument();
   });
 
   it("pasta inválida no seletor mostra o erro", async () => {

@@ -182,16 +182,20 @@ export interface GameCandidate {
   store: "steam" | "epic" | "manual";
 }
 
-/** Espelha `commands::GameDetection`. */
+/** Espelha `commands::GameDetection`. `ambiguous`: várias pastas parecem ser o jogo; nenhuma é sugerida. */
 export interface GameDetection {
   settings: Settings;
   candidate: GameCandidate | null;
+  ambiguous: boolean;
 }
 
-/** Pasta atual ou procura de novo (Steam/Epic). Uma pasta não confiável volta só como `candidate`, sem ser gravada. */
+/**
+ * Pasta atual ou procura de novo (Steam/Epic). Uma pasta não confiável volta só como `candidate` (e só se for a única),
+ * sem ser gravada.
+ */
 export const detectGame = (): Promise<GameDetection> => call("detect_game");
 /**
- * "Usar esta pasta": o Rust procura de novo, só aceita se achar exatamente `dir`, pede confirmação no diálogo do
+ * "Usar esta pasta": o Rust procura de novo, só aceita se achar exatamente `dir` (e só ela), pede confirmação no diálogo do
  * Windows e grava como o seletor. Cancelar no diálogo devolve as configurações sem mudança.
  */
 export const useDetectedGame = (dir: string): Promise<Settings> => call("use_detected_game", { dir });

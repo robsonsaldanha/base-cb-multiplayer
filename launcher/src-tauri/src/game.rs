@@ -19,8 +19,9 @@ const STEAM_USER_KEY: &str = r"Software\Valve\Steam";
 const STEAM_MACHINE_KEY: &str = r"SOFTWARE\WOW6432Node\Valve\Steam";
 /// Teto dos arquivos de texto lidos (VDF/ACF/`.item`): os reais têm poucos KB.
 const MAX_TEXT: u64 = 1024 * 1024;
-/// Teto de manifests da Epic olhados.
-const MAX_EPIC_ITEMS: usize = 1000;
+/// Teto de manifests da Epic olhados. Passou disso, nenhuma pasta não confiável é sugerida (alguém pode ter enchido a
+/// pasta de manifests para esconder o verdadeiro).
+pub const MAX_EPIC_ITEMS: usize = 1000;
 const MAX_VDF_DEPTH: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -221,8 +222,14 @@ pub struct GameCandidate {
 pub enum Detection {
     /// Instalação confiável: usada direto, como sempre.
     Trusted(GameInstall),
-    /// Achada, mas não confiável: só com confirmação do usuário.
+    /// Exatamente uma pasta achada, mas não confiável: só com confirmação do usuário.
     Candidate(GameCandidate),
+    /// Mais de uma pasta não confiável (ou manifests demais para olhar todos): qualquer uma pode ter sido plantada, então
+    /// nenhuma é sugerida; o usuário escolhe a pasta pelo seletor. `candidates` = pastas distintas vistas.
+    Ambiguous {
+        candidates: usize,
+        flooded: bool,
+    },
     NotFound,
 }
 
@@ -235,11 +242,12 @@ pub fn locate(reg: &dyn Registry, roots: &Roots) -> Option<GameInstall> {
 pub fn locate_with(reg: &dyn Registry, roots: &Roots, trust: &dyn Trust) -> Option<GameInstall> {
     match detect_with(reg, roots, trust) {
         Detection::Trusted(g) => Some(g),
-        Detection::Candidate(_) | Detection::NotFound => None,
+        Detection::Candidate(_) | Detection::Ambiguous { .. } | Detection::NotFound => None,
     }
 }
 
-/// Procura na Steam e depois na Epic: instalação confiável, candidata (Epic não confiável) ou nada.
+/// Procura na Steam e depois na Epic: instalação confiável, uma candidata (Epic não confiável), várias (ambíguo) ou
+/// nada.
 pub fn detect(reg: &dyn Registry, roots: &Roots) -> Detection {
     detect_with(reg, roots, &SystemTrust)
 }
@@ -257,6 +265,18 @@ pub fn detect_with(reg: &dyn Registry, roots: &Roots, trust: &dyn Trust) -> Dete
             c.store,
             c.dir.display(),
             labels(&c.failed)
+        ),
+        Detection::Ambiguous {
+            candidates,
+            flooded,
+        } => log::warn!(
+            "Hogwarts Legacy ambíguo nos manifests da Epic ({candidates} pastas não confiáveis distintas{}); nenhuma \
+             sugerida, o usuário precisa escolher a pasta",
+            if *flooded {
+                ", manifests demais para olhar todos"
+            } else {
+                ""
+            }
         ),
         Detection::NotFound => {}
     }
@@ -304,13 +324,39 @@ fn with_store(g: GameInstall, store: Store) -> GameInstall {
     GameInstall { store, ..g }
 }
 
+/// Lê um arquivo de texto de até [`MAX_TEXT`]. Abre uma vez e limita a leitura pelo próprio handle: trocar o arquivo
+/// por um enorme depois da checagem de tamanho não faz o launcher ler tudo.
 fn read_text(path: &Path) -> Option<String> {
-    let md = std::fs::metadata(path).ok()?;
+    use std::io::Read;
+    let f = std::fs::File::open(path).ok()?;
+    let md = f.metadata().ok()?;
     if !md.is_file() || md.len() > MAX_TEXT {
         return None;
     }
-    let bytes = std::fs::read(path).ok()?;
+    let mut bytes = Vec::new();
+    f.take(MAX_TEXT + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_TEXT {
+        return None;
+    }
     Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Caractere que não deve aparecer num caminho mostrado ao usuário: controle, ou formatação/direção do Unicode (ex.
+/// U+202E), que faz um caminho parecer outro na tela.
+fn deceptive_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+        )
 }
 
 /// O Steam grava `SteamPath` como `c:/program files (x86)/steam`.
@@ -416,9 +462,10 @@ fn steam_game_in(lib: &Path) -> Option<GameInstall> {
         .map(|g| with_store(g, Store::Steam))
 }
 
-/// Manifests da Epic em ordem de nome. O primeiro confiável vence; sem nenhum confiável, o primeiro válido mas não
-/// confiável vira candidato. O texto de um `.item` não confiável é só lido (até [`MAX_TEXT`]) e interpretado como
-/// JSON; nada dele é executado nem usado sem confirmação.
+/// Manifests da Epic. O primeiro confiável (em ordem de nome) vence. Sem nenhum confiável, as pastas válidas mas não
+/// confiáveis são juntadas sem repetir: **uma** vira candidata; duas ou mais, ou mais de [`MAX_EPIC_ITEMS`] manifests,
+/// viram [`Detection::Ambiguous`] (outra conta pode ter plantado um `.item` para tomar o lugar do verdadeiro, então
+/// nenhuma é sugerida). O texto de um `.item` não confiável é só lido (até [`MAX_TEXT`]) e interpretado como JSON.
 fn locate_epic(manifests: &Path, trust: &dyn Trust) -> Detection {
     let Ok(rd) = std::fs::read_dir(manifests) else {
         return Detection::NotFound;
@@ -430,10 +477,12 @@ fn locate_epic(manifests: &Path, trust: &dyn Trust) -> Detection {
             p.extension()
                 .is_some_and(|e| e.eq_ignore_ascii_case("item"))
         })
-        .take(MAX_EPIC_ITEMS)
+        .take(MAX_EPIC_ITEMS + 1)
         .collect();
+    let flooded = items.len() > MAX_EPIC_ITEMS;
+    items.truncate(MAX_EPIC_ITEMS);
     items.sort();
-    let mut candidate: Option<GameCandidate> = None;
+    let mut candidates: Vec<GameCandidate> = Vec::new();
     for item in items {
         let Some(g) = epic_item_game(&item) else {
             continue;
@@ -459,15 +508,22 @@ fn locate_epic(manifests: &Path, trust: &dyn Trust) -> Detection {
                 .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
             labels(&failed)
         );
-        if candidate.is_none() {
-            candidate = Some(GameCandidate {
+        if !candidates.iter().any(|c| same_path(&c.dir, &g.dir)) {
+            candidates.push(GameCandidate {
                 dir: g.dir,
                 store: Store::Epic,
                 failed,
             });
         }
     }
-    candidate.map_or(Detection::NotFound, Detection::Candidate)
+    match (candidates.len(), flooded) {
+        (0, false) => Detection::NotFound,
+        (1, false) => Detection::Candidate(candidates.remove(0)),
+        (n, flooded) => Detection::Ambiguous {
+            candidates: n,
+            flooded,
+        },
+    }
 }
 
 /// Instalação para onde um `.item` da Epic aponta, se ele é do Hogwarts Legacy e a pasta passa em
@@ -487,6 +543,10 @@ fn epic_item_game(item: &Path) -> Option<GameInstall> {
         return None;
     }
     let loc = v.get("InstallLocation").and_then(|x| x.as_str())?;
+    // Caminho que vai ser mostrado ao usuário: nada de caracteres que o disfarcem.
+    if loc.chars().any(deceptive_char) {
+        return None;
+    }
     validate_game_dir(&native_path(loc)).ok()
 }
 

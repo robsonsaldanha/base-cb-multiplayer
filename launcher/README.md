@@ -267,11 +267,14 @@ O instalador NSIS é por usuário (sem administrador). Ele **não** tem assinatu
   `.item`, a pasta do jogo, o executável e `Phoenix\Binaries\Win64` tiverem dono SYSTEM, Administradores,
   TrustedInstaller ou o usuário atual e nenhuma outra conta com direito de escrita (dono e DACL lidos com
   `GetNamedSecurityInfoW`) para ser usado sozinho. O launcher da Epic costuma deixar esses caminhos graváveis por
-  outras contas: um resultado válido que falha nessa regra vira **sugestão** (`game::Detection::Candidate`; o log diz
-  qual verificação falhou: manifest, pasta do jogo, executável ou Binaries). `detect_game` devolve a sugestão sem
-  gravá-la; `use_detected_game(dir)` procura de novo, só aceita se achou exatamente `dir`, pede confirmação num
-  diálogo nativo (fora do alcance da UI) e grava pelo mesmo caminho do seletor (`validate_game_dir` +
-  `set_game_dir`). A UI nunca define `gameDir`.
+  outras contas: se **uma única** pasta válida falha nessa regra, ela vira **sugestão** (`game::Detection::Candidate`;
+  o log diz qual verificação falhou: manifest, pasta do jogo, executável ou Binaries). Duas ou mais pastas distintas,
+  ou mais de 1000 `.item`, viram `Detection::Ambiguous`: nenhuma sugestão (um `.item` plantado não toma o lugar do
+  verdadeiro) e a UI pede o seletor. Caminho com caractere de controle ou de direção/formatação do Unicode é
+  descartado. `detect_game` devolve a sugestão sem gravá-la; `use_detected_game(dir)` (uma confirmação por vez)
+  procura de novo, só aceita se a única candidata ainda é exatamente `dir` (instalação confiável não passa por aqui),
+  pede confirmação num diálogo nativo (fora do alcance da UI; o texto não atribui a pasta a ninguém) e grava pelo
+  mesmo caminho do seletor (`validate_game_dir` + `set_game_dir`). A UI nunca define `gameDir`.
 - **Mod**: `GET /v1/mod/latest?protocol=N` → zip baixado do próprio Hub (3 tentativas), tamanho e sha256 conferidos,
   assinatura minisign com a mesma chave do updater. O comentário confiável da assinatura tem de ser exatamente
   `cbmp-mod protocol=<N> version=<X.Y.Z> sha256=<hex>` e bater com o protocolo pedido, a versão anunciada e o zip

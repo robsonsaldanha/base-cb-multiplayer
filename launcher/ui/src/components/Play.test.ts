@@ -203,19 +203,21 @@ describe("Jogar", () => {
     await vi.waitFor(() => expect(b.calls("pick_game_dir")).toHaveLength(1));
   });
 
-  it("jogo não encontrado com instalação da Epic não confiável: sugere a pasta e confirma pelo Rust", async () => {
-    const EPIC = "C:\Program Files\Epic Games\HogwartsLegacy";
+  it("jogo não encontrado com uma pasta não verificada: sugere a pasta e confirma pelo Rust", async () => {
+    const EPIC = "C:\\Program Files\\Epic Games\\HogwartsLegacy";
     const { b } = setup({
       play: () => {
         throw { code: "game_not_found", message: "Hogwarts Legacy não encontrado." };
       },
-      detect_game: () => ({ settings: baseSettings, candidate: { dir: EPIC, store: "epic" } }),
+      detect_game: () => ({ settings: baseSettings, candidate: { dir: EPIC, store: "epic" }, ambiguous: false }),
       use_detected_game: () => ({ ...baseSettings, gameDir: EPIC }),
     });
     render(App);
     await clickPlay("Castelo Bruxo RP");
     const group = await screen.findByRole("group", { name: "Pasta do jogo encontrada" });
-    expect(group).toHaveTextContent(`Encontramos o Hogwarts Legacy em ${EPIC} (Epic Games). Usar esta pasta?`);
+    expect(group).toHaveTextContent("O launcher encontrou uma pasta que parece ser do Hogwarts Legacy:");
+    expect(within(group).getByText(EPIC)).toBeInTheDocument();
+    expect(group).toHaveTextContent(/não conseguiu verificar quem controla esta pasta/);
     // O seletor manual continua lá.
     expect(screen.getByRole("button", { name: "Escolher pasta do jogo" })).toBeInTheDocument();
     await fireEvent.click(within(group).getByRole("button", { name: "Usar esta pasta" }));
