@@ -9,6 +9,7 @@ import { join } from 'node:path';
 
 export const LAUNCHER_INPUTS = ['launcher/src-tauri/src', 'launcher/src-tauri/Cargo.toml', 'launcher/src-tauri/Cargo.lock',
   'launcher/src-tauri/build.rs', 'launcher/src-tauri/tauri.conf.json', 'launcher/src-tauri/tauri.localtest.conf.json',
+  'launcher/src-tauri/tauri.onlinetest.conf.json',
   'launcher/src-tauri/capabilities', 'launcher/src-tauri/permissions', 'launcher/src-tauri/keys', 'launcher/src-tauri/icons',
   // A UI inteira (node_modules/dist ficam de fora pelo .gitignore; testes pelo filtro abaixo).
   'launcher/ui', 'package.json', 'package-lock.json'];

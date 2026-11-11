@@ -1,20 +1,49 @@
-//! Perfil do build. Três sabores:
+//! Perfil do build. Quatro sabores:
 //! - **release oficial** (padrão): Hub fixo em https, servidores só em endereços públicos;
 //! - **debug** (`cargo test`, `tauri dev`): regras de rede relaxadas e `CBMP_HUB_URL`/`CBMP_DATA_DIR` aceitos;
 //! - **teste local** (`--features local-test` + `tauri.localtest.conf.json`, ligado só por flag explícita): build
 //!   release para os testes manuais com o Hub local (`tools/dev-env.mjs`). Hub em [`LOCAL_TEST_HUB_URL`], servidores
 //!   em loopback/rede privada aceitos, updater apontado para o Hub local, nome "CB Multiplayer (Teste local)" e
 //!   identificador próprio. Nunca é publicado.
+//! - **teste online** (`--features online-test` + `tauri.onlinetest.conf.json`, só por flag explícita): build release
+//!   para testadores com o Hub de teste PÚBLICO em [`ONLINE_TEST_HUB_URL`] (`docs/TESTE-ONLINE.md`). Mesmas regras de
+//!   rede do oficial (Hub só https, servidores só em endereços públicos); muda só o Hub, o updater, o nome
+//!   "CB Multiplayer (Teste)", o identificador, a pasta de dados e o serviço do cofre. Nunca é o build oficial.
 
 /// Build de teste local (feature Cargo `local-test`).
 pub const LOCAL_TEST: bool = cfg!(feature = "local-test");
 
+/// Build de teste online (feature Cargo `online-test`).
+pub const ONLINE_TEST: bool = cfg!(feature = "online-test");
+
+#[cfg(all(feature = "local-test", feature = "online-test"))]
+compile_error!("as features `local-test` e `online-test` são mutuamente exclusivas");
+
+/// Regra única de quando a rede fica relaxada: só em debug ou no teste local. **Nunca** no release oficial nem no
+/// de teste online (público). `tests/config_guard.rs` confere a tabela inteira.
+pub const fn relaxed_network_for(debug: bool, local_test: bool, online_test: bool) -> bool {
+    let _ = online_test; // o teste online segue as regras do oficial
+    debug || local_test
+}
+
 /// Regras de rede relaxadas: `http://` de loopback para o Hub e o navegador, servidores de jogo em loopback e redes
-/// privadas. Debug ou teste local; nunca no release oficial.
-pub const RELAXED_NETWORK: bool = cfg!(debug_assertions) || LOCAL_TEST;
+/// privadas. Debug ou teste local; nunca no release oficial nem no teste online.
+pub const RELAXED_NETWORK: bool =
+    relaxed_network_for(cfg!(debug_assertions), LOCAL_TEST, ONLINE_TEST);
+
+// Trava em tempo de compilação: o release do teste online (o exe dos testadores) nunca relaxa a rede. Se alguém mudar
+// a regra, o build release com `--features online-test` (CI `launcher` e tools/teste-online.mjs) deixa de compilar.
+#[cfg(all(feature = "online-test", not(debug_assertions)))]
+const _: () = assert!(
+    !RELAXED_NETWORK,
+    "o build de teste online não pode relaxar as regras de rede"
+);
 
 /// Hub do build de teste local (o Hub de `tools/dev-env.mjs`; IPv4 literal, como o `cb-server` usa).
 pub const LOCAL_TEST_HUB_URL: &str = "http://127.0.0.1:8787";
+
+/// Hub do build de teste online (ambiente de teste na VPS, `docs/AMBIENTE-TESTE-ONLINE.md`).
+pub const ONLINE_TEST_HUB_URL: &str = "https://cbmultiplayer.cntoficial.com.br";
 
 #[cfg(test)]
 mod tests {

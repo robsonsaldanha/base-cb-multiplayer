@@ -38,8 +38,9 @@ das tasks).
   é **somente leitura** (hard links do cache verificado, compartilhados entre servidores): o mod não pode gravar nada
   ali. Conferir `protocol` com o do mod e recusar se diferente.
 - **Pasta de dados por build** (revisão 9a, M-8): o launcher oficial usa `%LOCALAPPDATA%\CBMultiplayer` e o build
-  "Teste local" usa `%LOCALAPPDATA%\CBMultiplayer-TesteLocal` (`run\` e `mods\` inclusive). O mod não pode fixar o
-  nome da pasta: receber o caminho do `run\` do launcher (ex.: arquivo ao lado do mod instalado) ou procurar nos dois.
+  "Teste local" usa `%LOCALAPPDATA%\CBMultiplayer-TesteLocal` (`run\` e `mods\` inclusive); o build "Teste" (teste
+  online) usa `%LOCALAPPDATA%\CBMultiplayer-Teste`. O mod não pode fixar o nome da pasta: receber o caminho do `run\`
+  do launcher (ex.: arquivo ao lado do mod instalado) ou procurar nos três.
 - **Margem de renovação do ticket** (revisão 7, M-1): o launcher renova o ticket com mais de 240 s (TTL 300 − 60;
   `play::TICKET_RENEW_AFTER_SECS`) antes de gravar o `connect.json`, mas o tempo entre abrir o jogo e o mod resgatar o
   ticket não é medido. Medir com o mod real e ajustar a margem (ou renovar pelo mod).
@@ -118,6 +119,12 @@ Decisões registradas e limites aceitos; o comportamento atual está documentado
   descontando o tempo de disco do vigia.
 
 ## Antes de abrir ao público
+
+- **Ambiente de teste online** (`docs/AMBIENTE-TESTE-ONLINE.md`): Hub em modo `HUB_STAGING=1` com releases locais
+  assinadas com a chave **dev**. Antes da troca para o par de produção, decidir como o launcher de teste continua
+  aceitando releases de teste (par de teste próprio ou pública dev só no perfil `online-test`). O servidor de teste
+  pertence a um usuário de sistema (Discord ID `0`) e não aparece no painel de ninguém. O e2e do launcher não roda
+  contra esse Hub (exige dev-login); `node tools/teste-online.mjs --check` cobre o caminho sem login.
 
 - **Launcher (sub4)**:
   - **Trocar a chave de assinatura dev** (key id `BDCB478091E91629`) pela de produção antes do primeiro release real

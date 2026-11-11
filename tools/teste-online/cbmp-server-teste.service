@@ -1,0 +1,59 @@
+# CB Multiplayer: cb-server do ambiente de TESTE online (UDP+TCP 30500, hello-client, sem banco).
+# Instalado por tools/teste-online/remote-install.sh. docs/AMBIENTE-TESTE-ONLINE.md
+# Roda como o usuário de sistema `cbmp-server` (sem shell, sem sudo). Só enxerga, de /var/www, o binário e os
+# resources (leitura), server.cfg (leitura) e server/{data,logs} (escrita). Não vê hub-data nem /etc/cbmp-teste.
+[Unit]
+Description=CB Multiplayer - servidor de jogo de teste (porta 30500)
+After=network-online.target cbmp-hub-teste.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cbmp-server
+Group=cbmp-server
+WorkingDirectory=/var/www/html_cbmultiplayer/server
+# OpenSSL estático do vcpkg: aponta as CAs do sistema (TLS até o Hub).
+Environment=SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+Environment=SSL_CERT_DIR=/etc/ssl/certs
+ExecStart=/var/www/html_cbmultiplayer/server/bin/cb-server --config /var/www/html_cbmultiplayer/server/server.cfg
+Restart=on-failure
+RestartSec=5
+MemoryMax=400M
+TasksMax=256
+UMask=0077
+
+# --- sandbox
+TemporaryFileSystem=/var/www:ro
+BindReadOnlyPaths=/var/www/html_cbmultiplayer/server/bin /var/www/html_cbmultiplayer/server/resources /var/www/html_cbmultiplayer/server/server.cfg
+BindPaths=/var/www/html_cbmultiplayer/server/data /var/www/html_cbmultiplayer/server/logs
+InaccessiblePaths=-/etc/cbmp-teste
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @reboot @swap @obsolete @cpu-emulation @debug @raw-io
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

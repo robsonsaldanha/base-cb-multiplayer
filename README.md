@@ -15,6 +15,9 @@ Visão geral para quem está chegando, inclusive como a DLL do mod funciona: [`d
 - `bots/`: `cb-bots`, bots de carga e segurança.
 - `tools/loadtest.py`: teste de carga e segurança; veja `docs/LOAD-TEST.md`.
 - `tools/dev-env.mjs`: ambiente de teste local (Hub de teste + `cb-server` + releases de teste do launcher).
+- `tools/teste-online.mjs`: ambiente de teste **online** na VPS (Hub `https://cbmultiplayer.cntoficial.com.br` +
+  servidor de teste), para testadores sem ferramentas: operação em `docs/AMBIENTE-TESTE-ONLINE.md`, guia do testador
+  em `docs/TESTE-ONLINE.md`.
 
 ## Nativo
 
@@ -43,7 +46,8 @@ npm test -w launcher/ui && npm run typecheck -w launcher/ui && npm run build -w 
 node tools/dev-env.mjs --run                     # Hub local + cb-server de teste (veja docs/TESTES-MANUAIS-SUB4.md)
 ```
 
-Workflows: `launcher` (testes, e2e e os dois instaladores, oficial e "Teste local", como artefatos) e `release`
+Workflows: `launcher` (testes, e2e e os instaladores oficial, "Teste local" e "Teste" (online) como artefatos),
+`server-linux-dist` (pacote do `cb-server` para Linux x64/Ubuntu 22.04, usado no teste online) e `release`
 (manual: assina e publica `launcher-vX.Y.Z` ou `mod-pN-vX.Y.Z`; só a partir da `main`, no environment `release` com o
 secret `CBMP_UPDATE_KEY`; recusa a chave de desenvolvimento). Roteiro dos testes manuais: `docs/TESTES-MANUAIS-SUB4.md` (máquina de desenvolvimento) e
 `docs/TESTES-EM-CASA-SUB4.md` (outro PC, só com Node 24: kit pronto gerado por `node tools/make-test-kit.mjs`).

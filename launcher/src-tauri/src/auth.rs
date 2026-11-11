@@ -15,10 +15,12 @@ use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use url::Url;
 
-/// Serviço do Credential Manager. O build de teste local usa outro, para o login no Hub local não trocar o do
-/// launcher oficial.
+/// Serviço do Credential Manager. Os builds de teste (local e online) usam outros, para o login no Hub de teste não
+/// trocar o do launcher oficial.
 pub const VAULT_SERVICE: &str = if crate::profile::LOCAL_TEST {
     "CBMultiplayer (Teste local)"
+} else if crate::profile::ONLINE_TEST {
+    "CBMultiplayer (Teste)"
 } else {
     "CBMultiplayer"
 };

@@ -1,4 +1,5 @@
-//! Pastas do launcher em `%LOCALAPPDATA%\CBMultiplayer` (build de teste local: `CBMultiplayer-TesteLocal`).
+//! Pastas do launcher em `%LOCALAPPDATA%\CBMultiplayer` (build de teste local: `CBMultiplayer-TesteLocal`; de teste
+//! online: `CBMultiplayer-Teste`).
 //!
 //! No Windows a raiz vem da pasta conhecida `FOLDERID_LocalAppData` (`SHGetKnownFolderPath`), não da variável de
 //! ambiente (que qualquer processo pai pode trocar). `CBMP_DATA_DIR` troca a raiz, mas só em builds de debug
@@ -10,6 +11,8 @@ use std::path::PathBuf;
 /// (identificadores diferentes) e não podem dividir cache, `run\`, índices nem log.
 pub const APP_DIR: &str = if crate::profile::LOCAL_TEST {
     "CBMultiplayer-TesteLocal"
+} else if crate::profile::ONLINE_TEST {
+    "CBMultiplayer-Teste"
 } else {
     "CBMultiplayer"
 };
@@ -128,6 +131,8 @@ mod tests {
     fn pasta_do_app_por_perfil() {
         if cfg!(feature = "local-test") {
             assert_eq!(APP_DIR, "CBMultiplayer-TesteLocal");
+        } else if cfg!(feature = "online-test") {
+            assert_eq!(APP_DIR, "CBMultiplayer-Teste");
         } else {
             assert_eq!(APP_DIR, "CBMultiplayer");
         }

@@ -8,7 +8,9 @@
 //! - o updater ganhar opções `dangerous*` no build oficial;
 //! - o overlay do build de teste local (`tauri.localtest.conf.json`) mexer em algo além de nome, identificador,
 //!   janela e endpoint do updater no Hub local, ou a configuração mesclada falhar em qualquer regra acima;
-//! - a feature `local-test` entrar no padrão do Cargo.
+//! - o overlay do build de teste online (`tauri.onlinetest.conf.json`) mexer em algo além de nome, identificador,
+//!   janela e endpoint https do updater no Hub de teste, ou ligar qualquer opção `dangerous*`;
+//! - a feature `local-test` ou `online-test` entrar no padrão do Cargo.
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -52,6 +54,11 @@ fn conf() -> Value {
 fn localtest_overlay() -> Value {
     serde_json::from_str(&read(&root().join("tauri.localtest.conf.json")))
         .expect("tauri.localtest.conf.json inválido")
+}
+
+fn onlinetest_overlay() -> Value {
+    serde_json::from_str(&read(&root().join("tauri.onlinetest.conf.json")))
+        .expect("tauri.onlinetest.conf.json inválido")
 }
 
 /// JSON Merge Patch (RFC 7396), como a CLI do Tauri aplica `--config`: objetos mesclados, o resto substituído.
@@ -723,17 +730,107 @@ fn overlay_de_teste_local_so_muda_o_permitido_e_passa_no_guarda() {
 }
 
 #[test]
+fn overlay_de_teste_online_so_muda_o_permitido_e_segue_as_regras_do_oficial() {
+    let overlay = onlinetest_overlay();
+    assert_eq!(overlay_violations(&overlay), Vec::<String>::new());
+    assert!(
+        overlay["plugins"]["updater"]["dangerousInsecureTransportProtocol"].is_null(),
+        "o teste online é público: updater só em https"
+    );
+    let base = conf();
+    let mut merged = base.clone();
+    merge_patch(&mut merged, &overlay);
+    assert_eq!(
+        violations(&merged, &real_capabilities()),
+        Vec::<String>::new()
+    );
+    // Regras do OFICIAL (false): nenhuma opção dangerous*, endpoint só https.
+    assert_eq!(updater_violations(&merged, false), Vec::<String>::new());
+    assert_eq!(merged["app"]["security"], base["app"]["security"]);
+    assert_eq!(
+        merged["plugins"]["updater"]["pubkey"],
+        base["plugins"]["updater"]["pubkey"]
+    );
+    assert_eq!(
+        merged["plugins"]["updater"]["requireSignedVersion"],
+        serde_json::json!(true)
+    );
+    assert_eq!(merged["plugins"]["deep-link"], base["plugins"]["deep-link"]);
+    assert_eq!(merged["bundle"]["createUpdaterArtifacts"], false);
+
+    assert_eq!(merged["productName"], "CB Multiplayer (Teste)");
+    assert_eq!(merged["identifier"], "br.com.castelobruxo.cbmp.teste");
+    assert_eq!(merged["mainBinaryName"], "CBMultiplayerTeste");
+    let (w, base_w) = (&merged["app"]["windows"][0], &base["app"]["windows"][0]);
+    assert_eq!(merged["app"]["windows"].as_array().unwrap().len(), 1);
+    let mut expected = base_w.clone();
+    expected["title"] = serde_json::json!("CB Multiplayer (Teste)");
+    assert_eq!(w, &expected);
+
+    let hub = cbmp_launcher_lib::profile::ONLINE_TEST_HUB_URL;
+    assert_eq!(hub, "https://cbmultiplayer.cntoficial.com.br");
+    let eps = merged["plugins"]["updater"]["endpoints"]
+        .as_array()
+        .unwrap();
+    assert_eq!(eps.len(), 1);
+    let built = cbmp_launcher_lib::update::endpoint(hub).unwrap();
+    assert_eq!(
+        eps[0].as_str().unwrap(),
+        built.as_str().replace("%7B", "{").replace("%7D", "}")
+    );
+}
+
+#[test]
+fn regra_de_rede_relaxada_por_perfil() {
+    use cbmp_launcher_lib::profile::{
+        relaxed_network_for, LOCAL_TEST, ONLINE_TEST, RELAXED_NETWORK,
+    };
+    // Release: oficial e teste online (público) SEMPRE estritos; só o teste local relaxa.
+    assert!(
+        !relaxed_network_for(false, false, false),
+        "release oficial relaxado"
+    );
+    assert!(
+        !relaxed_network_for(false, false, true),
+        "release do teste online relaxado"
+    );
+    assert!(
+        relaxed_network_for(false, true, false),
+        "teste local deve aceitar loopback/LAN"
+    );
+    // Debug (cargo test / tauri dev) relaxa em qualquer perfil.
+    assert!(relaxed_network_for(true, false, false));
+    assert!(relaxed_network_for(true, false, true));
+    // A constante usada pelo app vem da regra (não de uma conta paralela).
+    assert_eq!(
+        RELAXED_NETWORK,
+        relaxed_network_for(cfg!(debug_assertions), LOCAL_TEST, ONLINE_TEST)
+    );
+    // E o código-fonte não tem outra definição escondida.
+    let src: String = read(&root().join("src/profile.rs"))
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(
+        src.contains("pubconstRELAXED_NETWORK:bool=relaxed_network_for(cfg!(debug_assertions),LOCAL_TEST,ONLINE_TEST);"),
+        "RELAXED_NETWORK precisa vir de relaxed_network_for"
+    );
+    assert_eq!(src.matches("RELAXED_NETWORK:bool").count(), 1);
+}
+
+#[test]
 fn feature_local_test_so_por_flag_explicita() {
     let manifest: toml::Table = toml::from_str(&read(&root().join("Cargo.toml"))).unwrap();
     let features = manifest["features"].as_table().expect("[features]");
     assert_eq!(features["local-test"], toml::Value::Array(vec![]));
+    assert_eq!(features["online-test"], toml::Value::Array(vec![]));
     assert!(
         !features.contains_key("default"),
-        "nenhuma feature no padrão (local-test só por flag explícita)"
+        "nenhuma feature no padrão (local-test/online-test só por flag explícita)"
     );
     assert_eq!(
         features.len(),
-        1,
+        2,
         "feature nova precisa ser revisada aqui: {features:?}"
     );
     // Pasta de dados: a oficial é `CBMultiplayer` (restrição global); a de teste local é outra.
@@ -741,19 +838,28 @@ fn feature_local_test_so_por_flag_explicita() {
         cbmp_launcher_lib::paths::APP_DIR,
         if cfg!(feature = "local-test") {
             "CBMultiplayer-TesteLocal"
+        } else if cfg!(feature = "online-test") {
+            "CBMultiplayer-Teste"
         } else {
             "CBMultiplayer"
         }
     );
-    if !cfg!(feature = "local-test") {
-        assert_eq!(
-            cbmp_launcher_lib::settings::default_hub_url(),
-            cbmp_launcher_lib::settings::DEFAULT_HUB_URL
-        );
+    let expected_hub = if cfg!(feature = "local-test") {
+        cbmp_launcher_lib::profile::LOCAL_TEST_HUB_URL
+    } else if cfg!(feature = "online-test") {
+        cbmp_launcher_lib::profile::ONLINE_TEST_HUB_URL
     } else {
-        assert_eq!(
-            cbmp_launcher_lib::settings::default_hub_url(),
-            cbmp_launcher_lib::profile::LOCAL_TEST_HUB_URL
-        );
-    }
+        cbmp_launcher_lib::settings::DEFAULT_HUB_URL
+    };
+    assert_eq!(cbmp_launcher_lib::settings::default_hub_url(), expected_hub);
+    assert_eq!(
+        cbmp_launcher_lib::auth::VAULT_SERVICE,
+        if cfg!(feature = "local-test") {
+            "CBMultiplayer (Teste local)"
+        } else if cfg!(feature = "online-test") {
+            "CBMultiplayer (Teste)"
+        } else {
+            "CBMultiplayer"
+        }
+    );
 }
