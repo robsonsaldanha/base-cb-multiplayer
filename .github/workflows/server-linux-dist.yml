@@ -59,7 +59,8 @@ jobs:
           "$GITHUB_WORKSPACE/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
           echo "VCPKG_ROOT=$GITHUB_WORKSPACE/vcpkg" >> $GITHUB_ENV
       - run: |
-          cmake --preset linux-release -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
+          # glibc 2.28: getaddrinfo_a/gai_error (httplib) ficam na libanl (na 2.34+ estão na libc; a libanl.so.1 continua existindo).
+          cmake --preset linux-release -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc" -DCMAKE_CXX_STANDARD_LIBRARIES=-lanl
           cmake --build --preset linux-release --target cb-server
       - uses: actions/cache/save@v4
         if: always()
