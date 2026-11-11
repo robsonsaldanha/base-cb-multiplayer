@@ -26,16 +26,20 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    container: quay.io/pypa/manylinux_2_28_x86_64
+    # Imagem fixada por digest (tag manylinux_2_28_x86_64 de 2026-11-11). Para atualizar, troque o digest de propósito.
+    container: quay.io/pypa/manylinux_2_28_x86_64@sha256:9555ba6c479fa69a2aa80ad1dc57154a60d562b19df159361d9379a02beb1e36
     timeout-minutes: 150
     defaults:
       run:
         shell: bash
     steps:
       - run: |
-          dnf install -y zip unzip perl perl-IPC-Cmd perl-Time-Piece             autoconf automake libtool kernel-headers pkgconf-pkg-config which
+          dnf install -y zip unzip perl perl-IPC-Cmd perl-Time-Piece autoconf automake libtool kernel-headers pkgconf-pkg-config which
           dnf install -y epel-release && dnf install -y autoconf-archive || echo "autoconf-archive indisponível"
-          /opt/python/cp312-cp312/bin/python -m pip install --quiet 'cmake>=3.29,<4' ninja
+          # cmake/ninja com versão e hash fixados (wheels manylinux x86_64 do PyPI).
+          echo 'cmake==3.31.10 --hash=sha256:2f766bb46367e5e0559fa33184653754bce044583a06014dcaebf8e6dff8a1f1 --hash=sha256:3c17bb24dba15f8ecc3fd706afe04264410ef88796f4115c119327c961d5dc57' > /tmp/build-tools.txt
+          echo 'ninja==1.13.0 --hash=sha256:fb46acf6b93b8dd0322adc3a4945452a4e774b75b91293bafcc7b7f8e6517dfa' >> /tmp/build-tools.txt
+          /opt/python/cp312-cp312/bin/python -m pip install --quiet --only-binary=:all: --require-hashes -r /tmp/build-tools.txt
           ln -sf /opt/python/cp312-cp312/bin/cmake /usr/local/bin/cmake
           ln -sf /opt/python/cp312-cp312/bin/ninja /usr/local/bin/ninja
           git config --global --add safe.directory '*'
@@ -75,7 +79,8 @@ jobs:
           mkdir -p "$D"
           cp "$B/server/cb-server" "$D/"
           cp -a "$B"/vcpkg_installed/x64-linux/lib/libmariadb.so* "$D/"
-          cp -a "$B/server/plugins" "$D/" || true
+          [ -d "$B/server/plugins/libmariadb" ] || { echo "plugins da libmariadb ausentes"; exit 1; }
+          cp -a "$B/server/plugins" "$D/"
           cp "$B/vcpkg_installed/x64-linux/share/libmariadb/copyright" "$D/LICENSE-libmariadb.txt"
           patchelf --set-rpath '$ORIGIN' "$D/cb-server"
           echo "${GITHUB_SHA}" > "$D/COMMIT"
@@ -92,10 +97,18 @@ jobs:
           objdump -T "$D/cb-server" "$D"/libmariadb.so.* | grep -E 'GLIBC_2\.(3[6-9]|[4-9][0-9])' || true
           [ "$(printf '%s\nGLIBC_2.35\n' "$MAXG" | sort -V | tail -1)" = "GLIBC_2.35" ]
           "$D/cb-server" --help
-      - run: tar -C dist -czf cb-server-linux-x64.tar.gz cb-server-linux-x64
+      # O deploy (tools/teste-online.mjs --deploy) exige este sha256 e confere o COMMIT de dentro do pacote.
+      - name: pacote final + sha256
+        run: |
+          tar -C dist -czf cb-server-linux-x64.tar.gz cb-server-linux-x64
+          sha256sum cb-server-linux-x64.tar.gz | tee cb-server-linux-x64.tar.gz.sha256
+          { echo "### cb-server-linux-x64"; echo; echo "- commit: \`${GITHUB_SHA}\`";
+            echo "- sha256: \`$(cut -d' ' -f1 cb-server-linux-x64.tar.gz.sha256)\`"; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: cb-server-linux-x64
-          path: cb-server-linux-x64.tar.gz
+          path: |
+            cb-server-linux-x64.tar.gz
+            cb-server-linux-x64.tar.gz.sha256
           if-no-files-found: error
           retention-days: 30
