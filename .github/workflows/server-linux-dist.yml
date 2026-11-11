@@ -1,7 +1,9 @@
 name: server-linux-dist
-# Pacote do cb-server para Linux x64 que roda em Ubuntu 22.04 (glibc 2.35, g++ 11 no sistema): compilado no
-# ubuntu-22.04 com GCC 13 (C++23), Release sem sanitizers, libstdc++/libgcc estáticas e libmariadb.so (LGPL,
-# dinâmica) ao lado do executável com RPATH $ORIGIN. Usado pelo ambiente de teste online (docs/AMBIENTE-TESTE-ONLINE.md).
+# Pacote do cb-server para Linux x64 que roda em Ubuntu 22.04 (glibc 2.35, g++ 11 no sistema): compilado na imagem
+# oficial gcc:14 (Debian bookworm, glibc 2.36; o código usa std::print, que exige GCC 14), Release sem sanitizers,
+# libstdc++/libgcc estáticas e libmariadb.so (LGPL, dinâmica) ao lado do executável com RPATH $ORIGIN. O passo de
+# conferência falha se o binário ou a libmariadb exigirem glibc acima de 2.35. Usado pelo ambiente de teste online
+# (docs/AMBIENTE-TESTE-ONLINE.md).
 on:
   workflow_dispatch:
   push:
@@ -23,28 +25,29 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
+    container: gcc:14-bookworm
     timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
     env:
-      CC: gcc-13
-      CXX: g++-13
+      CC: gcc
+      CXX: g++
     steps:
+      - run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ninja-build cmake zip unzip patchelf autoconf-archive pkg-config linux-libc-dev
+          git config --global --add safe.directory '*'
+          g++ --version && cmake --version && ldd --version | head -1
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4
         with:
           path: .vcpkg-cache
-          key: vcpkg-u2204-gcc13-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
+          key: vcpkg-bookworm-gcc14-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
           restore-keys: |
-            vcpkg-u2204-gcc13-${{ hashFiles('vcpkg.json') }}-
-            vcpkg-u2204-gcc13-
-      # GCC 13 do PPA oficial de toolchains do Ubuntu (o 22.04 só tem até o 12). Também vira o gcc/g++ padrão,
-      # para os ports do vcpkg usarem o mesmo compilador.
-      - run: |
-          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
-          sudo apt-get update
-          sudo apt-get install -y gcc-13 g++-13 ninja-build pkg-config autoconf autoconf-archive automake libtool patchelf
-          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 130 --slave /usr/bin/g++ g++ /usr/bin/g++-13
-          g++ --version
+            vcpkg-bookworm-gcc14-${{ hashFiles('vcpkg.json') }}-
+            vcpkg-bookworm-gcc14-
       - run: |
           mkdir -p .vcpkg-cache
           git clone https://github.com/microsoft/vcpkg "$GITHUB_WORKSPACE/vcpkg"
@@ -58,7 +61,7 @@ jobs:
         if: always()
         with:
           path: .vcpkg-cache
-          key: vcpkg-u2204-gcc13-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
+          key: vcpkg-bookworm-gcc14-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
       - name: pacote (cb-server + libmariadb.so + plugins + licença)
         run: |
           set -euo pipefail
