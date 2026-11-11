@@ -282,12 +282,16 @@ const sigs = verifyKitReleases(kit);
 log(`assinaturas conferidas com a chave pública ${sigs.keyId}: launcher ${LAUNCHER_VERSIONS.join(', ')} e mod ${MOD.version}`);
 const files = walk(kit).sort();
 const problems = scanForSecrets(kit, files);
-// Nenhum caminho desta máquina (pasta de montagem, perfil do usuário) gravado em arquivo do kit.
-const localPaths = [stagingRoot, homedir()].flatMap((x) => [x, x.split(sep).join('/'), x.split(sep).join('\\\\')]);
+// Caminhos desta máquina gravados em arquivos do kit: a pasta de montagem nunca (sinal de sobra de build, como o
+// build\ do node-gyp); o perfil do usuário só nos binários de bin\ (as DLLs do vcpkg trazem o caminho do PDB/build de
+// onde foram compiladas, e só sairia recompilando o vcpkg; o kit vai só para o PC do próprio dono).
+const variants = (x) => [x, x.split(sep).join('/'), x.split(sep).join('\\\\')].map((v) => v.toLowerCase());
+const stagingPaths = variants(stagingRoot);
+const homePaths = variants(homedir());
 for (const f of files) {
   const text = readFileSync(join(kit, ...f.split('/'))).toString('latin1').toLowerCase();
-  const hit = localPaths.find((x) => text.includes(x.toLowerCase()));
-  if (hit) problems.push(`${f}: contém um caminho desta máquina (${hit === stagingRoot || hit.includes('cbmp-kit-') ? 'pasta de montagem' : 'perfil do usuário'})`);
+  if (stagingPaths.some((x) => text.includes(x))) problems.push(`${f}: contém o caminho da pasta de montagem`);
+  else if (!f.startsWith('bin/') && homePaths.some((x) => text.includes(x))) problems.push(`${f}: contém o caminho do perfil do usuário desta máquina`);
 }
 if (problems.length) fail(`o kit tem arquivos proibidos ou com cara de segredo:\n  ${problems.join('\n  ')}`);
 log(`${files.length} arquivos sem chave privada, segredo, .env ou dados do Hub`);
