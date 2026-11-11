@@ -26,20 +26,25 @@ npm run tauri -w launcher/ui -- build   # instalador NSIS em launcher/src-tauri/
 Requisitos no Windows: Rust stable (MSVC), Visual Studio com C++ e Windows SDK, Node 24, WebView2 (já vem no
 Windows 11).
 
-## Builds: oficial e "Teste local"
+## Builds: oficial, "Teste local" e "Teste" (online)
 
-Há dois perfis de build, com a **mesma** CSP, capabilities, plugins e chave pública (`tests/config_guard.rs` confere
-os dois):
+Há três perfis de build, com a **mesma** CSP, capabilities, plugins e chave pública (`tests/config_guard.rs` confere
+os três):
 
-| | Oficial | Teste local (`--features local-test`) |
-|---|---|---|
-| Nome / identificador | CB Multiplayer / `br.com.castelobruxo.cbmp` | CB Multiplayer (Teste local) / `br.com.castelobruxo.cbmp.localtest` |
-| Executável | `CBMultiplayer.exe` | `CBMultiplayerTesteLocal.exe` |
-| Hub | `settings::DEFAULT_HUB_URL` (fixo) | `http://127.0.0.1:8787` (fixo) |
-| Servidores | só endereços públicos | aceita loopback e rede privada |
-| Updater | endpoint do Hub em `tauri.conf.json` | Hub local (`tauri.localtest.conf.json`, http liberado) |
-| Dados | `%LOCALAPPDATA%\CBMultiplayer` | `%LOCALAPPDATA%\CBMultiplayer-TesteLocal` |
-| Cofre (Credential Manager) | serviço `CBMultiplayer` | serviço `CBMultiplayer (Teste local)` |
+| | Oficial | Teste local (`--features local-test`) | Teste online (`--features online-test`) |
+|---|---|---|---|
+| Nome / identificador | CB Multiplayer / `br.com.castelobruxo.cbmp` | CB Multiplayer (Teste local) / `br.com.castelobruxo.cbmp.localtest` | CB Multiplayer (Teste) / `br.com.castelobruxo.cbmp.teste` |
+| Executável | `CBMultiplayer.exe` | `CBMultiplayerTesteLocal.exe` | `CBMultiplayerTeste.exe` |
+| Hub | `settings::DEFAULT_HUB_URL` (fixo) | `http://127.0.0.1:8787` (fixo) | `https://cbmultiplayer.cntoficial.com.br` (fixo) |
+| Servidores | só endereços públicos | aceita loopback e rede privada | só endereços públicos (regras do oficial) |
+| Updater | endpoint do Hub em `tauri.conf.json` | Hub local (`tauri.localtest.conf.json`, http liberado) | Hub de teste (`tauri.onlinetest.conf.json`, só https) |
+| Dados | `%LOCALAPPDATA%\CBMultiplayer` | `%LOCALAPPDATA%\CBMultiplayer-TesteLocal` | `%LOCALAPPDATA%\CBMultiplayer-Teste` |
+| Cofre (Credential Manager) | serviço `CBMultiplayer` | serviço `CBMultiplayer (Teste local)` | serviço `CBMultiplayer (Teste)` |
+
+O perfil "Teste" é o do ambiente de teste online (`docs/AMBIENTE-TESTE-ONLINE.md`); `local-test` e `online-test` não
+podem ser ligados juntos (`compile_error!`). Build: `node tools/teste-online.mjs --build-releases` (assina com a chave
+dev) ou, sem assinar, `npm run tauri -w launcher/ui -- build --ci --features online-test --config
+../src-tauri/tauri.onlinetest.conf.json --config '{"bundle":{"createUpdaterArtifacts":false}}' -- --locked`.
 
 No Git Bash, na raiz do repositório (os mesmos comandos do CI):
 
@@ -54,7 +59,8 @@ npm run tauri -w launcher/ui -- build --ci --features local-test --config ../src
 O PowerShell estraga as aspas do JSON ao repassar para o `npm`: use o Git Bash (ou deixe o `tools/dev-env.mjs`
 gerar o build de teste). O CI (`.github/workflows/launcher.yml`) gera os dois instaladores como artefatos
 (`cb-multiplayer-nsis` e `cb-multiplayer-teste-local-nsis`) e falha se o binário oficial contiver qualquer marca do
-perfil de teste (`127.0.0.1:8787`, `Teste local`, `localtest`, `TesteLocal`).
+perfil de teste (`127.0.0.1:8787`, `Teste local`, `localtest`, `TesteLocal`, e do teste online:
+`cbmultiplayer.cntoficial`, `CBMultiplayer-Teste`, `CBMultiplayer (Teste)`, `cbmp.teste`).
 
 Os dois builds registram o esquema `cbmp://`: com os dois instalados, o login cai no que foi instalado por último.
 Mantenha só um instalado (ou reinstale o que vai usar). Isso fica em `docs/PENDENCIAS.md`.

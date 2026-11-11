@@ -15,6 +15,10 @@ name = "cbmp_launcher_lib"
 # explícita, junto com `tauri.localtest.conf.json`: `--features local-test --config tauri.localtest.conf.json`.
 # Nunca entra no padrão nem em release publicado.
 local-test = []
+# Build de TESTE ONLINE para testadores (Hub https://cbmultiplayer.cntoficial.com.br, nome "CB Multiplayer (Teste)",
+# identificador e pasta próprios; mesmas regras de rede do oficial). Só por flag explícita, junto com
+# `tauri.onlinetest.conf.json`: `--features online-test --config tauri.onlinetest.conf.json`. Nunca é o build oficial.
+online-test = []
 
 [build-dependencies]
 tauri-build = { version = "=2.7.4", features = [] }

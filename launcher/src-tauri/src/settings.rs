@@ -219,10 +219,12 @@ fn salvage(map: &Map<String, Value>) -> (Settings, bool) {
     (s, lossy)
 }
 
-/// Hub padrão deste build: o oficial, ou o local no build de teste local.
+/// Hub padrão deste build: o oficial, o local no build de teste local ou o de teste online.
 pub fn default_hub_url() -> &'static str {
     if crate::profile::LOCAL_TEST {
         crate::profile::LOCAL_TEST_HUB_URL
+    } else if crate::profile::ONLINE_TEST {
+        crate::profile::ONLINE_TEST_HUB_URL
     } else {
         DEFAULT_HUB_URL
     }

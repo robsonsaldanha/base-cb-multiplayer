@@ -46,6 +46,9 @@ jobs:
       # Perfil de teste local (Hub em 127.0.0.1, servidores em LAN): mesmos testes com a feature ligada.
       - run: cargo test --locked --features local-test
         working-directory: launcher/src-tauri
+      # Perfil de teste online (Hub de teste público, regras de rede do oficial).
+      - run: cargo test --locked --features online-test
+        working-directory: launcher/src-tauri
       # Assinador do workflow de release (crate próprio, Cargo.lock próprio).
       - run: cargo test --locked
         working-directory: launcher/release-signer
@@ -53,9 +56,9 @@ jobs:
       # bash (Git Bash do runner): passa o JSON intacto até a CLI, como no build local.
       - run: npm run tauri -w launcher/ui -- build --ci --config '{"bundle":{"createUpdaterArtifacts":false}}' -- --locked
         shell: bash
-      # Tripwire: o binário oficial não pode carregar nada do perfil de teste local (Hub local, nome, pasta).
+      # Tripwire: o binário oficial não pode carregar nada dos perfis de teste local e online (Hub, nome, pasta).
       - run: |
-          for s in '127.0.0.1:8787' 'Teste local' 'localtest' 'TesteLocal'; do
+          for s in '127.0.0.1:8787' 'Teste local' 'localtest' 'TesteLocal' 'cbmultiplayer.cntoficial' 'CBMultiplayer-Teste' 'CBMultiplayer (Teste)' 'cbmp.teste'; do
             if grep -q -a -F "$s" CBMultiplayer.exe; then echo "binário oficial contém '$s'"; exit 1; fi
           done
         shell: bash
@@ -78,6 +81,25 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: cb-multiplayer-teste-local-nsis
+          path: launcher/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+      # Instalador de TESTE ONLINE ("CB Multiplayer (Teste)", Hub https://cbmultiplayer.cntoficial.com.br): o que os
+      # testadores instalam (docs/TESTE-ONLINE.md). Sem assinatura de updater aqui (a release de teste é assinada à parte).
+      - run: rm -rf target/release/bundle/nsis
+        shell: bash
+        working-directory: launcher/src-tauri
+      - run: npm run tauri -w launcher/ui -- build --ci --features online-test --config ../src-tauri/tauri.onlinetest.conf.json --config '{"bundle":{"createUpdaterArtifacts":false}}' -- --locked
+        shell: bash
+      - run: |
+          grep -q -a -F 'https://cbmultiplayer.cntoficial.com.br' CBMultiplayerTeste.exe
+          for s in '127.0.0.1:8787' 'TesteLocal'; do
+            if grep -q -a -F "$s" CBMultiplayerTeste.exe; then echo "binário de teste online contém '$s'"; exit 1; fi
+          done
+        shell: bash
+        working-directory: launcher/src-tauri/target/release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cb-multiplayer-teste-online-nsis
           path: launcher/src-tauri/target/release/bundle/nsis/*.exe
           if-no-files-found: error
 

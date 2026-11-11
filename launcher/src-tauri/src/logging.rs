@@ -384,6 +384,8 @@ pub fn init(dir: &Path) {
             "CB Multiplayer iniciado{}",
             if crate::profile::LOCAL_TEST {
                 " (Teste local)"
+            } else if crate::profile::ONLINE_TEST {
+                " (Teste)"
             } else {
                 ""
             }
