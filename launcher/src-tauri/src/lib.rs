@@ -24,7 +24,8 @@ use tauri::Manager;
 use tauri_plugin_deep_link::DeepLinkExt;
 
 pub fn run() {
-    // Antes de tudo: `%LOCALAPPDATA%\CBMultiplayer\logs\launcher.log` (rotação, sem tokens/tickets/códigos).
+    // Antes de tudo: `<dados>\logs\launcher.log` (`%LOCALAPPDATA%\CBMultiplayer`, ou `CBMultiplayer-TesteLocal` no build
+    // de teste local; rotação, sem tokens/tickets/códigos).
     logging::init(&paths::logs_dir());
     let state = AppState::load(paths::settings_file());
     let hub =

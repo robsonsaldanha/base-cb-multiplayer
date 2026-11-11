@@ -46,6 +46,9 @@ jobs:
       # Perfil de teste local (Hub em 127.0.0.1, servidores em LAN): mesmos testes com a feature ligada.
       - run: cargo test --locked --features local-test
         working-directory: launcher/src-tauri
+      # Assinador do workflow de release (crate próprio, Cargo.lock próprio).
+      - run: cargo test --locked
+        working-directory: launcher/release-signer
       # Build comum sem chave de updater: só o workflow de release liga createUpdaterArtifacts e assina.
       # bash (Git Bash do runner): passa o JSON intacto até a CLI, como no build local.
       - run: npm run tauri -w launcher/ui -- build --ci --config '{"bundle":{"createUpdaterArtifacts":false}}' -- --locked

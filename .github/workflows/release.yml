@@ -5,12 +5,22 @@ name: release
 #   kind=mod      → tag mod-pN-vX.Y.Z: cbmp-mod-pN-vX.Y.Z.zip + .zip.sig (comentário confiável exato
 #                   "cbmp-mod protocol=N version=X.Y.Z sha256=<hex>") + .zip.sha256. O zip vem do artefato "cbmp-mod"
 #                   de outra execução de workflow (mod_run_id), gerado pelo build do mod (subprojeto 5).
+#
 # A chave privada só existe no secret CBMP_UPDATE_KEY (formato do Tauri; senha em CBMP_UPDATE_KEY_PASSWORD, opcional),
-# guardado como secret do ENVIRONMENT "release" (restrito à branch main, com revisores; nunca secret do repositório),
-# e só chega aos passos que assinam. O job só roda a partir de refs/heads/main.
-# kind=mod só assina o artefato de uma execução confiável: deste repositório, do workflow MOD_WORKFLOW, disparada por
-# push/workflow_dispatch na main e concluída com sucesso (nunca pull_request). Recusa assinar enquanto keys/update.pub for a chave de desenvolvimento
-# (key id BDCB478091E91629). Tudo é conferido com a chave pública embutida, como o launcher confere, antes de publicar.
+# guardado como secret do ENVIRONMENT "release" (restrito à branch main, com revisores; nunca secret do repositório).
+# Isolamento da chave (o build roda código de terceiros: pacotes npm, build scripts e proc-macros de ~400 crates, e
+# qualquer um deles poderia ler o ambiente ou deixar um processo vivo no runner até o fim do job):
+#   build  (sem secrets)  testes e build do instalador SEM assinatura (createUpdaterArtifacts=false).
+#   signer (sem secrets)  compila só launcher/release-signer (crate próprio: minisign/base64/sha2/semver, Cargo.lock
+#                         próprio, --locked) num runner limpo e entrega o binário como artefato.
+#   sign   (environment release, ÚNICO job com a chave)  runner limpo, sem checkout, sem npm, sem cargo, sem ações de
+#                         terceiros: baixa o binário do assinador e o que vai ser assinado e roda só o assinador, com a
+#                         chave apenas no ambiente desse passo. Para kind=mod a proveniência é conferida aqui (bash+gh).
+#   verify (sem secrets)  confere o que foi assinado com as mesmas funções do launcher (examples/release_sign.rs).
+#   publish (sem secrets; único com contents: write)  só gh: cria a tag e o Release (nada com dry_run).
+# Recusa assinar enquanto keys/update.pub for a chave de desenvolvimento (key id BDCB478091E91629): o build confere
+# antes, e o assinador (que embute a mesma keys/update.pub) recusa de novo antes de ler a chave.
+# Todos os jobs só rodam a partir de refs/heads/main.
 on:
   workflow_dispatch:
     inputs:
@@ -47,28 +57,30 @@ concurrency:
   group: release
   cancel-in-progress: false
 
+# Entradas só por variável de ambiente (nunca ${{ }} dentro dos scripts).
+env:
+  KIND: ${{ inputs.kind }}
+  VERSION: ${{ inputs.version }}
+  PROTOCOL: ${{ inputs.protocol }}
+  MOD_RUN_ID: ${{ inputs.mod_run_id }}
+  DRY_RUN: ${{ inputs.dry_run }}
+  # Único workflow cujo artefato "cbmp-mod" pode ser assinado (o build do mod, subprojeto 5).
+  MOD_WORKFLOW: .github/workflows/mod.yml
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  release:
+  # ------------------------------------------------------------------------------------------------------------ build
+  # Sem secrets. Roda código de terceiros (npm, build scripts): nada aqui pode depender de sigilo.
+  build:
     runs-on: windows-2025
     timeout-minutes: 60
-    # Secrets de assinatura só existem neste environment (regras de proteção: só main, revisores obrigatórios).
-    environment: release
     permissions:
-      contents: write # criar a tag e o Release
-      actions: read # baixar o artefato do mod de outra execução
-    # Entradas só por variável de ambiente (nunca ${{ }} dentro dos scripts).
-    env:
-      KIND: ${{ inputs.kind }}
-      VERSION: ${{ inputs.version }}
-      PROTOCOL: ${{ inputs.protocol }}
-      MOD_RUN_ID: ${{ inputs.mod_run_id }}
-      DRY_RUN: ${{ inputs.dry_run }}
-      GH_TOKEN: ${{ github.token }}
-      # Único workflow cujo artefato "cbmp-mod" pode ser assinado (o build do mod, subprojeto 5).
-      MOD_WORKFLOW: .github/workflows/mod.yml
-    defaults:
-      run:
-        shell: bash
+      contents: read
+    outputs:
+      tag: ${{ steps.inputs.outputs.tag }}
     steps:
       # Antes de tudo: release só a partir da main (o environment também restringe; aqui falha mesmo sem a regra).
       - name: Exigir a main
@@ -76,8 +88,14 @@ jobs:
           [[ "$GITHUB_REF" == refs/heads/main ]] || { echo "release só a partir de refs/heads/main (veio de '$GITHUB_REF')"; exit 1; }
 
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Conferir entradas e tag
+        id: inputs
+        # Token (só leitura) apenas neste passo; o checkout não guarda credenciais.
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           num='(0|[1-9][0-9]{0,8})'
@@ -92,23 +110,17 @@ jobs:
               TAG="mod-p$PROTOCOL-v$VERSION" ;;
             *) echo "kind inválido: '$KIND'"; exit 1 ;;
           esac
-          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
-            echo "a tag $TAG já existe: versões publicadas não são substituídas"; exit 1
-          fi
-          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          n=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" --jq "[.[] | select(.ref == \"refs/tags/$TAG\")] | length") \
+            || { echo "falha ao consultar as tags do repositório"; exit 1; }
+          [[ "$n" == 0 ]] || { echo "a tag $TAG já existe: versões publicadas não são substituídas"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "release: $TAG"
-
-      - name: Conferir o secret
-        env:
-          CBMP_UPDATE_KEY: ${{ secrets.CBMP_UPDATE_KEY }}
-        run: |
-          [[ -n "${CBMP_UPDATE_KEY// /}" ]] || { echo "secret CBMP_UPDATE_KEY ausente (launcher/README.md, \"Chaves\")"; exit 1; }
 
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
-      # Ações de terceiros fixadas por commit (o instalador é gerado sob elas).
+      # Ações de terceiros fixadas por commit.
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
@@ -119,28 +131,30 @@ jobs:
           shared-key: release
       - run: npm ci
 
-      # Antes de qualquer build: com a chave dev em keys/update.pub nada é assinado.
+      # O `generate_context!` exige a UI compilada antes de compilar o Rust (inclusive os examples).
+      - run: npm test -w launcher/ui
+      - run: npm run build -w launcher/ui
+      - run: npm run check:dist -w launcher/ui
+
+      # Antes de qualquer build do instalador: com a chave dev em keys/update.pub nada é assinado.
       - name: Recusar a chave de desenvolvimento
         working-directory: launcher/src-tauri
         run: cargo run --quiet --locked --example release_sign -- check-pubkey
 
-      # Mesmos testes do CI (inclui os do assinador, com pares gerados no teste) antes de publicar qualquer coisa.
-      - run: npm test -w launcher/ui
-      - run: npm run build -w launcher/ui
-      - run: npm run check:dist -w launcher/ui
+      # Mesmos testes do CI (inclui os do núcleo do assinador, com pares gerados no teste) antes de publicar.
       - run: cargo test --locked
         working-directory: launcher/src-tauri
+      - run: cargo test --locked
+        working-directory: launcher/release-signer
 
-      # ------------------------------------------------------------------------------------------------- launcher
-      - name: Build assinado do launcher
+      # ------------------------------------------------------------------------------------------- launcher
+      # SEM chave: o instalador sai sem .sig; quem assina é o job sign.
+      - name: Build do launcher (sem assinatura)
         if: env.KIND == 'launcher'
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.CBMP_UPDATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.CBMP_UPDATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
           npm run tauri -w launcher/ui -- build --ci \
-            --config "{\"version\":\"$VERSION\",\"bundle\":{\"createUpdaterArtifacts\":true}}" -- --locked
+            --config "{\"version\":\"$VERSION\",\"bundle\":{\"createUpdaterArtifacts\":false}}" -- --locked
 
       - name: Conferir e separar o instalador
         if: env.KIND == 'launcher'
@@ -152,19 +166,112 @@ jobs:
             if grep -q -a -F "$s" "$rel/CBMultiplayer.exe"; then echo "binário oficial contém '$s'"; exit 1; fi
           done
           src="$rel/bundle/nsis/CB Multiplayer_${VERSION}_x64-setup.exe"
-          [[ -f "$src" && -f "$src.sig" ]] || { echo "build não gerou $src e .sig"; ls -la "$rel/bundle/nsis" || true; exit 1; }
-          # Sem espaço no nome (o GitHub troca espaços em nomes de asset).
-          mkdir -p dist
-          dst="dist/CBMultiplayer_${VERSION}_x64-setup.exe"
-          cp "$src" "$dst"
-          cp "$src.sig" "$dst.sig"
-          cd launcher/src-tauri
-          cargo run --quiet --locked --example release_sign -- verify-launcher \
-            --installer "../../$dst" --sig "../../$dst.sig" --version "$VERSION"
+          [[ -f "$src" ]] || { echo "build não gerou $src"; ls -la "$rel/bundle/nsis" || true; exit 1; }
+          # Sem espaço no nome (o GitHub troca espaços em nomes de asset). Só o .exe vai adiante.
+          mkdir -p unsigned
+          cp "$src" "unsigned/CBMultiplayer_${VERSION}_x64-setup.exe"
+          ls -la unsigned
 
-      # ------------------------------------------------------------------------------------------------------ mod
+      - name: Entregar o instalador ao job sign
+        if: env.KIND == 'launcher'
+        uses: actions/upload-artifact@v4
+        with:
+          name: launcher-unsigned
+          path: unsigned/
+          if-no-files-found: error
+          retention-days: 1
+
+  # ----------------------------------------------------------------------------------------------------------- signer
+  # Sem secrets. Runner limpo que só compila o assinador mínimo (nada do launcher, nada de npm).
+  signer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Exigir a main
+        run: |
+          [[ "$GITHUB_REF" == refs/heads/main ]] || { echo "release só a partir de refs/heads/main (veio de '$GITHUB_REF')"; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      # Sem cache de build (nada vindo de outras execuções entra no binário que recebe a chave).
+      - name: Compilar e testar o assinador
+        working-directory: launcher/release-signer
+        run: |
+          set -euo pipefail
+          cargo test --locked --release
+          cargo build --locked --release
+          sha256sum target/release/cbmp-release-signer
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-signer
+          path: launcher/release-signer/target/release/cbmp-release-signer
+          if-no-files-found: error
+          retention-days: 1
+
+  # ------------------------------------------------------------------------------------------------------------- sign
+  # ÚNICO job com a chave. Sem checkout, sem npm, sem cargo, sem ações de terceiros: só bash, gh, as ações de artefato
+  # do próprio GitHub e o binário do assinador compilado no job signer. A chave só entra no ambiente do passo que
+  # roda o assinador.
+  sign:
+    needs: [build, signer]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Secrets de assinatura só existem neste environment (regras de proteção: só main, revisores obrigatórios).
+    environment: release
+    permissions:
+      contents: read
+      actions: read # consultar e baixar o artefato do mod de outra execução
+    outputs:
+      mod_head_sha: ${{ steps.provenance.outputs.sha }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Exigir a main
+        run: |
+          [[ "$GITHUB_REF" == refs/heads/main ]] || { echo "release só a partir de refs/heads/main (veio de '$GITHUB_REF')"; exit 1; }
+
+      - name: Conferir o secret
+        env:
+          CBMP_UPDATE_KEY: ${{ secrets.CBMP_UPDATE_KEY }}
+        run: |
+          [[ -n "${CBMP_UPDATE_KEY// /}" ]] || { echo "secret CBMP_UPDATE_KEY ausente (launcher/README.md, \"Chaves\")"; exit 1; }
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-signer
+          path: signer
+      - run: |
+          chmod +x signer/cbmp-release-signer
+          sha256sum signer/cbmp-release-signer
+
+      # ------------------------------------------------------------------------------------------- launcher
+      - name: Baixar o instalador
+        if: env.KIND == 'launcher'
+        uses: actions/download-artifact@v4
+        with:
+          name: launcher-unsigned
+          path: dist
+
+      - name: Assinar o instalador
+        if: env.KIND == 'launcher'
+        env:
+          CBMP_UPDATE_KEY: ${{ secrets.CBMP_UPDATE_KEY }}
+          CBMP_UPDATE_KEY_PASSWORD: ${{ secrets.CBMP_UPDATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          exe="dist/CBMultiplayer_${VERSION}_x64-setup.exe"
+          [[ -f "$exe" ]] || { echo "artefato sem $exe"; ls -la dist; exit 1; }
+          ./signer/cbmp-release-signer sign-launcher --installer "$exe" --version "$VERSION"
+
+      # ------------------------------------------------------------------------------------------------ mod
       # Proveniência: só assina o artefato de uma execução confiável. Falha fechado em qualquer campo diferente.
       - name: Conferir a execução do mod
+        id: provenance
         if: env.KIND == 'mod'
         run: |
           set -euo pipefail
@@ -196,7 +303,7 @@ jobs:
             || { echo "recusado: não foi possível comparar $sha com a main"; exit 1; }
           [[ "$cmp" == identical || "$cmp" == ahead ]] \
             || { echo "recusado: o commit $sha da execução não está na branch main (compare: '$cmp')"; exit 1; }
-          echo "MOD_HEAD_SHA=$sha" >> "$GITHUB_ENV"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "execução $MOD_RUN_ID confiável: $path, $event em main, commit $sha (na main: $cmp de $main_sha)"
 
       - name: Baixar o zip do mod
@@ -208,7 +315,7 @@ jobs:
           run-id: ${{ env.MOD_RUN_ID }}
           github-token: ${{ github.token }}
 
-      - name: Assinar e conferir o mod
+      - name: Assinar o mod
         if: env.KIND == 'mod'
         env:
           CBMP_UPDATE_KEY: ${{ secrets.CBMP_UPDATE_KEY }}
@@ -218,21 +325,99 @@ jobs:
           shopt -s nullglob
           zips=(mod-in/*.zip)
           [[ ${#zips[@]} -eq 1 ]] || { echo "o artefato cbmp-mod deve ter exatamente um .zip (tem ${#zips[@]})"; exit 1; }
-          mkdir -p dist
-          cd launcher/src-tauri
-          cargo run --quiet --locked --example release_sign -- sign-mod \
-            --zip "../../${zips[0]}" --protocol "$PROTOCOL" --version "$VERSION" --out ../../dist
+          ./signer/cbmp-release-signer sign-mod \
+            --zip "${zips[0]}" --protocol "$PROTOCOL" --version "$VERSION" --out dist
 
-      - name: Conferir o mod gravado
+      # ---------------------------------------------------------------------------------------------- saída
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-signed
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  # ----------------------------------------------------------------------------------------------------------- verify
+  # Sem secrets. Confere como o launcher confere (mesmas funções da biblioteca), antes de publicar.
+  verify:
+    needs: [build, sign]
+    runs-on: windows-2025
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Exigir a main
+        run: |
+          [[ "$GITHUB_REF" == refs/heads/main ]] || { echo "release só a partir de refs/heads/main (veio de '$GITHUB_REF')"; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: launcher/src-tauri -> target
+          shared-key: release
+          save-if: false
+      # O `generate_context!` exige a UI compilada para compilar o example.
+      - run: npm ci
+      - run: npm run build -w launcher/ui
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-signed
+          path: dist
+
+      - name: Conferir o instalador
+        if: env.KIND == 'launcher'
+        working-directory: launcher/src-tauri
+        run: |
+          set -euo pipefail
+          exe="../../dist/CBMultiplayer_${VERSION}_x64-setup.exe"
+          [[ $(ls ../../dist | wc -l) -eq 2 ]] || { echo "dist deveria ter só o instalador e o .sig"; ls -la ../../dist; exit 1; }
+          cargo run --quiet --locked --example release_sign -- verify-launcher \
+            --installer "$exe" --sig "$exe.sig" --version "$VERSION"
+
+      - name: Conferir o mod
         if: env.KIND == 'mod'
         working-directory: launcher/src-tauri
-        run: cargo run --quiet --locked --example release_sign -- verify-mod --dir ../../dist --protocol "$PROTOCOL" --version "$VERSION"
+        run: |
+          set -euo pipefail
+          [[ $(ls ../../dist | wc -l) -eq 3 ]] || { echo "dist deveria ter só o zip, o .sig e o .sha256"; ls -la ../../dist; exit 1; }
+          cargo run --quiet --locked --example release_sign -- verify-mod --dir ../../dist --protocol "$PROTOCOL" --version "$VERSION"
 
-      # ---------------------------------------------------------------------------------------------- publicação
+  # ---------------------------------------------------------------------------------------------------------- publish
+  # Sem secrets e sem código de build: só gh. Único job com permissão de escrita.
+  publish:
+    needs: [build, sign, verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # criar a tag e o Release
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.build.outputs.tag }}
+      MOD_HEAD_SHA: ${{ needs.sign.outputs.mod_head_sha }}
+    steps:
+      - name: Exigir a main
+        run: |
+          [[ "$GITHUB_REF" == refs/heads/main ]] || { echo "release só a partir de refs/heads/main (veio de '$GITHUB_REF')"; exit 1; }
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-signed
+          path: dist
       - name: Criar o Release
         run: |
           set -euo pipefail
+          [[ "$TAG" =~ ^(launcher|mod-p[0-9]+)-v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "tag inesperada: '$TAG'"; exit 1; }
           ls -la dist
+          # A tag pode ter surgido durante a aprovação: versões publicadas não são substituídas.
+          n=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" --jq "[.[] | select(.ref == \"refs/tags/$TAG\")] | length") \
+            || { echo "falha ao consultar as tags do repositório"; exit 1; }
+          [[ "$n" == 0 ]] || { echo "a tag $TAG já existe: versões publicadas não são substituídas"; exit 1; }
           if [[ "$KIND" == launcher ]]; then
             notes="CB Multiplayer $VERSION (instalador NSIS, Windows x64). Assinado para o updater do launcher."
           else
@@ -243,4 +428,5 @@ jobs:
             echo "notas: $notes"
             exit 0
           fi
-          gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "$TAG" --notes "$notes" --latest=false
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$TAG" \
+            --notes "$notes" --latest=false

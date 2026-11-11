@@ -40,6 +40,9 @@ das tasks).
 - **Pasta de dados por build** (revisão 9a, M-8): o launcher oficial usa `%LOCALAPPDATA%\CBMultiplayer` e o build
   "Teste local" usa `%LOCALAPPDATA%\CBMultiplayer-TesteLocal` (`run\` e `mods\` inclusive). O mod não pode fixar o
   nome da pasta: receber o caminho do `run\` do launcher (ex.: arquivo ao lado do mod instalado) ou procurar nos dois.
+- **Margem de renovação do ticket** (revisão 7, M-1): o launcher renova o ticket com mais de 240 s (TTL 300 − 60;
+  `play::TICKET_RENEW_AFTER_SECS`) antes de gravar o `connect.json`, mas o tempo entre abrir o jogo e o mod resgatar o
+  ticket não é medido. Medir com o mod real e ajustar a margem (ou renovar pelo mod).
 
 ## Servidor: resíduos do subprojeto 3 (Lua / MySQL / admin)
 
@@ -132,6 +135,38 @@ Decisões registradas e limites aceitos; o comportamento atual está documentado
     proxy não pingam nem baixam conteúdo (o jogo também não conectaria). Documentado em `launcher/README.md`.
   - Instalação do mod com disco cheio: a troca é atômica (staging + rename), mas não há teste automatizado de disco
     cheio.
+  - **Ping: leque de portas por host** (revisão 8, R1-1): cada id da lista vira um ping, então vários servidores no
+    mesmo host com portas diferentes geram vários pacotes para ele (`ping.rs`, `Pinger::ping`). Limitado (≤ 200 ids,
+    cache de 25 s, 16 simultâneos); agrupar por host ou limitar portas por host.
+  - **NAT64 e 6to4 não são desembrulhados** em `content::ip_allowed` (revisão 8, R1-2): `64:ff9b::/96` e `2002::/16`
+    podem levar a um IPv4 privado. Exige Hub comprometido e rede NAT64; tratar os dois prefixos como o IPv4 embutido.
+  - **Erro de leitura do índice apaga o cache inteiro** (revisão 6, R1-3a): `Index::get` trata índice ilegível como
+    vazio e o `startup` remove os arquivos que não estão nele. É re-baixável, mas é uma remoção em massa silenciosa;
+    distinguir "não existe" de "não deu para ler" e não varrer no segundo caso.
+  - **Montagem por cópia sem fsync** (revisão 6, R1-2): no fallback sem hard link (`content.rs`, `mount`) os arquivos
+    copiados não passam por `sync_all` antes de gravar o registro da montagem; queda de energia pode deixar arquivo
+    truncado marcado como montado (o arquivo do cache continua verificado).
+  - **Registro do mod gravado depois da troca** (revisão 7, R1-m1): `modpkg.rs` troca a pasta do mod e só então grava
+    o registro; um crash entre os dois, somado a um Hub comprometido, permite reinstalar outra versão assinada.
+    Gravar o registro (versão mínima) antes da troca.
+  - **Confiança da pasta da Epic só na descoberta, e só na folha** (revisão 7, R1-m3): `game.rs` (`SystemTrust`) confere
+    dono/ACL do caminho quando acha o jogo, não de novo ao abrir, e não confere as pastas acima nem pontos de
+    reanálise. Só atacante local; conferir a cadeia e repetir antes de abrir.
+  - **Anti-downgrade do mod lembra só o último protocolo** (revisão 7, R1-m4): o piso de versão assinada fica no
+    registro de um protocolo só (`modpkg.rs`, `installed`); alternar de protocolo zera o piso do anterior. Exige Hub
+    comprometido; guardar o piso por protocolo.
+  - **Validade do access token pelo `Date` do Hub sem limite** (revisão 5, N1): `hub::Tokens::access_lifetime` usa o
+    `Date` da resposta sem teto; um `Date` muito errado faz o launcher renovar cedo ou tarde demais. Corrige-se sozinho
+    pelo 401 + refresh; limitar ao `expires_in` anunciado.
+  - Erro `protocol_mismatch` na tabela da UI e em `blocksPlay` (`ui/src/lib/errors.ts`), mas o Rust nunca o emite
+    (protocolo incompatível sai como `manifest_mismatch`/`mod_unavailable`): remover ou criar a checagem no launcher.
+  - **Gravações de configuração da UI sem fila** (`ui/src/lib/settings.ts`): cada uma lê, altera e grava o store;
+    `pushRecent` (depois do Jogar) concorrendo com `toggleFavorite` pode perder uma das duas. Encadear numa fila.
+  - O User-Agent (`hub.rs`, `content.rs`) usa `CARGO_PKG_VERSION` (sempre `0.1.0`), enquanto o `release.yml` só troca
+    a versão do Tauri: todo release se anuncia `CBMultiplayer/0.1.0`. Usar `app.package_info().version`.
+- **Hub: release mantido com ids de asset antigos** (revisão 3, Mn2): quando um release é excluído por `.sig`/`.sha256`
+  ilegível, `hub/src/github.ts` mantém a entrada anterior (não regride a versão), mas os ids de asset dela podem já ter
+  sido trocados no GitHub; o `/v1/dl` então falha para esse release até ele voltar a ser legível. Só disponibilidade.
 
 - **Pacote de distribuição do `cb-server`**: levar `libmariadb.so*`/`libmariadb.dll` (LGPL, ligada dinamicamente) com
   o aviso de licença, a pasta `plugins/libmariadb/` ao lado do executável (sem ela, MySQL 8 com

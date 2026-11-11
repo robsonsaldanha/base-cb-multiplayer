@@ -93,7 +93,10 @@ O launcher em `tauri dev` (debug) também aceita o Hub local: `CBMP_HUB_URL=http
 ## Testes
 
 - `cargo test` (em `launcher/src-tauri`, também com `--features local-test`): unidade, guarda de configuração,
-  Hub/`cb-server` falsos (axum) e os testes do assinador de release (`examples/release_sign.rs`, `test = true`).
+  Hub/`cb-server` falsos (axum) e os testes da assinatura de release (`examples/release_sign.rs`, `test = true`:
+  o que o núcleo do assinador grava é conferido com as funções do próprio launcher).
+- `cargo test` em `launcher/release-signer`: o assinador do workflow de release (crate próprio, veja "Publicar um
+  release").
 - **Ponta a ponta** (`tests/e2e.rs`): `tools/dev-env.mjs --run`, em portas livres e pasta temporária, sobe o Hub real
   (node) e o `cb-server` real com o `hello-client`. O teste faz o login de dev pelo mesmo caminho do botão Entrar
   (PKCE + state → formulário do Hub → `cbmp://auth`), acha o servidor em destaque, roda o `play` em modo simular e
@@ -136,14 +139,15 @@ assinados com a chave cuja parte pública está em `src-tauri/keys/update.pub` (
 `plugins.updater.pubkey` do `tauri.conf.json`; o teste `config_guard` exige que as duas sejam iguais).
 
 `bundle.createUpdaterArtifacts` fica `false` no `tauri.conf.json`: o build comum (local e CI) não precisa da chave
-privada. Só o workflow de release (e o `dev-env --build-releases`, com a chave dev) liga essa opção e assina.
+privada. O workflow de release também compila assim (sem a chave) e assina depois, num job separado (veja "Publicar
+um release"); só o `dev-env --build-releases` (local, com a chave dev) liga essa opção e deixa o `tauri build` assinar.
 
 A checagem roda ao abrir e a cada 6 h (`update://available` para a UI); nada é instalado sozinho. `check_update`
 devolve `{available, version, notes}` e `install_update` baixa (3 tentativas com espera crescente: o Hub derruba quem
 fica abaixo de 32 KiB/s e não serve `Range`), confere a assinatura e instala (o instalador fecha o launcher). Pacote
 anunciado fora da origem do Hub é recusado. A versão também precisa estar assinada: `requireSignedVersion: true` no
-`tauri.conf.json` (o comentário confiável do `.sig` traz `version:X.Y.Z`, gravado por `tauri build` ou
-`tauri signer sign --app-version`) e o launcher confere de novo que a versão assinada é a anunciada. Assim um Hub
+`tauri.conf.json` (o comentário confiável do `.sig` traz `version:X.Y.Z`, gravado pelo `launcher/release-signer` no
+release, ou pelo `tauri build` no `dev-env`) e o launcher confere de novo que a versão assinada é a anunciada. Assim um Hub
 comprometido não consegue oferecer um launcher antigo assinado como se fosse novo.
 
 ## Chaves
@@ -188,12 +192,30 @@ real para ensaiar o workflow antes do primeiro release. É seguro, porque nada �
 runner, que é descartado. Não troque a chave para o ensaio: a conferência usa o `keys/update.pub` da `main` e o
 secret do environment, e trocar os dois e depois desfazer é fácil de errar.
 
-- `kind=launcher`, `version=X.Y.Z`: roda os testes, faz o build oficial com `version` e `createUpdaterArtifacts`
-  ligados, assinando com `CBMP_UPDATE_KEY`; confere a assinatura com `keys/update.pub` e `version:X.Y.Z` no comentário
-  confiável (mesma função do launcher); cria o Release `launcher-vX.Y.Z` com `CBMultiplayer_X.Y.Z_x64-setup.exe` e o
-  `.sig` (sem espaço no nome: o GitHub troca espaços em nomes de asset).
+**A chave nunca fica perto de código de terceiros.** O build do instalador roda pacotes npm e os build scripts e
+proc-macros de ~400 crates; qualquer um deles poderia ler o ambiente (ou deixar um processo vivo no runner até o fim
+do job). Por isso o workflow tem cinco jobs, e só um vê a chave:
+
+| job | secrets | o que roda |
+|---|---|---|
+| `build` | nenhum | testes (UI, launcher, assinador), `check-pubkey` e o build do instalador **sem assinatura** (`createUpdaterArtifacts=false`) |
+| `signer` | nenhum | runner limpo; compila só `launcher/release-signer` (`minisign`/`base64`/`sha2`/`semver`, versões exatas e `Cargo.lock` próprio, `--locked`, sem cache) |
+| `sign` | `CBMP_UPDATE_KEY` (environment `release`) | runner limpo, **sem checkout, npm, cargo nem ações de terceiros**: baixa o binário do assinador e o que vai ser assinado e roda só o assinador, com a chave apenas no ambiente desse passo |
+| `verify` | nenhum | confere o que foi assinado com as funções do launcher (`examples/release_sign.rs verify-*`) |
+| `publish` | nenhum (`contents: write`) | só `gh`: cria a tag e o Release (nada com `dry_run`) |
+
+O assinador embute a mesma `keys/update.pub` do launcher, recusa a chave dev antes de ler a privada, confere a própria
+assinatura com a pública antes de gravar e nunca sobrescreve arquivos. O núcleo (`examples/common/signing.rs`) não
+pode usar a biblioteca do launcher nem outras dependências: o crate do assinador o inclui pelo caminho. A aprovação do
+environment acontece antes do job `sign`, depois do build e dos testes.
+
+- `kind=launcher`, `version=X.Y.Z`: roda os testes e faz o build oficial com `version`, sem chave; o job `sign` grava
+  o `.sig` no formato do updater do Tauri (`timestamp:<unix>	file:CBMultiplayer_X.Y.Z_x64-setup.exe	version:X.Y.Z`
+  no comentário confiável); o `verify` confere a assinatura com `keys/update.pub` e `version:X.Y.Z` (mesma função do
+  launcher); o `publish` cria o Release `launcher-vX.Y.Z` com `CBMultiplayer_X.Y.Z_x64-setup.exe` e o `.sig` (sem
+  espaço no nome: o GitHub troca espaços em nomes de asset).
 - `kind=mod`, `version=X.Y.Z`, `protocol=N`, `mod_run_id=<id da execução que gerou o artefato "cbmp-mod">`: baixa o
-  zip, assina com o comentário confiável exato `cbmp-mod protocol=N version=X.Y.Z sha256=<hex>`, confere e cria o
+  zip (no job `sign`), assina com o comentário confiável exato `cbmp-mod protocol=N version=X.Y.Z sha256=<hex>`, confere e cria o
   Release `mod-pN-vX.Y.Z` com `cbmp-mod-pN-vX.Y.Z.zip`, `.zip.sig` e `.zip.sha256`. O build que gera o artefato
   `cbmp-mod` é do subprojeto 5.
   - **Proveniência (falha fechado):** antes de baixar, o workflow consulta a execução `mod_run_id` na API e só segue
@@ -208,8 +230,10 @@ secret do environment, e trocar os dois e depois desfazer é fácil de errar.
     O check confia em `head_sha`, então construir outro commit dentro de uma execução "confiável" anularia a proteção.
 
 O workflow recusa: chave dev em `keys/update.pub`, secret ausente, versão fora de `X.Y.Z`, tag já existente,
-assinatura que não confere. Assinar e conferir fica em `examples/release_sign.rs` (testado no `cargo test` com pares
-gerados no teste); o `examples/dev_sign_mod.rs` (mod de teste do dev-env) usa o mesmo código (`examples/common/`).
+assinatura que não confere. Assinar fica em `launcher/release-signer` (núcleo em `src-tauri/examples/common/signing.rs`)
+e conferir em `examples/release_sign.rs` (`examples/common/verify.rs`); os dois são testados no `cargo test` com
+pares gerados no teste. O `examples/dev_sign_mod.rs` (mod de teste do dev-env) usa o mesmo código
+(`examples/common/`).
 
 ## Instalação e SmartScreen
 

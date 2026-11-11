@@ -13,10 +13,13 @@
 //! `CBMP_KEY_PASSWORD` (vazia se ausente, como a chave dev).
 //!
 //! É um *example* (não um binário do app) para usar o crate `minisign`, que é só dependência de desenvolvimento.
-//! Assinatura e conferência ficam em `common/signing.rs`, as mesmas do `release_sign` do workflow de release.
+//! Assinatura em `common/signing.rs` (a mesma do assinador do workflow de release, `launcher/release-signer`) e
+//! conferência em `common/verify.rs` (a mesma do `release_sign`).
 
 #[path = "common/signing.rs"]
 mod signing;
+#[path = "common/verify.rs"]
+mod verify;
 
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
@@ -83,7 +86,7 @@ fn run() -> Result<(), String> {
     let zip = test_zip(a.protocol, &a.version);
     let (sig_b64, sha) = signing::sign_mod(&sk, &zip, a.protocol, &a.version)?;
     // Confere com a chave pública embutida e com a mesma leitura do launcher.
-    signing::verify_mod(
+    verify::verify_mod(
         cbmp_launcher_lib::update::pubkey(),
         &zip,
         &sig_b64,

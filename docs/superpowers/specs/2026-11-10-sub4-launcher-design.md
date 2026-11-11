@@ -51,7 +51,8 @@ Código do `game.rs` escrito do zero (não copiar o launcher atual do CB nem nad
 
 ## Hub: mudanças
 
-- `featured: boolean` em `server_status`/listagem (`ServerListing`, `ServerDetail`); lista ordena destacados primeiro.
+- `featured: boolean` na tabela `servers` (exposto na listagem: `ServerListing`, `ServerDetail`); lista ordena destacados
+  primeiro.
   `PATCH /v1/admin/servers/:id {featured}` (sessão de admin da plataforma, auditado).
 - Updates (Tauri dynamic update): `GET /v1/launcher/update/{target}/{arch}/{current_version}` →
   `204` sem update; `200 {version, notes, pub_date, url, signature}` quando há versão maior. Releases com tag

@@ -124,7 +124,7 @@ impl Settings {
                 return Err(AppError::new(
                     "settings_unreadable",
                     format!(
-                        "Não foi possível ler {}: {e}. As configurações não serão gravadas até o arquivo voltar a ser legível.",
+                        "Não foi possível ler {}: {e}. As configurações não serão gravadas até reiniciar o launcher com o arquivo legível.",
                         path.display()
                     ),
                 ))

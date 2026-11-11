@@ -1,38 +1,35 @@
-//! Assinatura e conferência do workflow de release (`.github/workflows/release.yml`).
+//! Conferência do workflow de release (`.github/workflows/release.yml`), SEM a chave privada.
 //!
 //! ```text
 //! cargo run --example release_sign -- check-pubkey
-//! cargo run --example release_sign -- sign-mod --zip <arquivo.zip> --protocol N --version X.Y.Z --out <pasta>
 //! cargo run --example release_sign -- verify-mod --dir <pasta> --protocol N --version X.Y.Z
 //! cargo run --example release_sign -- verify-launcher --installer <setup.exe> --sig <setup.exe.sig> --version X.Y.Z
 //! ```
 //!
 //! - Todos os comandos recusam se `keys/update.pub` (a chave pública embutida no launcher) ainda for a chave de
 //!   desenvolvimento (key id `BDCB478091E91629`), lida dos bytes da chave e não do comentário.
-//! - `sign-mod` lê a chave privada (formato do Tauri) só da variável `CBMP_UPDATE_KEY` e a senha de
-//!   `CBMP_UPDATE_KEY_PASSWORD` (vazia se ausente); nunca de argumento, nunca impressa. Grava
-//!   `cbmp-mod-pN-vX.Y.Z.zip`, `.zip.sig` (base64, formato do Tauri) com o comentário confiável exato
-//!   `cbmp-mod protocol=N version=X.Y.Z sha256=<hex>` e `.zip.sha256`, e confere com a pública antes de sair.
-//! - `verify-*` conferem como o launcher confere (mesmas funções da biblioteca), antes de publicar.
+//! - `verify-*` conferem como o launcher confere (mesmas funções da biblioteca, `common/verify.rs`), antes de publicar.
+//! - **Assinar não é daqui.** Quem assina é `launcher/release-signer` (crate próprio, só `minisign`/`base64`/`sha2`/
+//!   `semver`), num job que não roda npm nem compila o launcher: este example liga a biblioteca do launcher (Tauri e
+//!   ~400 crates com build scripts) e por isso nunca roda com a chave no ambiente. O núcleo do assinador é
+//!   `common/signing.rs`, e os testes daqui conferem o que ele grava com as funções do launcher.
 //!
 //! É um *example* para usar o crate `minisign` (dependência só de desenvolvimento); `test = true` no Cargo.toml faz
 //! o `cargo test` rodar os testes daqui, com pares de chaves gerados no próprio teste.
 
 #[path = "common/signing.rs"]
 mod signing;
+#[path = "common/verify.rs"]
+mod verify;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-const USAGE: &str = "uso: release_sign check-pubkey | sign-mod --zip <zip> --protocol N --version X.Y.Z --out <pasta> \
-                     | verify-mod --dir <pasta> --protocol N --version X.Y.Z \
-                     | verify-launcher --installer <exe> --sig <sig> --version X.Y.Z";
+const USAGE: &str = "uso: release_sign check-pubkey | verify-mod --dir <pasta> --protocol N --version X.Y.Z                      | verify-launcher --installer <exe> --sig <sig> --version X.Y.Z";
 
 #[derive(Default)]
 struct Opts {
-    zip: Option<PathBuf>,
     dir: Option<PathBuf>,
-    out: Option<PathBuf>,
     installer: Option<PathBuf>,
     sig: Option<PathBuf>,
     protocol: Option<u32>,
@@ -46,67 +43,33 @@ fn parse(args: &[String]) -> Result<(String, Opts), String> {
     while let Some(a) = it.next() {
         let v = it.next().ok_or_else(|| format!("{a} sem valor"))?;
         match a.as_str() {
-            "--zip" => o.zip = Some(v.into()),
             "--dir" => o.dir = Some(v.into()),
-            "--out" => o.out = Some(v.into()),
             "--installer" => o.installer = Some(v.into()),
             "--sig" => o.sig = Some(v.into()),
-            "--protocol" => o.protocol = Some(parse_protocol(v)?),
+            "--protocol" => o.protocol = Some(signing::parse_protocol(v)?),
             "--version" => o.version = Some(v.clone()),
-            other => return Err(format!("argumento desconhecido: {other}\n{USAGE}")),
+            other => {
+                return Err(format!(
+                    "argumento desconhecido: {other}
+{USAGE}"
+                ))
+            }
         }
     }
     Ok((cmd, o))
 }
 
-/// Protocolo como as tags `mod-pN-...` do Hub: inteiro sem zeros à esquerda.
-fn parse_protocol(v: &str) -> Result<u32, String> {
-    let ok = !v.is_empty()
-        && v.len() <= 9
-        && v.bytes().all(|b| b.is_ascii_digit())
-        && (v == "0" || !v.starts_with('0'));
-    ok.then(|| v.parse().ok())
-        .flatten()
-        .ok_or_else(|| format!("protocolo inválido: {v}"))
-}
-
 fn need<T>(v: Option<T>, name: &str) -> Result<T, String> {
-    v.ok_or_else(|| format!("{name} é obrigatório\n{USAGE}"))
+    v.ok_or_else(|| {
+        format!(
+            "{name} é obrigatório
+{USAGE}"
+        )
+    })
 }
 
 fn read(p: &Path) -> Result<Vec<u8>, String> {
     std::fs::read(p).map_err(|e| format!("não foi possível ler {}: {e}", p.display()))
-}
-
-/// Assina `zip` e grava os três arquivos do release em `out`; confere com `pubkey` antes de gravar.
-fn sign_mod_release(
-    pubkey: &str,
-    sk: &minisign::SecretKey,
-    zip: &[u8],
-    protocol: u32,
-    version: &str,
-    out: &Path,
-) -> Result<String, String> {
-    signing::refuse_dev_key(pubkey)?;
-    signing::check_version(version)?;
-    if !zip.starts_with(b"PK\x03\x04") {
-        return Err("o arquivo do mod não é um zip".into());
-    }
-    let (sig, sha) = signing::sign_mod(sk, zip, protocol, version)?;
-    signing::verify_mod(pubkey, zip, &sig, protocol, version)
-        .map_err(|e| format!("{e} (CBMP_UPDATE_KEY não é o par de keys/update.pub?)"))?;
-    std::fs::create_dir_all(out).map_err(|e| format!("criar {}: {e}", out.display()))?;
-    let name = signing::mod_zip_name(protocol, version);
-    let write = |n: String, data: &[u8]| {
-        std::fs::write(out.join(&n), data).map_err(|e| format!("gravar {n}: {e}"))
-    };
-    write(name.clone(), zip)?;
-    write(format!("{name}.sig"), sig.as_bytes())?;
-    write(
-        format!("{name}.sha256"),
-        signing::sha256_line(&sha, &name).as_bytes(),
-    )?;
-    Ok(signing::mod_comment(protocol, version, &sha))
 }
 
 /// Confere os três arquivos do mod em `dir` (zip, `.sig`, `.sha256`) como o launcher e o Hub os leem.
@@ -122,7 +85,7 @@ fn verify_mod_release(
     let zip = read(&dir.join(&name))?;
     let sig = String::from_utf8(read(&dir.join(format!("{name}.sig")))?)
         .map_err(|_| "o .sig não é texto")?;
-    signing::verify_mod(pubkey, &zip, sig.trim(), protocol, version)?;
+    verify::verify_mod(pubkey, &zip, sig.trim(), protocol, version)?;
     let sha_file = String::from_utf8(read(&dir.join(format!("{name}.sha256")))?)
         .map_err(|_| "o .sha256 não é texto")?;
     if sha_file != signing::sha256_line(&signing::sha256_hex(&zip), &name) {
@@ -140,7 +103,7 @@ fn verify_launcher_release(
     signing::refuse_dev_key(pubkey)?;
     let bytes = read(installer)?;
     let sig = String::from_utf8(read(sig)?).map_err(|_| "o .sig não é texto")?;
-    signing::verify_launcher(pubkey, &bytes, &sig, version)
+    verify::verify_launcher(pubkey, &bytes, &sig, version)
 }
 
 fn run(args: &[String], pubkey: &str) -> Result<String, String> {
@@ -152,25 +115,6 @@ fn run(args: &[String], pubkey: &str) -> Result<String, String> {
                 "keys/update.pub: chave {} (não é a de desenvolvimento)",
                 signing::key_id(pubkey)?
             ))
-        }
-        "sign-mod" => {
-            let (protocol, version) = (
-                need(o.protocol, "--protocol")?,
-                need(o.version, "--version")?,
-            );
-            let zip = read(&need(o.zip, "--zip")?)?;
-            let out = need(o.out, "--out")?;
-            // Antes de tocar na chave: com a pública dev nem tenta.
-            signing::refuse_dev_key(pubkey)?;
-            let key = std::env::var("CBMP_UPDATE_KEY")
-                .ok()
-                .filter(|k| !k.trim().is_empty())
-                .ok_or("CBMP_UPDATE_KEY ausente (secret do workflow de release)")?;
-            let password = std::env::var("CBMP_UPDATE_KEY_PASSWORD").unwrap_or_default();
-            let sk = signing::load_secret_key(&key, &password)
-                .map_err(|e| format!("CBMP_UPDATE_KEY: {e}"))?;
-            let comment = sign_mod_release(pubkey, &sk, &zip, protocol, &version, &out)?;
-            Ok(format!("mod assinado e conferido ({comment})"))
         }
         "verify-mod" => {
             let (protocol, version) = (
@@ -306,9 +250,15 @@ mod tests {
             assert!(e.contains(signing::DEV_KEY_ID), "{args:?}: {e}");
         }
         let p = pair();
-        let e = sign_mod_release(repo_pub, &p.sk, &zip(), 1, "1.0.0", tmp.path()).unwrap_err();
+        let e =
+            signing::sign_mod_release(repo_pub, &p.sk, &zip(), 1, "1.0.0", tmp.path()).unwrap_err();
         assert!(e.contains(signing::DEV_KEY_ID), "{e}");
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+        let exe = tmp.path().join(signing::launcher_installer_name("1.0.0"));
+        std::fs::write(&exe, b"MZ instalador").unwrap();
+        let e = signing::sign_launcher_release(repo_pub, &p.sk, &exe, "1.0.0", 1).unwrap_err();
+        assert!(e.contains(signing::DEV_KEY_ID), "{e}");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
     }
 
     #[test]
@@ -340,7 +290,8 @@ mod tests {
         let p = pair();
         let tmp = tempfile::tempdir().unwrap();
         let z = zip();
-        let comment = sign_mod_release(&p.pubkey, &p.sk, &z, 3, "1.4.2", tmp.path()).unwrap();
+        let comment =
+            signing::sign_mod_release(&p.pubkey, &p.sk, &z, 3, "1.4.2", tmp.path()).unwrap();
         let sha = signing::sha256_hex(&z);
         assert_eq!(
             comment,
@@ -381,7 +332,8 @@ mod tests {
     fn chave_privada_que_nao_e_o_par_da_publica_nao_grava_nada() {
         let (a, b) = (pair(), pair());
         let tmp = tempfile::tempdir().unwrap();
-        let e = sign_mod_release(&a.pubkey, &b.sk, &zip(), 1, "1.0.0", tmp.path()).unwrap_err();
+        let e = signing::sign_mod_release(&a.pubkey, &b.sk, &zip(), 1, "1.0.0", tmp.path())
+            .unwrap_err();
         assert!(e.contains("não é o par"), "{e}");
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
@@ -408,7 +360,7 @@ mod tests {
             let sig = minisign::sign(None, &p.sk, Cursor::new(&z), Some(&comment), None).unwrap();
             let sig = b64(sig.to_string());
             assert!(
-                signing::verify_mod(&p.pubkey, &z, &sig, 1, "1.0.0").is_err(),
+                verify::verify_mod(&p.pubkey, &z, &sig, 1, "1.0.0").is_err(),
                 "aceitou \"{comment}\""
             );
         }
@@ -448,6 +400,63 @@ mod tests {
         );
     }
 
+    /// O assinador do workflow (`launcher/release-signer`, núcleo em `common/signing.rs`) grava um `.sig` que o
+    /// launcher aceita: mesmo formato do `tauri build` com `requireSignedVersion`.
+    #[test]
+    fn instalador_assinado_pelo_assinador_do_release_e_aceito_pelo_launcher() {
+        let p = pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("CBMultiplayer_1.2.0_x64-setup.exe");
+        std::fs::write(&exe, b"MZ instalador de teste").unwrap();
+        let comment =
+            signing::sign_launcher_release(&p.pubkey, &p.sk, &exe, "1.2.0", 1_700_000_000).unwrap();
+        assert_eq!(
+            comment,
+            "timestamp:1700000000	file:CBMultiplayer_1.2.0_x64-setup.exe	version:1.2.0"
+        );
+        let sig_path = tmp.path().join("CBMultiplayer_1.2.0_x64-setup.exe.sig");
+        let sig = std::fs::read_to_string(&sig_path).unwrap();
+        assert_eq!(trusted_comment(&sig), comment);
+        verify_launcher_release(&p.pubkey, &exe, &sig_path, "1.2.0").unwrap();
+        // Mesma leitura do plugin/launcher.
+        let bytes = std::fs::read(&exe).unwrap();
+        cbmp_launcher_lib::update::verify_launcher_package(&bytes, &sig, &p.pubkey, "1.2.0")
+            .unwrap();
+        assert!(cbmp_launcher_lib::update::verify_launcher_package(
+            &bytes, &sig, &p.pubkey, "1.2.1"
+        )
+        .is_err());
+        // Nunca sobrescreve um .sig existente.
+        let e = signing::sign_launcher_release(&p.pubkey, &p.sk, &exe, "1.2.0", 2).unwrap_err();
+        assert!(e.contains(".sig"), "{e}");
+        assert_eq!(std::fs::read_to_string(&sig_path).unwrap(), sig);
+
+        // Nome que não é o da versão, versão fora de X.Y.Z, arquivo que não é executável: nada gravado.
+        let other = tmp.path().join("CBMultiplayer_1.2.1_x64-setup.exe");
+        std::fs::write(&other, b"MZ outro").unwrap();
+        assert!(signing::sign_launcher_release(&p.pubkey, &p.sk, &other, "1.2.0", 1).is_err());
+        assert!(signing::sign_launcher_release(&p.pubkey, &p.sk, &other, "v1.2.1", 1).is_err());
+        let not_exe = tmp.path().join("CBMultiplayer_1.3.0_x64-setup.exe");
+        std::fs::write(&not_exe, b"nao e exe").unwrap();
+        assert!(signing::sign_launcher_release(&p.pubkey, &p.sk, &not_exe, "1.3.0", 1).is_err());
+        // Chave privada que não é o par da pública: recusada antes de gravar.
+        let q = pair();
+        let e = signing::sign_launcher_release(&p.pubkey, &q.sk, &other, "1.2.1", 1).unwrap_err();
+        assert!(e.contains("não é o par"), "{e}");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 4);
+    }
+
+    #[test]
+    fn mod_nao_sobrescreve_arquivos_existentes() {
+        let p = pair();
+        let tmp = tempfile::tempdir().unwrap();
+        signing::sign_mod_release(&p.pubkey, &p.sk, &zip(), 1, "1.0.0", tmp.path()).unwrap();
+        assert!(
+            signing::sign_mod_release(&p.pubkey, &p.sk, &zip(), 1, "1.0.0", tmp.path()).is_err()
+        );
+        verify_mod_release(&p.pubkey, tmp.path(), 1, "1.0.0").unwrap();
+    }
+
     #[test]
     fn chave_no_formato_do_tauri_com_senha() {
         let kp =
@@ -458,7 +467,7 @@ mod tests {
         assert!(!e.contains(&key) && !e.contains("senha-de-teste"), "{e}");
         let sk = signing::load_secret_key(&key, "senha-de-teste").unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        sign_mod_release(&pubkey, &sk, &zip(), 1, "0.2.0", tmp.path()).unwrap();
+        signing::sign_mod_release(&pubkey, &sk, &zip(), 1, "0.2.0", tmp.path()).unwrap();
         verify_mod_release(&pubkey, tmp.path(), 1, "0.2.0").unwrap();
         assert!(signing::load_secret_key("nao-e-base64!", "").is_err());
     }
@@ -479,13 +488,16 @@ mod tests {
         ] {
             assert!(signing::check_version(v).is_err(), "{v}");
         }
-        assert_eq!(parse_protocol("0").unwrap(), 0);
-        assert_eq!(parse_protocol("12").unwrap(), 12);
+        assert_eq!(signing::parse_protocol("0").unwrap(), 0);
+        assert_eq!(signing::parse_protocol("12").unwrap(), 12);
         for v in ["", "01", "-1", "1a", "1234567890"] {
-            assert!(parse_protocol(v).is_err(), "{v}");
+            assert!(signing::parse_protocol(v).is_err(), "{v}");
         }
         let p = pair();
         let tmp = tempfile::tempdir().unwrap();
-        assert!(sign_mod_release(&p.pubkey, &p.sk, b"nao e zip", 1, "1.0.0", tmp.path()).is_err());
+        assert!(
+            signing::sign_mod_release(&p.pubkey, &p.sk, b"nao e zip", 1, "1.0.0", tmp.path())
+                .is_err()
+        );
     }
 }

@@ -213,8 +213,8 @@ Depois, feche esse terminal (as variáveis somem com ele), abra outro e suba o a
    `%LOCALAPPDATA%\CBMultiplayer-TesteLocal\cache` são as cópias verificadas (nomes = sha256).
 2. Abra `%LOCALAPPDATA%\CBMultiplayer-TesteLocal\run` **em até 60 segundos** depois do Jogar.
    **Esperado**: existe `connect.json` (não o abra num editor que trave o arquivo; o Bloco de Notas serve) com
-   `host`, `port`, `ticket`, `serverId`, `contentDir` e `"contentReadOnly": true`. Depois de 60 s o arquivo some
-   sozinho (o launcher apaga o ticket que o mod não leu).
+   `host`, `port`, `ticket`, `serverId`, `contentDir`, `protocol` e `"contentReadOnly": true`. Depois de 60 s o
+   arquivo some sozinho (o launcher apaga o ticket que o mod não leu).
 3. Abra `logs\launcher.log`.
    **Esperado**: linhas com data/hora (UTC) e nível (`INFO`/`WARN`), sem nenhum token, ticket ou código (procure
    por `at_`, `rt_`, `ticket`, `code=`; se aparecerem, o valor está trocado por `***`).

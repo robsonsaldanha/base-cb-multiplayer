@@ -109,7 +109,11 @@ pub fn retriable(e: &tauri_plugin_updater::Error) -> bool {
 pub fn map_updater_error(e: &tauri_plugin_updater::Error, checking: bool) -> AppError {
     use tauri_plugin_updater::Error as E;
     match e {
-        E::Minisign(_) | E::Base64(_) | E::SignatureUtf8(_) => signature_invalid(),
+        E::Minisign(_)
+        | E::Base64(_)
+        | E::SignatureUtf8(_)
+        | E::SignedVersionMismatch { .. }
+        | E::MissingSignedVersion => signature_invalid(),
         _ if checking => AppError::new(
             "update_check_failed",
             "Não foi possível procurar atualização agora. Tente mais tarde.",

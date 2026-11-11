@@ -31,7 +31,7 @@ export const ERROR_TEXT: Readonly<Record<string, string>> = {
   size_mismatch: "Um arquivo baixado do servidor veio com tamanho diferente do anunciado.",
   download_slow: "A conexão está lenta demais ou caiu durante o download.",
   cancelled: "Entrada no servidor cancelada.",
-  busy: "Já existe uma entrada em servidor em andamento.",
+  busy: "O launcher já está ocupado com outra tarefa (entrada em servidor, atualização ou limpeza do cache).",
   // Disco
   disk_full: "Disco cheio. Libere espaço e tente de novo.",
   permission_denied: "Sem permissão para gravar na pasta.",

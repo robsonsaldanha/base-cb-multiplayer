@@ -85,7 +85,7 @@ impl Drop for PlayRun<'_> {
 fn busy() -> AppError {
     AppError::new(
         "busy",
-        "Já existe uma entrada em servidor em andamento. Aguarde ou cancele.",
+        "O launcher já está ocupado (entrada em servidor, atualização ou limpeza do cache). Aguarde ou cancele.",
     )
 }
 
