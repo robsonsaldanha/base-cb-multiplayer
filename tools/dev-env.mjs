@@ -18,6 +18,11 @@
 //
 // Idempotente: rodar de novo reaproveita os dados do Hub, o servidor cadastrado (estado em <pasta>\state.json) e as
 // releases prontas. Nada aqui vai para produção: Hub só em 127.0.0.1, login de dev, releases de teste.
+//
+// Modo kit (automático quando há kit.json na raiz, ou seja, dentro do kit gerado por tools/make-test-kit.mjs):
+// releases e cb-server já vêm prontos no kit (releases\, bin\cb-server\) e são usados como estão; nada é compilado,
+// a chave dev nunca é procurada e --build-releases/--key/--force são recusados. A pasta de trabalho padrão é
+// <kit>\dados. Antes de subir, confere o sha256 de cada arquivo listado em kit.json (kit incompleto → erro).
 
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
@@ -26,6 +31,7 @@ import { createServer } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, relative, resolve, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { sourceStamp as stampOf } from './lib/source-stamp.mjs';
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 // Portas padrão (as que o launcher "Teste local" conhece: Hub fixo em 127.0.0.1:8787). --hub-port/--game-port só para
@@ -40,6 +46,11 @@ const MOD_PROTOCOL = 1;
 const MOD_VERSION = '0.1.0';
 const LAUNCHER_VERSIONS = ['0.1.0', '0.1.1'];
 const PRODUCT = 'CB Multiplayer (Teste local)';
+// Kit de teste (tools/make-test-kit.mjs): a raiz tem kit.json. O repositório nunca tem esse arquivo.
+const KIT_FILE = join(REPO, 'kit.json');
+const KIT = existsSync(KIT_FILE);
+// Windows: STATUS_DLL_NOT_FOUND (0xC0000135), STATUS_INVALID_IMAGE_FORMAT (0xC000007B), STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139).
+const DLL_EXIT = new Map([[0xC0000135, 'DLL não encontrada'], [0xC000007B, 'DLL inválida (32/64 bits)'], [0xC0000139, 'DLL de versão errada']]);
 
 // ----------------------------------------------------------------------------------------------------- argumentos
 
@@ -91,17 +102,21 @@ const log = (msg) => console.log(`[dev-env] ${msg}`);
 // ------------------------------------------------------------------------------------------------------- caminhos
 
 function paths(o) {
-  const dir = resolve(o.dir ?? process.env.CBMP_DEV_DIR ?? join(tmpdir(), 'cbmp-dev-env'));
+  const dir = resolve(o.dir ?? process.env.CBMP_DEV_DIR ?? (KIT ? join(REPO, 'dados') : join(tmpdir(), 'cbmp-dev-env')));
   return {
     dir,
-    releases: join(dir, 'releases'),
+    // No kit, os releases prontos (assinados na máquina de desenvolvimento) ficam fora da pasta de trabalho.
+    releases: KIT ? join(REPO, 'releases') : join(dir, 'releases'),
     hubData: join(dir, 'hub-data'),
     server: join(dir, 'server'),
     logs: join(dir, 'logs'),
     state: join(dir, 'state.json'),
     pids: join(dir, 'pids.json'),
-    key: resolve(o.key ?? process.env.CBMP_DEV_KEY ?? join(homedir(), '.cbmp-devkeys', 'update.key')),
-    cbServer: resolve(o.cbServer ?? process.env.CBMP_CB_SERVER ?? join(REPO, 'build-native', 'windows-release', 'server', 'Release', 'cb-server.exe')),
+    // No kit a chave nunca é procurada (nem o caminho é montado).
+    key: KIT ? null : resolve(o.key ?? process.env.CBMP_DEV_KEY ?? join(homedir(), '.cbmp-devkeys', 'update.key')),
+    cbServer: resolve(o.cbServer ?? process.env.CBMP_CB_SERVER ?? (KIT
+      ? join(REPO, 'bin', 'cb-server', 'cb-server.exe')
+      : join(REPO, 'build-native', 'windows-release', 'server', 'Release', 'cb-server.exe'))),
   };
 }
 
@@ -180,27 +195,9 @@ function buildMod(p, o) {
   writeFileSync(join(out, 'notes.txt'), `Mod de teste ${MOD_VERSION} (protocolo ${MOD_PROTOCOL}), gerado por tools/dev-env.mjs.\n`);
 }
 
-// O que entra no binário do launcher (testes e examples ficam de fora): um release pronto só é reaproveitado se isso
-// não mudou desde o build. Sem essa conferência, um instalador antigo (outra pasta de dados, outro Hub) passaria por novo.
-const LAUNCHER_INPUTS = ['launcher/src-tauri/src', 'launcher/src-tauri/Cargo.toml', 'launcher/src-tauri/Cargo.lock',
-  'launcher/src-tauri/build.rs', 'launcher/src-tauri/tauri.conf.json', 'launcher/src-tauri/tauri.localtest.conf.json',
-  'launcher/src-tauri/capabilities', 'launcher/src-tauri/permissions', 'launcher/src-tauri/keys', 'launcher/src-tauri/icons',
-  // A UI inteira (node_modules/dist ficam de fora pelo .gitignore; testes pelo filtro abaixo).
-  'launcher/ui', 'package.json', 'package-lock.json'];
-
-/** sha256 do conteúdo dos arquivos que entram no launcher (versionados e novos não ignorados; sem testes). */
+/** Carimbo do código do launcher (tools/lib/source-stamp.mjs). */
 function sourceStamp() {
-  const r = spawnSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', ...LAUNCHER_INPUTS], { cwd: REPO, encoding: 'utf8' });
-  if (r.status !== 0) fail('git ls-files falhou (o dev-env precisa rodar dentro do repositório git)');
-  const files = [...new Set(r.stdout.split('\0').filter(Boolean))].sort();
-  const h = createHash('sha256');
-  for (const f of files) {
-    if (/(^|\/)(tests|__tests__)\//.test(f) || /\.test\.ts$/.test(f)) continue;
-    const full = join(REPO, f);
-    if (!existsSync(full)) continue; // apagado e ainda não commitado
-    h.update(`${f}\0`).update(readFileSync(full)).update('\0');
-  }
-  return h.digest('hex');
+  try { return stampOf(REPO); } catch (e) { return fail(e.message); }
 }
 
 function buildLauncher(p, o, version, keyText, stamp) {
@@ -236,6 +233,7 @@ function buildLauncher(p, o, version, keyText, stamp) {
 }
 
 function buildReleases(p, o) {
+  if (KIT) fail('este é o kit de teste: os releases já vêm prontos e assinados em releases\\ (não há o que gerar nem chave a usar).');
   const keyText = readKey(p);
   mkdirSync(p.releases, { recursive: true });
   // O mod primeiro: o assinador confere a chave com keys/update.pub e para tudo se não for o par.
@@ -369,8 +367,35 @@ function stopFromPidFile(p, quiet = false) {
   rmSync(p.pids, { force: true });
 }
 
+/** Kit: cada arquivo listado em kit.json existe e tem o sha256 registrado (pega zip mal extraído/OneDrive incompleto). */
+function verifyKit() {
+  let kit;
+  try { kit = JSON.parse(readFileSync(KIT_FILE, 'utf8')); } catch (e) { fail(`kit.json ilegível (${e.message}); extraia o kit de novo`); }
+  const major = Number(process.versions.node.split('.')[0]);
+  const want = Number(String(kit.node ?? '').replace(/^v/, '').split('.')[0]);
+  // Os módulos nativos do kit são N-API/executáveis (servem para Node >= 22), mas só o Node do kit foi testado.
+  if (major < 22) fail(`este é o Node ${process.version}; o kit precisa do Node ${want || 24} (LTS). Instale-o (LEIA-ME.md, passo 1).`);
+  if (want && major !== want) log(`AVISO: o kit foi montado e testado com o Node ${want}.x e este é o ${process.version}; se o Hub não subir, instale o Node ${want} LTS.`);
+  const files = Object.entries(kit.files ?? {});
+  if (files.length === 0) fail('kit.json sem lista de arquivos; extraia o kit de novo');
+  const bad = [];
+  for (const [rel, sha] of files) {
+    const full = join(REPO, ...rel.split('/'));
+    let got = null;
+    try { got = createHash('sha256').update(readFileSync(full)).digest('hex'); } catch { /* falta */ }
+    if (got !== sha) bad.push(`${rel} (${got === null ? 'faltando' : 'conteúdo diferente'})`);
+  }
+  if (bad.length) {
+    fail(`o kit está incompleto ou corrompido:\n  ${bad.slice(0, 10).join('\n  ')}${bad.length > 10 ? `\n  … e mais ${bad.length - 10}` : ''}
+  Se o zip veio pelo OneDrive, confira que ele terminou de baixar (botão direito → "Sempre manter neste
+  dispositivo"), apague a pasta do kit e extraia o zip de novo.`);
+  }
+  log(`kit conferido: ${files.length} arquivos ok (commit ${String(kit.commit ?? '?').slice(0, 7)}, gerado em ${kit.builtAt ?? '?'})`);
+}
+
 async function run(p) {
   if (process.platform !== 'win32') log('aviso: feito para Windows; em outro sistema ajuste --cb-server');
+  if (KIT) verifyKit();
   if (!existsSync(p.cbServer)) fail(`cb-server não encontrado em ${p.cbServer}. Compile antes (server/README.md, preset windows-release) ou use --cb-server.`);
   // Sobras de um --run anterior que não foi encerrado com Ctrl+C.
   stopFromPidFile(p, true);
@@ -436,7 +461,13 @@ async function run(p) {
   const srvLog = join(p.logs, 'cb-server.log');
   log(`subindo o cb-server na porta ${GAME_PORT} (log: ${srvLog})`);
   children.cbServer = startChild('cb-server', p.cbServer, ['--config', join(p.server, 'server.cfg')], { cwd: p.server }, srvLog);
-  children.cbServer.on('exit', (c) => { if (!stopping) { console.error(`[dev-env] o cb-server parou (código ${c}); veja ${srvLog}`); stopAll(1); } });
+  children.cbServer.on('exit', (c) => {
+    if (stopping) return;
+    const dll = DLL_EXIT.get(c >>> 0);
+    console.error(`[dev-env] o cb-server parou (código ${c}${dll ? `, ${dll}` : ''}); veja ${srvLog}`);
+    if (dll) console.error('[dev-env] provável falta do Microsoft Visual C++ Redistributable (x64): instale de https://aka.ms/vs/17/release/vc_redist.x64.exe e tente de novo.');
+    stopAll(1);
+  });
   savePids();
   await waitFor('servidor na lista do Hub', async () => {
     const r = await http('GET', '/v1/servers');
@@ -464,11 +495,13 @@ async function report(p, srv) {
  [${ok(!!s?.featured)}] Hub ${HUB_URL} lista "${SERVER_NAME}" em destaque e online (${s?.id ?? '?'})
  [${ok(up.status === 200 && up.json?.version === '0.1.1')}] update 0.1.0 → ${up.json?.version ?? `HTTP ${up.status}`}
  [${ok(mod.status === 200)}] mod de teste: ${mod.status === 200 ? `${mod.json.version} (protocolo ${mod.json.protocol})` : `HTTP ${mod.status}`}
-${haveInstaller ? '' : `
+${haveInstaller ? '' : KIT ? `
+ Instalador de teste ausente no kit (${installer}): extraia o kit de novo.
+` : `
  Releases de teste ausentes: rode antes "node tools/dev-env.mjs --build-releases" (alguns minutos).
 `}
  O que fazer (só nesta máquina):
-  Passo a passo completo: docs/TESTES-MANUAIS-SUB4.md. Resumo:
+  Passo a passo completo: ${KIT ? 'LEIA-ME.md (na pasta do kit)' : 'docs/TESTES-MANUAIS-SUB4.md'}. Resumo:
   1. Instale o launcher de teste: ${installer}
      (nome "${PRODUCT}"; o SmartScreen pode avisar: "Mais informações" → "Executar assim mesmo").
   2. Abra o "${PRODUCT}" e clique em "Entrar com Discord". O navegador abre a página do Hub de teste:
@@ -481,7 +514,7 @@ ${haveInstaller ? '' : `
      teste local tem pasta própria (o oficial usa %LOCALAPPDATA%\\CBMultiplayer).
 
  Painel do Hub: ${HUB_URL}/panel   Logs: ${p.logs}   Dados: ${p.dir}
- Ctrl+C encerra tudo (ou, de outro terminal: node tools/dev-env.mjs --stop).
+ Ctrl+C encerra tudo (ou, de outro terminal: ${KIT ? 'PARAR.cmd' : 'node tools/dev-env.mjs --stop'}).
 ==========================================================================================
 `);
 }
@@ -493,10 +526,11 @@ if (o.help || (!o.buildReleases && !o.run && !o.stop)) {
   usage();
   process.exit(o.help ? 0 : 1);
 }
+if (KIT && (o.key || o.force)) fail('no kit de teste não há chave nem builds: --key/--force não se aplicam.');
 if (o.hubPort) { HUB_PORT = o.hubPort; HUB_URL = `http://127.0.0.1:${HUB_PORT}`; }
 if (o.gamePort) GAME_PORT = o.gamePort;
 const p = paths(o);
-if (inside(REPO, p.dir)) fail(`a pasta de trabalho não pode ficar dentro do repositório (${p.dir})`);
+if (!KIT && inside(REPO, p.dir)) fail(`a pasta de trabalho não pode ficar dentro do repositório (${p.dir})`);
 mkdirSync(p.dir, { recursive: true });
 if (o.stop) stopFromPidFile(p);
 if (o.buildReleases) buildReleases(p, o);
