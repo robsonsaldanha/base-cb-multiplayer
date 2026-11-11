@@ -1,0 +1,13 @@
+{
+  "name": "CB Multiplayer – Servidor de teste",
+  "description": "Servidor de teste do CB Multiplayer: conteúdo de exemplo (hello-client) para testar lista, login, download e Jogar (modo simular).",
+  "tags": ["teste"],
+  "locale": "pt-BR",
+  "maxPlayers": 32,
+  "port": 30500,
+  "hub": { "url": "https://cbmultiplayer.cntoficial.com.br", "serverId": "@SERVER_ID@", "key": "@SERVER_KEY@" },
+  "auth": { "devPublicKey": null },
+  "resourcesDir": "/var/www/html_cbmultiplayer/server/resources",
+  "logsDir": "/var/www/html_cbmultiplayer/server/logs",
+  "scripting": { "bansFile": "/var/www/html_cbmultiplayer/server/data/bans.json" }
+}

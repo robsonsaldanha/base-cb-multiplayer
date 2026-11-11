@@ -1,0 +1,29 @@
+# CB Multiplayer: Hub do ambiente de TESTE online (https://cbmultiplayer.cntoficial.com.br, atrás do nginx).
+# Instalado por tools/teste-online/remote-install.sh (@USER@ = usuário que roda o deploy). docs/AMBIENTE-TESTE-ONLINE.md
+[Unit]
+Description=CB Multiplayer - Hub de teste (cbmultiplayer.cntoficial.com.br)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@USER@
+WorkingDirectory=/var/www/html_cbmultiplayer/hub
+EnvironmentFile=/var/www/html_cbmultiplayer/hub.env
+# App Discord (DISCORD_CLIENT_ID/DISCORD_CLIENT_SECRET, opcional HUB_PLATFORM_ADMINS): arquivo criado pelo dono,
+# root:root 600. Sem ele o Hub sobe e o login responde 503 login_unavailable.
+EnvironmentFile=-/etc/cbmp-teste/discord.env
+ExecStart=/usr/local/bin/node /var/www/html_cbmultiplayer/hub/main.mjs
+Restart=on-failure
+RestartSec=5
+MemoryMax=300M
+TasksMax=128
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/www/html_cbmultiplayer/hub-data
+
+[Install]
+WantedBy=multi-user.target

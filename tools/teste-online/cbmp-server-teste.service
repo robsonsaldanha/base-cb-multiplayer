@@ -1,0 +1,28 @@
+# CB Multiplayer: cb-server do ambiente de TESTE online (UDP+TCP 30500, hello-client, sem banco).
+# Instalado por tools/teste-online/remote-install.sh (@USER@ = usuário que roda o deploy). docs/AMBIENTE-TESTE-ONLINE.md
+[Unit]
+Description=CB Multiplayer - servidor de jogo de teste (porta 30500)
+After=network-online.target cbmp-hub-teste.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@USER@
+WorkingDirectory=/var/www/html_cbmultiplayer/server
+# OpenSSL estático do vcpkg: aponta as CAs do sistema (TLS até o Hub).
+Environment=SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+Environment=SSL_CERT_DIR=/etc/ssl/certs
+ExecStart=/var/www/html_cbmultiplayer/server/bin/cb-server --config /var/www/html_cbmultiplayer/server/server.cfg
+Restart=on-failure
+RestartSec=5
+MemoryMax=400M
+TasksMax=256
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/www/html_cbmultiplayer/server/data /var/www/html_cbmultiplayer/server/logs
+
+[Install]
+WantedBy=multi-user.target
