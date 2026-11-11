@@ -1,9 +1,10 @@
 name: server-linux-dist
 # Pacote do cb-server para Linux x64 que roda em Ubuntu 22.04 (glibc 2.35, g++ 11 no sistema): compilado na imagem
-# oficial gcc:14 (Debian bookworm, glibc 2.36; o código usa std::print, que exige GCC 14), Release sem sanitizers,
-# libstdc++/libgcc estáticas e libmariadb.so (LGPL, dinâmica) ao lado do executável com RPATH $ORIGIN. O passo de
-# conferência falha se o binário ou a libmariadb exigirem glibc acima de 2.35. Usado pelo ambiente de teste online
-# (docs/AMBIENTE-TESTE-ONLINE.md).
+# manylinux_2_28 (AlmaLinux 8, glibc 2.28) com o gcc-toolset-14 (o código usa std::print, que exige GCC 14), Release
+# sem sanitizers, libstdc++/libgcc estáticas e libmariadb.so (LGPL, dinâmica) ao lado do executável com RPATH $ORIGIN.
+# Uma imagem com glibc mais nova (ex. gcc:14 em Debian 12) não serve: a libstdc++ estática dela usa arc4random
+# (GLIBC_2.36). O passo de conferência falha se o binário ou a libmariadb exigirem glibc acima de 2.35. Usado pelo
+# ambiente de teste online (docs/AMBIENTE-TESTE-ONLINE.md).
 on:
   workflow_dispatch:
   push:
@@ -19,37 +20,40 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.vcpkg-cache,readwrite"
   # Mesmo commit do workflow native.
   VCPKG_COMMIT: ec48c11eae9448c8c6e7739d93e06fa2433aa95f
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-    container: gcc:14-bookworm
+    container: quay.io/pypa/manylinux_2_28_x86_64
     timeout-minutes: 150
     defaults:
       run:
         shell: bash
-    env:
-      CC: gcc
-      CXX: g++
     steps:
       - run: |
-          apt-get update
-          apt-get install -y --no-install-recommends ninja-build cmake zip unzip patchelf autoconf-archive pkg-config linux-libc-dev
+          dnf install -y zip unzip perl-IPC-Cmd perl-FindBin perl-File-Compare perl-File-Copy perl-Time-Piece             autoconf automake libtool kernel-headers pkgconf-pkg-config which
+          dnf install -y epel-release && dnf install -y autoconf-archive || echo "autoconf-archive indisponível"
+          /opt/python/cp312-cp312/bin/python -m pip install --quiet 'cmake>=3.29,<4' ninja
+          ln -sf /opt/python/cp312-cp312/bin/cmake /usr/local/bin/cmake
+          ln -sf /opt/python/cp312-cp312/bin/ninja /usr/local/bin/ninja
           git config --global --add safe.directory '*'
-          g++ --version; cmake --version; ldd --version || true
+          echo "CC=$(command -v gcc)" >> $GITHUB_ENV
+          echo "CXX=$(command -v g++)" >> $GITHUB_ENV
+          g++ --version; cmake --version; ninja --version; ldd --version || true
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4
         with:
           path: .vcpkg-cache
-          key: vcpkg-bookworm-gcc14-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
+          key: vcpkg-manylinux228-gcc14-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
           restore-keys: |
-            vcpkg-bookworm-gcc14-${{ hashFiles('vcpkg.json') }}-
-            vcpkg-bookworm-gcc14-
+            vcpkg-manylinux228-gcc14-${{ hashFiles('vcpkg.json') }}-
+            vcpkg-manylinux228-gcc14-
       - run: |
           mkdir -p .vcpkg-cache
+          # Caminho de DENTRO do contêiner (o github.workspace da expressão é o do host).
+          echo "VCPKG_BINARY_SOURCES=clear;files,$GITHUB_WORKSPACE/.vcpkg-cache,readwrite" >> $GITHUB_ENV
           git clone https://github.com/microsoft/vcpkg "$GITHUB_WORKSPACE/vcpkg"
           git -C "$GITHUB_WORKSPACE/vcpkg" checkout "$VCPKG_COMMIT"
           "$GITHUB_WORKSPACE/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
@@ -61,7 +65,7 @@ jobs:
         if: always()
         with:
           path: .vcpkg-cache
-          key: vcpkg-bookworm-gcc14-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
+          key: vcpkg-manylinux228-gcc14-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
       - name: pacote (cb-server + libmariadb.so + plugins + licença)
         run: |
           set -euo pipefail
@@ -84,6 +88,7 @@ jobs:
           grep -q "libmariadb\.so.*$PWD/$D/" ldd.txt
           MAXG=$(objdump -T "$D/cb-server" "$D"/libmariadb.so.* | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
           echo "glibc máxima exigida: $MAXG"
+          objdump -T "$D/cb-server" "$D"/libmariadb.so.* | grep -E 'GLIBC_2\.(3[6-9]|[4-9][0-9])' || true
           [ "$(printf '%s\nGLIBC_2.35\n' "$MAXG" | sort -V | tail -1)" = "GLIBC_2.35" ]
           "$D/cb-server" --help
       - run: tar -C dist -czf cb-server-linux-x64.tar.gz cb-server-linux-x64
