@@ -24,6 +24,7 @@ launcher/src-tauri/gen/
 # (que é público). Dumps do UE4SS, relatórios do cb-recon, zips do COLETAR e a pasta onde eles ficam.
 cbmp-dumps/
 cbmp-recon-*.zip
+cbmp-recon-*/
 UE4SS_ObjectDump.txt
 UHTHeaderDump/
 CXXHeaderDump/

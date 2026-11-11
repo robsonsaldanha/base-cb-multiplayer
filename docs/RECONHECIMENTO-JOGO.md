@@ -73,7 +73,8 @@ pasta do OneDrive ele fica em `OneDrive\CasteloBruxoRP\Launcher_livre\dist\`.
 1. **OneDrive com "arquivos sob demanda"**: se o ícone do zip for uma **nuvem**, clique com o botão direito →
    **Sempre manter neste dispositivo** e espere virar um **check verde**.
 2. **Copie** o zip para fora do OneDrive, para `C:\cbmp-kit\` (crie a pasta).
-3. (Recomendado) Confira se chegou inteiro. No PowerShell:
+3. (Recomendado) Confira se chegou inteiro. Abra o **PowerShell** (menu Iniciar → digite `PowerShell` → Enter), cole
+   o comando abaixo e aperte Enter:
 
    ```
    Get-FileHash C:\cbmp-kit\cbmp-kit-reconhecimento.zip
@@ -92,7 +93,7 @@ pasta do OneDrive ele fica em `OneDrive\CasteloBruxoRP\Launcher_livre\dist\`.
 Test-Path C:\cbmp-kit\cbmp-kit-reconhecimento\INSTALAR.bat
 ```
 
-**Esperado**: `True`.
+**Esperado**: `True` (comando no PowerShell, como no item 3).
 
 **Se falhar**: `False` e existe `C:\cbmp-kit\cbmp-kit-reconhecimento\cbmp-kit-reconhecimento` (pasta repetida) →
 apague `C:\cbmp-kit\cbmp-kit-reconhecimento` inteira e refaça o item 5. Use caminho curto, sem acentos, fora do
@@ -126,7 +127,8 @@ OneDrive (não extraia dentro da pasta do jogo: este kit, ao contrário do pacot
 
 ## 4. Jogar: reconhecimento + teste do F8
 
-1. Abra o jogo **normalmente pela Steam ou pela Epic**.
+1. Abra o jogo **normalmente pela Steam ou pela Epic**. Na primeira abertura depois de uma atualização o jogo pode
+   passar vários minutos **compilando shaders** antes do menu: é normal, espere (esse tempo não conta para o mod).
 2. Junto com o jogo abre uma **janela preta de console do UE4SS**. É esperado: **não feche** essa janela. Deixe-a
    visível ao lado (ou dê Alt+Tab para olhar) — é nela que o progresso aparece, em linhas começando com
    `[cb-recon]`.
@@ -151,8 +153,13 @@ OneDrive (não extraia dentro da pasta do jogo: este kit, ao contrário do pacot
 **Se falhar**:
 - **Nenhuma janela preta** ao abrir o jogo → o UE4SS não carregou. Anote e pule para o passo 5 (COLETAR) mesmo
   assim.
-- **Fica só em `aguardando (... s): ...`** por mais de 5 minutos já dentro do mundo → anote a última linha
-  `aguardando` (mostra controller/pawn/mundo). Saia do jogo e siga para o COLETAR.
+- **Fica só em `aguardando (...): ...`** por mais de 5 minutos já dentro do mundo, parado → anote a última linha
+  `aguardando` (mostra controller/pawn/mundo). Ande um pouco, entre e saia de um prédio, e espere mais uns minutos:
+  o mod continua tentando.
+- **Apareceu `tempo esgotado`** (30 minutos no mundo sem achar o jogador) → o mod grava um relatório parcial e
+  **continua esperando**; dê mais uns 5 minutos parado. Se ainda não vier `jogador encontrado`: **saia do jogo, abra
+  de novo e carregue o save logo** — o mod tenta tudo do zero (o tempo esgotado não fica marcado). Se acontecer de
+  novo, anote a última linha `aguardando` e siga para o COLETAR (o relatório parcial já ajuda).
 - **O jogo fechou ou travou de vez numa etapa** (ex.: `etapa 3/6: sdk_cxx começando` e nada mais por 15 minutos)
   → feche o jogo pelo Gerenciador de Tarefas se precisar, **abra de novo**, carregue o save e espere: o mod pula a
   etapa que travou e continua das outras (aparece `começou numa sessão anterior e não terminou`). Anote qual etapa
@@ -195,12 +202,16 @@ COLETAR: só dizem que aquela parte não rodou no jogo (anote na tabela).
      integridade dos arquivos do jogo**.
    - **Epic**: biblioteca → **…** no jogo → **Gerenciar** → **Verificar**.
 
-   **Esperado**: a loja termina sem baixar nada (ou só alguns MB). Ela não olha arquivos extras; por isso o
-   DESINSTALAR confere a pasta antes.
+   **Esperado**: a loja termina sem baixar nada (ou só alguns MB). A loja não acusa arquivos **a mais**; quem
+   confere isso é o DESINSTALAR: ele compara a lista de itens da pasta `Win64` com a que anotou na instalação e
+   confere o hash dos originais devolvidos. Se sobrar ou faltar algo, ele avisa em amarelo ("NÃO está exatamente
+   como antes") em vez de dizer "voltou a ser como antes".
 4. Abra o jogo uma vez e veja se o save carrega normal (sem janela preta agora).
 
-**Se falhar**: `não consegui remover ... (arquivo em uso?)` → feche o jogo e rode de novo. Os originais (se havia)
-continuam em `Phoenix\Binaries\Win64\cbmp-recon-backup\` até a desinstalação terminar.
+**Se falhar**: `não consegui remover ... (arquivo em uso?)` ou qualquer erro no meio → feche o jogo (e, se puder,
+espere o antivírus terminar) e **rode o DESINSTALAR.bat de novo**: ele pode ser repetido quantas vezes precisar,
+reconhece o que já foi devolvido e só mexe no que ainda é do kit. Os originais (se havia) continuam em
+`Phoenix\Binaries\Win64\cbmp-recon-backup\` até a desinstalação terminar.
 
 Depois de desinstalar pode apagar `C:\cbmp-kit\cbmp-kit-reconhecimento` e o zip do kit.
 

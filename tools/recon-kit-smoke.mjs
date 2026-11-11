@@ -53,10 +53,13 @@ const kit = join(root, 'cbmp-kit-reconhecimento');
 const kitJson = JSON.parse(readFileSync(join(kit, 'kit.json'), 'utf8'));
 const script = join(kit, 'ferramentas', 'cbmp-recon.ps1');
 
+// OneDrive/USERPROFILE falsos: nenhum cenário pode gravar no OneDrive real de quem roda o teste.
+let fakeOneDrive = join(root, 'SemOneDrive');
 function ps(acao, extra = []) {
   const res = spawnSync(PS, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-Acao', acao,
     '-SemPerguntas', '-SemPausa', '-SemAdmin', ...extra], {
-    encoding: 'utf8', env: { ...process.env, LOCALAPPDATA: localAppData, OneDrive: join(root, 'SemOneDrive') },
+    encoding: 'utf8',
+    env: { ...process.env, LOCALAPPDATA: localAppData, OneDrive: fakeOneDrive, OneDriveConsumer: fakeOneDrive, USERPROFILE: join(root, 'Perfil') },
   });
   return { code: res.status, out: `${res.stdout}\n${res.stderr}` };
 }
@@ -213,6 +216,73 @@ function zipListing(dir) {
   const r4 = ps('Instalar', ['-PastaJogo', g4]);
   writeFileSync(lua, orig);
   check(r4.code !== 0 && /incompleto ou corrompido/.test(r4.out) && sameSnap(b4, snapshot(w4)), 'D: kit alterado -> recusa sem mexer em nada');
+}
+
+// --- Cenário E: restauração pela metade (dwmapi.dll já devolvido, ue4ss não) e nova execução ------------------------
+const mv = (a, b) => { const r2 = spawnSync('cmd.exe', ['/c', 'move', a, b], { encoding: 'utf8' }); if (r2.status !== 0) throw new Error(r2.stdout + r2.stderr); };
+{
+  const game = join(root, 'Jogos', 'E-parcial');
+  const win64 = fakeGame(game, { withOriginals: true });
+  const before = snapshot(win64);
+  check(ps('Instalar', ['-PastaJogo', game]).code === 0, 'E: instalar');
+  const bk = join(win64, 'cbmp-recon-backup');
+  // o que um DESINSTALAR interrompido deixa: dwmapi do kit apagado e o original devolvido; ue4ss do kit e o backup ainda lá
+  rmSync(join(win64, 'dwmapi.dll'));
+  mv(join(bk, 'dwmapi.dll'), join(win64, 'dwmapi.dll'));
+  const un = ps('Desinstalar', ['-PastaJogo', game]);
+  check(un.code === 0 && /já estava devolvido: dwmapi\.dll/.test(un.out) && /voltou a ser como antes/.test(un.out), `E: reexecução reconhece o dwmapi.dll já devolvido (código ${un.code})`);
+  check(!existsSync(join(win64, 'cbmp-recon-sobras')), 'E: o original do usuário NÃO vai para cbmp-recon-sobras');
+  check(sameSnap(before, snapshot(win64)), `E: Win64 idêntica a antes${sameSnap(before, snapshot(win64)) ? '' : `: ${diffSnap(before, snapshot(win64)).join(', ')}`}`);
+  const again = ps('Desinstalar', ['-PastaJogo', game]);
+  check(again.code === 0 && /Nada para desinstalar/.test(again.out), 'E: terceira execução não faz nada');
+}
+
+// --- Cenário F: tudo devolvido mas estado.json ficou (interrompido no fim) ------------------------------------------
+{
+  const game = join(root, 'Jogos', 'F-quase');
+  const win64 = fakeGame(game, { withOriginals: true });
+  const before = snapshot(win64);
+  check(ps('Instalar', ['-PastaJogo', game]).code === 0, 'F: instalar');
+  const bk = join(win64, 'cbmp-recon-backup');
+  rmSync(join(win64, 'dwmapi.dll'));
+  rmSync(join(win64, 'ue4ss'), { recursive: true });
+  mv(join(bk, 'dwmapi.dll'), join(win64, 'dwmapi.dll'));
+  mv(join(bk, 'ue4ss'), join(win64, 'ue4ss'));
+  const un = ps('Desinstalar', ['-PastaJogo', game]);
+  check(un.code === 0 && (un.out.match(/já estava devolvido/g) || []).length === 2, `F: os dois originais reconhecidos como devolvidos (código ${un.code})`);
+  check(sameSnap(before, snapshot(win64)), 'F: Win64 idêntica a antes');
+}
+
+// --- Cenário G: original sumiu do backup e o que está no lugar não é ele -> para sem apagar nada --------------------
+{
+  const game = join(root, 'Jogos', 'G-estranho');
+  const win64 = fakeGame(game, { withOriginals: true });
+  check(ps('Instalar', ['-PastaJogo', game]).code === 0, 'G: instalar');
+  rmSync(join(win64, 'cbmp-recon-backup', 'dwmapi.dll'));
+  const mid = snapshot(win64);
+  const un = ps('Desinstalar', ['-PastaJogo', game]);
+  check(un.code !== 0 && /não está em/.test(un.out) && sameSnap(mid, snapshot(win64)), 'G: recusa e não mexe em nada');
+}
+
+// --- Cenário H: dwmapi.dll trocado por outro programa; destino padrão no OneDrive falso ------------------------------
+{
+  const game = join(root, 'Jogos', 'H-trocado');
+  const win64 = fakeGame(game);
+  check(ps('Instalar', ['-PastaJogo', game]).code === 0, 'H: instalar');
+  simulateGameRun(win64);
+  fakeOneDrive = join(root, 'OneDriveFalso');
+  mkdirSync(join(fakeOneDrive, 'CasteloBruxoRP'), { recursive: true });
+  const col = ps('Coletar', ['-PastaJogo', game]);
+  const destH = join(fakeOneDrive, 'CasteloBruxoRP', 'cbmp-dumps');
+  check(col.code === 0 && zipListing(destH).zips.length === 1, 'H: COLETAR sem -Destino grava em <OneDrive>\\CasteloBruxoRP\\cbmp-dumps');
+  const repoDest = join(REPO, 'dist', 'nao-pode');
+  const bad = ps('Coletar', ['-PastaJogo', game, '-Destino', repoDest]);
+  check(bad.code !== 0 && !existsSync(repoDest), 'H: COLETAR recusa destino dentro do repositório');
+  w(join(win64, 'dwmapi.dll'), 'outro programa trocou');
+  const un = ps('Desinstalar', ['-PastaJogo', game]);
+  check(un.code === 0 && /NÃO está exatamente/.test(un.out) && !/voltou a ser como antes/.test(un.out)
+    && existsSync(join(win64, 'cbmp-recon-sobras', 'dwmapi.dll')), 'H: dll estranha vai para sobras e o aviso final não diz "como antes"');
+  fakeOneDrive = join(root, 'SemOneDrive');
 }
 
 if (!keep) rmSync(root, { recursive: true, force: true });

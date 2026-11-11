@@ -19,7 +19,9 @@ local VERSION = "0.1.0"
 local CFG = {
     pollMs = 2000,             -- intervalo da espera pelo jogador
     stableSeconds = 45,        -- o mesmo Pawn por este tempo = jogador no mundo
-    timeoutSeconds = 20 * 60,  -- desiste de esperar depois disso (grava o que achou)
+    timeoutSeconds = 30 * 60,  -- conta só a partir do primeiro mundo fora de menu com controller local; ao esgotar
+                               -- grava um relatório parcial, avisa no log e CONTINUA esperando (compilação de shaders,
+                               -- vídeos e menu não contam)
     statusEverySeconds = 30,   -- linha de "aguardando" no log
     gapMs = 4000,              -- pausa entre etapas (o jogo respira e o log mostra o progresso)
     maxStr = 400,
@@ -76,16 +78,30 @@ local function ts() return os.date("%Y-%m-%d %H:%M:%S") end
 
 local function trunc(s)
     s = tostring(s)
-    if #s > CFG.maxStr then return s:sub(1, CFG.maxStr) .. "...(+" .. (#s - CFG.maxStr) .. ")" end
-    return s
+    if #s <= CFG.maxStr then return s end
+    -- corta numa fronteira de caractere UTF-8 (não deixa um byte de continuação 10xxxxxx no começo do resto)
+    local cut = CFG.maxStr
+    while cut > 0 do
+        local b = s:byte(cut + 1)
+        if not b or b < 0x80 or b >= 0xC0 then break end
+        cut = cut - 1
+    end
+    return s:sub(1, cut) .. "...(+" .. (#s - cut) .. ")"
 end
 
+local warnedWrite = false
 local function appendLine(path, line)
-    local ok = pcall(function()
+    local wrote = false
+    pcall(function()
         local f = io.open(path, "a")
-        if f then f:write(line, "\n"); f:close() end
+        if f then f:write(line, "\n"); f:close(); wrote = true end
     end)
-    return ok
+    if not wrote and not warnedWrite then
+        -- ex.: caminho com acento (io.open usa a página de código ANSI): sem log nem estado.txt nesta sessão
+        warnedWrite = true
+        pcall(print, "[cb-recon] AVISO: não consigo gravar em " .. tostring(path) .. " (sem permissão ou caminho com acentos?)\n")
+    end
+    return wrote
 end
 
 local function log(level, msg)
@@ -475,8 +491,8 @@ local function buildReport(pc, pawn, waitedSeconds)
 
     section(report, "meta", function()
         local m = { mod = "cb-recon " .. VERSION, data = ts(), espera_segundos = waitedSeconds, lua = _VERSION }
-        local a, b, c = try(function() return UE4SS.GetVersion() end)
-        if a then m.ue4ss = string.format("%s.%s.%s", tostring(a), tostring(b), tostring(c)) end
+        local okv, a, b, c = pcall(function() return UE4SS.GetVersion() end)
+        if okv and a then m.ue4ss = string.format("%s.%s.%s", tostring(a), tostring(b), tostring(c)) end
         local maj = try(function() return UnrealVersion.GetMajor() end)
         local min = try(function() return UnrealVersion.GetMinor() end)
         if maj then m.unreal = tostring(maj) .. "." .. tostring(min) end
@@ -744,9 +760,11 @@ end
 
 local function startRecon(pc, pawn, waited, prev)
     info("jogador encontrado depois de " .. waited .. " s: " .. tostring(fullName(pawn)))
-    if prev.relatorio == "INICIADO" then
+    if prev.relatorio == "INICIADO" or prev.relatorio == "PULADO" then
+        -- PULADO também não tenta de novo (senão alternaria travar/pular a cada sessão). ERRO (erro Lua, sem travar
+        -- o jogo) tenta de novo.
         warn("o relatório travou numa sessão anterior; pulando o relatório e seguindo para os dumpers")
-        mark("relatorio", "PULADO", "travou numa sessão anterior")
+        if prev.relatorio == "INICIADO" then mark("relatorio", "PULADO", "travou numa sessão anterior") end
     else
         mark("relatorio", "INICIADO")
         local ok, report = safe("relatório", buildReport, pc, pawn, waited)
@@ -765,12 +783,14 @@ local function main()
     info("cb-recon " .. VERSION .. " carregado; pasta " .. MOD_DIR)
     local prev = readState()
     mark("sessao", "INICIADO")
-    info("aguardando o jogador entrar no mundo (carregue um save; limite " .. (CFG.timeoutSeconds // 60) .. " min)")
+    info("aguardando o jogador entrar no mundo (carregue um save). Compilação de shaders, vídeos e menu não contam" ..
+        " no limite de espera")
 
     local phase = "esperando"            -- esperando -> vigiando
     local candidate, since, lastStatus = nil, nil, 0
     local reportedKey, extras = nil, 0
     local cachedPc, tick, watchStart = nil, 0, nil
+    local clockStart, timedOut = nil, false  -- relógio do limite: só a partir do 1º mundo fora de menu
     loop(CFG.pollMs, function()
         local now = os.time()
         local waited = now - START
@@ -816,19 +836,29 @@ local function main()
         end
 
         if phase == "esperando" then
+            if not clockStart and valid(pc) and wname and not looksLikeMenu(wname) then
+                clockStart = now
+                info("primeiro mundo fora de menu (" .. tostring(wname) .. "); limite de espera: " ..
+                    (CFG.timeoutSeconds // 60) .. " min a partir de agora")
+            end
             if now - lastStatus >= CFG.statusEverySeconds then
                 lastStatus = now
-                info(string.format("aguardando (%d s): controller=%s pawn=%s mundo=%s", waited,
-                    tostring(shortName(pc)), tostring(shortName(pawn)), tostring(wname)))
+                info(string.format("aguardando (%d s desde o início, %s no mundo): controller=%s pawn=%s mundo=%s",
+                    waited, clockStart and ((now - clockStart) .. " s") or "ainda não", tostring(shortName(pc)),
+                    tostring(shortName(pawn)), tostring(wname)))
             end
-            if waited >= CFG.timeoutSeconds then
-                err("tempo esgotado esperando o jogador; gravando o que achei e encerrando")
+            if clockStart and not timedOut and now - clockStart >= CFG.timeoutSeconds then
+                -- Não desiste: grava o que achou e continua esperando. O guia manda reabrir o jogo se nada mudar;
+                -- TIMEOUT não é etapa, então a próxima sessão tenta tudo de novo.
+                timedOut = true
+                err("tempo esgotado esperando o jogador (" .. (CFG.timeoutSeconds // 60) .. " min no mundo). " ..
+                    "Gravei um relatório parcial e continuo esperando; se nada acontecer, saia, abra o jogo de novo " ..
+                    "e carregue o save logo")
                 mark("sessao", "TIMEOUT")
                 if valid(pc) then
                     local ok, report = safe("relatório parcial", buildReport, pc, pawn, waited)
                     if ok then writeReport(report) end
                 end
-                return true
             end
         end
         return false

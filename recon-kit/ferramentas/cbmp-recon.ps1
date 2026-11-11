@@ -231,6 +231,23 @@ function Listar-Arquivos([string]$base) {
     return $out
 }
 
+# $p (arquivo ou pasta) tem exatamente os arquivos e hashes do original registrado na instalação?
+function Igual-Ao-Original([string]$p, $orig) {
+    $esperado = @($orig.arquivos | Where-Object { $_ })
+    if ($orig.tipo -eq "arquivo") {
+        if (-not (Test-Path -LiteralPath $p -PathType Leaf) -or $esperado.Count -ne 1) { return $false }
+        return (Hash $p) -eq $esperado[0].sha256
+    }
+    if (-not (Test-Path -LiteralPath $p -PathType Container)) { return $false }
+    $atuais = @(Get-ChildItem -LiteralPath $p -Recurse -Force -File)
+    if ($atuais.Count -ne $esperado.Count) { return $false }
+    foreach ($a in $esperado) {
+        $f = Join-Path $p $a.rel
+        if (-not (Test-Path -LiteralPath $f -PathType Leaf) -or (Hash $f) -ne $a.sha256) { return $false }
+    }
+    return $true
+}
+
 function Ler-Estado([string]$win64) {
     $e = Join-Path $win64 "$BackupNome\estado.json"
     if (-not (Test-Path -LiteralPath $e)) { return $null }
@@ -287,6 +304,7 @@ function Instalar {
         $estado = [ordered]@{
             kit = $kit.versao; instaladoEm = (Get-Date).ToString("s"); pastaJogo = $jogo.pasta; win64 = $win64
             loja = $jogo.loja; originais = $originais; adicionados = $Itens
+            topo = @(Get-ChildItem -LiteralPath $win64 -Force | Where-Object { $_.Name -ne $BackupNome } | ForEach-Object { $_.Name })
         }
         [IO.File]::WriteAllText((Join-Path $backup "estado.json"), ($estado | ConvertTo-Json -Depth 8), (New-Object Text.UTF8Encoding $false))
         foreach ($o in $originais) {
@@ -350,7 +368,10 @@ function Dentro-De-Repo([string]$pasta) {
 }
 
 function Pasta-Destino {
-    if ($Destino) { return $Destino }
+    if ($Destino) {
+        if (Dentro-De-Repo $Destino) { Falha "o destino $Destino fica dentro de um repositório git; os dados são privados. Escolha outra pasta." }
+        return $Destino
+    }
     $bases = @()
     if ($env:OneDrive) { $bases += $env:OneDrive }
     if ($env:OneDriveConsumer) { $bases += $env:OneDriveConsumer }
@@ -362,7 +383,9 @@ function Pasta-Destino {
             if (-not (Dentro-De-Repo $d)) { return $d }
         }
     }
-    return [Environment]::GetFolderPath("Desktop")
+    $desk = [Environment]::GetFolderPath("Desktop")
+    if (Dentro-De-Repo $desk) { Falha "a Área de Trabalho fica dentro de um repositório git; use COLETAR com outra pasta." }
+    return $desk
 }
 
 function Copiar-Se-Existe([string]$origem, [string]$destino) {
@@ -462,7 +485,7 @@ function Coletar {
             Select-Object -First 5000 | ForEach-Object { "{0}`t{1}" -f $_.FullName.Substring($ue.Length + 1), $_.Length })
         [IO.File]::WriteAllText((Join-Path $raizZip "info-jogo.json"), ($info | ConvertTo-Json -Depth 8), (New-Object Text.UTF8Encoding $false))
         [IO.File]::WriteAllText((Join-Path $raizZip "PRIVADO-LEIA.txt"),
-            "Dados extraídos do jogo no PC do Robson para desenvolver o CB Multiplayer. PRIVADO: não publicar, não commitar,`r`nnão anexar em issue/PR. Guardar só na pasta cbmp-dumps (fora do repositório).`r`n")
+            "Dados extraídos do jogo neste PC para desenvolver o CB Multiplayer. PRIVADO: não publicar, não commitar,`r`nnão anexar em issue/PR. Guardar só na pasta cbmp-dumps (fora do repositório).`r`n")
 
         $destDir = Pasta-Destino
         New-Item -ItemType Directory -Force -Path $destDir | Out-Null
@@ -499,11 +522,30 @@ function Desinstalar {
     if (-not $estado) { Ok "Nada para desinstalar em $win64."; return 0 }
     if (Jogo-Aberto) { Falha "o jogo está aberto. Feche o Hogwarts Legacy e rode de novo." }
 
-    # Garante que os resultados foram coletados antes de apagar a pasta ue4ss.
+    # Plano antes de mexer em qualquer coisa (idempotente: pode rodar de novo depois de uma restauração pela metade).
+    # Para cada item que o kit põe (dwmapi.dll, ue4ss):
+    #   - havia original e ele NÃO está mais no backup: se o que está na Win64 bate com os hashes do original, já foi
+    #     devolvido (não mexe); se não bate, para tudo sem apagar nada;
+    #   - senão o que está na Win64 é do kit: apaga (dwmapi.dll só se o hash for o do kit) e devolve o original.
+    $kit = $null
+    try { $kit = [IO.File]::ReadAllText($KitJson) | ConvertFrom-Json } catch { }
+    $plano = @{}
+    foreach ($nome in $Itens) {
+        $orig = @($estado.originais) | Where-Object { $_ -and $_.nome -eq $nome } | Select-Object -First 1
+        $de = Join-Path $backup $nome
+        $para = Join-Path $win64 $nome
+        if ($orig -and -not (Test-Path -LiteralPath $de)) {
+            if ((Test-Path -LiteralPath $para) -and (Igual-Ao-Original $para $orig)) { $plano[$nome] = "devolvido"; continue }
+            Falha "o original de $nome não está em $backup e o que está em $para não é ele. Nada foi apagado; mande esta mensagem."
+        }
+        $plano[$nome] = "do-kit"
+    }
+
+    # Garante que os resultados foram coletados antes de apagar a pasta ue4ss (se ela ainda é a do kit).
     $ue = Join-Path $win64 "ue4ss"
     $ultimaColeta = if (Test-Path -LiteralPath $MarcaColeta) { [datetime]::Parse(([IO.File]::ReadAllText($MarcaColeta)).Trim()) } else { [datetime]::MinValue }
     $ultimaMudanca = [datetime]::MinValue
-    if (Test-Path -LiteralPath $ue) {
+    if ($plano["ue4ss"] -eq "do-kit" -and (Test-Path -LiteralPath $ue)) {
         $m = Get-ChildItem -LiteralPath $ue -Recurse -File -Force -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
         if ($m) { $ultimaMudanca = $m.LastWriteTime }
     }
@@ -519,43 +561,58 @@ function Desinstalar {
         Falha "sem permissão para gravar em $win64. Clique com o botão direito em DESINSTALAR.bat > Executar como administrador."
     }
 
-    $kit = $null
-    try { $kit = [IO.File]::ReadAllText($KitJson) | ConvertFrom-Json } catch { }
+    $sobrou = $false
     $dll = Join-Path $win64 "dwmapi.dll"
-    if (Test-Path -LiteralPath $dll) {
-        $nosso = $kit -and (@($kit.payload | Where-Object { $_.caminho -eq "dwmapi.dll" -and $_.sha256 -eq (Hash $dll) }).Count -gt 0)
-        if (-not $nosso -and $kit) {
+    if ($plano["dwmapi.dll"] -eq "do-kit" -and (Test-Path -LiteralPath $dll)) {
+        if (-not $kit) { Falha "não consegui ler o kit.json do kit; não apago o dwmapi.dll sem conferir. Extraia o zip do kit de novo no mesmo lugar e rode outra vez." }
+        $h = Hash $dll
+        $nosso = @($kit.payload | Where-Object { $_.caminho -eq "dwmapi.dll" -and $_.sha256 -eq $h }).Count -gt 0
+        if ($nosso) {
+            Remove-Item -LiteralPath $dll -Force
+        } else {
             $sobras = Join-Path $win64 "cbmp-recon-sobras"
             New-Item -ItemType Directory -Force -Path $sobras | Out-Null
             Move-Item -LiteralPath $dll -Destination (Join-Path $sobras "dwmapi.dll") -Force
             Aviso "dwmapi.dll foi trocado por outro programa depois da instalação; guardei em $sobras."
-        } else {
-            Remove-Item -LiteralPath $dll -Force
+            $sobrou = $true
         }
     }
-    if (Test-Path -LiteralPath $ue) { Remove-Item -LiteralPath $ue -Recurse -Force }
+    if ($plano["ue4ss"] -eq "do-kit" -and (Test-Path -LiteralPath $ue)) { Remove-Item -LiteralPath $ue -Recurse -Force }
     foreach ($nome in $Itens) {
-        if (Test-Path -LiteralPath (Join-Path $win64 $nome)) { Falha "não consegui remover $nome (arquivo em uso?). Seus originais continuam em $backup." }
+        if ($plano[$nome] -eq "do-kit" -and (Test-Path -LiteralPath (Join-Path $win64 $nome))) {
+            Falha "não consegui remover $nome (arquivo em uso?). Feche o jogo e rode de novo; seus originais continuam em $backup."
+        }
     }
 
     $problemas = @()
     foreach ($o in @($estado.originais)) {
         if (-not $o) { continue }
-        $de = Join-Path $backup $o.nome
         $para = Join-Path $win64 $o.nome
-        Move-Item -LiteralPath $de -Destination $para
-        foreach ($a in @($o.arquivos)) {
-            $p = if ($a.rel) { Join-Path $para $a.rel } else { $para }
-            if (-not (Test-Path -LiteralPath $p) -or (Hash $p) -ne $a.sha256) { $problemas += $p }
-        }
+        if ($plano[$o.nome] -eq "devolvido") { Escrever "Original já estava devolvido: $($o.nome)"; continue }
+        Move-Item -LiteralPath (Join-Path $backup $o.nome) -Destination $para
+        if (-not (Igual-Ao-Original $para $o)) { $problemas += $para }
         Escrever "Original devolvido: $($o.nome)"
     }
+    if ($problemas.Count) { Falha ("originais devolvidos com diferença: " + ($problemas -join ", ") + ". O estado foi mantido em $backup.") }
     Remove-Item -LiteralPath (Join-Path $backup "estado.json") -Force
     $resto = @(Get-ChildItem -LiteralPath $backup -Force -ErrorAction SilentlyContinue)
-    if ($resto.Count -eq 0) { Remove-Item -LiteralPath $backup -Force } else { Aviso "Sobrou algo em $backup; não apaguei." }
+    if ($resto.Count -eq 0) { Remove-Item -LiteralPath $backup -Force } else { Aviso "Sobrou algo em $backup; não apaguei."; $sobrou = $true }
     Remove-Item -LiteralPath $MarcaInstalacao -Force -ErrorAction SilentlyContinue
-    if ($problemas.Count) { Falha ("originais devolvidos com diferença: " + ($problemas -join ", ")) }
+
+    # Confere o nível de cima da Win64 contra a lista tirada na instalação (o que a loja não olha: arquivos a mais).
+    if ($estado.PSObject.Properties["topo"]) {
+        $antes = @($estado.topo)
+        $agora = @(Get-ChildItem -LiteralPath $win64 -Force | ForEach-Object { $_.Name })
+        $novos = @($agora | Where-Object { $antes -notcontains $_ })
+        $sumiram = @($antes | Where-Object { $agora -notcontains $_ })
+        if ($novos.Count) { Aviso ("Itens a mais na pasta Win64 (não são do kit, ou sobras dele): " + ($novos -join ", ")); $sobrou = $true }
+        if ($sumiram.Count) { Aviso ("Itens que existiam na instalação e sumiram: " + ($sumiram -join ", ")); $sobrou = $true }
+    }
     Ok ""
+    if ($sobrou) {
+        Aviso "Desinstalado, mas com os avisos acima: a pasta $win64 NÃO está exatamente como antes. Anote e mande."
+        return 0
+    }
     Ok "Desinstalado. A pasta $win64 voltou a ser como antes da instalação."
     Escrever "Para ter certeza, use 'Verificar arquivos' na Steam/Epic (veja o LEIA-ME.md)."
     return 0

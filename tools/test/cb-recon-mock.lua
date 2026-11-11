@@ -3,7 +3,7 @@
 -- vez, erro de dumper registrado, etapa travada pulada na sessão seguinte).
 --
 -- Uso: build\lua54\lua.exe tools\test\cb-recon-mock.lua <pasta-temporária-vazia> <caminho do main.lua>
--- (o tools/recon-kit-smoke.mjs chama assim e depois valida o JSON com o Node).
+-- (o tools/make-recon-kit.mjs chama assim e depois valida cada relatorio-*.json com JSON.parse em UTF-8 estrito).
 
 local tmp, mainSrc = arg[1], arg[2]
 assert(tmp and mainSrc, "uso: cb-recon-mock.lua <tmp> <main.lua>")
@@ -87,21 +87,21 @@ local CObject = class("/Script/CoreUObject.Object", "Object")
 local CActor = class("/Script/Engine.Actor", "Actor", CObject)
 local CPawn = class("/Script/Engine.Pawn", "Pawn", CActor)
 local CCharacter = class("/Script/Engine.Character", "Character", CPawn)
-local CBiped = class("/Script/Phoenix.Biped_Character", "Biped_Character", CCharacter,
+local CBiped = class("/Script/TestGame.TestCharBase", "TestCharBase", CCharacter,
     { { "Health", "FloatProperty" }, { "Gear", "ObjectProperty" }, { "Broken", "FloatProperty" }, { "OnHit", "MulticastDelegateProperty" } })
-local CPlayer = class("/Script/Phoenix.Biped_Player", "Biped_Player", CBiped, { { "PlayerId", "IntProperty" } })
+local CPlayer = class("/Script/TestGame.TestPlayerChar", "TestPlayerChar", CBiped, { { "PlayerId", "IntProperty" }, { "Apelido", "StrProperty" } })
 local CController = class("/Script/Engine.PlayerController", "PlayerController", CActor)
-local CPhxController = class("/Script/Phoenix.PhoenixPlayerController", "PhoenixPlayerController", CController,
+local CPhxController = class("/Script/TestGame.TestPlayerController", "TestPlayerController", CController,
     { { "bInMenu", "BoolProperty" } })
 local CActorComp = class("/Script/Engine.ActorComponent", "ActorComponent", CObject)
 local CScene = class("/Script/Engine.SceneComponent", "SceneComponent", CActorComp)
 local CPrim = class("/Script/Engine.PrimitiveComponent", "PrimitiveComponent", CScene)
 local CSkel = class("/Script/Engine.SkeletalMeshComponent", "SkeletalMeshComponent", CPrim)
 local CMove = class("/Script/Engine.CharacterMovementComponent", "CharacterMovementComponent", CActorComp)
-local CAppear = class("/Script/Phoenix.CustomizableCharacterComponent", "CustomizableCharacterComponent", CActorComp,
+local CAppear = class("/Script/TestGame.TestLookComponent", "TestLookComponent", CActorComp,
     { { "HeadId", "NameProperty" } })
-local CAnim = class("/Script/Phoenix.PhoenixAnimInstance", "PhoenixAnimInstance", CObject, { { "Speed", "FloatProperty" } })
-local CSpellTool = class("/Script/Phoenix.SpellTool", "SpellTool", CActor)
+local CAnim = class("/Script/TestGame.TestAnimInstance", "TestAnimInstance", CObject, { { "Speed", "FloatProperty" } })
+local CTestHeldTool = class("/Script/TestGame.TestHeldTool", "TestHeldTool", CActor)
 local CWorld = class("/Script/Engine.World", "World", CObject)
 
 local function world(name)
@@ -110,26 +110,27 @@ local function world(name)
 end
 
 local state = {}
-local function makeScene(wname)
+local function makeScene(wname, pawnClass)
     -- troca de mapa: os objetos da cena anterior deixam de valer
     for _, o in ipairs(state.actors or {}) do o.__valid = false end
     for _, o in ipairs(state.components or {}) do o.__valid = false end
     local w = world(wname)
-    local pc = new("UObject", "PhoenixPlayerController /Game/Maps/" .. wname .. ".PC_0", "PC_0", CPhxController,
+    local pc = new("UObject", "TestPlayerController /Game/Maps/" .. wname .. ".PC_0", "PC_0", CPhxController,
         { __world = w, bInMenu = false })
-    local anim = new("UObject", "PhoenixAnimInstance /Transient.Anim_0", "Anim_0", CAnim, { Speed = 0.0 })
-    local pawn = new("AActor", "Biped_Player /Game/Maps/" .. wname .. ".Player_0", "Player_0", CPlayer,
-        { __world = w, Health = 100.0, Broken = "THROW", PlayerId = 7 })
+    local anim = new("UObject", "TestAnimInstance /Transient.Anim_0", "Anim_0", CAnim, { Speed = 0.0 })
+    local pawn = new("AActor", "TestPlayerChar /Game/Maps/" .. wname .. ".Player_0", "Player_0", pawnClass or CPlayer,
+        { __world = w, Health = 100.0, Broken = "THROW", PlayerId = 7,
+          Apelido = { type = function() return "FString" end, ToString = function() return "a" .. string.rep("ã", 300) end } })
     local mesh = new("UObject", "SkeletalMeshComponent Player_0.Mesh", "Mesh", CSkel,
         { __outer = pawn, __anim = anim, SkeletalMesh = new("UObject", "SkeletalMesh /Game/Char/SK_Body.SK_Body", "SK_Body", nil) })
     local move = new("UObject", "CharacterMovementComponent Player_0.CharMoveComp", "CharMoveComp", CMove,
         { __outer = pawn, MaxWalkSpeed = 420.0, MovementMode = 1 })
-    local appear = new("UObject", "CustomizableCharacterComponent Player_0.Customization", "Customization", CAppear,
+    local appear = new("UObject", "TestLookComponent Player_0.Customization", "Customization", CAppear,
         { __outer = pawn, HeadId = { type = function() return "FName" end, ToString = function() return "Head_03" end } })
     pawn.__fields.Mesh = mesh
     pawn.__fields.CharacterMovement = move
     pc.__fields.Pawn = pawn
-    local wand = new("AActor", "SpellTool /Game/Maps/" .. wname .. ".Wand_0", "Wand_0", CSpellTool,
+    local wand = new("AActor", "TestHeldTool /Game/Maps/" .. wname .. ".Wand_0", "Wand_0", CTestHeldTool,
         { __world = w, Owner = pawn })
     state.pc, state.pawn, state.world = pc, pawn, w
     state.components = { mesh, move, appear }
@@ -137,7 +138,7 @@ local function makeScene(wname)
 end
 
 local classesAll = { CObject, CActor, CPawn, CCharacter, CBiped, CPlayer, CController, CPhxController, CActorComp, CScene,
-    CPrim, CSkel, CMove, CAppear, CAnim, CSpellTool, CWorld }
+    CPrim, CSkel, CMove, CAppear, CAnim, CTestHeldTool, CWorld }
 
 -- API UE4SS falsa --------------------------------------------------------------------------------------------------
 local calls = {}
@@ -211,7 +212,7 @@ local START1 = clock
 dofile(scriptPath)
 runFor(60)
 check(#calls == 0 and #listReports() == 0, "sessão 1: nada roda enquanto o mundo parece menu")
-makeScene("Overland")
+makeScene("WorldA")
 runFor(40)
 check(#listReports() == 0, "sessão 1: espera a estabilidade antes do relatório")
 runFor(120)
@@ -226,15 +227,15 @@ check(log1:find("falha simulada do gerador de SDK", 1, true) ~= nil, "sessão 1:
 local st = readAll(modDir .. "\\estado.txt") or ""
 check(st:find("sdk_cxx ERRO", 1, true) ~= nil and st:find("objetos OK", 1, true) ~= nil, "sessão 1: estado.txt com OK/ERRO")
 local rep = reps[1] and readAll(modDir .. "\\" .. reps[1]) or ""
-check(rep:find("Biped_Player", 1, true) and rep:find("CustomizableCharacterComponent", 1, true)
-    and rep:find("SK_Body", 1, true) and rep:find("SpellTool", 1, true) and rep:find("Head_03", 1, true)
-    and rep:find("PhoenixAnimInstance", 1, true) and rep:find("Overland", 1, true) ~= nil,
+check(rep:find("TestPlayerChar", 1, true) and rep:find("TestLookComponent", 1, true)
+    and rep:find("SK_Body", 1, true) and rep:find("TestHeldTool", 1, true) and rep:find("Head_03", 1, true)
+    and rep:find("TestAnimInstance", 1, true) and rep:find("WorldA", 1, true) ~= nil,
     "sessão 1: relatório tem pawn, componentes, malha, anim, ator ligado e mundo")
 check(rep:find("explodiu", 1, true) ~= nil, "sessão 1: propriedade que dá erro vira 'erro' no relatório, sem parar")
 runFor(30 * 60)
 check(#calls == #expected, "sessão 1: nada repete depois")
 -- mudança de mundo gera relatório extra
-makeScene("Hogsmeade")
+makeScene("WorldB")
 runFor(120)
 check(#listReports() >= 2, "sessão 1: relatório extra ao mudar de mundo")
 
@@ -246,24 +247,37 @@ do
 end
 tasks = {}
 resetApi()
-makeScene("Overland")
+makeScene("WorldA")
 dofile(scriptPath)
 runFor(200)
 check(#calls == 0, "sessão 2: nenhum dumper repetido; o travado é pulado (" .. table.concat(calls, ",") .. ")")
 st = readAll(modDir .. "\\estado.txt") or ""
 check(st:find("usmap PULADO", 1, true) ~= nil, "sessão 2: etapa travada marcada PULADO")
 
--- Sessão 3: API sem jogador nenhum até o tempo esgotar (não pode dar erro) ------------------------------------------
+-- Sessão 3: shaders/menu demorados não contam; tempo esgotado no mundo não desiste ----------------------------------
 tasks = {}
 resetApi()
 state.pc = nil
 os.remove(modDir .. "\\estado.txt")
-START1 = clock
+os.remove(modDir .. "\\cb-recon.log")
 dofile(scriptPath)
-runFor(21 * 60)
+runFor(15 * 60)                       -- "compilando shaders": nenhum controller
+makeScene("MainMenu_P")
+runFor(25 * 60)                       -- menu muito longo
 local log3 = readAll(modDir .. "\\cb-recon.log") or ""
-check(log3:find("tempo esgotado", 1, true) ~= nil, "sessão 3: timeout registrado")
-check(#calls == 0, "sessão 3: sem jogador, nenhum dumper roda")
+check(log3:find("tempo esgotado", 1, true) == nil and #calls == 0, "sessão 3: 40 min sem controller/no menu não contam no limite")
+makeScene("WorldA", CPawn)            -- mundo de verdade, mas Pawn que não é Character (nunca vira candidato)
+runFor(31 * 60)
+log3 = readAll(modDir .. "\\cb-recon.log") or ""
+check(log3:find("tempo esgotado", 1, true) ~= nil, "sessão 3: timeout registrado 30 min depois do primeiro mundo fora de menu")
+check(#calls == 0, "sessão 3: sem jogador válido, nenhum dumper roda")
+makeScene("WorldA")                   -- o jogador aparece depois do timeout: continua esperando e roda tudo
+runFor(200)
+check(#calls == 6, "sessão 3: depois do timeout o mod continua esperando e roda os dumpers (" .. #calls .. ")")
+local reps3 = listReports()
+local anyVer = false
+for _, r in ipairs(reps3) do if (readAll(modDir .. "\\" .. r) or ""):find('"ue4ss": "3.0.1"', 1, true) then anyVer = true end end
+check(anyVer, "sessão 3: versão do UE4SS completa no relatório (3.0.1)")
 
 print(failures == 0 and "TODOS OK" or (failures .. " FALHA(S)"))
 os.exit(failures == 0 and 0 or 1)

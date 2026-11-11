@@ -119,10 +119,18 @@ if (existsSync(luac) && existsSync(lua)) {
   if (p.status !== 0) fail(`luac -p falhou:\n${p.stderr}`);
   const tmp = mkdtempSync(join(tmpdir(), 'cbrecon-mock-'));
   const m = sh(lua, [join(REPO, 'tools', 'test', 'cb-recon-mock.lua'), tmp, mainLua]);
+  // Os relatórios do teste simulado têm de ser JSON válido em UTF-8 estrito (inclui texto longo com acentos cortado).
+  const repDir = join(tmp, 'Mods', 'cb-recon');
+  const reps = existsSync(repDir) ? readdirSync(repDir).filter((f) => /^relatorio-.*\.json$/.test(f)) : [];
+  const badJson = [];
+  for (const f of reps) {
+    try { JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(readFileSync(join(repDir, f)))); } catch (e) { badJson.push(`${f}: ${e.message}`); }
+  }
   rmSync(tmp, { recursive: true, force: true });
   const lines = (m.stdout || '').split(/\r?\n/).filter((l) => /^(ok|FALHA|TODOS|\d+ FALHA)/.test(l));
   if (m.status !== 0) fail(`teste simulado do cb-recon falhou:\n${lines.join('\n')}\n${m.stderr}`);
-  log(`Lua: ${ver}; luac -p ok; teste simulado: ${lines.filter((l) => l.startsWith('ok')).length} verificações ok`);
+  if (!reps.length || badJson.length) fail(`relatórios do teste simulado: ${reps.length} arquivo(s); inválidos: ${badJson.join('; ') || '-'}`);
+  log(`Lua: ${ver}; luac -p ok; teste simulado: ${lines.filter((l) => l.startsWith('ok')).length} verificações ok; ${reps.length} relatório(s) JSON/UTF-8 válidos`);
 } else if (!o.noLua) {
   fail(`luac/lua não encontrados em ${LUA_DIR} (rode tools/build-lua54.ps1 no Developer PowerShell, ou use --no-lua-check)`);
 } else {
