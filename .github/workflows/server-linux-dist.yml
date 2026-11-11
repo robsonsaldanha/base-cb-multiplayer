@@ -1,0 +1,92 @@
+name: server-linux-dist
+# Pacote do cb-server para Linux x64 que roda em Ubuntu 22.04 (glibc 2.35, g++ 11 no sistema): compilado no
+# ubuntu-22.04 com GCC 13 (C++23), Release sem sanitizers, libstdc++/libgcc estáticas e libmariadb.so (LGPL,
+# dinâmica) ao lado do executável com RPATH $ORIGIN. Usado pelo ambiente de teste online (docs/AMBIENTE-TESTE-ONLINE.md).
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, teste-online]
+    paths: ['proto/**', 'server/**', 'CMakeLists.txt', 'CMakePresets.json', 'vcpkg.json', 'vcpkg-overlays/**',
+      'vcpkg-triplets/**', '.github/workflows/server-linux-dist.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-linux-dist-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.vcpkg-cache,readwrite"
+  # Mesmo commit do workflow native.
+  VCPKG_COMMIT: ec48c11eae9448c8c6e7739d93e06fa2433aa95f
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    env:
+      CC: gcc-13
+      CXX: g++-13
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache/restore@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-u2204-gcc13-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-u2204-gcc13-${{ hashFiles('vcpkg.json') }}-
+            vcpkg-u2204-gcc13-
+      # GCC 13 do PPA oficial de toolchains do Ubuntu (o 22.04 só tem até o 12). Também vira o gcc/g++ padrão,
+      # para os ports do vcpkg usarem o mesmo compilador.
+      - run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y gcc-13 g++-13 ninja-build pkg-config autoconf autoconf-archive automake libtool patchelf
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 130 --slave /usr/bin/g++ g++ /usr/bin/g++-13
+          g++ --version
+      - run: |
+          mkdir -p .vcpkg-cache
+          git clone https://github.com/microsoft/vcpkg "$GITHUB_WORKSPACE/vcpkg"
+          git -C "$GITHUB_WORKSPACE/vcpkg" checkout "$VCPKG_COMMIT"
+          "$GITHUB_WORKSPACE/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$GITHUB_WORKSPACE/vcpkg" >> $GITHUB_ENV
+      - run: |
+          cmake --preset linux-release -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
+          cmake --build --preset linux-release --target cb-server
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-u2204-gcc13-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}
+      - name: pacote (cb-server + libmariadb.so + plugins + licença)
+        run: |
+          set -euo pipefail
+          B=build-native/linux-release
+          D=dist/cb-server-linux-x64
+          mkdir -p "$D"
+          cp "$B/server/cb-server" "$D/"
+          cp -a "$B"/vcpkg_installed/x64-linux/lib/libmariadb.so* "$D/"
+          cp -a "$B/server/plugins" "$D/" || true
+          cp "$B/vcpkg_installed/x64-linux/share/libmariadb/copyright" "$D/LICENSE-libmariadb.txt"
+          patchelf --set-rpath '$ORIGIN' "$D/cb-server"
+          echo "${GITHUB_SHA}" > "$D/COMMIT"
+          ls -la "$D"
+      - name: conferência (glibc <= 2.35, sem libstdc++ dinâmica, libmariadb pelo $ORIGIN)
+        run: |
+          set -euo pipefail
+          D=dist/cb-server-linux-x64
+          ldd "$D/cb-server" | tee /dev/stderr > ldd.txt
+          if grep -q 'libstdc++\|libgcc_s' ldd.txt; then echo "libstdc++/libgcc dinâmicas"; exit 1; fi
+          grep -q "libmariadb\.so.*$PWD/$D/" ldd.txt
+          MAXG=$(objdump -T "$D/cb-server" "$D"/libmariadb.so.* | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+          echo "glibc máxima exigida: $MAXG"
+          [ "$(printf '%s\nGLIBC_2.35\n' "$MAXG" | sort -V | tail -1)" = "GLIBC_2.35" ]
+          "$D/cb-server" --help
+      - run: tar -C dist -czf cb-server-linux-x64.tar.gz cb-server-linux-x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cb-server-linux-x64
+          path: cb-server-linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 30
