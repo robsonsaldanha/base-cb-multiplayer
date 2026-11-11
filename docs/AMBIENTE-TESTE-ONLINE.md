@@ -89,10 +89,12 @@ o usuário de sistema, ele não aparece no painel de ninguém; mudanças passam 
 ## cb-server Linux
 
 Workflow `.github/workflows/server-linux-dist.yml` (push na `main`/`teste-online` que mexe no nativo, ou manual):
-imagem `gcc:14-bookworm` (o código usa `std::print`, GCC 14), Release sem sanitizers, `-static-libstdc++
--static-libgcc`, `libmariadb.so` (LGPL, dinâmica) ao lado com RPATH `$ORIGIN`. O job **falha** se o binário ou a
-libmariadb exigirem glibc acima de 2.35 (a da VPS, Ubuntu 22.04) ou se a libstdc++ ficar dinâmica. Artefato
-`cb-server-linux-x64` (`cb-server-linux-x64.tar.gz`).
+imagem `manylinux_2_28` (AlmaLinux 8, glibc 2.28) com `gcc-toolset-14` (o código usa `std::print`, GCC 14), Release
+sem sanitizers, `-static-libstdc++ -static-libgcc` e `-lanl`, `libmariadb.so` (LGPL, dinâmica) ao lado com RPATH
+`$ORIGIN`. O job **falha** se o binário ou a libmariadb exigirem glibc acima de 2.35 (a da VPS, Ubuntu 22.04) ou se a
+libstdc++ ficar dinâmica (hoje a maior exigida é `GLIBC_2.27`). Artefato `cb-server-linux-x64`
+(`cb-server-linux-x64.tar.gz`). Imagens com glibc mais nova não servem: a libstdc++ estática do GCC 14 do Debian 12
+usa `arc4random` (`GLIBC_2.36`).
 
 O `cb-server` usa o OpenSSL estático do vcpkg; a unit aponta `SSL_CERT_FILE`/`SSL_CERT_DIR` para as CAs do sistema
 (TLS até o Hub).
