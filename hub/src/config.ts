@@ -42,6 +42,12 @@ export interface HubConfig {
   discordClientSecret: string;
   platformAdmins: string[];
   devLogin: boolean;
+  /**
+   * Hub de teste PÚBLICO (`HUB_STAGING=1`, ex. o ambiente de teste online): permite `HUB_RELEASES_DIR` sem dev-login e
+   * sobe sem o app Discord configurado (o login responde 503 `login_unavailable` até `DISCORD_CLIENT_ID`/`_SECRET`
+   * existirem). Exige `HUB_PUBLIC_URL` https; recusado com `HUB_DEV_LOGIN=1` e com `NODE_ENV=production`.
+   */
+  staging: boolean;
   trustProxy: string | false;
   allowPrivateServers: boolean;
   rateLimit: boolean;
@@ -69,6 +75,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
   const port = Number(env.HUB_PORT ?? 8787);
   const host = env.HUB_HOST ?? '127.0.0.1';
   const devLogin = env.HUB_DEV_LOGIN === '1';
+  const staging = env.HUB_STAGING === '1';
   const cfg: HubConfig = {
     port,
     host,
@@ -78,6 +85,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
     discordClientSecret: env.DISCORD_CLIENT_SECRET ?? '',
     platformAdmins: (env.HUB_PLATFORM_ADMINS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
     devLogin,
+    staging,
     trustProxy: parseTrustProxy(env.HUB_TRUST_PROXY),
     allowPrivateServers: env.HUB_ALLOW_PRIVATE_SERVERS === '1',
     rateLimit: env.HUB_RATE_LIMIT !== '0',
@@ -91,7 +99,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
     dlRateWindowMs: 30_000,
   };
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('HUB_PORT inválida');
-  if (!devLogin && (!cfg.discordClientId || !cfg.discordClientSecret)) {
+  if (staging) assertStagingSafe(cfg, env);
+  if (!devLogin && !staging && (!cfg.discordClientId || !cfg.discordClientSecret)) {
     throw new Error('DISCORD_CLIENT_ID e DISCORD_CLIENT_SECRET são obrigatórios (ou HUB_DEV_LOGIN=1 para testes locais)');
   }
   const repoOk = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/.test(cfg.releasesRepo)
@@ -102,12 +111,21 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
   if (cfg.releasesDir) {
     // NODE_ENV não é definido pelo deploy deste projeto: a trava que vale é o dev-login, que já prende o Hub a
     // HUB_HOST/HUB_PUBLIC_URL locais e sem proxy (assertDevLoginSafe).
-    if (!devLogin) throw new Error('HUB_RELEASES_DIR (releases locais, só para testes) exige HUB_DEV_LOGIN=1, que prende o Hub a esta máquina');
+    if (!devLogin && !staging) {
+      throw new Error('HUB_RELEASES_DIR (releases locais, só para testes) exige HUB_DEV_LOGIN=1 (Hub preso a esta máquina) ou HUB_STAGING=1 (Hub de teste público)');
+    }
     if (cfg.githubToken) throw new Error('HUB_RELEASES_DIR e HUB_GITHUB_TOKEN são mutuamente exclusivos (pasta local de releases é só para testes)');
     if ((env.NODE_ENV ?? '').trim() === 'production') throw new Error('HUB_RELEASES_DIR (releases locais, só para testes) é recusado com NODE_ENV=production');
   }
   if (devLogin) assertDevLoginSafe(cfg);
   return cfg;
+}
+
+/** Hub de teste público: https, sem dev-login e nunca marcado como produção. */
+function assertStagingSafe(cfg: HubConfig, env: NodeJS.ProcessEnv): void {
+  if (cfg.devLogin) throw new Error('HUB_STAGING=1 (Hub de teste público) não pode ser combinado com HUB_DEV_LOGIN=1');
+  if ((env.NODE_ENV ?? '').trim() === 'production') throw new Error('HUB_STAGING=1 (Hub de teste) é recusado com NODE_ENV=production');
+  if (!cfg.publicUrl.startsWith('https://')) throw new Error(`HUB_STAGING=1 exige HUB_PUBLIC_URL https; recebido "${cfg.publicUrl}"`);
 }
 
 /** Login de teste só em máquina local: escuta local, URL pública local e sem proxy na frente. */

@@ -67,6 +67,10 @@ function devLoginPage(q: Record<string, string | undefined>): string {
 <p><button type="submit">Entrar como dev</button></p></form></body></html>`;
 }
 
+/** Login com Discord ainda não configurado (só acontece com HUB_STAGING=1; produção nem sobe assim). */
+const loginUnavailable = (missing: string) =>
+  new HttpError(503, 'login_unavailable', `login com Discord ainda não configurado neste Hub (falta ${missing}); tente mais tarde`);
+
 const tokenResponse = (s: SessionTokens): TokenResponse => ({
   accessToken: s.access, accessExpiresAt: s.accessExpiresAt, refreshToken: s.refresh, refreshExpiresAt: s.refreshExpiresAt,
 });
@@ -104,6 +108,8 @@ export async function authRoutes(app: FastifyInstance) {
         .type('text/html; charset=utf-8')
         .send(devLoginPage(q));
     }
+    // Hub de teste (HUB_STAGING) sobe antes do app Discord existir: sem client id não há para onde mandar.
+    if (!config.discordClientId) throw loginUnavailable('DISCORD_CLIENT_ID');
     const state = store.createOauthState(q.client, now(), challenge, returnOf(q), clientStateOf(q) ?? undefined);
     reply.setCookie(OAUTH_COOKIE, state, { path: OAUTH_COOKIE_PATH, httpOnly: true, sameSite: 'lax', secure, maxAge: 600 });
     const url = new URL('https://discord.com/oauth2/authorize');
@@ -125,6 +131,7 @@ export async function authRoutes(app: FastifyInstance) {
       if (st.client === 'launcher') return reply.redirect(launcherLink({ error: 'access_denied' }, st.clientState));
       return reply.status(400).type('text/html; charset=utf-8').send(deniedPage(q.error ?? 'access_denied'));
     }
+    if (!config.discordClientSecret) throw loginUnavailable('DISCORD_CLIENT_SECRET');
     const du = await discord.getUser(await discord.exchangeCode(q.code, redirectUri));
     const user = store.upsertUserFromDiscord({ discordId: du.id, name: du.global_name ?? du.username, avatar: du.avatar }, now());
     return finishLogin(reply, user.id, st.client, st.codeChallenge, st.returnTo, st.clientState);

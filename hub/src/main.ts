@@ -43,6 +43,10 @@ try {
 }
 app.log.info(`Hub em ${config.publicUrl} (chave ativa ${keyring.active.kid})`);
 if (config.releasesDir) app.log.warn(`releases LOCAIS de ${config.releasesDir} (HUB_RELEASES_DIR, só para testes)`);
+if (config.staging) app.log.warn('HUB_STAGING=1: Hub de TESTE público (releases locais permitidas; não é produção)');
+if (!config.devLogin && (!config.discordClientId || !config.discordClientSecret)) {
+  app.log.warn('login com Discord desligado até DISCORD_CLIENT_ID e DISCORD_CLIENT_SECRET serem definidos (rotas de login respondem 503 login_unavailable)');
+}
 
 let closing = false;
 async function shutdown(signal: string): Promise<void> {

@@ -24,7 +24,8 @@ Veja `.env.example` para a lista completa. Updates do launcher, mod e downloads 
 |---|---|
 | `HUB_GITHUB_TOKEN` | token do GitHub com leitura de Releases (fine-grained, só *Contents: read* no repo privado). Vazio → as três rotas respondem `503 updates_disabled`. Nunca vai para log nem para o cliente. |
 | `HUB_RELEASES_REPO` | `dono/repo` dos Releases; obrigatório quando há token. Tags `launcher-vX.Y.Z` (instalador `*-setup.exe` + `.sig`) e `mod-pN-vX.Y.Z` (`cbmp-mod-pN-vX.Y.Z.zip` + `.sig` + `.sha256`). |
-| `HUB_RELEASES_DIR` | **só testes locais**: pasta com `<tag>/<asset>` (e `notes.txt` opcional com as notas) servida no lugar do GitHub. Exige `HUB_DEV_LOGIN=1` (Hub preso a esta máquina); mutuamente exclusivo com `HUB_GITHUB_TOKEN`; recusado com `NODE_ENV=production`. Links simbólicos/junções e nomes fora de `[A-Za-z0-9 ._()+-]` são ignorados. É o que `tools/dev-env.mjs` usa. |
+| `HUB_RELEASES_DIR` | **só testes**: pasta com `<tag>/<asset>` (e `notes.txt` opcional com as notas) servida no lugar do GitHub. Exige `HUB_DEV_LOGIN=1` (Hub preso a esta máquina) ou `HUB_STAGING=1` (Hub de teste público); mutuamente exclusivo com `HUB_GITHUB_TOKEN`; recusado com `NODE_ENV=production`. Links simbólicos/junções e nomes fora de `[A-Za-z0-9 ._()+-]` são ignorados. É o que `tools/dev-env.mjs` e o ambiente de teste online usam. |
+| `HUB_STAGING` | `1` = Hub de teste **público** (ambiente de teste online, `docs/AMBIENTE-TESTE-ONLINE.md`): permite `HUB_RELEASES_DIR` sem dev-login e sobe sem o app Discord (login responde `503 login_unavailable` até `DISCORD_CLIENT_ID`/`DISCORD_CLIENT_SECRET` existirem). Exige `HUB_PUBLIC_URL` https; recusado com `HUB_DEV_LOGIN=1` e com `NODE_ENV=production`. |
 | `HUB_DL_MAX_CONCURRENT` | downloads de `/v1/dl` repassados ao mesmo tempo, somando todos os clientes (padrão 32; inteiro ≥ 1). Cada IP tem no máximo 2. |
 | `HUB_DL_STALL_SECONDS` | download cujo cliente não drena o socket por este tempo é derrubado (padrão 30; 1–3600). |
 | `HUB_DL_MIN_KBPS` | taxa mínima em KiB/s (média dos últimos 30 s, após 30 s de carência); abaixo dela o download é derrubado (padrão 32; 0 desliga). |
@@ -35,6 +36,13 @@ A lista de releases fica 60 s em cache (falha: 15 s, servindo a anterior). Draft
 
 Ficam em `<HUB_DATA_DIR>/keys/<kid>.pem`. A de maior nome é a ativa. Para girar: crie um novo `.pem` com kid maior
 (`k` + AAAAMMDDhhmmss) e reinicie; remova a antiga depois de 10 minutos (tickets duram 5 min).
+
+## Ferramenta de linha de comando
+
+`tsx src/cli.ts ensure-server --name <nome> --state <arquivo> [--description <t>] [--tag <t>]... [--featured]`
+(no deploy, `node cli.mjs ...` do bundle): cadastra ou reaproveita, direto no banco de `HUB_DATA_DIR`, um servidor
+do usuário de sistema (Discord ID `0`), opcionalmente em destaque, e grava `{serverId, key}` em `--state` (modo 600).
+A chave nunca é impressa. Usado pelo ambiente de teste online.
 
 ## Testes
 
