@@ -2,6 +2,8 @@
 
 Plataforma de multiplayer para Hogwarts Legacy no estilo FiveM: Hub, servidores dedicados e launcher.
 
+Visão geral para quem está chegando, inclusive como a DLL do mod funciona: [`docs/COMO-FUNCIONA.md`](docs/COMO-FUNCIONA.md).
+
 ## Estrutura
 
 - `packages/contracts`: contratos compartilhados (tickets, mensagens) em TypeScript.
