@@ -27,7 +27,7 @@ die() { printf '[teste-online] ERRO: %s\n' "$*" >&2; exit 1; }
 nginx_apply() { # $1 = arquivo de site a instalar
   # Outro site já responde por este nome? (o nosso arquivo é o único permitido)
   local others
-  others=$(sudo -n grep -rlE "server_name[^;]*\b${HOST//./\\.}\b" /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null | grep -v "^$SITE_LINK\$" || true)
+  others=$(sudo -n grep -RlE "server_name[^;]*\b${HOST//./\\.}\b" /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null | grep -v "^$SITE_LINK\$" || true)
   [ -z "$others" ] || die "outro site nginx já usa $HOST: $others"
   sudo -n install -m 644 -o root -g root "$1" "$SITE"
   [ -L "$SITE_LINK" ] || sudo -n ln -s "$SITE" "$SITE_LINK"
