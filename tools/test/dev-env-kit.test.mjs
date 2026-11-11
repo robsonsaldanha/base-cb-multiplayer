@@ -22,7 +22,7 @@ function fakeKit(files = { 'releases/a.txt': 'conteúdo' }, kitJson = undefined)
     writeFileSync(p, content);
     hashes[rel] = createHash('sha256').update(content).digest('hex');
   }
-  writeFileSync(join(root, 'kit.json'), JSON.stringify(kitJson ?? { kind: 'teste', commit: 'abc1234', node: process.version, files: hashes }));
+  writeFileSync(join(root, 'kit.json'), JSON.stringify(kitJson ?? { kind: 'cbmp-kit-teste-sub4', commit: 'abc1234', node: process.version, files: hashes }));
   return { root, done: () => rmSync(root, { recursive: true, force: true }) };
 }
 
@@ -94,4 +94,39 @@ test('fora do kit (sem kit.json) o comportamento não muda: pasta de trabalho de
     assert.equal(ok.status, 1);
     assert.match(ok.stderr, /chave privada dev não encontrada/);
   } finally { rmSync(root, { recursive: true, force: true }); rmSync(join(tmpdir(), `fora-${process.pid}`), { recursive: true, force: true }); }
+});
+
+test('kit: kind errado em kit.json para o --run com mensagem clara', () => {
+  const k = fakeKit({ 'releases/a.txt': 'x' }, { kind: 'outra-coisa', files: { 'releases/a.txt': '0'.repeat(64) } });
+  try {
+    const r = devEnv(k.root, ['--run']);
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /kit\.json não é de um kit "cbmp-kit-teste-sub4"/);
+  } finally { k.done(); }
+});
+
+test('kit: Node diferente do usado na montagem só avisa', () => {
+  const k = fakeKit({ 'releases/a.txt': 'x' }, {
+    kind: 'cbmp-kit-teste-sub4', node: 'v99.0.0',
+    files: { 'releases/a.txt': '2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881' },
+  });
+  try {
+    const r = devEnv(k.root, ['--run']);
+    assert.equal(r.status, 1); // para depois, no cb-server que a cópia não tem
+    assert.match(r.stdout, /AVISO: o kit foi montado e testado com o Node 99\.x/);
+    assert.match(r.stdout, /kit conferido: 1 arquivos ok/);
+  } finally { k.done(); }
+});
+
+test('kit.json dentro de um repositório git não liga o modo kit (avisa e segue o modo normal)', () => {
+  const k = fakeKit();
+  const out = join(tmpdir(), `fora-git-${process.pid}`);
+  try {
+    mkdirSync(join(k.root, '.git'));
+    const r = devEnv(k.root, ['--build-releases', '--dir', out], { CBMP_DEV_KEY: join(out, 'nao-existe.key') });
+    assert.equal(r.status, 1);
+    assert.match(r.stdout, /kit\.json na raiz do repositório ignorado/);
+    assert.match(r.stderr, /chave privada dev não encontrada/);
+    assert.ok(!existsSync(join(k.root, 'dados')), 'modo normal não usa <raiz>\dados');
+  } finally { k.done(); rmSync(out, { recursive: true, force: true }); }
 });

@@ -93,17 +93,33 @@ Na pasta do OneDrive ele fica em `OneDrive\CasteloBruxoRP\Launcher_livre\dist\` 
 4. Se o zip veio por **download do navegador** (não pelo OneDrive sincronizado nem pendrive): botão direito no zip →
    **Propriedades** → marque **Desbloquear** → OK. Sem isso o Windows marca todos os arquivos extraídos como "vindos
    da internet" e pede confirmação a cada um.
-5. Botão direito no zip → **Extrair Tudo…** → em "Os arquivos serão extraídos para esta pasta" deixe
-   **`C:\cbmp-kit`** → **Extrair**.
+5. Botão direito no zip → **Extrair Tudo…**. Na janela que abre, o campo "Os arquivos serão extraídos para esta
+   pasta" já vem preenchido pelo Windows com **`C:\cbmp-kit\cbmp-kit-teste-sub4`**. **Apague o final
+   `\cbmp-kit-teste-sub4`** para o campo ficar **exatamente `C:\cbmp-kit`** (o zip já traz a pasta
+   `cbmp-kit-teste-sub4` dentro dele; se você deixar como o Windows sugere, ela fica repetida). Clique
+   **Extrair**.
 
-**Esperado**: existe a pasta **`C:\cbmp-kit\cbmp-kit-teste-sub4`** com `LEIA-ME.md` (este roteiro), `INICIAR.cmd`,
-`PARAR.cmd`, `CONFERIR.cmd`, `kit.json` e as pastas `bin`, `hub`, `node_modules`, `releases`, `tools` etc.
+**Esperado**: existe a pasta **`C:\cbmp-kit\cbmp-kit-teste-sub4`** e, **direto dentro dela**, `LEIA-ME.md` (este
+roteiro), `INICIAR.cmd`, `PARAR.cmd`, `CONFERIR.cmd`, `kit.json` e as pastas `bin`, `hub`, `node_modules`,
+`releases`, `tools` etc. Para conferir no PowerShell:
+
+```
+Test-Path C:\cbmp-kit\cbmp-kit-teste-sub4\INICIAR.cmd
+```
+
+**Esperado**: `True`. Todos os caminhos deste roteiro partem de `C:\cbmp-kit\cbmp-kit-teste-sub4`.
 
 Use um caminho **curto, sem espaços e sem acentos** (como `C:\cbmp-kit`). Evite a Área de Trabalho, Downloads
 (caminhos longos) e pastas dentro do OneDrive.
 
-**Se falhar**: erro de "caminho muito longo" ou "arquivo não encontrado" ao extrair → confira o item 1 (arquivo
-inteiro no PC) e extraia em `C:\cbmp-kit`. Mande o print do erro.
+**Se falhar**:
+
+- O comando mostrou `False`, e existe `C:\cbmp-kit\cbmp-kit-teste-sub4\cbmp-kit-teste-sub4` (a pasta repetida: o
+  final do caminho não foi apagado no item 5) → apague a pasta `C:\cbmp-kit\cbmp-kit-teste-sub4` inteira e refaça o
+  item 5, apagando o final `\cbmp-kit-teste-sub4` do campo. (O kit até funcionaria na pasta repetida, mas os caminhos
+  do roteiro ficariam todos errados.)
+- Erro de "caminho muito longo" ou "arquivo não encontrado" ao extrair → confira o item 1 (arquivo inteiro no PC) e
+  extraia em `C:\cbmp-kit`. Mande o print do erro.
 
 ---
 
@@ -121,8 +137,8 @@ o de produção). Os dados dele são digitados só na janela do terminal, nunca 
 
 1. Em `C:\cbmp-kit\cbmp-kit-teste-sub4`, dê dois cliques em **`INICIAR.cmd`**. Abre uma janela preta: **deixe-a
    aberta durante todo o teste** (fechá-la desliga o Hub e o servidor).
-2. Se aparecer **"O Firewall do Windows Defender bloqueou alguns recursos deste aplicativo"** (para `cb-server.exe`
-   ou `node.exe`): clique **Cancelar** (recomendado). O teste todo acontece dentro do próprio PC, que o firewall
+2. Se aparecer **"O Firewall do Windows Defender bloqueou alguns recursos deste aplicativo"** para `cb-server.exe`
+   (o Hub, `node.exe`, só escuta dentro do PC e não deve gerar esse aviso): clique **Cancelar** (recomendado). O teste todo acontece dentro do próprio PC, que o firewall
    não bloqueia; "Cancelar" só impede que outros PCs da rede alcancem a porta 30500 do `cb-server`.
 
 **Esperado** (em até 1 minuto), na janela preta:
@@ -206,12 +222,15 @@ Só se você quiser testar o Discord de verdade, com um **app de teste** (nunca 
 1. No app de teste (Discord Developer Portal → OAuth2 → Redirects), cadastre
    `http://127.0.0.1:8787/v1/auth/discord/callback`.
 2. Na janela do ambiente aperte **Ctrl+C** e responda `S` em "Deseja finalizar o arquivo em lotes". Abra o
-   **PowerShell**, e nele (os valores ficam só nesta janela, nunca em arquivo):
+   **PowerShell** e cole estas linhas, uma por vez. As duas do meio **perguntam** o Client ID e o Client Secret do
+   app de teste: digite (ou cole) cada um quando pedir e aperte Enter. Assim os valores ficam só nesta janela: o
+   secret nem aparece na tela, e nenhum dos dois vai para o histórico do PowerShell (que é gravado em arquivo; por
+   isso **não** escreva o secret direto num comando).
 
    ```
    cd C:\cbmp-kit\cbmp-kit-teste-sub4
-   $env:DISCORD_CLIENT_ID = "<client id do app de teste>"
-   $env:DISCORD_CLIENT_SECRET = "<client secret do app de teste>"
+   $env:DISCORD_CLIENT_ID = Read-Host 'Client ID do app de teste'
+   $env:DISCORD_CLIENT_SECRET = [Net.NetworkCredential]::new('', (Read-Host -AsSecureString 'Client Secret do app de teste')).Password
    node tools\dev-env.mjs --run
    ```
 
@@ -364,13 +383,19 @@ normal, single-player, sem nenhuma mudança.
 
 1. Feche o Hogwarts Legacy se estiver aberto. Steam ou Epic podem ficar abertas (ajuda: o jogo pode precisar delas).
 2. Confira que **não existe** uma pasta `cbmp` (nem `cbmp.old`/`cbmp.staging`) em
-   `<pasta do jogo>\Phoenix\Binaries\Win64`. No PowerShell, trocando pelo caminho do passo 8:
+   `<pasta do jogo>\Phoenix\Binaries\Win64`. Abra o **PowerShell** e cole as duas linhas abaixo, trocando **só** o
+   que está entre aspas na primeira pela **Pasta do jogo** anotada no passo 8 (a pasta que tem
+   `HogwartsLegacy.exe`; o resto do caminho a segunda linha completa sozinha). Deixe essa janela aberta: ela é usada de
+   novo em "Desfazer".
 
    ```
-   Get-ChildItem "C:\Program Files (x86)\Steam\steamapps\common\Hogwarts Legacy\Phoenix\Binaries\Win64" -Filter cbmp*
+   $jogo = "C:\Program Files (x86)\Steam\steamapps\common\Hogwarts Legacy"
+   Get-ChildItem -LiteralPath (Join-Path $jogo 'Phoenix\Binaries\Win64') -Filter cbmp*
    ```
 
-   **Esperado**: não mostra nada. Se mostrar algo, **pare** este passo, marque **PULEI** e conte o que apareceu.
+   **Esperado**: não mostra nada. Se mostrar algo, **pare** este passo, marque **PULEI** e conte o que apareceu. Se
+   aparecer um erro em vermelho dizendo que o caminho não existe, a pasta da primeira linha está errada: confira com a
+   do passo 8.
 
 ### Fazer
 
@@ -401,15 +426,20 @@ Anote no resultado: Steam ou Epic, se o jogo abriu, e qualquer mensagem da Steam
 ### Desfazer (sempre, mesmo se deu certo)
 
 5. Feche o jogo. Em **Configurações**, **marque de novo** **Modo simular**.
-6. Apague a pasta `<pasta do jogo>\Phoenix\Binaries\Win64\cbmp` (e `cbmp.staging`/`cbmp.old`, se existirem). Pelo
-   Explorador, ou no PowerShell (troque o caminho):
+6. Apague **só** a pasta `cbmp` (e `cbmp.staging`/`cbmp.old`, se existirem) de dentro de
+   `<pasta do jogo>\Phoenix\Binaries\Win64`. **Jeito recomendado, pelo Explorador**: abra a Pasta do jogo, entre em
+   `Phoenix` → `Binaries` → `Win64`, clique **uma vez** na pasta chamada exatamente **`cbmp`** e aperte
+   **Delete**. Não apague nada além dela: o resto de `Win64` é do jogo.
+
+   Jeito alternativo, no PowerShell do item 2 (se fechou a janela, rode de novo a linha `$jogo = ...` do item 2). O
+   comando só apaga entradas com esses três nomes exatos; com a pasta errada ele simplesmente não acha nada:
 
    ```
-   Remove-Item -Recurse -Force "C:\Program Files (x86)\Steam\steamapps\common\Hogwarts Legacy\Phoenix\Binaries\Win64\cbmp"
+   Get-ChildItem -LiteralPath (Join-Path $jogo 'Phoenix\Binaries\Win64') -Filter cbmp* | Where-Object Name -in 'cbmp','cbmp.staging','cbmp.old' | Remove-Item -Recurse -Force
    ```
 
-7. Confira com o mesmo `Get-ChildItem ... -Filter cbmp*` do item 2: **Esperado**: não mostra nada. A pasta do jogo
-   está como antes do teste.
+7. Confira com o mesmo comando `Get-ChildItem ... -Filter cbmp*` do item 2: **Esperado**: não mostra nada. A pasta
+   do jogo está como antes do teste.
 
 (Se depois disso você clicar **Jogar** com o modo simular **desligado**, o launcher instala a pasta `cbmp` de novo:
 deixe o modo simular marcado.)

@@ -21,8 +21,8 @@ export const FORBIDDEN_CONTENT = [
   // Chave privada do Tauri/minisign: texto e o base64 do texto (o arquivo do Tauri é base64 do arquivo do minisign).
   [/rsign encrypted secret key|minisign encrypted secret key/, 'chave privada minisign'],
   [/dW50cnVzdGVkIGNvbW1lbnQ6IHJzaWduIGVuY3J5cHRlZCBzZWNyZXQga2V5|dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIGVuY3J5cHRlZCBzZWNyZXQga2V5/, 'chave privada do Tauri (base64)'],
-  // Linha da chave secreta minisign: "Ed" + "Sc" + "B2" em base64.
-  [/RWRTY0Iy[A-Za-z0-9+/]{20,}/, 'linha de chave secreta minisign'],
+  // Linha da chave secreta minisign em base64: "Ed" + "Sc" + "B2" (cifrada) ou "Ed" + 0,0 + "B2" (sem senha).
+  [/(RWRTY0Iy|RWQAAEIy)[A-Za-z0-9+/]{20,}/, 'linha de chave secreta minisign'],
   // Cabeçalho seguido de material da chave (as DLLs de TLS/SSH têm o cabeçalho sozinho como constante do parser).
   [/-----BEGIN (RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----\r?\n[A-Za-z0-9+/=]{40,}/, 'chave privada PEM'],
   [/\bgh[pousr]_[A-Za-z0-9]{36}\b|\bgithub_pat_[A-Za-z0-9_]{22,}/, 'token do GitHub'],
@@ -31,13 +31,11 @@ export const FORBIDDEN_CONTENT = [
 
 /**
  * Confere `files` (relativos a `root`, com `/`). Devolve a lista de problemas ("caminho: motivo"); vazia = ok.
- * `allow` (opcional) pula arquivos conhecidos por conter padrões inofensivos.
  */
-export function scanForSecrets(root, files, allow = new Set()) {
+export function scanForSecrets(root, files) {
   const out = [];
   for (const f of files) {
     for (const [re, why] of FORBIDDEN_NAMES) if (re.test(f)) out.push(`${f}: ${why}`);
-    if (allow.has(f)) continue;
     const text = readFileSync(join(root, ...f.split('/'))).toString('latin1');
     for (const [re, why] of FORBIDDEN_CONTENT) if (re.test(text)) out.push(`${f}: ${why}`);
   }

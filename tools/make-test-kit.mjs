@@ -26,7 +26,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, lstatSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseModComment, parsePublicKey, tauriCommentFields, verifyMinisign } from './lib/minisign.mjs';
@@ -261,14 +261,17 @@ for (const v of LAUNCHER_VERSIONS) {
 // 3. Dependências do Hub: as versões do package-lock (o npm poda as do launcher). Pastas dos workspaces viram cópias
 // de verdade em node_modules (zip não guarda junções); o @cbmp/hub não é dependência de ninguém e sai.
 log('instalando as dependências do Hub (npm install, versões do package-lock)…');
-// Linha fixa, sem nada de fora (o npm.cmd do Windows só roda via shell).
-run('npm install --omit=dev --no-audit --no-fund --loglevel=error', [], { cwd: kit, shell: true });
+// Linha fixa, sem nada de fora (o npm.cmd do Windows só roda via shell). --ignore-scripts: nada é compilado nem
+// executado na instalação (sem ele o npm roda o node-gyp do better-sqlite3, que deixa sobras em build\ com caminhos
+// desta máquina); os binários usados já vêm prontos nos pacotes.
+run('npm install --omit=dev --ignore-scripts --no-audit --no-fund --loglevel=error', [], { cwd: kit, shell: true });
 const cbmpMods = join(kit, 'node_modules', '@cbmp');
 for (const n of existsSync(cbmpMods) ? readdirSync(cbmpMods) : []) rmSync(join(cbmpMods, n), { recursive: false, force: true });
 cpSync(join(kit, 'packages', 'contracts'), join(cbmpMods, 'contracts'), { recursive: true });
-for (const junk of ['.package-lock.json']) rmSync(join(kit, 'node_modules', junk), { force: true });
-// O npm ci de reserva (LEIA-ME) usa este lock podado. Os binários nativos vêm prontos no pacote (nada é compilado):
-// better-sqlite3 traz prebuilds N-API (servem para qualquer Node >= 22) e o esbuild do tsx é um executável Go.
+for (const junk of ['.package-lock.json', 'better-sqlite3/build']) rmSync(join(kit, 'node_modules', ...junk.split('/')), { recursive: true, force: true });
+// Os binários nativos vêm prontos nos pacotes (nada é compilado): better-sqlite3 traz prebuilds N-API (servem para
+// qualquer Node >= 22) e o esbuild do tsx é um executável Go. O package-lock.json do kit é o lock podado pelo npm
+// (registro das versões; o roteiro não usa npm em casa: kit estragado se resolve extraindo de novo).
 for (const f of [['better-sqlite3', 'prebuilds', 'win32-x64.node'], ['@esbuild', 'win32-x64', 'esbuild.exe'], ['tsx', 'dist', 'cli.mjs']]) {
   if (!existsSync(join(kit, 'node_modules', ...f))) fail(`node_modules do kit sem ${f.join('/')}`);
 }
@@ -279,6 +282,13 @@ const sigs = verifyKitReleases(kit);
 log(`assinaturas conferidas com a chave pública ${sigs.keyId}: launcher ${LAUNCHER_VERSIONS.join(', ')} e mod ${MOD.version}`);
 const files = walk(kit).sort();
 const problems = scanForSecrets(kit, files);
+// Nenhum caminho desta máquina (pasta de montagem, perfil do usuário) gravado em arquivo do kit.
+const localPaths = [stagingRoot, homedir()].flatMap((x) => [x, x.split(sep).join('/'), x.split(sep).join('\\\\')]);
+for (const f of files) {
+  const text = readFileSync(join(kit, ...f.split('/'))).toString('latin1').toLowerCase();
+  const hit = localPaths.find((x) => text.includes(x.toLowerCase()));
+  if (hit) problems.push(`${f}: contém um caminho desta máquina (${hit === stagingRoot || hit.includes('cbmp-kit-') ? 'pasta de montagem' : 'perfil do usuário'})`);
+}
 if (problems.length) fail(`o kit tem arquivos proibidos ou com cara de segredo:\n  ${problems.join('\n  ')}`);
 log(`${files.length} arquivos sem chave privada, segredo, .env ou dados do Hub`);
 const longest = files.reduce((a, f) => (f.length > a.length ? f : a), '');

@@ -46,9 +46,12 @@ const MOD_PROTOCOL = 1;
 const MOD_VERSION = '0.1.0';
 const LAUNCHER_VERSIONS = ['0.1.0', '0.1.1'];
 const PRODUCT = 'CB Multiplayer (Teste local)';
-// Kit de teste (tools/make-test-kit.mjs): a raiz tem kit.json. O repositório nunca tem esse arquivo.
+// Kit de teste (tools/make-test-kit.mjs): a raiz tem kit.json e não é um repositório git. Um kit.json perdido no
+// repositório (ignorado pelo .gitignore) não liga o modo kit: nele a pasta de trabalho poderia cair dentro do repo.
+const KIT_NAME = 'cbmp-kit-teste-sub4';
 const KIT_FILE = join(REPO, 'kit.json');
-const KIT = existsSync(KIT_FILE);
+const KIT = existsSync(KIT_FILE) && !existsSync(join(REPO, '.git'));
+if (!KIT && existsSync(KIT_FILE)) console.log('[dev-env] aviso: kit.json na raiz do repositório ignorado (modo kit só fora de um repositório git); apague-o.');
 // Windows: STATUS_DLL_NOT_FOUND (0xC0000135), STATUS_INVALID_IMAGE_FORMAT (0xC000007B), STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139).
 const DLL_EXIT = new Map([[0xC0000135, 'DLL não encontrada'], [0xC000007B, 'DLL inválida (32/64 bits)'], [0xC0000139, 'DLL de versão errada']]);
 
@@ -371,6 +374,7 @@ function stopFromPidFile(p, quiet = false) {
 function verifyKit() {
   let kit;
   try { kit = JSON.parse(readFileSync(KIT_FILE, 'utf8')); } catch (e) { fail(`kit.json ilegível (${e.message}); extraia o kit de novo`); }
+  if (kit?.kind !== KIT_NAME) fail(`kit.json não é de um kit "${KIT_NAME}" (kind: ${JSON.stringify(kit?.kind)}); extraia o kit de novo`);
   const major = Number(process.versions.node.split('.')[0]);
   const want = Number(String(kit.node ?? '').replace(/^v/, '').split('.')[0]);
   // Os módulos nativos do kit são N-API/executáveis (servem para Node >= 22), mas só o Node do kit foi testado.

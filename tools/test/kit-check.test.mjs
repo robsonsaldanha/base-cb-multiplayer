@@ -50,3 +50,8 @@ test('acha chave do Tauri, PEM com material, token, .env, .key e dados de execuÃ
     }
   } finally { t.done(); }
 });
+
+test('acha tambÃ©m a linha de chave secreta minisign sem senha', () => {
+  const t = tree({ 'x/sem-senha.txt': `RWQAAEIy${'B'.repeat(40)}` });
+  try { assert.match(scanForSecrets(t.root, t.files).join('\n'), /x\/sem-senha\.txt: linha de chave secreta minisign/); } finally { t.done(); }
+});
