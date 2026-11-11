@@ -19,3 +19,24 @@ launcher/src-tauri/gen/
 # kit de teste (tools/make-test-kit.mjs): nunca na raiz do repositório
 /kit.json
 /dados/
+
+# kit de reconhecimento (docs/RECONHECIMENTO-JOGO.md): tudo o que sai do jogo é PRIVADO e nunca entra no repositório
+# (que é público). Dumps do UE4SS, relatórios do cb-recon, zips do COLETAR e a pasta onde eles ficam.
+cbmp-dumps/
+cbmp-recon-*.zip
+cbmp-recon-*/
+UE4SS_ObjectDump.txt
+UHTHeaderDump/
+CXXHeaderDump/
+*.usmap
+*.jmap
+*ue4ss_actor_data.csv
+*ue4ss_static_mesh_data.csv
+relatorio-*.json
+cb-recon.log
+estado.txt
+info-jogo.json
+**/Mods/shared/types/
+cbmp-recon-backup/
+instalado-em.txt
+ultima-coleta.txt

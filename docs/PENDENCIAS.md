@@ -194,4 +194,13 @@ Decisões registradas e limites aceitos; o comportamento atual está documentado
 
 ## Mod do jogo (spike)
 
-- `dist/cb-mp-spike.zip` aguardando teste em PC com Hogwarts Legacy.
+- Teste do spike (F8 clone) **e reconhecimento do jogo** juntos no kit `dist/cbmp-kit-reconhecimento.zip`
+  (`node tools/make-recon-kit.mjs`; roteiro `docs/RECONHECIMENTO-JOGO.md`), aguardando a visita ao PC de casa. Ele
+  substitui o `dist/cb-mp-spike.zip` (mesmo UE4SS e mesmo `cb-mp.dll`). Só no jogo dá para confirmar: que o UE4SS
+  carrega nesta versão do jogo; o critério de "jogador no mundo" do `cb-recon` (Character estável 45 s num mundo sem
+  nome de menu); quanto tempo cada dumper leva e se algum derruba o jogo; e os nomes de propriedades lidos no
+  relatório (`SkeletalMesh`, `AnimClass`, `CharacterMovement` etc. são os do UE 4.27 padrão).
+- **Dados do jogo são privados**: o zip do COLETAR (`cbmp-recon-*.zip`) fica em `OneDrive\CasteloBruxoRP\cbmp-dumps\`,
+  fora do repositório. Nada derivado dele (dumps, cabeçalhos, relatório, listas de nomes copiadas em massa) entra no
+  repositório público; o `.gitignore` bloqueia os nomes conhecidos, mas a regra vale para qualquer formato. O que o
+  subprojeto 5 precisar do SDK fica fora do repo ou é reescrito à mão só com o mínimo necessário.
