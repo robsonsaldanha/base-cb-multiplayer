@@ -20,6 +20,7 @@ add_executable(cbmp_client_tests
     test_session_errors.cpp
     test_session_fixes.cpp
     test_gns_transport.cpp
+    test_game_glue.cpp
 )
 target_link_libraries(cbmp_client_tests PRIVATE cbmp_client_core Catch2::Catch2WithMain)
 # Pasta do núcleo para o teste de guarda (test_guard.cpp), em caminho absoluto (UTF-8 com /utf-8 no MSVC).
