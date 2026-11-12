@@ -80,9 +80,12 @@ impl AppState {
         self.store(|cur| cur.with_update(update))
     }
 
-    /// Só para o Rust (seletor de pasta / localizador do jogo); não é comando da UI.
+    /// Só para o Rust (seletor de pasta / localizador do jogo); não é comando da UI. O caminho gravado é sempre o final
+    /// ([`game::resolve_dir`]: junções e nomes curtos 8.3 resolvidos, sem `\\?\`), o mesmo que [`resolve_game`] usa:
+    /// seletor, candidata confirmada e instalação achada gravam o mesmo texto para a mesma pasta.
     pub fn set_game_dir(&self, dir: Option<PathBuf>) -> AppResult<Settings> {
         validate_game_dir(dir.as_deref())?;
+        let dir = dir.map(|d| game::resolve_dir(&d).unwrap_or(d));
         self.store(|cur| Settings {
             game_dir: dir,
             ..cur.clone()
@@ -896,11 +899,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         let state = AppState::load(path.clone());
-        let game = std::env::temp_dir().join("Hogwarts Legacy");
+        let game = dir.path().join("Hogwarts Legacy");
+        std::fs::create_dir_all(&game).unwrap();
         state.set_game_dir(Some(game.clone())).unwrap();
+        // Gravada no caminho final (o `%TEMP%` pode estar em nome curto 8.3, ex.: `RUNNER~1`).
+        let final_dir = game::resolve_dir(&game).unwrap();
 
         let after = state.set_settings(update(&["a"], 1024)).unwrap();
-        assert_eq!(after.game_dir, Some(game));
+        assert_eq!(after.game_dir, Some(final_dir));
         assert_eq!(after.hub_url, Settings::default().hub_url);
     }
 
