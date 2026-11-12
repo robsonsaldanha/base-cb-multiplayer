@@ -96,6 +96,26 @@ test('todo passo depois do passo token tem if: steps.token.outputs.have == true'
   }
 });
 
+test('submódulos do UE4SS: reescreve git@github.com: e https://github.com/ só na linha de comando', () => {
+  const t = text();
+  assert.ok(t.includes('$rewrite = "url.https://x-access-token:$($env:UE4SS_SUBMODULES_TOKEN)@github.com/.insteadOf"'));
+  const cmd = lines().find((l) => /submodule update/.test(l));
+  assert.ok(cmd, 'linha do submodule update');
+  assert.ok(cmd.includes('-c "$rewrite=git@github.com:"'), 'reescrita da forma SSH (git@github.com:)');
+  assert.ok(cmd.includes('-c "$rewrite=https://github.com/"'), 'reescrita da forma HTTPS');
+  assert.match(cmd, /--init --recursive/);
+  // nada gravado na configuração do git em disco
+  assert.doesNotMatch(t, /git\b[^\n]*\bconfig\b/);
+  assert.doesNotMatch(t, /--global|--system/);
+});
+
+test('o token nunca é impresso', () => {
+  for (const [i, l] of lines().entries()) {
+    if (!/UE4SS_SUBMODULES_TOKEN\)|\$env:UE4SS_SUBMODULES_TOKEN|\$rewrite\b/.test(l)) continue;
+    assert.doesNotMatch(l, /Write-(Output|Host)|\becho\b|GITHUB_(OUTPUT|ENV|STEP_SUMMARY)/, `token impresso (linha ${i + 1})`);
+  }
+});
+
 test('o checkout não guarda credenciais', () => {
   assert.match(text(), /actions\/checkout@\S+\s*\n\s+with:\s*\n\s+persist-credentials: false/);
 });

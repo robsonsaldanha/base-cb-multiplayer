@@ -70,19 +70,16 @@ jobs:
           UE4SS_SUBMODULES_TOKEN: ${{ secrets.UE4SS_SUBMODULES_TOKEN }}
         run: |
           $dest = "client/deps/RE-UE4SS"
+          git clone https://github.com/UE4SS-RE/RE-UE4SS $dest
+          if ($LASTEXITCODE) { throw "clone do UE4SS falhou" }
+          git -C $dest checkout $env:UE4SS_COMMIT
+          if ($LASTEXITCODE) { throw "checkout do UE4SS falhou" }
+          # O .gitmodules do UE4SS usa URLs SSH (git@github.com:...): as duas formas viram HTTPS com o token. As
+          # reescritas vão só na linha de comando (git -c chega aos clones dos submódulos em todos os níveis) e nada
+          # é gravado na configuração do git em disco; o token nunca é impresso.
           $rewrite = "url.https://x-access-token:$($env:UE4SS_SUBMODULES_TOKEN)@github.com/.insteadOf"
-          try {
-            git clone https://github.com/UE4SS-RE/RE-UE4SS $dest
-            if ($LASTEXITCODE) { throw "clone do UE4SS falhou" }
-            git -C $dest checkout $env:UE4SS_COMMIT
-            if ($LASTEXITCODE) { throw "checkout do UE4SS falhou" }
-            git -C $dest config "$rewrite" "https://github.com/"
-            git -C $dest submodule update --init --recursive
-            if ($LASTEXITCODE) { throw "submódulos do UE4SS falharam" }
-          } finally {
-            git -C $dest config --unset-all "$rewrite" 2>$null
-            $global:LASTEXITCODE = 0
-          }
+          git -c "$rewrite=git@github.com:" -c "$rewrite=https://github.com/" -C $dest submodule update --init --recursive
+          if ($LASTEXITCODE) { throw "submódulos do UE4SS falharam" }
       - name: build do mod
         if: steps.token.outputs.have == 'true'
         run: tools/build.ps1 -Target mod -VcpkgInstalled D:/vi-mod
