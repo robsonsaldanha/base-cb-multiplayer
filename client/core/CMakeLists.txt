@@ -17,6 +17,7 @@ add_library(cbmp_client_core STATIC
     src/SendScheduler.cpp
     src/Interp.cpp
     src/PuppetDirector.cpp
+    src/Session.cpp
 )
 target_include_directories(cbmp_client_core PUBLIC include)
 target_compile_features(cbmp_client_core PUBLIC cxx_std_23)
