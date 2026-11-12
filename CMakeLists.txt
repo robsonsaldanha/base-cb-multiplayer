@@ -64,6 +64,9 @@ function(cbmp_copy_mariadb_plugins tgt)
 endfunction()
 
 add_subdirectory(proto)
+# Núcleo do cliente (mod): C++ puro, sem UE4SS nem Windows.h; testado aqui em toda plataforma.
+add_subdirectory(client/core)
+add_subdirectory(client/tests)
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/server/script/CMakeLists.txt)
   add_subdirectory(server/script)
 endif()

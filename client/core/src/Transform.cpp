@@ -1,9 +1,9 @@
-#include <cbmp/Transform.hpp>
+#include <cbmp/client/Transform.hpp>
 #include <cmath>
 #include <format>
 #include <numbers>
 
-namespace cbmp {
+namespace cbmp::client {
 std::string FormatTransform(const Transform& t) {
     return std::format("pos=({:.2f}, {:.2f}, {:.2f}) rot=(p {:.2f}, y {:.2f}, r {:.2f})",
                        t.pos.x, t.pos.y, t.pos.z, t.rot.pitch, t.rot.yaw, t.rot.roll);

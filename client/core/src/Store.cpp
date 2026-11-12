@@ -1,9 +1,9 @@
-#include <cbmp/Store.hpp>
+#include <cbmp/client/Store.hpp>
 #include <algorithm>
 #include <cwctype>
 #include <string>
 
-namespace cbmp {
+namespace cbmp::client {
 static std::wstring Lower(std::wstring_view s) {
     std::wstring r(s);
     std::transform(r.begin(), r.end(), r.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });

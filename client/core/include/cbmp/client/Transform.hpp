@@ -1,7 +1,7 @@
 #pragma once
 #include <string>
 
-namespace cbmp {
+namespace cbmp::client {
 struct Vec3 { double x{}, y{}, z{}; };
 struct Rot3 { double pitch{}, yaw{}, roll{}; };
 struct Transform { Vec3 pos{}; Rot3 rot{}; };

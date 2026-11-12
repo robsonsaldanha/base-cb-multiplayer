@@ -1,10 +1,14 @@
 find_package(unofficial-sodium CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 
+# Codec (bitstream + messages), sem libsodium nem nlohmann_json: usado também pelo cliente (client/core).
+add_library(cbmp_codec STATIC src/bitstream.cpp src/messages.cpp)
+target_include_directories(cbmp_codec PUBLIC include)
+
 add_library(cbmp_proto STATIC)
 target_include_directories(cbmp_proto PUBLIC include)
-target_sources(cbmp_proto PRIVATE src/bitstream.cpp src/messages.cpp src/base64url.cpp src/ticket.cpp)
-target_link_libraries(cbmp_proto PUBLIC unofficial-sodium::sodium nlohmann_json::nlohmann_json)
+target_sources(cbmp_proto PRIVATE src/base64url.cpp src/ticket.cpp)
+target_link_libraries(cbmp_proto PUBLIC cbmp_codec unofficial-sodium::sodium nlohmann_json::nlohmann_json)
 
 add_executable(cbmp_proto_tests tests/test_bitstream.cpp tests/test_messages.cpp tests/test_snapshot.cpp tests/test_base64url.cpp tests/test_ticket.cpp)
 target_link_libraries(cbmp_proto_tests PRIVATE cbmp_proto Catch2::Catch2WithMain)
