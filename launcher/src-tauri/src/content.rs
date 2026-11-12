@@ -436,6 +436,64 @@ impl reqwest::dns::Resolve for ServerResolver {
     }
 }
 
+/// Prazo da resolução do nome do servidor de jogo.
+const GAME_DNS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Endereço do servidor de jogo para o `connect.json` (o mod só aceita IP literal): IP literal (inclusive as formas
+/// numéricas do WHATWG, como em [`server_base_url`]) ou nome resolvido pelo sistema; só endereços que [`ip_allowed`]
+/// aceita com `dev`; IPv4 primeiro. IPv4 mapeado em IPv6 vira IPv4. Falha → `server_unavailable`.
+pub async fn resolve_game_ip(host: &str, dev: bool) -> AppResult<IpAddr> {
+    let bad = |why: &str| {
+        log::warn!("endereço do servidor de jogo recusado: {why}");
+        AppError::new(
+            "server_unavailable",
+            "Servidor indisponível: endereço do servidor de jogo inválido ou não permitido.",
+        )
+    };
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let normalize = |ip: IpAddr| match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 => v4,
+    };
+    let candidates: Vec<IpAddr> = if bare.contains(':') {
+        vec![IpAddr::V6(bare.parse().map_err(|_| bad("IPv6 inválido"))?)]
+    } else {
+        if bare.is_empty()
+            || !bare
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-'))
+        {
+            return Err(bad("caracteres inválidos"));
+        }
+        match url::Host::parse(bare).map_err(|_| bad("nome inválido"))? {
+            url::Host::Ipv4(a) => vec![IpAddr::V4(a)],
+            url::Host::Ipv6(a) => vec![IpAddr::V6(a)],
+            url::Host::Domain(d) => {
+                tokio::time::timeout(GAME_DNS_TIMEOUT, tokio::net::lookup_host((d.as_str(), 0)))
+                    .await
+                    .map_err(|_| bad("resolução demorou demais"))?
+                    .map_err(|_| bad("nome não resolvido"))?
+                    .map(|a| a.ip())
+                    .collect()
+            }
+        }
+    };
+    let allowed: Vec<IpAddr> = candidates
+        .into_iter()
+        .map(normalize)
+        .filter(|ip| ip_allowed(*ip, dev))
+        .collect();
+    allowed
+        .iter()
+        .find(|ip| ip.is_ipv4())
+        .or_else(|| allowed.first())
+        .copied()
+        .ok_or_else(|| bad("nenhum endereço permitido"))
+}
+
 /// Cliente do conteúdo: sem redirecionamentos (nem para o mesmo host), conexão 10 s, ociosidade 30 s.
 fn content_client() -> reqwest::Client {
     if rustls::crypto::CryptoProvider::get_default().is_none() {

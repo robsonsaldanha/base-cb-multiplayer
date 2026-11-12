@@ -8,6 +8,10 @@
 //! - `hub_url`: fixo por build ([`build_hub_url`]); o valor no arquivo é ignorado.
 //! - `game_dir`: só o Rust (seletor de pasta / localizador do jogo).
 //! - o resto: a UI, via [`SettingsUpdate`].
+//!
+//! Versão do arquivo ([`SETTINGS_VERSION`]): arquivo sem `settingsVersion` ou com valor menor que 2 é de um launcher
+//! anterior à 0.2.0, quando o modo simular vinha ligado por padrão; nessa carga ele é desligado e o arquivo é
+//! regravado com `settingsVersion: 2` (uma vez; depois vale o que o usuário escolher).
 
 use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
@@ -18,6 +22,8 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_HUB_URL: &str = "https://hub.cbmp.invalid";
 pub const DEFAULT_CACHE_LIMIT_MB: u64 = 10_240;
 pub const DEFAULT_MAX_SERVER_CONTENT_MB: u64 = 2_048;
+/// Versão atual do formato de `settings.json`.
+pub const SETTINGS_VERSION: u32 = 2;
 
 const CACHE_LIMIT_RANGE_MB: std::ops::RangeInclusive<u64> = 256..=1_048_576;
 const MAX_SERVER_CONTENT_RANGE_MB: std::ops::RangeInclusive<u64> = 1..=65_536;
@@ -39,6 +45,8 @@ pub struct Settings {
     #[serde(rename = "maxServerContentMB")]
     pub max_server_content_mb: u64,
     pub simulate_launch: bool,
+    /// Só leitura para a UI; ver o topo do módulo.
+    pub settings_version: u32,
 }
 
 /// Campos que a UI pode alterar (`set_settings`). Campo a mais (ex.: `gameDir`, `hubUrl`) é recusado.
@@ -63,7 +71,8 @@ impl Default for Settings {
             game_dir: None,
             cache_limit_mb: DEFAULT_CACHE_LIMIT_MB,
             max_server_content_mb: DEFAULT_MAX_SERVER_CONTENT_MB,
-            simulate_launch: true,
+            simulate_launch: false,
+            settings_version: SETTINGS_VERSION,
         }
     }
 }
@@ -107,6 +116,7 @@ impl Settings {
             cache_limit_mb: u.cache_limit_mb,
             max_server_content_mb: u.max_server_content_mb,
             simulate_launch: u.simulate_launch,
+            settings_version: self.settings_version,
         }
     }
 
@@ -115,7 +125,8 @@ impl Settings {
     /// - existe mas não pôde ser lido (permissão, arquivo em uso) → `Err`, sem tocar no arquivo;
     /// - não é objeto JSON → renomeado para `.bad`, padrões;
     /// - campo com tipo/valor inválido → só esse campo volta ao padrão (item inválido de lista é descartado) e o
-    ///   original é copiado para `.bad`.
+    ///   original é copiado para `.bad`;
+    /// - `settingsVersion` ausente ou menor que [`SETTINGS_VERSION`] → modo simular desligado e arquivo regravado.
     pub fn load(path: &Path) -> AppResult<Settings> {
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
@@ -136,9 +147,17 @@ impl Settings {
             let _ = std::fs::rename(path, sibling(path, ".bad"));
             return Ok(Settings::default());
         };
-        let (settings, lossy) = salvage(&map);
+        let (settings, lossy, migrated) = salvage(&map);
         if lossy {
             let _ = std::fs::copy(path, sibling(path, ".bad"));
+        }
+        if migrated {
+            match settings.save(path) {
+                Ok(()) => log::info!(
+                    "configurações migradas para a versão {SETTINGS_VERSION} (modo simular desligado)"
+                ),
+                Err(e) => log::warn!("configurações migradas, mas não regravadas: {}", e.code),
+            }
         }
         Ok(settings)
     }
@@ -165,8 +184,9 @@ impl Settings {
     }
 }
 
-/// Monta as configurações campo a campo; devolve `true` se algo do arquivo foi descartado.
-fn salvage(map: &Map<String, Value>) -> (Settings, bool) {
+/// Monta as configurações campo a campo; devolve se algo do arquivo foi descartado e se o arquivo era de uma versão
+/// anterior (migrado).
+fn salvage(map: &Map<String, Value>) -> (Settings, bool, bool) {
     fn field<T: serde::de::DeserializeOwned>(
         map: &Map<String, Value>,
         key: &str,
@@ -216,7 +236,16 @@ fn salvage(map: &Map<String, Value>) -> (Settings, bool) {
     if let Some(b) = field::<bool>(map, "simulateLaunch", &mut lossy) {
         s.simulate_launch = b;
     }
-    (s, lossy)
+    let version = field::<u32>(map, "settingsVersion", &mut lossy);
+    let migrated = version.is_none_or(|v| v < SETTINGS_VERSION);
+    if migrated {
+        // Launcher anterior à 0.2.0: o modo simular vinha ligado por padrão.
+        s.simulate_launch = false;
+        s.settings_version = SETTINGS_VERSION;
+    } else if let Some(v) = version {
+        s.settings_version = v;
+    }
+    (s, lossy, migrated)
 }
 
 /// Hub padrão deste build: o oficial, o local no build de teste local ou o de teste online.
@@ -322,7 +351,8 @@ mod tests {
             game_dir: Some(std::env::temp_dir().join("Hogwarts Legacy")),
             cache_limit_mb: 4096,
             max_server_content_mb: 1024,
-            simulate_launch: false,
+            simulate_launch: true,
+            settings_version: SETTINGS_VERSION,
         }
     }
 
@@ -346,8 +376,44 @@ mod tests {
         assert_eq!(s.game_dir, None);
         assert_eq!(s.cache_limit_mb, 10_240);
         assert_eq!(s.max_server_content_mb, 2_048);
-        assert!(s.simulate_launch);
+        assert!(!s.simulate_launch, "modo simular desligado por padrão");
+        assert_eq!(s.settings_version, 2);
+        assert_eq!(SETTINGS_VERSION, 2);
         s.validate_with(RELEASE_RULES).unwrap();
+    }
+
+    #[test]
+    fn arquivo_antigo_desliga_o_modo_simular_uma_vez_e_e_regravado() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, br#"{"simulateLaunch": true, "favorites": ["a"]}"#).unwrap();
+        let s = load(&path);
+        assert!(!s.simulate_launch);
+        assert_eq!(s.settings_version, 2);
+        assert_eq!(s.favorites, vec!["a".to_string()]);
+        let on_disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["settingsVersion"], 2);
+        assert_eq!(on_disk["simulateLaunch"], false);
+        assert!(!bad_path(&path).exists(), "migração não é erro");
+        // Versão 1 explícita também migra.
+        std::fs::write(&path, br#"{"settingsVersion": 1, "simulateLaunch": true}"#).unwrap();
+        assert!(!load(&path).simulate_launch);
+    }
+
+    #[test]
+    fn arquivo_da_versao_2_mantem_a_escolha_do_usuario() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, br#"{"settingsVersion": 2, "simulateLaunch": true}"#).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let s = load(&path);
+        assert!(s.simulate_launch);
+        assert_eq!(std::fs::read(&path).unwrap(), before, "nada regravado");
+        // Escolha gravada depois da migração continua valendo.
+        let mut s = s;
+        s.simulate_launch = true;
+        s.save(&path).unwrap();
+        assert!(load(&path).simulate_launch);
     }
 
     #[test]
@@ -361,6 +427,7 @@ mod tests {
             "cacheLimitMB",
             "maxServerContentMB",
             "simulateLaunch",
+            "settingsVersion",
         ] {
             assert!(v.get(k).is_some(), "faltou {k} em {v}");
         }
@@ -476,7 +543,8 @@ mod tests {
             "gameDir": game,
             "cacheLimitMB": 0,
             "maxServerContentMB": 512,
-            "simulateLaunch": false
+            "simulateLaunch": false,
+            "settingsVersion": 2
         })
         .to_string();
         std::fs::write(&path, &original).unwrap();

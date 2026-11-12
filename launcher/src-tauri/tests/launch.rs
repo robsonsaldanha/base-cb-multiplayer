@@ -1,5 +1,5 @@
-//! Arquivo de conexão (ACL só do usuário, remoção em 60 s), abertura/simulação e a orquestração do `play` contra um
-//! Hub + `cb-server` falsos (axum em 127.0.0.1).
+//! Arquivo de conexão (ACL só do usuário, `launchId`), ponteiro do mod (`cbmp-run.json`), prazo de 240 s,
+//! abertura/simulação e a orquestração do `play` contra um Hub + `cb-server` falsos (axum em 127.0.0.1).
 
 use axum::extract::{Path as AxPath, State};
 use axum::http::StatusCode;
@@ -7,14 +7,15 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use cbmp_launcher_lib::auth::{Auth, Clock, MemoryVault, TokenVault};
-use cbmp_launcher_lib::content::{ContentStore, Limits};
-use cbmp_launcher_lib::game::{GameInstall, Store};
+use cbmp_launcher_lib::content::{resolve_game_ip, ContentStore, Limits};
+use cbmp_launcher_lib::game::{GameInstall, Processes, Store};
 use cbmp_launcher_lib::hub::HubClient;
 use cbmp_launcher_lib::launch::{
-    self, acl, connect_json, launch, remove_after, write_connect_file, ConnectInfo, LaunchOutcome,
-    CONNECT_TTL,
+    self, acl, connect_json, expire_launch, launch, new_launch_id, pointer_json,
+    remove_pointer_if_ours, write_connect_file, write_pointer, ConnectInfo, LaunchOutcome,
+    CONNECT_TTL, POINTER_FILE,
 };
-use cbmp_launcher_lib::modpkg::ModInstaller;
+use cbmp_launcher_lib::modpkg::{container_dir, win64_dir, ModInstaller};
 use cbmp_launcher_lib::play::{play, PlayContext, PlayGate, Stage, TICKET_RENEW_AFTER_SECS};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -24,7 +25,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+#[path = "common/modzip.rs"]
+mod modzip;
+
 const TICKET_MARK: &str = "TICKETSECRETO";
+const LAUNCH_ID: &str = "0123456789abcdef0123456789abcdef";
 
 fn info(content_dir: &Path) -> ConnectInfo {
     ConnectInfo {
@@ -34,7 +39,12 @@ fn info(content_dir: &Path) -> ConnectInfo {
         server_id: "srv_A".into(),
         content_dir: content_dir.to_path_buf(),
         protocol: 3,
+        launch_id: LAUNCH_ID.into(),
     }
+}
+
+fn is_launch_id(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 // ----- connect.json -----
@@ -52,6 +62,23 @@ fn connect_json_tem_os_campos_do_contrato() {
     assert_eq!(v["contentDir"], tmp.path().display().to_string());
     // A pasta de conteúdo compartilha arquivos com o cache (hard links): o mod só lê.
     assert_eq!(v["contentReadOnly"], true);
+    // O mesmo `launchId` do ponteiro: o mod confere que o arquivo é desta abertura.
+    assert_eq!(v["launchId"], LAUNCH_ID);
+    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "contentDir",
+            "contentReadOnly",
+            "host",
+            "launchId",
+            "port",
+            "protocol",
+            "serverId",
+            "ticket"
+        ]
+    );
     // `Debug` nunca mostra o ticket (logs).
     assert!(!format!("{i:?}").contains(TICKET_MARK));
 }
@@ -118,33 +145,175 @@ fn connect_json_tem_dacl_so_do_usuario_atual() {
     assert!(dacl.protected && dacl.aces.len() == 1 && dacl.aces[0].sid == me);
 }
 
-#[tokio::test(start_paused = true)]
-async fn connect_json_e_apagado_depois_de_60_s() {
-    assert_eq!(CONNECT_TTL, Duration::from_secs(60));
+#[test]
+fn launch_id_e_aleatorio_com_32_hex_minusculos() {
+    let ids: HashSet<String> = (0..64).map(|_| new_launch_id()).collect();
+    assert_eq!(ids.len(), 64, "valores repetidos");
+    for id in &ids {
+        assert!(is_launch_id(id), "{id}");
+    }
+}
+
+// ----- ponteiro (cbmp-run.json) -----
+
+#[test]
+fn ponteiro_tem_so_as_chaves_do_contrato_e_nenhum_segredo() {
     let tmp = tempfile::tempdir().unwrap();
-    let i = info(tmp.path());
-    let path = write_connect_file(tmp.path(), &i).unwrap();
-    let task = tokio::spawn(remove_after(path.clone(), connect_json(&i), CONNECT_TTL));
-    tokio::time::sleep(Duration::from_secs(59)).await;
-    assert!(path.exists(), "ainda dentro dos 60 s");
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    task.await.unwrap();
-    assert!(!path.exists(), "apagado depois de 60 s");
+    let run = tmp.path().join("run");
+    let bytes = pointer_json(&run, LAUNCH_ID, 1_794_438_789, "0.2.0");
+    assert!(bytes.len() <= 4096);
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["launchId", "launcher", "runDir", "v", "writtenAt"]);
+    assert_eq!(v["v"], 1);
+    assert_eq!(v["runDir"], run.display().to_string());
+    assert_eq!(v["launchId"], LAUNCH_ID);
+    assert_eq!(v["writtenAt"], 1_794_438_789u64);
+    assert_eq!(v["launcher"], "0.2.0");
+    let text = String::from_utf8(bytes).unwrap();
+    assert!(!text.contains(TICKET_MARK) && !text.contains("ticket") && !text.contains("host"));
+}
+
+#[test]
+fn ponteiro_e_gravado_por_rename_e_sobrescreve_o_anterior() {
+    let tmp = tempfile::tempdir().unwrap();
+    let container = tmp.path().join("cbmp");
+    let run = tmp.path().join("run");
+    let path = write_pointer(&container, &run, LAUNCH_ID, 10, "0.2.0").unwrap();
+    assert_eq!(path, container.join(POINTER_FILE));
+    assert_eq!(POINTER_FILE, "cbmp-run.json");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        pointer_json(&run, LAUNCH_ID, 10, "0.2.0")
+    );
+    let other = new_launch_id();
+    write_pointer(&container, &run, &other, 20, "0.2.0").unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        pointer_json(&run, &other, 20, "0.2.0")
+    );
+    let names: Vec<_> = std::fs::read_dir(&container)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, vec![std::ffi::OsString::from(POINTER_FILE)]);
+}
+
+#[test]
+fn remove_pointer_so_apaga_o_nosso() {
+    let tmp = tempfile::tempdir().unwrap();
+    let container = tmp.path().join("cbmp");
+    let run = tmp.path().join("run");
+    let path = write_pointer(&container, &run, LAUNCH_ID, 10, "0.2.0").unwrap();
+    remove_pointer_if_ours(&container, &new_launch_id());
+    assert!(path.exists(), "ponteiro de outro launchId fica");
+    remove_pointer_if_ours(&container, LAUNCH_ID);
+    assert!(!path.exists());
+    // Ausente, ou que não é JSON: nada acontece.
+    remove_pointer_if_ours(&container, LAUNCH_ID);
+    std::fs::write(&path, b"lixo").unwrap();
+    remove_pointer_if_ours(&container, LAUNCH_ID);
+    assert!(path.exists());
+}
+
+// ----- prazo de 240 s -----
+
+struct Launched {
+    _tmp: tempfile::TempDir,
+    run: PathBuf,
+    container: PathBuf,
+}
+
+impl Launched {
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        Launched {
+            run: tmp.path().join("run"),
+            container: tmp.path().join("cbmp"),
+            _tmp: tmp,
+        }
+    }
+
+    /// Grava conexão e ponteiro como o `play` e agenda o prazo.
+    fn write(&self, i: &ConnectInfo) -> (PathBuf, PathBuf, tokio::task::JoinHandle<()>) {
+        let connect = write_connect_file(&self.run, i).unwrap();
+        let pointer = write_pointer(&self.container, &self.run, &i.launch_id, 1, "0.2.0").unwrap();
+        let task = tokio::spawn(expire_launch(
+            connect.clone(),
+            connect_json(i),
+            Some(self.container.clone()),
+            i.launch_id.clone(),
+            CONNECT_TTL,
+        ));
+        (connect, pointer, task)
+    }
 }
 
 #[tokio::test(start_paused = true)]
-async fn remocao_nao_apaga_o_arquivo_de_um_play_mais_novo() {
-    let tmp = tempfile::tempdir().unwrap();
-    let old = info(tmp.path());
-    let path = write_connect_file(tmp.path(), &old).unwrap();
-    let task = tokio::spawn(remove_after(path.clone(), connect_json(&old), CONNECT_TTL));
-    tokio::time::sleep(Duration::from_secs(30)).await;
-    let mut new = info(tmp.path());
-    new.ticket = format!("{TICKET_MARK}_novo");
-    write_connect_file(tmp.path(), &new).unwrap();
-    tokio::time::sleep(Duration::from_secs(31)).await;
+async fn conexao_e_ponteiro_saem_depois_de_240_s() {
+    assert_eq!(CONNECT_TTL, Duration::from_secs(240));
+    let l = Launched::new();
+    let i = info(&l.run);
+    let (connect, pointer, task) = l.write(&i);
+    tokio::time::sleep(Duration::from_secs(239)).await;
+    assert!(
+        connect.exists() && pointer.exists(),
+        "ainda dentro dos 240 s"
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
     task.await.unwrap();
-    assert_eq!(std::fs::read(&path).unwrap(), connect_json(&new));
+    assert!(!connect.exists(), "connect.json apagado aos 240 s");
+    assert!(!pointer.exists(), "ponteiro apagado aos 240 s");
+}
+
+#[tokio::test(start_paused = true)]
+async fn ponteiro_sai_mesmo_com_connect_json_ja_lido_pelo_mod() {
+    let l = Launched::new();
+    let i = info(&l.run);
+    let (connect, pointer, task) = l.write(&i);
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    std::fs::remove_file(&connect).unwrap(); // o mod leu e apagou
+    tokio::time::sleep(Duration::from_secs(231)).await;
+    task.await.unwrap();
+    assert!(!pointer.exists());
+}
+
+#[tokio::test(start_paused = true)]
+async fn prazo_nao_apaga_conexao_nem_ponteiro_de_um_play_mais_novo() {
+    let l = Launched::new();
+    let old = info(&l.run);
+    let (connect, pointer, task) = l.write(&old);
+    tokio::time::sleep(Duration::from_secs(100)).await;
+    let mut new = info(&l.run);
+    new.ticket = format!("{TICKET_MARK}_novo");
+    new.launch_id = new_launch_id();
+    write_connect_file(&l.run, &new).unwrap();
+    write_pointer(&l.container, &l.run, &new.launch_id, 2, "0.2.0").unwrap();
+    tokio::time::sleep(Duration::from_secs(141)).await;
+    task.await.unwrap();
+    assert_eq!(std::fs::read(&connect).unwrap(), connect_json(&new));
+    assert_eq!(
+        std::fs::read(&pointer).unwrap(),
+        pointer_json(&l.run, &new.launch_id, 2, "0.2.0")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn prazo_sem_ponteiro_simulado_so_apaga_a_conexao() {
+    let tmp = tempfile::tempdir().unwrap();
+    let i = info(tmp.path());
+    let connect = write_connect_file(tmp.path(), &i).unwrap();
+    let task = tokio::spawn(expire_launch(
+        connect.clone(),
+        connect_json(&i),
+        None,
+        i.launch_id.clone(),
+        CONNECT_TTL,
+    ));
+    tokio::time::sleep(Duration::from_secs(241)).await;
+    task.await.unwrap();
+    assert!(!connect.exists());
 }
 
 #[test]
@@ -248,14 +417,29 @@ struct Fake {
     mod_queries: Vec<String>,
     /// Atraso (ms) antes de responder o ticket.
     ticket_delay_ms: u64,
+    /// `host` anunciado pelo Hub (padrão `127.0.0.1`).
+    host: String,
+    /// Pedidos de detalhe do servidor recebidos (o primeiro pedido de todo play).
+    detail_requests: u32,
+    /// Segundos somados ao relógio do launcher quando o manifest é servido.
+    advance_on_manifest: i64,
 }
 
 type Shared = Arc<Mutex<Fake>>;
 
+/// Lista de processos falsa (jogo aberto ou não).
+struct FakeProcs(Vec<&'static str>);
+
+impl Processes for FakeProcs {
+    fn names(&self) -> Option<Vec<String>> {
+        Some(self.0.iter().map(|s| s.to_string()).collect())
+    }
+}
+
 struct Env {
     /// Chave pública do par gerado neste teste (formato do Tauri).
     pubkey: String,
-    keys: (minisign::PublicKey, minisign::SecretKey),
+    keys: modzip::Keys,
     _tmp: tempfile::TempDir,
     root: PathBuf,
     fake: Shared,
@@ -280,7 +464,8 @@ async fn ticket(State(s): State<Shared>) -> Response {
 }
 
 async fn server(State(s): State<Shared>, AxPath(id): AxPath<String>) -> Response {
-    let f = s.lock().unwrap();
+    let mut f = s.lock().unwrap();
+    f.detail_requests += 1;
     if id != SERVER {
         return (
             StatusCode::NOT_FOUND,
@@ -295,7 +480,7 @@ async fn server(State(s): State<Shared>, AxPath(id): AxPath<String>) -> Response
     if f.online {
         v["players"] = 1.into();
         v["maxPlayers"] = 10.into();
-        v["host"] = "127.0.0.1".into();
+        v["host"] = f.host.clone().into();
         v["gamePort"] = 7777.into();
         v["httpPort"] = f.port.into();
         v["version"] = "1.0.0".into();
@@ -305,7 +490,9 @@ async fn server(State(s): State<Shared>, AxPath(id): AxPath<String>) -> Response
 }
 
 async fn manifest(State(s): State<Shared>) -> Response {
-    Json(s.lock().unwrap().manifest.clone()).into_response()
+    let f = s.lock().unwrap();
+    f.clock.fetch_add(f.advance_on_manifest, Ordering::SeqCst);
+    Json(f.manifest.clone()).into_response()
 }
 
 fn shared_clock(env_clock: &Arc<AtomicI64>) -> Clock {
@@ -364,6 +551,7 @@ async fn env() -> Env {
     let fake: Shared = Arc::new(Mutex::new(Fake {
         online: true,
         clock: clock.clone(),
+        host: "127.0.0.1".into(),
         ..Fake::default()
     }));
     let files: Vec<(&str, &[u8])> = vec![("client/main.lua", b"print(1)"), ("data/a.bin", b"abc")];
@@ -399,13 +587,10 @@ async fn env() -> Env {
     vault.set("rt_1").unwrap();
     let hub = HubClient::new(&format!("http://127.0.0.1:{port}")).unwrap();
     let auth = Arc::new(Auth::with_clock(hub, vault, shared_clock(&clock)));
-    let kp = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
-    use base64::Engine as _;
-    let pubkey =
-        base64::engine::general_purpose::STANDARD.encode(kp.pk.to_box().unwrap().to_string());
+    let keys = modzip::keys();
     Env {
-        pubkey,
-        keys: (kp.pk, kp.sk),
+        pubkey: modzip::pubkey(&keys),
+        keys,
         _tmp: tmp,
         root,
         fake,
@@ -416,10 +601,20 @@ async fn env() -> Env {
 
 impl Env {
     fn ctx(&self, simulate: bool, game: Option<GameInstall>) -> PlayContext {
+        self.ctx_with(simulate, game, vec!["explorer.exe"])
+    }
+
+    fn ctx_with(
+        &self,
+        simulate: bool,
+        game: Option<GameInstall>,
+        processes: Vec<&'static str>,
+    ) -> PlayContext {
         PlayContext {
             auth: self.auth.clone(),
             content: ContentStore::new(self.root.join("cache"), self.root.join("servers"))
                 .with_retry_delay(Duration::from_millis(5)),
+            // Sem fixar versão: o launcher já é 0.2.0 (o `minLauncher` do pacote).
             mods: ModInstaller::new(self.root.join("mods"), self.pubkey.clone()),
             run_dir: self.root.join("run"),
             clock: shared_clock(&self.clock),
@@ -429,7 +624,37 @@ impl Env {
             cache_limit_bytes: 10_240 * 1024 * 1024,
             keep: HashSet::new(),
             connect_ttl: CONNECT_TTL,
+            processes: Arc::new(FakeProcs(processes)),
+            launcher_version: "0.2.0".into(),
+            confirm_conflict: false,
         }
+    }
+
+    /// Pasta de jogo falsa (`HogwartsLegacy.exe` é cópia do `whoami.exe` no Windows: nunca o jogo real).
+    fn fake_game(&self) -> GameInstall {
+        let dir = self.root.join("HL");
+        std::fs::create_dir_all(dir.join("Phoenix").join("Binaries").join("Win64")).unwrap();
+        let exe = dir.join("HogwartsLegacy.exe");
+        #[cfg(windows)]
+        {
+            let sys = std::env::var_os("SystemRoot").unwrap();
+            std::fs::copy(Path::new(&sys).join("System32").join("whoami.exe"), &exe).unwrap();
+        }
+        #[cfg(not(windows))]
+        std::fs::write(&exe, b"x").unwrap();
+        GameInstall {
+            dir,
+            exe,
+            store: Store::Manual,
+        }
+    }
+
+    /// Publica no Hub falso o mod 1.0.0 (layout 2, carregador `b"mod"`) do protocolo do servidor, assinado como no
+    /// release.
+    fn publish_mod(&self) {
+        let zip = modzip::build("1.0.0", PROTOCOL, b"mod");
+        let sig = modzip::sign(&self.keys, &zip, PROTOCOL, "1.0.0");
+        self.fake.lock().unwrap().mod_pkg = Some((zip, sig, "1.0.0".into()));
     }
 
     async fn run(
@@ -497,11 +722,10 @@ async fn play_simulado_percorre_as_etapas_e_grava_a_conexao() {
 }
 
 #[tokio::test]
-async fn ticket_renovado_quando_passa_de_240_s_desde_a_emissao() {
-    assert_eq!(TICKET_RENEW_AFTER_SECS, 240);
+async fn ticket_emitido_ha_31_s_e_renovado() {
+    assert_eq!(TICKET_RENEW_AFTER_SECS, 30);
     let e = env().await;
-    // 2 arquivos × 121 s = 242 s entre a emissão e a conexão.
-    e.fake.lock().unwrap().advance_per_file = 121;
+    e.fake.lock().unwrap().advance_on_manifest = 31;
     let (r, _) = e.run(&e.ctx(true, None)).await;
     r.unwrap();
     assert_eq!(e.fake.lock().unwrap().tickets, 2);
@@ -509,13 +733,126 @@ async fn ticket_renovado_quando_passa_de_240_s_desde_a_emissao() {
 }
 
 #[tokio::test]
-async fn ticket_nao_renovado_dentro_de_240_s() {
+async fn ticket_emitido_ha_29_s_nao_e_renovado() {
     let e = env().await;
-    e.fake.lock().unwrap().advance_per_file = 120;
+    e.fake.lock().unwrap().advance_on_manifest = 29;
     let (r, _) = e.run(&e.ctx(true, None)).await;
     r.unwrap();
     assert_eq!(e.fake.lock().unwrap().tickets, 1);
     assert_eq!(e.connect()["ticket"], format!("{TICKET_MARK}_1"));
+}
+
+#[tokio::test]
+async fn host_por_nome_vira_ip_literal_no_connect_json() {
+    let e = env().await;
+    e.fake.lock().unwrap().host = "localhost".into();
+    let (r, _) = e.run(&e.ctx(true, None)).await;
+    let out = r.unwrap();
+    let c = e.connect();
+    assert_eq!(c["host"], "127.0.0.1");
+    assert!(is_launch_id(c["launchId"].as_str().unwrap()));
+    // A prévia mostra o mesmo endereço gravado para o mod.
+    let LaunchOutcome::Simulated(p) = out else {
+        panic!("{out:?}")
+    };
+    assert_eq!(p.host, "127.0.0.1");
+}
+
+#[tokio::test]
+async fn resolver_endereco_do_servidor_de_jogo() {
+    use std::net::IpAddr;
+    let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+    assert_eq!(
+        resolve_game_ip("localhost", true).await.unwrap(),
+        ip("127.0.0.1")
+    );
+    assert_eq!(
+        resolve_game_ip("8.8.8.8", false).await.unwrap(),
+        ip("8.8.8.8")
+    );
+    assert_eq!(
+        resolve_game_ip("[2001:4860:4860::8888]", false)
+            .await
+            .unwrap(),
+        ip("2001:4860:4860::8888")
+    );
+    // Formas numéricas do WHATWG e IPv4 mapeado viram IPv4 comum.
+    assert_eq!(
+        resolve_game_ip("127.1", true).await.unwrap(),
+        ip("127.0.0.1")
+    );
+    assert_eq!(
+        resolve_game_ip("[::ffff:8.8.4.4]", false).await.unwrap(),
+        ip("8.8.4.4")
+    );
+    // Nome (ou IP) que leva a endereço proibido pela regra do build oficial.
+    for bad in [
+        "localhost",
+        "127.0.0.1",
+        "10.0.0.1",
+        "[::1]",
+        "0.0.0.0",
+        "169.254.1.1",
+    ] {
+        assert_eq!(
+            resolve_game_ip(bad, false).await.unwrap_err().code,
+            "server_unavailable",
+            "{bad}"
+        );
+    }
+    for bad in ["", "a b", "x/y", "nao-existe.invalid", "[zz]"] {
+        assert_eq!(
+            resolve_game_ip(bad, true).await.unwrap_err().code,
+            "server_unavailable",
+            "{bad}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn jogo_aberto_e_recusado_antes_de_qualquer_pedido_ao_hub() {
+    let e = env().await;
+    let game = e.fake_game();
+    let ctx = e.ctx_with(false, Some(game), vec!["steam.exe", "HogwartsLegacy.exe"]);
+    let (r, stages) = e.run(&ctx).await;
+    let err = r.unwrap_err();
+    assert_eq!(err.code, "game_running");
+    assert_eq!(
+        err.message,
+        "O Hogwarts Legacy está aberto. Feche o jogo e tente de novo."
+    );
+    assert!(stages.is_empty());
+    let f = e.fake.lock().unwrap();
+    assert_eq!((f.detail_requests, f.tickets), (0, 0));
+    assert!(f.mod_queries.is_empty());
+}
+
+#[tokio::test]
+async fn simular_nao_confere_jogo_aberto_nem_grava_ponteiro() {
+    let e = env().await;
+    let ctx = e.ctx_with(true, None, vec!["HogwartsLegacy.exe"]);
+    let (r, _) = e.run(&ctx).await;
+    assert!(matches!(r.unwrap(), LaunchOutcome::Simulated(_)));
+    assert!(e.fake.lock().unwrap().mod_queries.is_empty(), "nada de mod");
+    assert!(is_launch_id(e.connect()["launchId"].as_str().unwrap()));
+}
+
+#[tokio::test]
+async fn conflito_plantado_para_o_jogar_sem_gravar_a_conexao() {
+    let e = env().await;
+    let game = e.fake_game();
+    let win64 = win64_dir(&game);
+    std::fs::write(win64.join("dwmapi.dll"), b"UE4SS do jogador").unwrap();
+    e.publish_mod();
+    let (r, stages) = e.run(&e.ctx(false, Some(game.clone()))).await;
+    assert_eq!(r.unwrap_err().code, "mod_conflict");
+    assert_eq!(stages.last(), Some(&Stage::Mod));
+    assert_eq!(
+        std::fs::read(win64.join("dwmapi.dll")).unwrap(),
+        b"UE4SS do jogador"
+    );
+    assert!(!e.root.join("run").join("connect.json").exists());
+    assert!(!container_dir(&game).join(POINTER_FILE).exists());
 }
 
 #[tokio::test]
@@ -571,48 +908,17 @@ async fn play_e_um_por_vez() {
     assert!(!gate.cancel(), "nada em andamento");
 }
 
-/// Fluxo completo sem simular: mod pedido com o protocolo do servidor, instalado no jogo, conexão gravada e o
-/// executável aberto (cópia do `whoami.exe`, nunca o jogo real).
+/// Fluxo completo sem simular: mod pedido com o protocolo do servidor, instalado e ativado no jogo, conexão e ponteiro
+/// gravados com o mesmo `launchId`, e o executável aberto (cópia do `whoami.exe`, nunca o jogo real).
 #[cfg(windows)]
 #[tokio::test]
-async fn play_sem_simular_instala_o_mod_e_abre_o_jogo() {
-    use std::io::Write as _;
+async fn play_sem_simular_instala_ativa_grava_o_ponteiro_e_abre_o_jogo() {
     let e = env().await;
-    let dir = e.root.join("HL");
-    let win64 = dir.join("Phoenix").join("Binaries").join("Win64");
-    std::fs::create_dir_all(&win64).unwrap();
-    let sys = std::env::var_os("SystemRoot").unwrap();
-    let exe = dir.join("HogwartsLegacy.exe");
-    std::fs::copy(Path::new(&sys).join("System32").join("whoami.exe"), &exe).unwrap();
-    let game = GameInstall {
-        dir: dir.clone(),
-        exe,
-        store: Store::Manual,
-    };
-    // Mod 1.0.0 do protocolo do servidor, assinado como no release.
-    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    w.start_file("cbmp.dll", zip::write::SimpleFileOptions::default())
-        .unwrap();
-    w.write_all(b"mod").unwrap();
-    let zip = w.finish().unwrap().into_inner();
-    let comment = format!(
-        "cbmp-mod protocol={PROTOCOL} version=1.0.0 sha256={}",
-        sha_hex(&zip)
-    );
-    let sig = minisign::sign(
-        Some(&e.keys.0),
-        &e.keys.1,
-        std::io::Cursor::new(&zip),
-        Some(&comment),
-        None,
-    )
-    .unwrap()
-    .to_string();
-    use base64::Engine as _;
-    let sig = base64::engine::general_purpose::STANDARD.encode(sig);
-    e.fake.lock().unwrap().mod_pkg = Some((zip, sig, "1.0.0".into()));
+    let game = e.fake_game();
+    let win64 = win64_dir(&game);
+    e.publish_mod();
 
-    let (r, stages) = e.run(&e.ctx(false, Some(game))).await;
+    let (r, stages) = e.run(&e.ctx(false, Some(game.clone()))).await;
     let out = r.unwrap();
     assert_eq!(out, LaunchOutcome::Started);
     assert_eq!(
@@ -632,10 +938,49 @@ async fn play_sem_simular_instala_o_mod_e_abre_o_jogo() {
         vec![format!("protocol={PROTOCOL}")]
     );
     assert_eq!(
-        std::fs::read(win64.join("cbmp").join("cbmp.dll")).unwrap(),
+        std::fs::read(
+            win64
+                .join("cbmp")
+                .join("atual")
+                .join("loader")
+                .join("dwmapi.dll")
+        )
+        .unwrap(),
         b"mod"
     );
-    assert_eq!(e.connect()["ticket"], format!("{TICKET_MARK}_1"));
+    // Ativo: carregador em `Win64\` e `override.txt` apontando para `cbmp\atual\ue4ss`.
+    assert_eq!(std::fs::read(win64.join("dwmapi.dll")).unwrap(), b"mod");
+    assert_eq!(
+        std::fs::read_to_string(win64.join("override.txt"))
+            .unwrap()
+            .trim(),
+        r"cbmp\atual\ue4ss"
+    );
+    let c = e.connect();
+    assert_eq!(c["ticket"], format!("{TICKET_MARK}_1"));
+    assert_eq!(c["host"], "127.0.0.1");
+    let launch_id = c["launchId"].as_str().unwrap().to_string();
+    assert!(is_launch_id(&launch_id));
+    let pointer_path = win64.join("cbmp").join(POINTER_FILE);
+    let p: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&pointer_path).unwrap()).unwrap();
+    assert_eq!(p["v"], 1);
+    assert_eq!(p["launchId"], launch_id.as_str());
+    assert_eq!(p["runDir"], e.root.join("run").display().to_string());
+    assert_eq!(p["launcher"], "0.2.0");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(p["writtenAt"].as_u64().unwrap().abs_diff(now) < 60);
+    // Segundo Jogar: outro `launchId`, ponteiro regravado.
+    let (r, _) = e.run(&e.ctx(false, Some(game))).await;
+    r.unwrap();
+    let id2 = e.connect()["launchId"].as_str().unwrap().to_string();
+    assert_ne!(id2, launch_id);
+    let p2: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&pointer_path).unwrap()).unwrap();
+    assert_eq!(p2["launchId"], id2.as_str());
 }
 
 #[tokio::test]

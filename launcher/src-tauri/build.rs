@@ -19,6 +19,11 @@ fn main() {
         "list_servers",
         "cached_servers",
         "ping_servers",
+        "mod_status",
+        "remove_mod",
+        "resolve_mod_conflict",
+        "open_mod_logs",
+        "forget_mod_folder",
     ]);
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(manifest))
         .expect("falha no tauri-build");

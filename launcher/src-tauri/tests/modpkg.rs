@@ -11,7 +11,7 @@ use base64::Engine as _;
 use cbmp_launcher_lib::game::{GameInstall, Store};
 use cbmp_launcher_lib::hub::HubClient;
 use cbmp_launcher_lib::modpkg::{
-    extract_zip, mod_dir, verify_minisign, ModInstaller, MAX_ENTRY_BYTES,
+    container_dir, extract_zip, mod_dir, verify_minisign, win64_dir, ModInstaller, MAX_ENTRY_BYTES,
 };
 use sha2::{Digest, Sha256};
 use std::io::{Cursor, Write};
@@ -19,6 +19,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+
+#[path = "common/modzip.rs"]
+mod modzip;
+
+/// Carregador (`loader/dwmapi.dll`) dos pacotes de teste.
+const LOADER: &[u8] = b"MZ-loader-1";
 
 // ----- chaves e assinatura (par só deste teste) -----
 
@@ -112,6 +118,7 @@ fn minisign_valido_alterado_chave_errada_e_sem_assinatura() {
 
 // ----- zip -----
 
+#[derive(Clone, Copy)]
 enum Entry<'a> {
     File(&'a str, &'a [u8]),
     Dir(&'a str),
@@ -400,12 +407,29 @@ impl Env {
         self.publish_p(3, version, entries)
     }
 
-    fn publish_p(&self, protocol: u32, version: &str, entries: &[Entry]) -> Vec<u8> {
+    /// Publica o zip v2 completo de `version`/`protocol` mais `extras`.
+    fn publish_p(&self, protocol: u32, version: &str, extras: &[Entry]) -> Vec<u8> {
         self.publish_zip(
-            zip_bytes(entries),
+            v2_zip(protocol, version, LOADER, extras),
             mod_sig_for(&self.keys, protocol, version),
         )
         .1
+    }
+
+    /// Publica exatamente estas entradas (sem o layout v2 completo), assinadas como `version`/`protocol`.
+    fn publish_raw(&self, protocol: u32, version: &str, entries: &[(String, Vec<u8>)]) {
+        self.publish_zip(
+            modzip::zip_of(entries),
+            mod_sig_for(&self.keys, protocol, version),
+        );
+    }
+
+    fn latest_calls(&self) -> u32 {
+        self.fake.lock().unwrap().latest_calls
+    }
+
+    fn container(&self) -> std::path::PathBuf {
+        container_dir(&self.game)
     }
 
     /// Publica `zip` com a assinatura que `sign` produz para ele; devolve (versão anunciada, zip).
@@ -457,6 +481,28 @@ fn record(mods: &Path) -> serde_json::Value {
     serde_json::from_slice(&std::fs::read(mods.join("installed.json")).unwrap()).unwrap()
 }
 
+/// Zip v2 completo (`cbmp-mod.json`, carregador, UE4SS, mod...) com `extras` no fim.
+fn v2_zip(protocol: u32, version: &str, loader: &[u8], extras: &[Entry]) -> Vec<u8> {
+    let base = modzip::entries(version, protocol, loader);
+    let mut all: Vec<Entry> = base
+        .iter()
+        .map(|(n, d)| Entry::File(n.as_str(), d.as_slice()))
+        .collect();
+    all.extend_from_slice(extras);
+    zip_bytes(&all)
+}
+
+/// Arquivos do zip v2 mais `extras`, ordenados como `files_under`.
+fn v2_files(extras: &[&str]) -> Vec<String> {
+    let mut v: Vec<String> = modzip::entries("1.0.0", 3, LOADER)
+        .into_iter()
+        .map(|(n, _)| n)
+        .chain(extras.iter().map(|s| s.to_string()))
+        .collect();
+    v.sort();
+    v
+}
+
 #[tokio::test]
 async fn instala_registra_e_nao_baixa_de_novo() {
     let e = env().await;
@@ -480,23 +526,38 @@ async fn instala_registra_e_nao_baixa_de_novo() {
             .join("Binaries")
             .join("Win64")
             .join("cbmp")
+            .join("atual")
     );
-    assert_eq!(files_under(&dir), vec!["cbmp.dll", "data/x.bin"]);
-    // Nada fora de `cbmp\` dentro do jogo.
-    assert_eq!(
-        files_under(&e.game.dir),
-        vec![
-            "HogwartsLegacy.exe",
-            "Phoenix/Binaries/Win64/cbmp/cbmp.dll",
-            "Phoenix/Binaries/Win64/cbmp/data/x.bin"
-        ]
+    assert_eq!(dir.parent().unwrap(), e.container());
+    assert_eq!(e.container().parent().unwrap(), win64_dir(&e.game));
+    assert_eq!(files_under(&dir), v2_files(&["cbmp.dll", "data/x.bin"]));
+    // Nada fora de `cbmp\atual\` dentro do jogo (a ativação é do `modact`).
+    let mut want = vec!["HogwartsLegacy.exe".to_string()];
+    want.extend(
+        v2_files(&["cbmp.dll", "data/x.bin"])
+            .into_iter()
+            .map(|f| format!("Phoenix/Binaries/Win64/cbmp/atual/{f}")),
     );
+    want.sort();
+    assert_eq!(files_under(&e.game.dir), want);
     let r = record(&e.mods);
     assert_eq!(r["version"], "1.0.0");
     assert_eq!(r["protocol"], 3);
-    assert_eq!(r["files"].as_array().unwrap().len(), 2);
-    assert_eq!(r["files"][0]["path"], "cbmp.dll");
-    assert_eq!(r["files"][0]["sha256"], sha_hex(b"v1"));
+    assert_eq!(r["layout"], 2);
+    assert_eq!(r["loader"]["sha256"], sha_hex(LOADER));
+    assert_eq!(r["loader"]["size"], LOADER.len());
+    assert_eq!(r["loaderHistory"], serde_json::json!([]));
+    assert_eq!(r["backups"], serde_json::json!([]));
+    assert_eq!(r["removed"], false);
+    let files = r["files"].as_array().unwrap();
+    assert_eq!(files.len(), 12);
+    let dll = files.iter().find(|f| f["path"] == "cbmp.dll").unwrap();
+    assert_eq!(dll["sha256"], sha_hex(b"v1"));
+    let loader = files
+        .iter()
+        .find(|f| f["path"] == "loader/dwmapi.dll")
+        .unwrap();
+    assert_eq!(loader["sha256"], sha_hex(LOADER));
     assert!(e.installer.check_installed(&e.game).unwrap());
     assert_eq!(e.downloads(), 1);
     assert!(e
@@ -561,7 +622,7 @@ async fn versao_nova_substitui_e_remove_arquivos_antigos() {
     let st = e.ensure(3).await.unwrap();
     assert!(st.changed);
     assert_eq!(st.version, "1.1.0");
-    assert_eq!(files_under(&mod_dir(&e.game)), vec!["cbmp.dll"]);
+    assert_eq!(files_under(&mod_dir(&e.game)), v2_files(&["cbmp.dll"]));
     assert_eq!(record(&e.mods)["version"], "1.1.0");
 }
 
@@ -835,10 +896,14 @@ async fn zip_que_falha_no_meio_da_extracao_preserva_o_mod_instalado() {
     );
     e.ensure(3).await.unwrap();
     // 1.0.2 assinado (por um build comprometido, por exemplo) com o CRC do 2º arquivo quebrado.
-    let bad = crc_broken_zip(
-        &[("a.dll", b"novo-a"), ("b.dll", b"MARCADOR-CRC-XYZ")],
-        b"MARCADOR-CRC-XYZ",
-    );
+    let mut entries = modzip::entries("1.0.2", 3, LOADER);
+    entries.push(("a.dll".into(), b"novo-a".to_vec()));
+    entries.push(("b.dll".into(), b"MARCADOR-CRC-XYZ".to_vec()));
+    let refs: Vec<(&str, &[u8])> = entries
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+    let bad = crc_broken_zip(&refs, b"MARCADOR-CRC-XYZ");
     e.publish_zip(bad, mod_sig_for(&e.keys, 3, "1.0.2"));
     let err = e.ensure(3).await.unwrap_err();
     assert_eq!(err.code, "mod_invalid", "{err}");
@@ -848,8 +913,8 @@ async fn zip_que_falha_no_meio_da_extracao_preserva_o_mod_instalado() {
         std::fs::read(mod_dir(&e.game).join("a.dll")).unwrap(),
         b"bom-a"
     );
-    let win64 = mod_dir(&e.game).parent().unwrap().to_path_buf();
-    assert!(!win64.join("cbmp.staging").exists() && !win64.join("cbmp.old").exists());
+    let c = e.container();
+    assert!(!c.join("atual.staging").exists() && !c.join("atual.old").exists());
 }
 
 #[test]
@@ -892,4 +957,287 @@ fn sobras_de_troca_interrompida_sao_resolvidas() {
     recover_mod_dir(&dest).unwrap();
     assert_eq!(files_under(&dest), vec!["v1.dll"]);
     assert!(!tmp.path().join("cbmp.old").exists());
+}
+
+// ----- layout 2: `cbmp\atual`, `cbmp-mod.json`, migração, `removed` -----
+
+#[tokio::test]
+async fn ponteiro_e_logs_do_conteiner_sobrevivem_a_instalar_e_atualizar() {
+    let e = env().await;
+    let c = e.container();
+    std::fs::create_dir_all(c.join("logs")).unwrap();
+    std::fs::write(c.join("cbmp-run.json"), b"{}").unwrap();
+    std::fs::write(c.join("logs").join("x.log"), b"log").unwrap();
+    std::fs::write(c.join("cb-mp.json"), b"{\"maxBonecos\":8}").unwrap();
+    e.publish("1.0.0", &[Entry::File("cbmp.dll", b"v1")]);
+    e.ensure(3).await.unwrap();
+    e.publish("1.1.0", &[Entry::File("cbmp.dll", b"v2")]);
+    assert!(e.ensure(3).await.unwrap().changed);
+    assert_eq!(std::fs::read(c.join("cbmp-run.json")).unwrap(), b"{}");
+    assert_eq!(std::fs::read(c.join("logs").join("x.log")).unwrap(), b"log");
+    assert!(c.join("cb-mp.json").is_file());
+    assert_eq!(
+        std::fs::read(mod_dir(&e.game).join("cbmp.dll")).unwrap(),
+        b"v2"
+    );
+}
+
+/// Entradas do zip v2 de `1.0.0`/protocolo 3 com `cbmp-mod.json` trocado (`None` = sem o arquivo).
+fn with_meta(meta: Option<&str>) -> Vec<(String, Vec<u8>)> {
+    let mut v = modzip::entries("1.0.0", 3, LOADER);
+    v.retain(|(n, _)| n != "cbmp-mod.json");
+    if let Some(m) = meta {
+        v.insert(0, ("cbmp-mod.json".into(), m.as_bytes().to_vec()));
+    }
+    v
+}
+
+fn meta(layout: u32, version: &str, protocol: u32, min: &str) -> String {
+    format!(
+        r#"{{"layout":{layout},"version":"{version}","protocol":{protocol},"ue4ss":"3.0.1+4fb9b615","minLauncher":"{min}"}}"#
+    )
+}
+
+#[tokio::test]
+async fn cbmp_mod_json_ausente_ou_divergente_e_recusado() {
+    let e = env().await;
+    let cases: Vec<(&str, Option<String>)> = vec![
+        ("ausente", None),
+        ("json inválido", Some("{layout:2".into())),
+        ("layout 1", Some(meta(1, "1.0.0", 3, "0.2.0"))),
+        ("versão diferente", Some(meta(2, "1.0.1", 3, "0.2.0"))),
+        ("protocolo diferente", Some(meta(2, "1.0.0", 4, "0.2.0"))),
+    ];
+    for (what, m) in cases {
+        e.publish_raw(3, "1.0.0", &with_meta(m.as_deref()));
+        let err = e.ensure(3).await.unwrap_err();
+        assert_eq!(err.code, "mod_invalid", "{what}: {err}");
+        assert!(!mod_dir(&e.game).exists(), "{what}");
+        assert!(!e.mods.join("installed.json").exists(), "{what}");
+    }
+}
+
+#[tokio::test]
+async fn min_launcher_maior_que_o_launcher_e_incompativel() {
+    let e = env().await;
+    for min in ["0.3.0", "x.y"] {
+        e.publish_raw(3, "1.0.0", &with_meta(Some(&meta(2, "1.0.0", 3, min))));
+        let err = e.ensure(3).await.unwrap_err();
+        assert_eq!(err.code, "mod_incompatible", "{min}: {err}");
+        assert_eq!(
+            err.message,
+            "Este mod precisa de uma versão mais nova do launcher. Atualize e tente de novo."
+        );
+        assert!(!mod_dir(&e.game).exists());
+    }
+    e.publish_raw(3, "1.0.0", &with_meta(Some(&meta(2, "1.0.0", 3, "0.2.0"))));
+    assert_eq!(e.ensure(3).await.unwrap().version, "1.0.0");
+}
+
+#[tokio::test]
+async fn zip_sem_carregador_ue4ss_ou_main_dll_e_recusado() {
+    let e = env().await;
+    for missing in [
+        "loader/dwmapi.dll",
+        "ue4ss/UE4SS.dll",
+        "ue4ss/Mods/cb-mp/dlls/main.dll",
+    ] {
+        let mut v = modzip::entries("1.0.0", 3, LOADER);
+        v.retain(|(n, _)| n != missing);
+        e.publish_raw(3, "1.0.0", &v);
+        let err = e.ensure(3).await.unwrap_err();
+        assert_eq!(err.code, "mod_invalid", "{missing}: {err}");
+        assert!(!mod_dir(&e.game).exists(), "{missing}");
+    }
+}
+
+#[tokio::test]
+async fn migracao_do_layout_antigo_apaga_so_os_arquivos_registrados() {
+    let e = env().await;
+    let c = e.container();
+    std::fs::create_dir_all(c.join("docs")).unwrap();
+    std::fs::write(c.join("LEIA-ME.txt"), b"velho").unwrap();
+    std::fs::write(c.join("docs").join("a.txt"), b"a").unwrap();
+    std::fs::write(c.join("meu.txt"), b"do jogador").unwrap();
+    // Registro do launcher 0.1.x: sem `layout`, arquivos direto em `cbmp\`.
+    let old = serde_json::json!({
+        "version": "0.1.0",
+        "protocol": 3,
+        "gameDir": e.game.dir,
+        "sha256": "a".repeat(64),
+        "files": [
+            { "path": "LEIA-ME.txt", "sha256": sha_hex(b"velho"), "size": 5 },
+            { "path": "docs/a.txt", "sha256": sha_hex(b"a"), "size": 1 },
+        ],
+    });
+    std::fs::create_dir_all(&e.mods).unwrap();
+    std::fs::write(
+        e.mods.join("installed.json"),
+        serde_json::to_vec(&old).unwrap(),
+    )
+    .unwrap();
+    e.publish("1.0.0", &[]);
+    assert!(e.ensure(3).await.unwrap().changed);
+    assert!(!c.join("LEIA-ME.txt").exists());
+    assert!(!c.join("docs").exists(), "pasta que ficou vazia sai");
+    assert_eq!(std::fs::read(c.join("meu.txt")).unwrap(), b"do jogador");
+    assert_eq!(files_under(&mod_dir(&e.game)), v2_files(&[]));
+    assert_eq!(record(&e.mods)["layout"], 2);
+}
+
+#[tokio::test]
+async fn queda_entre_as_renomeacoes_e_recuperada() {
+    let e = env().await;
+    e.publish("1.0.0", &[Entry::File("cbmp.dll", b"v1")]);
+    e.ensure(3).await.unwrap();
+    let c = e.container();
+    std::fs::rename(c.join("atual"), c.join("atual.old")).unwrap();
+    let st = e.ensure(3).await.unwrap();
+    assert!(!st.changed, "a versão anterior volta inteira");
+    assert!(!c.join("atual.old").exists());
+    assert_eq!(
+        std::fs::read(mod_dir(&e.game).join("cbmp.dll")).unwrap(),
+        b"v1"
+    );
+    assert_eq!(e.downloads(), 1);
+}
+
+#[tokio::test]
+async fn trocar_de_carregador_guarda_o_hash_anterior_no_historico() {
+    let e = env().await;
+    e.publish_zip(
+        v2_zip(3, "1.0.0", b"loader-A", &[]),
+        mod_sig_for(&e.keys, 3, "1.0.0"),
+    );
+    e.ensure(3).await.unwrap();
+    e.publish_zip(
+        v2_zip(3, "1.1.0", b"loader-B", &[]),
+        mod_sig_for(&e.keys, 3, "1.1.0"),
+    );
+    e.ensure(3).await.unwrap();
+    // Mesmo carregador na versão seguinte: o histórico não repete.
+    e.publish_zip(
+        v2_zip(3, "1.2.0", b"loader-B", &[]),
+        mod_sig_for(&e.keys, 3, "1.2.0"),
+    );
+    e.ensure(3).await.unwrap();
+    let r = record(&e.mods);
+    assert_eq!(r["loader"]["sha256"], sha_hex(b"loader-B"));
+    assert_eq!(
+        r["loaderHistory"],
+        serde_json::json!([sha_hex(b"loader-A")])
+    );
+}
+
+#[tokio::test]
+async fn removido_reinstala_do_pacote_local_sem_chamar_o_hub() {
+    let e = env().await;
+    e.publish("2.0.0", &[Entry::File("cbmp.dll", b"v2")]);
+    e.ensure(3).await.unwrap();
+    let (downloads, latest) = (e.downloads(), e.latest_calls());
+    // Como depois de `remove_mod`: `atual\` apagado, registro com `removed` e sem arquivos.
+    std::fs::remove_dir_all(mod_dir(&e.game)).unwrap();
+    let mut r = e.installer.installed().unwrap();
+    r.removed = true;
+    r.files.clear();
+    e.installer.save_record(&r).unwrap();
+    assert!(!e.installer.check_installed(&e.game).unwrap());
+
+    let st = e.ensure(3).await.unwrap();
+    assert_eq!((st.version.as_str(), st.changed), ("2.0.0", true));
+    assert_eq!(e.downloads() - downloads, 0);
+    assert_eq!(e.latest_calls() - latest, 0, "nem pergunta ao Hub");
+    assert!(e.installer.check_installed(&e.game).unwrap());
+    let r = record(&e.mods);
+    assert_eq!(r["removed"], false);
+    assert_eq!(r["version"], "2.0.0");
+    assert_eq!(
+        std::fs::read(mod_dir(&e.game).join("cbmp.dll")).unwrap(),
+        b"v2"
+    );
+
+    // Removido e sem pacote local: a versão registrada continua sendo o piso (sem downgrade).
+    std::fs::remove_dir_all(mod_dir(&e.game)).unwrap();
+    std::fs::remove_dir_all(e.package()).unwrap();
+    let mut r = e.installer.installed().unwrap();
+    r.removed = true;
+    r.files.clear();
+    e.installer.save_record(&r).unwrap();
+    e.publish("1.0.0", &[Entry::File("cbmp.dll", b"v1")]);
+    assert_eq!(e.ensure(3).await.unwrap_err().code, "mod_altered");
+    assert_eq!(e.downloads() - downloads, 0);
+    assert!(!mod_dir(&e.game).exists());
+}
+
+#[tokio::test]
+async fn pacote_e_assinatura_ficam_em_mods_package() {
+    let e = env().await;
+    e.publish("1.0.0", &[]);
+    e.ensure(3).await.unwrap();
+    assert_eq!(e.installer.package_zip(), e.package().join("cbmp-mod.zip"));
+    assert_eq!(
+        e.installer.package_sig(),
+        e.package().join("cbmp-mod.zip.sig")
+    );
+    assert!(e.installer.package_zip().is_file() && e.installer.package_sig().is_file());
+    assert_eq!(e.installer.pubkey(), tauri_pubkey(&e.keys));
+}
+
+// ----- Task 10 revisada: pasta do jogo sem permissão e junção no lugar de `cbmp` -----
+
+#[cfg(windows)]
+#[path = "common/deny.rs"]
+mod deny;
+
+#[cfg(windows)]
+#[tokio::test]
+async fn pasta_sem_permissao_da_mod_folder_protected_antes_de_falar_com_o_hub() {
+    let e = env().await;
+    e.publish("1.0.0", &[]);
+    let err = {
+        let _deny = deny::Deny::new(&win64_dir(&e.game), "(W)");
+        e.ensure(3).await.unwrap_err()
+    };
+    assert_eq!(err.code, "mod_folder_protected");
+    assert_eq!(
+        err.message,
+        format!(
+            "O launcher não tem permissão para gravar na pasta do jogo ({}). Nesta versão de testes, instale o jogo \
+             numa pasta em que o seu usuário possa gravar (por exemplo, outra biblioteca da Steam ou outra pasta na \
+             Epic Games) e tente de novo.",
+            e.game.dir.display()
+        )
+    );
+    assert_eq!(e.latest_calls(), 0, "nada pedido ao Hub");
+    assert_eq!(e.downloads(), 0);
+    assert!(!e.container().exists());
+    assert!(!e.mods.join("pending").exists() && !e.package().exists());
+    // Nenhum arquivo de teste sobrou em `Win64`.
+    assert_eq!(std::fs::read_dir(win64_dir(&e.game)).unwrap().count(), 0);
+    // Com permissão: instala normalmente e o teste de gravação não deixa nada para trás.
+    e.ensure(3).await.unwrap();
+    let names: Vec<String> = std::fs::read_dir(win64_dir(&e.game))
+        .unwrap()
+        .map(|d| d.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["cbmp"]);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn cbmp_por_juncao_e_recusado_sem_gravar_fora() {
+    let e = env().await;
+    e.publish("1.0.0", &[]);
+    let elsewhere = e.game.dir.parent().unwrap().join("fora");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    deny::junction(&e.container(), &elsewhere);
+    let err = e.ensure(3).await.unwrap_err();
+    assert_eq!(err.code, "mod_activation_failed");
+    assert_eq!(
+        std::fs::read_dir(&elsewhere).unwrap().count(),
+        0,
+        "nada fora"
+    );
+    assert_eq!(e.downloads(), 0);
+    std::fs::remove_dir(e.container()).unwrap();
 }

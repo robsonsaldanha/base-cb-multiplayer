@@ -20,9 +20,18 @@ function setup(extra: Record<string, Handler> = {}) {
     get_settings: () => saved,
     set_settings: (a) => (saved = { ...saved, ...(a!.settings as object) }),
     app_version: () => "0.1.0",
+    mod_status: () => NOT_INSTALLED,
     ...extra,
   });
   return { b, saved: () => saved };
+}
+
+const NOT_INSTALLED = { state: "notInstalled", otherFolders: [], goneFolders: [] };
+const INSTALLED = { state: "installed", version: "0.2.0", otherFolders: [], goneFolders: [] };
+const CONFLICT = { state: "conflict", otherFolders: [], goneFolders: [] };
+
+function modSection() {
+  return screen.getByRole("region", { name: "Mod do jogo" });
 }
 
 describe("Configurações", () => {
@@ -160,9 +169,170 @@ describe("Configurações", () => {
     await loadSettings();
     render(Settings);
     const box = screen.getByRole("checkbox", { name: /Modo simular/ });
-    expect(box).toBeChecked();
+    expect(box).not.toBeChecked();
     await fireEvent.click(box);
-    await vi.waitFor(() => expect(saved().simulateLaunch).toBe(false));
+    await vi.waitFor(() => expect(saved().simulateLaunch).toBe(true));
+  });
+
+  it("modo simular fica em Avançado e vem desmarcado sem configurações", async () => {
+    setup();
+    render(Settings);
+    const adv = screen.getByRole("region", { name: "Avançado" });
+    const box = within(adv).getByRole("checkbox", { name: "Modo simular: prepara tudo e não abre o jogo" });
+    expect(box).not.toBeChecked();
+    expect(box).toBeDisabled();
+    expect(screen.queryByRole("heading", { name: "Modo simular" })).toBeNull();
+  });
+
+  it("estado do mod nos três valores", async () => {
+    for (const [st, text] of [
+      [NOT_INSTALLED, "Não instalado"],
+      [INSTALLED, "Instalado 0.2.0"],
+      [CONFLICT, "Conflito com outro carregador de mods"],
+    ] as const) {
+      setup({ mod_status: () => st });
+      await loadSettings();
+      const r = render(Settings);
+      expect(await within(modSection()).findByText(text)).toBeInTheDocument();
+      const remove = within(modSection()).getByRole("button", { name: "Remover mod do jogo" });
+      if (st === NOT_INSTALLED) expect(remove).toBeDisabled();
+      else expect(remove).toBeEnabled();
+      r.unmount();
+    }
+  });
+
+  it("remover o mod pede confirmação e chama remove_mod", async () => {
+    const { b } = setup({
+      mod_status: () => INSTALLED,
+      remove_mod: () => ({ status: NOT_INSTALLED, folders: [{ gameDir: "D:\\HL", error: null }] }),
+    });
+    await loadSettings();
+    render(Settings);
+    const sec = modSection();
+    await fireEvent.click(await within(sec).findByRole("button", { name: "Remover mod do jogo" }));
+    expect(b.calls("remove_mod")).toHaveLength(0);
+    expect(within(sec).getByText(/Feche o jogo antes/)).toBeInTheDocument();
+    await fireEvent.click(within(sec).getByRole("button", { name: "Remover agora" }));
+    expect(await within(sec).findByText("Mod removido do jogo.")).toBeInTheDocument();
+    expect(b.calls("remove_mod")).toEqual([undefined]);
+    expect(within(sec).getByText("Não instalado")).toBeInTheDocument();
+  });
+
+  it("remover com o jogo aberto mostra o erro e mantém o estado", async () => {
+    setup({
+      mod_status: () => INSTALLED,
+      remove_mod: () => {
+        throw { code: "game_running", message: "O Hogwarts Legacy está aberto. Feche o jogo e tente de novo." };
+      },
+    });
+    await loadSettings();
+    render(Settings);
+    const sec = modSection();
+    await fireEvent.click(await within(sec).findByRole("button", { name: "Remover mod do jogo" }));
+    await fireEvent.click(within(sec).getByRole("button", { name: "Remover agora" }));
+    await vi.waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent("O Hogwarts Legacy está aberto. Feche o jogo e tente de novo."),
+    );
+    expect(within(sec).getByText("Instalado 0.2.0")).toBeInTheDocument();
+  });
+
+  it("mod em pasta anterior do jogo: aparece, deixa remover e mostra o resultado por pasta", async () => {
+    const OLD = "E:\\Jogos\\Hogwarts Legacy";
+    setup({
+      mod_status: () => ({ ...NOT_INSTALLED, otherFolders: [OLD], goneFolders: [] }),
+      remove_mod: () => ({
+        status: { ...NOT_INSTALLED, otherFolders: [OLD], goneFolders: [] },
+        folders: [
+          {
+            gameDir: OLD,
+            error: { code: "mod_folder_unreachable", message: `A pasta do jogo ${OLD} não está acessível agora.` },
+          },
+        ],
+      }),
+    });
+    await loadSettings();
+    render(Settings);
+    const sec = modSection();
+    expect(await within(sec).findByText(OLD)).toBeInTheDocument();
+    expect(within(sec).getByText(/pasta anterior do jogo/)).toBeInTheDocument();
+    await fireEvent.click(within(sec).getByRole("button", { name: "Remover mod do jogo" }));
+    await fireEvent.click(within(sec).getByRole("button", { name: "Remover agora" }));
+    const failed = await within(sec).findByRole("list", { name: "Pastas onde o mod não saiu" });
+    expect(failed).toHaveTextContent(OLD);
+    expect(failed).toHaveTextContent(/não está acessível/);
+    expect(within(sec).queryByText("Mod removido do jogo.")).toBeNull();
+  });
+
+  it("pasta anterior que não existe mais: esquecer só depois de confirmar, citando os arquivos guardados", async () => {
+    const GONE = "E:\\Jogos\\Desinstalado";
+    const { b } = setup({
+      mod_status: () => ({
+        ...INSTALLED,
+        otherFolders: [GONE],
+        goneFolders: [{ gameDir: GONE, backups: ["dwmapi.dll", "override.txt"] }],
+      }),
+      forget_mod_folder: () => ({ ...INSTALLED }),
+    });
+    await loadSettings();
+    render(Settings);
+    const sec = modSection();
+    expect(await within(sec).findByText(GONE)).toBeInTheDocument();
+    expect(within(sec).getByText("Esta pasta não existe mais.")).toBeInTheDocument();
+    await fireEvent.click(within(sec).getByRole("button", { name: "Esquecer pasta" }));
+    expect(b.calls("forget_mod_folder")).toHaveLength(0);
+    expect(within(sec).getByText(/dwmapi\.dll, override\.txt/)).toHaveTextContent(
+      "Os seus arquivos guardados pelo launcher (dwmapi.dll, override.txt) estavam nesta pasta. Se ela foi apagada, o launcher não consegue devolvê-los; se foi movida, o launcher os encontra de novo no próximo Jogar a partir da pasta nova. Esquecer a pasta assim mesmo?",
+    );
+    // Cancelar não chama o Rust.
+    await fireEvent.click(within(sec).getByRole("button", { name: "Cancelar" }));
+    expect(b.calls("forget_mod_folder")).toHaveLength(0);
+    await fireEvent.click(within(sec).getByRole("button", { name: "Esquecer pasta" }));
+    await fireEvent.click(within(sec).getByRole("button", { name: "Esquecer pasta" }));
+    await vi.waitFor(() => expect(b.calls("forget_mod_folder")).toEqual([{ dir: GONE }]));
+    await vi.waitFor(() => expect(within(sec).queryByText(GONE)).toBeNull());
+  });
+
+  it("pasta que não existe mais sem arquivos guardados: confirmação sem lista", async () => {
+    const GONE = "E:\\Jogos\\Vazia";
+    setup({
+      mod_status: () => ({ ...INSTALLED, otherFolders: [GONE], goneFolders: [{ gameDir: GONE, backups: [] }] }),
+    });
+    await loadSettings();
+    render(Settings);
+    const sec = modSection();
+    await fireEvent.click(await within(sec).findByRole("button", { name: "Esquecer pasta" }));
+    expect(within(sec).getByText("O launcher não guardou arquivos seus nesta pasta. Esquecer a pasta?")).toBeInTheDocument();
+    expect(within(sec).queryByText(/não consegue devolvê-los/)).toBeNull();
+  });
+
+  it("pasta anterior que existe (ou está inacessível) não tem o botão de esquecer", async () => {
+    const OLD = "E:\\Jogos\\Hogwarts Legacy";
+    setup({ mod_status: () => ({ ...NOT_INSTALLED, otherFolders: [OLD], goneFolders: [] }) });
+    await loadSettings();
+    render(Settings);
+    const sec = modSection();
+    expect(await within(sec).findByText(OLD)).toBeInTheDocument();
+    expect(within(sec).queryByRole("button", { name: "Esquecer pasta" })).toBeNull();
+  });
+
+  it("abrir a pasta de logs do mod chama o Rust; pasta ausente avisa", async () => {
+    let missing = false;
+    const { b } = setup({
+      open_mod_logs: () => {
+        if (missing) throw { code: "mod_logs_missing", message: "A pasta de logs do mod ainda não existe." };
+        return undefined;
+      },
+    });
+    await loadSettings();
+    render(Settings);
+    const btn = within(modSection()).getByRole("button", { name: "Abrir pasta de logs do mod" });
+    await fireEvent.click(btn);
+    await vi.waitFor(() => expect(b.calls("open_mod_logs")).toEqual([undefined]));
+    missing = true;
+    await fireEvent.click(btn);
+    await vi.waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent("A pasta de logs do mod ainda não existe."),
+    );
   });
 
   it("limpar cache avisa sobre o jogo aberto e pede confirmação", async () => {
@@ -208,7 +378,7 @@ describe("Configurações", () => {
     render(Settings);
     const box = screen.getByRole("checkbox", { name: /Modo simular/ });
     await fireEvent.click(box);
-    await vi.waitFor(() => expect(box).toBeChecked());
+    await vi.waitFor(() => expect(box).not.toBeChecked());
   });
 
   it("mudar o modo simular não apaga o limite que está sendo digitado", async () => {
@@ -218,7 +388,7 @@ describe("Configurações", () => {
     const cache = screen.getByRole("spinbutton", { name: "Limite do cache (MB)" });
     await fireEvent.input(cache, { target: { value: "4096" } });
     await fireEvent.click(screen.getByRole("checkbox", { name: /Modo simular/ }));
-    await vi.waitFor(() => expect(saved().simulateLaunch).toBe(false));
+    await vi.waitFor(() => expect(saved().simulateLaunch).toBe(true));
     expect(cache).toHaveValue(4096);
   });
 });

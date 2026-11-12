@@ -171,6 +171,43 @@ pub fn validate_game_dir(dir: &Path) -> AppResult<GameInstall> {
     })
 }
 
+/// A mesma instalação pelo caminho final: a pasta escolhida pode passar por junções/links (biblioteca da Steam movida
+/// por junção); o launcher resolve uma vez e trabalha nesse caminho (o registro do mod também). `\\?\C:\…` vira
+/// `C:\…` e `\\?\UNC\s\x` vira `\\s\x`. Falha ao resolver → a instalação como veio.
+pub fn resolve_final(game: &GameInstall) -> GameInstall {
+    let Some(dir) = resolve_dir(&game.dir) else {
+        return game.clone();
+    };
+    if dir != game.dir {
+        log::info!("pasta do jogo resolvida para {}", dir.display());
+    }
+    GameInstall {
+        exe: dir.join(GAME_EXE),
+        dir,
+        store: game.store,
+    }
+}
+
+/// Caminho final de `dir` (junções/links resolvidos), sem o prefixo `\\?\`. Falha ao resolver (pasta ausente, nome
+/// que não é Unicode válido) → `None`.
+pub fn resolve_dir(dir: &Path) -> Option<PathBuf> {
+    let real = std::fs::canonicalize(dir).ok()?;
+    let s = real.as_os_str().to_str()?;
+    Some(if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{unc}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        real.clone()
+    })
+}
+
+/// `a` e `b` são a mesma pasta: o mesmo caminho, ou o mesmo caminho final depois de resolver junções/links (registro
+/// gravado antes por outro caminho para a mesma pasta).
+pub fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b || matches!((resolve_dir(a), resolve_dir(b)), (Some(x), Some(y)) if x == y)
+}
+
 /// Qual verificação de confiança falhou num caminho achado pelo manifest da Epic (vai para o log).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TrustCheck {
@@ -685,6 +722,84 @@ pub fn vdf_get(v: &Vdf, keys: &[&str]) -> Option<String> {
         Vdf::Str(s) => Some(s.clone()),
         Vdf::Obj(_) => None,
     }
+}
+
+// ----- jogo aberto -----
+
+/// Nomes dos executáveis em execução (injetável nos testes). `None`: a lista não pôde ser lida.
+pub trait Processes {
+    fn names(&self) -> Option<Vec<String>>;
+}
+
+/// Processos reais do sistema (`CreateToolhelp32Snapshot`).
+pub struct SystemProcesses;
+
+impl Processes for SystemProcesses {
+    #[cfg(windows)]
+    fn names(&self) -> Option<Vec<String>> {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        };
+        let mut out = Vec::new();
+        // SAFETY: snapshot fechado no fim; `PROCESSENTRY32W` com `dwSize` preenchido, como a API pede.
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snap == INVALID_HANDLE_VALUE || snap.is_null() {
+                log::warn!("lista de processos indisponível");
+                return None;
+            }
+            let mut e = PROCESSENTRY32W {
+                dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                ..Default::default()
+            };
+            let mut ok = Process32FirstW(snap, &mut e);
+            if ok == 0 {
+                CloseHandle(snap);
+                log::warn!("lista de processos vazia ou ilegível");
+                return None;
+            }
+            while ok != 0 {
+                let len = e
+                    .szExeFile
+                    .iter()
+                    .position(|c| *c == 0)
+                    .unwrap_or(e.szExeFile.len());
+                out.push(String::from_utf16_lossy(&e.szExeFile[..len]));
+                ok = Process32NextW(snap, &mut e);
+            }
+            CloseHandle(snap);
+        }
+        Some(out)
+    }
+
+    #[cfg(not(windows))]
+    fn names(&self) -> Option<Vec<String>> {
+        Some(Vec::new())
+    }
+}
+
+/// Algum processo se chama `HogwartsLegacy.exe` (sem diferenciar maiúsculas). Lista ilegível conta como jogo aberto
+/// (trava de segurança: falha fechada).
+pub fn game_running_with(p: &dyn Processes) -> bool {
+    match p.names() {
+        Some(names) => names.iter().any(|n| n.eq_ignore_ascii_case(GAME_EXE)),
+        None => true,
+    }
+}
+
+/// [`game_running_with`] com os processos reais.
+pub fn game_running() -> bool {
+    game_running_with(&SystemProcesses)
+}
+
+/// Jogo aberto: Jogar e Remover recusam.
+pub fn game_running_error() -> AppError {
+    AppError::new(
+        "game_running",
+        "O Hogwarts Legacy está aberto. Feche o jogo e tente de novo.",
+    )
 }
 
 #[cfg(test)]

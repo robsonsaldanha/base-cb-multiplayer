@@ -286,6 +286,23 @@ O instalador NSIS é por usuário (sem administrador). Ele **não** tem assinatu
   o `.sig` ficam em `mods\package\` para reparo: arquivo alterado → reinstala do pacote local (assinatura conferida de
   novo) ou baixa de novo. Nunca faz downgrade: se o Hub oferecer versão menor que a instalada no mesmo protocolo, a
   instalada fica (`mod_altered` se ela estiver alterada e não houver pacote local para reparar).
+- **Sem elevação, nunca**: o launcher não pede administrador nem muda permissões de nenhuma pasta do jogo. Antes de
+  baixar o mod ele confere se dá para gravar em `Phoenix\Binaries\Win64` (cria e apaga um arquivo de teste); sem
+  permissão (ex.: Epic em `C:\Program Files`), instalar, ativar e remover param em `mod_folder_protected` ("…instale o
+  jogo numa pasta em que o seu usuário possa gravar…"). O jogo aberto é conferido antes (`game_running`), para um
+  `dwmapi.dll` em uso não parecer falta de permissão. A instalação elevada foi retirada do subprojeto 5a (motivo e
+  direção futura em `docs/PENDENCIAS.md`, "Instalação em pasta protegida"); `config_guard` garante que não há caminho
+  de elevação no código.
+- **Junções**: a pasta escolhida pode passar por junções/links (biblioteca da Steam movida); o launcher a resolve uma
+  vez para o caminho final e trabalha nele (um registro do mod gravado antes pelo caminho da junção passa ao caminho
+  final, sem tirar e pôr o mod de novo). Dentro de `cbmp\` e `cbmp-backup\` links/junções são recusados (nada é
+  gravado, movido ou devolvido através deles), como nas entradas do zip.
+- **Backups do jogador e pastas anteriores**: arquivos de outro carregador (`dwmapi.dll`, `override.txt`) vão para
+  `Win64\cbmp-backup\` com um manifesto `cbmp-backup.json` dentro da própria pasta do jogo (viaja com ela se a pasta for
+  movida). Pasta anterior que não existe mais e tinha backups fica registrada; nas Configurações aparece "Esquecer
+  pasta", com uma confirmação que lista os arquivos do jogador que estavam lá (o comando só aceita, texto igual, uma
+  pasta do registro; outro caminho vindo da UI nunca chega ao disco). O aviso de pasta anterior
+  (`mod://warning`) aparece no máximo uma vez por execução do launcher.
 - **Jogar** (`play(serverId)`, um por vez; outro pedido → `busy`; `cancel_play` interrompe, inclusive pedidos ao Hub
   em andamento): detalhe do servidor → ticket → manifest (validado) → download → montagem (+ limite do cache, sem
   desmontar o servidor atual) → mod (só fora do modo simular) → `run\connect.json` → abrir. Etapas em `play://stage`
