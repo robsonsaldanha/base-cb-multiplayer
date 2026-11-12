@@ -1,5 +1,4 @@
 #include "CrashDump.hpp"
-#include "Utf8Path.hpp"
 #include <cbmp/client/Log.hpp>
 #include <Windows.h>
 #include <DbgHelp.h>
@@ -8,7 +7,7 @@
 
 namespace cbmp::client {
 namespace {
-// Sem heap/locks antes do dump: tudo pré-computado em buffers fixos.
+// Sem heap/locks no filtro: tudo em buffers fixos (nem antes nem depois do dump).
 wchar_t g_dumpDir[MAX_PATH * 2] = {};
 LPTOP_LEVEL_EXCEPTION_FILTER g_previous = nullptr;
 
@@ -24,7 +23,8 @@ LONG WINAPI OnCrash(EXCEPTION_POINTERS* info) {
         MINIDUMP_EXCEPTION_INFORMATION mei{GetCurrentThreadId(), info, FALSE};
         MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file, MiniDumpNormal, &mei, nullptr, nullptr);
         CloseHandle(file);
-        Log().Write(Level::Error, "CRASH: dump gravado em " + ToUtf8(std::filesystem::path(path)));
+        // Sem linha de log aqui: o log aloca e trava, e o crash pode ter acontecido com a trava presa ou o heap
+        // corrompido. A prova do crash é o próprio .dmp na pasta crash.
     }
     return g_previous ? g_previous(info) : EXCEPTION_CONTINUE_SEARCH;
 }

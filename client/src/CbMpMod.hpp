@@ -33,6 +33,10 @@ private:
         CbMpMod* owner = nullptr;
     };
 
+    void Arm();                                     // corpo do construtor; pode lançar (o construtor pega)
+    void AbandonArming(const char* why) noexcept;   // falha ao armar: volta a inerte
+    void StartSession();                            // corpo do on_unreal_init; pode lançar (o chamador pega)
+    void AbandonSession(const char* why) noexcept;  // falha ao iniciar: log e sem sessão
     void OnGameTick();       // game thread, sob TickGate::mutex
     void OnTickException();  // chamado no catch(...) do tick; pode lançar (o chamador engole)
 

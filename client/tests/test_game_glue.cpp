@@ -1,9 +1,11 @@
 // Peças puras da camada do jogo (client/src/game usa; aqui sem UE4SS): conversões, alternativas fixadas, tabela de
-// bonecos e o "registrar uma vez".
+// bonecos, o "registrar uma vez" e o cache de busca por nome que revalida.
 #include <catch2/catch_test_macros.hpp>
 #include <cbmp/client/GameGlue.hpp>
 
+#include <chrono>
 #include <cstdint>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -142,4 +144,83 @@ TEST_CASE("client: OnceSet diz sim so na primeira vez de cada chave") {
     CHECK_FALSE(once.First("K2_TeleportTo"));
     CHECK(once.First("SetInvulnerable"));
     CHECK_FALSE(once.First("SetInvulnerable"));
+}
+
+namespace {
+// Faz o papel do FWeakObjectPtr: o valor é o ObjectKey (índice + série); "vivo" = ainda está no conjunto.
+struct FakeObjects {
+    std::set<uint64_t> alive;
+};
+}  // namespace
+
+TEST_CASE("client: RetryingLookup guarda o achado so enquanto ele vive") {
+    using namespace std::chrono_literals;
+    RetryingLookup<std::string, uint64_t> cache(5s);
+    FakeObjects objs;
+    const auto t0 = std::chrono::steady_clock::time_point{} + 1h;
+    const uint64_t oldClass = ObjectKey(5, 7);
+    objs.alive.insert(oldClass);
+    int resolves = 0;
+    uint64_t current = oldClass;
+    auto alive = [&](const uint64_t& v) { return objs.alive.count(v) > 0; };
+    auto resolve = [&]() -> std::optional<uint64_t> {
+        ++resolves;
+        if (current == 0) return std::nullopt;
+        return current;
+    };
+
+    CHECK(cache.Get("BP_Classe_C", t0, alive, resolve) == oldClass);
+    CHECK(cache.Get("BP_Classe_C", t0 + 1s, alive, resolve) == oldClass);
+    CHECK(resolves == 1);  // achado e vivo: não procura de novo
+
+    // Troca de mundo: a classe sai da memória e outra ocupa o mesmo índice (série nova). Nunca devolve a antiga.
+    objs.alive.erase(oldClass);
+    const uint64_t newClass = ObjectKey(5, 8);
+    objs.alive.insert(newClass);
+    current = newClass;
+    CHECK(cache.Get("BP_Classe_C", t0 + 2s, alive, resolve) == newClass);
+    CHECK(resolves == 2);  // morto: procura na hora, sem esperar o intervalo
+
+    // Morreu e não voltou: ausente, e a ausência segue as regras do intervalo.
+    objs.alive.erase(newClass);
+    current = 0;
+    CHECK_FALSE(cache.Get("BP_Classe_C", t0 + 3s, alive, resolve).has_value());
+    CHECK(resolves == 3);
+    CHECK_FALSE(cache.Get("BP_Classe_C", t0 + 4s, alive, resolve).has_value());
+    CHECK(resolves == 3);
+}
+
+TEST_CASE("client: RetryingLookup nao guarda a ausencia para sempre") {
+    using namespace std::chrono_literals;
+    RetryingLookup<std::string, uint64_t> cache(5s);
+    const auto t0 = std::chrono::steady_clock::time_point{} + 1h;
+    int resolves = 0;
+    std::optional<uint64_t> answer;
+    auto alive = [](const uint64_t&) { return true; };
+    auto resolve = [&] {
+        ++resolves;
+        return answer;
+    };
+
+    CHECK_FALSE(cache.Get("BP_PlayerPerceptionPoint_C", t0, alive, resolve).has_value());
+    CHECK(resolves == 1);
+    CHECK_FALSE(cache.Get("BP_PlayerPerceptionPoint_C", t0 + 4999ms, alive, resolve).has_value());
+    CHECK(resolves == 1);  // dentro do intervalo: não varre o motor de novo
+
+    answer = ObjectKey(9, 1);  // a classe carregou
+    CHECK(cache.Get("BP_PlayerPerceptionPoint_C", t0 + 5s, alive, resolve) == ObjectKey(9, 1));
+    CHECK(resolves == 2);
+    CHECK(cache.Get("BP_PlayerPerceptionPoint_C", t0 + 6s, alive, resolve) == ObjectKey(9, 1));
+    CHECK(resolves == 2);
+
+    // Ausência de uma chave não segura outra.
+    answer.reset();
+    CHECK_FALSE(cache.Get("UIManager", t0 + 6s, alive, resolve).has_value());
+    CHECK(resolves == 3);
+    CHECK(cache.Size() == 2);
+    cache.Clear();
+    CHECK(cache.Size() == 0);
+    answer = ObjectKey(3, 3);
+    CHECK(cache.Get("UIManager", t0 + 6s, alive, resolve) == ObjectKey(3, 3));  // Clear esquece a ausência
+    CHECK(resolves == 4);
 }

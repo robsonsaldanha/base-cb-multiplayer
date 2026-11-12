@@ -22,6 +22,7 @@
 #include <array>
 #include <chrono>
 #include <ctime>
+#include <exception>
 #include <filesystem>
 #include <format>
 #include <string>
@@ -86,6 +87,29 @@ CbMpMod::CbMpMod() {
     ModDescription = STR("CB Multiplayer");
     ModAuthors = STR("Castelo Bruxo RP");
 
+    // Nada pode escapar para o carregador do UE4SS (start_mod é extern "C"; /EHa: cobre também SEH). Falha = inerte.
+    try {
+        Arm();
+    } catch (const std::exception& e) {
+        AbandonArming(e.what());
+    } catch (...) {
+        AbandonArming("exceção SEH ou desconhecida");
+    }
+}
+
+void CbMpMod::AbandonArming(const char* why) noexcept {
+    // Fica inerte: on_unreal_init volta logo e o destrutor não registra nada. O crash handler, se já instalado, fica
+    // (só grava .dmp na pasta crash).
+    try {
+        const bool logOpen = m_armed != nullptr;
+        m_gate.reset();
+        m_armed.reset();
+        if (logOpen) Log().Write(Level::Error, std::string("falha ao armar o mod; inerte: ") + why);
+    } catch (...) {
+    }
+}
+
+void CbMpMod::Arm() {
     // Thread do UE4SS. Inerte (sem ponteiro recente do launcher ou sem connect.json): para aqui, sem tocar em nada.
     const auto dll = ThisDllPath();
     auto armed = TryArm(dll.empty() ? std::filesystem::path{} : dll.parent_path(), UnixNow());
@@ -159,6 +183,38 @@ CbMpMod::~CbMpMod() {
 
 auto CbMpMod::on_unreal_init() -> void {
     if (!m_armed) return;
+    // Nada pode escapar para o UE4SS (/EHa: cobre também SEH). Falha = log e sem sessão.
+    try {
+        StartSession();
+    } catch (const std::exception& e) {
+        AbandonSession(e.what());
+    } catch (...) {
+        AbandonSession("exceção SEH ou desconhecida");
+    }
+}
+
+void CbMpMod::AbandonSession(const char* why) noexcept {
+    try {
+        const bool running = m_tickHookId.has_value();
+        if (!running) {
+            // Sem tick registrado: solta a sessão (GNS e portão ficam para o destrutor). O dono é zerado sob a trava
+            // caso o registro tenha acontecido antes da falha.
+            if (m_tickGate) {
+                std::lock_guard lock(m_tickGate->mutex);
+                m_tickGate->owner = nullptr;
+            }
+            m_session.reset();
+            m_connectFs.reset();
+            m_transport.reset();
+            m_game.reset();
+        }
+        // Com o tick já registrado a sessão está de pé (só uma linha de log depois dele falhou): fica.
+        Log().Write(Level::Error, std::string("falha ao iniciar a sessão: ") + why + (running ? "" : "; sem sessão"));
+    } catch (...) {
+    }
+}
+
+void CbMpMod::StartSession() {
     Log().Write(Level::Info, "Unreal inicializado");
     std::string err;
     if (!GnsInit(&err)) {

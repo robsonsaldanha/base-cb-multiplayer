@@ -1,11 +1,13 @@
 #pragma once
 // Peças puras da camada do jogo (client/src/game/Ue4ssGame usa; aqui sem UE4SS, para serem testadas no build da
 // raiz): conversões dos valores lidos do motor, alternativas de chamada que ficam fixadas na sessão, a tabela
-// PuppetId → referência fraca e o "registrar no log uma vez só".
+// PuppetId → referência fraca, o "registrar no log uma vez só" e o cache de busca por nome que revalida.
 #include <cbmp/client/IGame.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <set>
 #include <string>
@@ -95,5 +97,52 @@ public:
 
 private:
     std::set<std::string, std::less<>> m_seen;
+};
+
+// Busca por nome com cache que não guarda nada morto nem ausente para sempre (no jogo: nome curto → UClass em
+// FWeakObjectPtr). Um valor achado só é devolvido enquanto alive(valor) for verdadeiro; morto, é procurado de novo na
+// hora. A ausência só segura novas procuras até `retryAfter` depois da última tentativa (a classe pode carregar depois,
+// e a procura varre todos os objetos do motor, então não roda a cada tick).
+template <class Key, class Value>
+class RetryingLookup {
+public:
+    using TimePoint = std::chrono::steady_clock::time_point;
+    using Duration = std::chrono::steady_clock::duration;
+
+    explicit RetryingLookup(Duration retryAfter) : m_retryAfter(retryAfter) {}
+
+    // alive(const Value&) → bool; resolve() → std::optional<Value>. nullopt = ausente (ou ainda dentro do intervalo).
+    template <class Alive, class Resolve>
+    std::optional<Value> Get(const Key& key, TimePoint now, Alive&& alive, Resolve&& resolve) {
+        auto it = m_entries.find(key);
+        if (it != m_entries.end()) {
+            Entry& e = it->second;
+            if (e.value) {
+                if (alive(*e.value)) return e.value;
+                // Morto: procura de novo agora (sem esperar o intervalo).
+            } else if (now < e.retryAt) {
+                return std::nullopt;
+            }
+        }
+        std::optional<Value> found = resolve();
+        Entry e{found, found ? TimePoint{} : now + m_retryAfter};
+        if (it != m_entries.end()) {
+            it->second = std::move(e);
+        } else {
+            m_entries.emplace(key, std::move(e));
+        }
+        return found;
+    }
+
+    void Clear() { m_entries.clear(); }
+    size_t Size() const { return m_entries.size(); }
+
+private:
+    struct Entry {
+        std::optional<Value> value;
+        TimePoint retryAt{};
+    };
+    Duration m_retryAfter;
+    std::map<Key, Entry, std::less<>> m_entries;
 };
 }  // namespace cbmp::client

@@ -1,5 +1,6 @@
 #include "Reflect.hpp"
 
+#include <cbmp/client/GameGlue.hpp>
 #include <cbmp/client/IGame.hpp>
 
 #include <Helpers/String.hpp>
@@ -7,13 +8,16 @@
 #include <Unreal/CoreUObject/UObject/Class.hpp>
 #include <Unreal/CoreUObject/UObject/FStrProperty.hpp>
 #include <Unreal/CoreUObject/UObject/UnrealType.hpp>
+#include <Unreal/FWeakObjectPtr.hpp>
 #include <Unreal/Property/FEnumProperty.hpp>
+#include <Unreal/Property/FTextProperty.hpp>
 #include <Unreal/UObject.hpp>
 #include <Unreal/UObjectGlobals.hpp>
 #include <Unreal/UPackage.hpp>
 #include <Unreal/UnrealFlags.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -28,26 +32,38 @@ using namespace RC::Unreal;
 namespace cbmp::client {
 namespace {
 // Só no game thread: nenhum cache tem trava.
+//
+// Validade dos caches (revisão da Task 7, I1): a chave de uma classe ou função é o ObjectKey (índice + série no
+// GUObjectArray), recalculado a cada uso a partir de um objeto VIVO (a classe de `self`, a UFunction recém-achada),
+// nunca o endereço. Uma UClass/UFunction descarregada (classe Blueprint numa troca de mundo) e outra no mesmo endereço
+// ou no mesmo índice dão chaves diferentes; então nada que pertencia a uma classe morta é devolvido. Os valores
+// (UFunction*, FProperty*, layout) pertencem à classe da chave ou às mães, que a classe viva mantém vivas. As entradas
+// de classes mortas só ficam sem uso (poucas: só as classes que esta camada toca). A busca por nome de classe guarda
+// a UClass em FWeakObjectPtr (revalidada a cada uso) e não guarda a ausência para sempre (RetryingLookup).
 struct FunctionLayout {
-    std::vector<FProperty*> params;  // todas as propriedades da função (parâmetros e, em Blueprint, locais)
+    std::vector<FProperty*> params;    // só os parâmetros (CPF_Parm), inclusive o de retorno; nunca locais de Blueprint
+    std::vector<FProperty*> mustPass;  // parâmetros (fora o retorno) que não podem ficar com bytes zero (FText, contêineres)
     FProperty* returnProp = nullptr;
-    size_t bufferSize = 0;  // maior offset + tamanho
+    size_t bufferSize = 0;  // maior offset + tamanho entre todas as propriedades (parâmetros vêm antes dos locais)
 };
 
-std::map<std::pair<const void*, StringType>, UFunction*>& FunctionCache() {
-    static std::map<std::pair<const void*, StringType>, UFunction*> cache;
+using MemberKey = std::pair<uint64_t, StringType>;  // (ObjectKey da classe, nome)
+constexpr auto kClassRetry = std::chrono::seconds(5);  // classe ausente: nova procura (varre o motor) no máximo a cada 5 s
+
+std::map<MemberKey, UFunction*>& FunctionCache() {
+    static std::map<MemberKey, UFunction*> cache;
     return cache;
 }
-std::map<const void*, FunctionLayout>& LayoutCache() {
-    static std::map<const void*, FunctionLayout> cache;
+std::map<uint64_t, FunctionLayout>& LayoutCache() {  // chave: ObjectKey da UFunction
+    static std::map<uint64_t, FunctionLayout> cache;
     return cache;
 }
-std::map<std::pair<const void*, StringType>, FProperty*>& PropertyCache() {
-    static std::map<std::pair<const void*, StringType>, FProperty*> cache;
+std::map<MemberKey, FProperty*>& PropertyCache() {
+    static std::map<MemberKey, FProperty*> cache;
     return cache;
 }
-std::map<StringType, UClass*>& ClassCache() {
-    static std::map<StringType, UClass*> cache;
+RetryingLookup<StringType, FWeakObjectPtr>& ClassCache() {
+    static RetryingLookup<StringType, FWeakObjectPtr> cache(kClassRetry);
     return cache;
 }
 
@@ -60,17 +76,38 @@ std::string Utf8(const StringType& s) {
     return out;
 }
 
-const FunctionLayout& LayoutOf(UFunction* fn) {
+// ObjectKey de um objeto vivo do motor (o FWeakObjectPtr aloca a série se faltar). Fora do GUObjectArray: GameError
+// (sem chave confiável não há cache).
+uint64_t KeyOf(const UObject* o, const TCHAR* what) {
+    const FWeakObjectPtr weak(o);
+    const uint64_t key = ObjectKey(weak.ObjectIndex, weak.ObjectSerialNumber);
+    if (key == 0) throw GameError(Utf8(Key(what)) + ": objeto do motor sem índice válido");
+    return key;
+}
+
+// Tipos que não podem ficar com bytes zero no buffer: FText zerado é inválido; contêineres zerados não são o estado
+// vazio (TSet/TMap) ou, de saída, vazariam o que o motor alocou.
+bool MustBePassed(FProperty* p) {
+    return p->IsA<FTextProperty>() || p->IsA<FArrayProperty>() || p->IsA<FMapProperty>() || p->IsA<FSetProperty>();
+}
+
+const FunctionLayout& LayoutOf(UFunction* fn, const TCHAR* function) {
     auto& cache = LayoutCache();
-    if (const auto it = cache.find(fn); it != cache.end()) return it->second;
+    const uint64_t key = KeyOf(fn, function);
+    if (const auto it = cache.find(key); it != cache.end()) return it->second;
     FunctionLayout layout;
     for (FProperty* p : TFieldRange<FProperty>(fn, EFieldIterationFlags::IncludeDeprecated)) {
-        layout.params.push_back(p);
         const int32 end = p->GetOffset_Internal() + p->GetSize();
         if (end > 0) layout.bufferSize = std::max(layout.bufferSize, static_cast<size_t>(end));
-        if (p->HasAnyPropertyFlags(CPF_ReturnParm)) layout.returnProp = p;
+        if (!p->HasAnyPropertyFlags(CPF_Parm)) continue;  // local de Blueprint: não é parâmetro
+        layout.params.push_back(p);
+        if (p->HasAnyPropertyFlags(CPF_ReturnParm)) {
+            layout.returnProp = p;
+        } else if (MustBePassed(p)) {
+            layout.mustPass.push_back(p);
+        }
     }
-    return cache.emplace(fn, std::move(layout)).first->second;
+    return cache.emplace(key, std::move(layout)).first->second;
 }
 
 FProperty* FindParam(const FunctionLayout& layout, const TCHAR* name) {
@@ -141,7 +178,7 @@ UFunction* FindFunction(UObject* self, const TCHAR* function) {
     UClass* cls = self->GetClassPrivate();
     if (!cls) throw GameError(Utf8(Key(function)) + ": objeto sem classe");
     auto& cache = FunctionCache();
-    auto key = std::make_pair(static_cast<const void*>(cls), Key(function));
+    MemberKey key{KeyOf(cls, function), Key(function)};
     if (const auto it = cache.find(key); it != cache.end()) return it->second;
     UFunction* fn = self->GetFunctionByNameInChain(function);
     cache.emplace(std::move(key), fn);
@@ -150,7 +187,7 @@ UFunction* FindFunction(UObject* self, const TCHAR* function) {
 
 std::optional<StringType> FirstStringParam(UFunction* fn) {
     if (!fn) return std::nullopt;
-    for (FProperty* p : LayoutOf(fn).params) {
+    for (FProperty* p : LayoutOf(fn, CBMP_T("FirstStringParam")).params) {
         if (p->IsA<FStrProperty>() && !p->HasAnyPropertyFlags(CPF_ReturnParm)) return p->GetName();
     }
     return std::nullopt;
@@ -160,29 +197,43 @@ bool CallByName(UObject* self, const TCHAR* function, std::initializer_list<Arg>
                 size_t returnSize) {
     UFunction* fn = FindFunction(self, function);
     if (!fn) return false;
-    const FunctionLayout& layout = LayoutOf(fn);
+    const FunctionLayout& layout = LayoutOf(fn, function);
+
+    // Tudo o que pode recusar a chamada é conferido ANTES do ProcessEvent: uma falha nunca descreve uma chamada que
+    // já aconteceu no jogo.
+    FProperty* rp = layout.returnProp;
+    const bool returnAsBool = returnOut && rp && rp->IsA<FBoolProperty>() && returnSize == sizeof(bool);
+    if (returnOut) {
+        if (!rp) throw GameError(Utf8(Key(function)) + ": sem valor de retorno");
+        if (!returnAsBool && static_cast<size_t>(rp->GetSize()) > returnSize) {
+            throw GameError(Utf8(Key(function)) + ": retorno maior que o esperado");
+        }
+    }
 
     std::vector<uint8> buffer(layout.bufferSize, 0);  // operator new: alinhado a 16 bytes
     OwnedStrings owned;
+    std::vector<FProperty*> written;
+    written.reserve(args.size());
     for (const Arg& arg : args) {
         FProperty* p = FindParam(layout, arg.name);
-        if (!p || p == layout.returnProp) BadArg(function, arg.name, "não existe");
+        if (!p || p == rp) BadArg(function, arg.name, "não existe");
         WriteArg(function, arg, p, buffer.data(), owned);
+        written.push_back(p);
     }
-    if (returnOut && !layout.returnProp) throw GameError(Utf8(Key(function)) + ": sem valor de retorno");
+    for (FProperty* p : layout.mustPass) {
+        if (std::find(written.begin(), written.end(), p) == written.end()) {
+            throw GameError(Utf8(Key(function)) + ": parâmetro " + Utf8(p->GetName()) +
+                            " não pode ficar vazio (texto ou contêiner) e não foi passado");
+        }
+    }
 
     self->ProcessEvent(fn, buffer.empty() ? nullptr : buffer.data());
 
-    if (returnOut) {
-        FProperty* rp = layout.returnProp;
-        if (rp->IsA<FBoolProperty>() && returnSize == sizeof(bool)) {
-            const bool value = static_cast<FBoolProperty*>(rp)->GetPropertyValueInContainer(buffer.data());
-            std::memcpy(returnOut, &value, sizeof(value));
-        } else {
-            const auto size = static_cast<size_t>(rp->GetSize());
-            if (size > returnSize) throw GameError(Utf8(Key(function)) + ": retorno maior que o esperado");
-            std::memcpy(returnOut, buffer.data() + rp->GetOffset_Internal(), size);
-        }
+    if (returnAsBool) {
+        const bool value = static_cast<FBoolProperty*>(rp)->GetPropertyValueInContainer(buffer.data());
+        std::memcpy(returnOut, &value, sizeof(value));
+    } else if (returnOut) {
+        std::memcpy(returnOut, buffer.data() + rp->GetOffset_Internal(), static_cast<size_t>(rp->GetSize()));
     }
     return true;
 }
@@ -190,7 +241,7 @@ bool CallByName(UObject* self, const TCHAR* function, std::initializer_list<Arg>
 std::optional<bool> CallReturningBool(UObject* self, const TCHAR* function, std::initializer_list<Arg> args) {
     UFunction* fn = FindFunction(self, function);
     if (!fn) return std::nullopt;
-    FProperty* rp = LayoutOf(fn).returnProp;
+    FProperty* rp = LayoutOf(fn, function).returnProp;
     if (!rp || !rp->IsA<FBoolProperty>()) throw GameError(Utf8(Key(function)) + ": retorno não é bool");
     bool value = false;
     CallByName(self, function, args, &value, sizeof(value));
@@ -200,7 +251,7 @@ std::optional<bool> CallReturningBool(UObject* self, const TCHAR* function, std:
 std::optional<UObject*> CallReturningObject(UObject* self, const TCHAR* function, std::initializer_list<Arg> args) {
     UFunction* fn = FindFunction(self, function);
     if (!fn) return std::nullopt;
-    FProperty* rp = LayoutOf(fn).returnProp;
+    FProperty* rp = LayoutOf(fn, function).returnProp;
     if (!rp || !rp->IsA<FObjectProperty>() || rp->GetSize() != sizeof(UObject*)) {
         throw GameError(Utf8(Key(function)) + ": retorno não é objeto");
     }
@@ -215,7 +266,7 @@ FProperty* FindProperty(UObject* self, const TCHAR* name) {
     UClass* cls = self->GetClassPrivate();
     if (!cls) throw GameError(Utf8(Key(name)) + ": objeto sem classe");
     auto& cache = PropertyCache();
-    auto key = std::make_pair(static_cast<const void*>(cls), Key(name));
+    MemberKey key{KeyOf(cls, name), Key(name)};
     if (const auto it = cache.find(key); it != cache.end()) return it->second;
     FProperty* found = nullptr;
     for (FProperty* p : TFieldRange<FProperty>(cls, EFieldIterationFlags::Default)) {
@@ -280,12 +331,15 @@ bool WriteVectorProp(UObject* self, const TCHAR* name, const FVector& v) {
 }
 
 UClass* FindClassByName(const TCHAR* shortName) {
-    auto& cache = ClassCache();
-    StringType key = Key(shortName);
-    if (const auto it = cache.find(key); it != cache.end()) return it->second;
-    UClass* cls = UObjectGlobals::FindObject<UClass>(UObjectGlobals::ANY_PACKAGE, shortName);
-    cache.emplace(std::move(key), cls);
-    return cls;
+    const auto weak = ClassCache().Get(
+        Key(shortName), std::chrono::steady_clock::now(),
+        [](const FWeakObjectPtr& w) { return w.Get() != nullptr; },
+        [&]() -> std::optional<FWeakObjectPtr> {
+            UClass* cls = UObjectGlobals::FindObject<UClass>(UObjectGlobals::ANY_PACKAGE, shortName);
+            if (!cls) return std::nullopt;
+            return FWeakObjectPtr(cls);
+        });
+    return weak ? static_cast<UClass*>(weak->Get()) : nullptr;
 }
 
 UObject* DefaultObjectOf(const TCHAR* shortName) {

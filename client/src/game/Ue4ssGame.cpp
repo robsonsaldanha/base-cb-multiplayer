@@ -156,14 +156,22 @@ UObject* Ue4ssGame::UiManager() {
 }
 
 bool Ue4ssGame::FrontendHint() {
-    UObject* ui = UiManager();
-    if (!ui) return false;
-    const auto inFrontend = CallReturningBool(ui, CBMP_T("IsInFrontendLevel"));
-    if (!inFrontend) {
-        WarnOnce("IsInFrontendLevel", "jogo: UIManager.IsInFrontendLevel não encontrada; frontendHint = false");
+    // Opcional (brief: "senão false"): uma falha aqui nunca derruba a amostra do mundo.
+    try {
+        return SafeCall("frontendHint", [&] {
+            UObject* ui = UiManager();
+            if (!ui) return false;
+            const auto inFrontend = CallReturningBool(ui, CBMP_T("IsInFrontendLevel"));
+            if (!inFrontend) {
+                WarnOnce("IsInFrontendLevel", "jogo: UIManager.IsInFrontendLevel não encontrada; frontendHint = false");
+                return false;
+            }
+            return *inFrontend;
+        });
+    } catch (const GameError& e) {
+        WarnOnce("frontendHint:erro", std::string("jogo: frontendHint falhou; frontendHint = false: ") + e.what());
         return false;
     }
-    return *inFrontend;
 }
 
 WorldSample Ue4ssGame::SampleWorld() {
@@ -287,11 +295,15 @@ void Ue4ssGame::Neutralize(UObject* actor) {
     Step("SetActorEnableCollision", actor, CBMP_T("SetActorEnableCollision"),
          {{CBMP_T("bNewActorEnableCollision"), false}});
     try {
-        const bool hasController = SafeCall("Controller", [&] {
-            const auto ctrl = ReadObjectProp(actor, CBMP_T("Controller"));
-            return ctrl && *ctrl;
-        });
-        if (hasController) Step("DetachFromControllerPendingDestroy", actor, CBMP_T("DetachFromControllerPendingDestroy"), {});
+        UObject* ctrl = SafeCall("Controller", [&] { return ReadObjectProp(actor, CBMP_T("Controller")).value_or(nullptr); });
+        UObject* localController = m_controller.Get();
+        if (ctrl && localController && ctrl == localController) {
+            // O boneco pegou o controller do jogador: desconectar deixaria o jogador sem pawn.
+            WarnOnce("Controller:local", "boneco: nasceu com o PlayerController local; DetachFromControllerPendingDestroy "
+                                         "pulado");
+        } else if (ctrl) {
+            Step("DetachFromControllerPendingDestroy", actor, CBMP_T("DetachFromControllerPendingDestroy"), {});
+        }
     } catch (const GameError& e) {
         WarnOnce("Controller", std::string("boneco: leitura do Controller falhou: ") + e.what());
     }
