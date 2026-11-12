@@ -12,6 +12,11 @@ add_library(cbmp_client_core STATIC
     src/NetClient.cpp
     src/SnapshotMirror.cpp
     src/RemoteStore.cpp
+    src/WorldTracker.cpp
+    src/LocalSampler.cpp
+    src/SendScheduler.cpp
+    src/Interp.cpp
+    src/PuppetDirector.cpp
 )
 target_include_directories(cbmp_client_core PUBLIC include)
 target_compile_features(cbmp_client_core PUBLIC cxx_std_23)
