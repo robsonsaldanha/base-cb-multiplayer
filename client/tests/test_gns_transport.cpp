@@ -73,6 +73,13 @@ struct LoopServer {
     }
 };
 
+// GNS iniciado no teste e encerrado no fim (antes do fim do processo: sem o Kill, o LeakSanitizer acusa as conexões
+// e sockets internos do GNS). Declarar antes de transportes e servidores, para ser destruído por último.
+struct GnsScope {
+    GnsScope() { REQUIRE(GnsInit()); }
+    ~GnsScope() { GnsShutdown(); }
+};
+
 template <class F>
 bool WaitFor(F cond, double seconds = 10) {
     const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
@@ -95,10 +102,11 @@ TEST_CASE("client: GnsTransport init and shutdown are idempotent") {
     GnsShutdown();
     GnsShutdown();
     REQUIRE(GnsInit(&err));  // de novo depois do Kill
+    GnsShutdown();
 }
 
 TEST_CASE("client: GnsTransport refuses bad addresses and sends nothing before connecting") {
-    REQUIRE(GnsInit());
+    GnsScope gnsScope;
     GnsTransport t;
     CHECK(t.State() == LinkState::Idle);
     const std::string hello = "x";
@@ -114,7 +122,7 @@ TEST_CASE("client: GnsTransport refuses bad addresses and sends nothing before c
 }
 
 TEST_CASE("client: GnsTransport connects, exchanges messages and keeps messages queued before the peer closed") {
-    REQUIRE(GnsInit());
+    GnsScope gnsScope;
     LoopServer srv;
     REQUIRE(srv.port != 0);
     GnsTransport t;
@@ -169,7 +177,7 @@ TEST_CASE("client: GnsTransport connects, exchanges messages and keeps messages 
 }
 
 TEST_CASE("client: GnsTransport closes cleanly while still connecting") {
-    REQUIRE(GnsInit());
+    GnsScope gnsScope;
     GnsTransport t;
     REQUIRE(t.Connect("127.0.0.1", 9));  // porta sem ninguém
     CHECK(t.State() != LinkState::Connected);
