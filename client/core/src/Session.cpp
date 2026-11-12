@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <exception>
+#include <iterator>
 #include <utility>
 
 #include <cbmp/client/ClaimPolicy.hpp>
@@ -13,6 +14,7 @@ namespace {
 constexpr double kTimeEps = 1e-9;  // arredondamento de soma de tempos (s)
 constexpr std::string_view kStatusPrefix = "CB Multiplayer: ";
 
+bool IsFinite(const Vec3& v) { return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z); }
 double Dist(const Vec3& a, const Vec3& b) {
     const double dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
     return std::sqrt(dx * dx + dy * dy + dz * dz);
@@ -62,7 +64,16 @@ Session::Session(SessionDeps deps, SessionConfig cfg)
     : m_deps(std::move(deps)),
       m_cfg(std::move(cfg)),
       m_net(m_deps.transport, *this),
-      m_puppets(m_deps.game, m_store, m_interp, m_deps.log, m_cfg.maxPuppets) {}
+      m_puppets(m_deps.game, m_store, m_interp,
+                [this](Level level, std::string_view msg) {
+                    // Linhas de um só disparo (trava do singleton, bonecos desligados) nunca são suprimidas.
+                    if (msg.starts_with("bonecos_desligados") || msg.starts_with("singleton")) {
+                        Log(level, msg);
+                    } else {
+                        LogLimited(LogCat::Puppets, level, msg);
+                    }
+                },
+                m_cfg.maxPuppets) {}
 
 SessionState Session::State() const { return m_state; }
 OnlinePhase Session::Phase() const { return m_phase; }
@@ -81,6 +92,41 @@ void Session::Log(Level level, std::string_view msg) {
     }
 }
 
+namespace {
+const char* CatName(size_t cat) {
+    static constexpr const char* kNames[] = {"Correction",  "EntityEnter", "EntityLeave", "Reject/Kick",
+                                             "Welcome fora do handshake", "mensagens ignoradas", "bonecos"};
+    return cat < std::size(kNames) ? kNames[cat] : "?";
+}
+}  // namespace
+
+void Session::LogLimited(LogCat cat, Level level, std::string_view msg) {
+    LogBudget& b = m_logBudget[static_cast<size_t>(cat)];
+    if (b.windowStart < 0 || m_now - b.windowStart + kTimeEps >= limits::kServerLogWindowSec) {
+        if (b.dropped > 0) {
+            Log(Level::Warn, std::to_string(b.dropped) + " linhas suprimidas (" + CatName(static_cast<size_t>(cat)) + ")");
+        }
+        b = LogBudget{m_now, 0, 0};
+    }
+    if (b.used < limits::kServerLogLinesPerSec) {
+        ++b.used;
+        Log(level, msg);
+    } else {
+        ++b.dropped;
+    }
+}
+
+// Fecha as janelas vencidas (ou todas, com force) e escreve o resumo das linhas suprimidas.
+void Session::FlushSuppressed(double now, bool force) {
+    for (size_t i = 0; i < m_logBudget.size(); ++i) {
+        LogBudget& b = m_logBudget[i];
+        if (b.dropped == 0) continue;
+        if (!force && now - b.windowStart + kTimeEps < limits::kServerLogWindowSec) continue;
+        Log(Level::Warn, std::to_string(b.dropped) + " linhas suprimidas (" + CatName(i) + ")");
+        b = LogBudget{};
+    }
+}
+
 // ---------------------------------------------------------------- tick
 
 void Session::Tick(double nowSec) {
@@ -88,6 +134,7 @@ void Session::Tick(double nowSec) {
     m_now = nowSec;
     try {
         MaybeSummarizeExceptions(nowSec);
+        FlushSuppressed(nowSec, false);
         SampleWorld(nowSec);
         switch (m_state) {
             case SessionState::Armed: TickArmed(nowSec); break;
@@ -200,7 +247,13 @@ void Session::Claim(double now) {
 
     Log(Level::Info, "conectando a " + info.host + " porta " + std::to_string(info.port) + " servidor " +
                          SanitizeText(info.serverId, limits::kMaxServerIdBytes));
-    if (!m_deps.transport.Connect(info.host, info.port)) {
+    bool connecting = false;
+    try {
+        connecting = m_deps.transport.Connect(info.host, info.port);
+    } catch (...) {
+        connecting = false;  // sem isso o próximo tick resgataria de novo um arquivo já apagado (revisão, M1)
+    }
+    if (!connecting) {
         Disconnect("sem_resposta");
         return;
     }
@@ -216,11 +269,13 @@ void Session::TickConnecting(double now) {
         const bool sent = m_net.SendHello(m_cfg.buildHash, m_ticket);  // zera m_ticket
         SecureZero(m_ticket);
         if (m_deps.clearSecret) m_deps.clearSecret();
-        if (sent) {
-            Log(Level::Info, "Hello enviado");
-        } else {
+        if (!sent) {
+            // O transporte recusou o envio: o servidor nunca vai responder (revisão da Task 5, M1).
             Log(Level::Warn, "Hello não enviado");
+            Disconnect("sem_resposta");
+            return;
         }
+        Log(Level::Info, "Hello enviado");
         m_state = SessionState::Handshake;
         m_stateSince = now;
         return;
@@ -272,21 +327,22 @@ std::string Session::ReasonFromEnd(const LinkEnd& end) const {
 // ---------------------------------------------------------------- Online
 
 void Session::TickOnline(double now) {
+    // Sair de Playing vem antes de tratar as mensagens: no tick em que o mundo (ou o pawn) troca, os bonecos já
+    // foram soltos (ForgetAllPuppets se o mundo trocou) quando um EntityLeave, uma desconexão ou uma Correction
+    // chegarem, e nada disso toca atores que morreram com o mundo antigo (revisão da Task 5, I1).
+    const bool inWorld = m_worldPhase == WorldPhase::InWorld;
+    if (m_phase == OnlinePhase::Playing && !inWorld) LeavePlaying(m_change.worldChanged);
+
     if (!PumpOk(now)) return;
     if (CheckClosed()) return;
 
-    const bool inWorld = m_worldPhase == WorldPhase::InWorld;
-    if (m_phase == OnlinePhase::Playing && !inWorld) {
-        LeavePlaying(m_change.worldChanged);
-    } else if (m_phase == OnlinePhase::AwaitWorld && inWorld) {
-        EnterPlaying(now);
-    }
+    if (m_phase == OnlinePhase::AwaitWorld && inWorld) EnterPlaying(now);
 
     if (m_phase == OnlinePhase::Playing && m_local) {
         if (m_pendingTeleport && (!m_lastTeleport || now - *m_lastTeleport + kTimeEps >= limits::kTeleportMinIntervalSec)) {
             const Vec3 pos = *m_pendingTeleport;
             m_pendingTeleport.reset();
-            TryTeleport(pos, now);
+            RunPendingTeleport(pos, now);
         }
         if (m_sched.Due(now)) {
             if (const auto st = m_sampler.Sample(*m_local)) {
@@ -330,6 +386,20 @@ void Session::LeavePlaying(bool worldChanged) {
     m_puppets.ReleaseAll(worldChanged);
 }
 
+// Correction adiada pelo limite de 1/s: mede de novo contra o pawn de agora. Nunca move mais que 20 m; se o jogador
+// já está mais longe, ressincroniza com Apparate (revisão da Task 5, I2).
+void Session::RunPendingTeleport(const Vec3& pos, double now) {
+    if (!m_local || !IsFinite(m_local->pos)) return;
+    const double dist = Dist(pos, m_local->pos);
+    if (dist <= limits::kCorrectionIgnoreCm) return;
+    if (dist > limits::kCorrectionTeleportMaxCm) {
+        m_sampler.MarkJump();
+        Log(Level::Info, "Correction adiada agora a " + std::to_string(std::llround(dist)) + " cm: ressincroniza com Apparate");
+        return;
+    }
+    TryTeleport(pos, now);
+}
+
 void Session::TryTeleport(const Vec3& pos, double now) {
     m_lastTeleport = now;
     try {
@@ -345,7 +415,7 @@ void Session::TryTeleport(const Vec3& pos, double now) {
 void Session::OnWelcome(const cbmp::Welcome& w) {
     try {
         if (m_state != SessionState::Handshake) {
-            Log(Level::Warn, "Welcome fora do handshake ignorado");
+            LogLimited(LogCat::StrayWelcome, Level::Warn, "Welcome fora do handshake ignorado");
             return;
         }
         const int hz = w.tickRateHz;
@@ -395,13 +465,13 @@ void Session::OnEntityEnter(const cbmp::EntityEnter& e, double now) {
     try {
         if (m_state != SessionState::Online) return;
         if (!m_store.Enter(e, now)) {
-            Log(Level::Warn, "EntityEnter id=" + std::to_string(e.id) + " ignorado (cheio)");
+            LogLimited(LogCat::Ignored, Level::Warn, "EntityEnter id=" + std::to_string(e.id) + " ignorado (cheio)");
             return;
         }
         m_interp.PushNow(e.id, e.s, now);
         const auto it = m_store.All().find(e.id);
         const std::string name = it != m_store.All().end() ? it->second.name : std::string();
-        Log(Level::Info, "EntityEnter id=" + std::to_string(e.id) + " nome=" + name);
+        LogLimited(LogCat::EntityEnter, Level::Info, "EntityEnter id=" + std::to_string(e.id) + " nome=" + name);
     } catch (...) {
         NoteException(now, WhatOf(std::current_exception()));
     }
@@ -414,7 +484,7 @@ void Session::OnEntityLeave(const cbmp::EntityLeave& e) {
         m_mirror.Forget(e.id);
         m_interp.Remove(e.id);
         m_puppets.OnEntityLeave(e.id);
-        Log(Level::Info, "EntityLeave id=" + std::to_string(e.id));
+        LogLimited(LogCat::EntityLeave, Level::Info, "EntityLeave id=" + std::to_string(e.id));
     } catch (...) {
         NoteException(m_now, WhatOf(std::current_exception()));
     }
@@ -424,10 +494,12 @@ void Session::OnCorrection(const cbmp::Correction& c, double now) {
     try {
         if (m_state != SessionState::Online) return;
         const Vec3 target = ToVec(c.pos);
-        const bool playing = m_phase == OnlinePhase::Playing && m_local.has_value();
+        // Posição local não finita conta como "sem pawn" (revisão da Task 5, M5).
+        const bool playing = m_phase == OnlinePhase::Playing && m_local.has_value() && IsFinite(m_local->pos);
         const double dist = playing ? Dist(target, m_local->pos) : -1;
-        Log(Level::Info, "Correction seq=" + std::to_string(c.seq) + " distancia=" +
-                             (playing ? std::to_string(std::llround(dist)) + " cm" : std::string("sem pawn")));
+        LogLimited(LogCat::Correction, Level::Info,
+                   "Correction seq=" + std::to_string(c.seq) + " distancia=" +
+                       (playing ? std::to_string(std::llround(dist)) + " cm" : std::string("sem pawn")));
 
         if (!playing) {
             // AwaitWorld: guarda e ressincroniza no próximo Input (vale como correção longe).
@@ -466,7 +538,7 @@ void Session::OnCorrection(const cbmp::Correction& c, double now) {
 void Session::OnRefusal(std::string_view sanitizedText, bool kick) {
     try {
         m_refusal = std::string(sanitizedText);
-        Log(Level::Warn, std::string(kick ? "Kick: " : "Reject: ") + m_refusal.value());
+        LogLimited(LogCat::Refusal, Level::Warn, std::string(kick ? "Kick: " : "Reject: ") + m_refusal.value());
     } catch (...) {
         NoteException(m_now, WhatOf(std::current_exception()));
     }
@@ -492,9 +564,12 @@ void Session::Disconnect(std::string reason) {
         Log(Level::Warn, "desconectado: " + m_reason);
     }
     try {
-        m_puppets.ReleaseAll(false);
+        // Mundo trocado neste tick: os atores já morreram, só ForgetAllPuppets (revisão da Task 5, I1). Fora de
+        // Playing os bonecos já foram soltos.
+        if (m_phase == OnlinePhase::Playing) m_puppets.ReleaseAll(m_change.worldChanged);
     } catch (...) {
     }
+    m_phase = OnlinePhase::AwaitWorld;  // revisão da Task 5, M2
     try {
         m_deps.transport.Close();
     } catch (...) {
@@ -515,6 +590,7 @@ void Session::Disconnect(std::string reason) {
 void Session::Shutdown() {
     if (m_shutdown) return;
     m_shutdown = true;
+    FlushSuppressed(m_now, true);
     Log(Level::Info, "encerrando");
     const bool linked = m_state == SessionState::Connecting || m_state == SessionState::Handshake ||
                         m_state == SessionState::Online;

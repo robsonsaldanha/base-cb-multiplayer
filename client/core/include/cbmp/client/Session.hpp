@@ -72,7 +72,19 @@ private:
     void OnCorrection(const cbmp::Correction& c, double now) override;
     void OnRefusal(std::string_view sanitizedText, bool kick) override;
 
+    // Linhas de log disparadas por mensagens do servidor: no máximo limits::kServerLogLinesPerSec por categoria a cada
+    // janela de 1 s; as excedentes viram uma linha "N linhas suprimidas (<categoria>)" por janela. Transições de
+    // estado e erros mostrados ao jogador nunca passam por aqui.
+    enum class LogCat : uint8_t { Correction, EntityEnter, EntityLeave, Refusal, StrayWelcome, Ignored, Puppets, Count };
+    struct LogBudget {
+        double windowStart = -1;
+        int used = 0;
+        uint64_t dropped = 0;
+    };
+
     void Log(Level level, std::string_view msg);
+    void LogLimited(LogCat cat, Level level, std::string_view msg);
+    void FlushSuppressed(double now, bool force);
     void SampleWorld(double now);
     void TickArmed(double now);
     void Claim(double now);
@@ -83,6 +95,7 @@ private:
     bool CheckClosed();         // true = desconectou
     void EnterPlaying(double now);
     void LeavePlaying(bool worldChanged);
+    void RunPendingTeleport(const Vec3& pos, double now);
     void TryTeleport(const Vec3& pos, double now);
     void Disconnect(std::string reason);
     std::string ReasonFromEnd(const LinkEnd& end) const;
@@ -142,6 +155,9 @@ private:
     // Status na tela
     std::deque<std::string> m_pendingStatus;
     bool m_statusDisabled = false;
+
+    // Teto das linhas de log vindas do servidor (por categoria)
+    std::array<LogBudget, static_cast<size_t>(LogCat::Count)> m_logBudget{};
 
     // Exceções no tick
     std::deque<double> m_exceptions;  // instantes (últimos 60 s)

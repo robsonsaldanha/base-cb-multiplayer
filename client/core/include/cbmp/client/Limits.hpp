@@ -73,6 +73,13 @@ inline constexpr double kGameErrorWindowSec = 10;
 inline constexpr double kTickExceptionWindowSec = 60;
 inline constexpr double kExceptionSummarySec = 10;
 inline constexpr double kStatsIntervalSec = 10;
+// Teto do log disparado por mensagens do servidor (Correction, EntityEnter, EntityLeave, Reject/Kick, Welcome fora do
+// handshake, mensagens ignoradas, bonecos): até 5 linhas por categoria a cada janela de 1 s; o excedente vira uma
+// linha "N linhas suprimidas (<categoria>)" por janela. Transições de estado e erros mostrados ao jogador nunca são
+// suprimidos (revisão da Task 5, I3: um servidor malicioso não pode encher o disco nem travar o game thread com
+// flush por linha).
+inline constexpr int kServerLogLinesPerSec = 5;
+inline constexpr double kServerLogWindowSec = 1;
 
 // Códigos de fim de conexão da aplicação (k_ESteamNetConnectionEnd_App_Min = 1000)
 inline constexpr int kEndRejected = 1001;

@@ -24,7 +24,11 @@ inline constexpr int64_t kUnixBase = 1'794'438'789;
 
 // Transporte falso que também pode lançar em State() (exceção genérica no tick).
 struct SessionTransport : FakeTransport {
-    bool throwOnState = false;
+    bool throwOnState = false, throwOnConnect = false;
+    bool Connect(const std::string& ipLiteral, uint16_t port) override {
+        if (throwOnConnect) throw std::runtime_error("Connect falhou (teste)");
+        return FakeTransport::Connect(ipLiteral, port);
+    }
     LinkState State() override {
         if (throwOnState) throw std::runtime_error("State falhou (teste)");
         return FakeTransport::State();
