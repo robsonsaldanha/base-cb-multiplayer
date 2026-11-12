@@ -1,6 +1,7 @@
 //! CB Multiplayer — backend do launcher. Rede, disco, cofre e processos ficam aqui; a UI só chama os comandos
 //! de `commands`.
 
+pub mod admin_setup;
 pub mod auth;
 pub mod commands;
 pub mod content;
@@ -138,7 +139,8 @@ pub fn run() {
             commands::mod_status,
             commands::remove_mod,
             commands::resolve_mod_conflict,
-            commands::open_mod_logs
+            commands::open_mod_logs,
+            commands::mod_admin_setup
         ])
         .run(tauri::generate_context!())
         .expect("falha ao iniciar o CB Multiplayer");

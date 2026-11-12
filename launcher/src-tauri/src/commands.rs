@@ -1,5 +1,6 @@
 //! Superfície única exposta à UI. Cada comando aqui precisa constar em `build.rs` e na capability.
 
+use crate::admin_setup;
 use crate::auth::{self, Auth};
 use crate::content::{ContentStore, Limits, Progress};
 use crate::error::{AppError, AppResult};
@@ -610,6 +611,85 @@ pub fn resolve_conflict_with(
     log::info!("conflito do mod: jogador confirmou usar o carregador do CB Multiplayer");
     modact::ensure_active(game, mods, true)?;
     Ok(mod_info(Some(game), mods))
+}
+
+/// "Instalar com permissão de administrador (uma vez)": recusa com o jogo aberto; escolhe o pacote (`mods\pending`, senão
+/// `mods\package`; nenhum → `mod_unavailable`), confere-o, decide o conflito como a ativação (`confirm` = diálogo nativo,
+/// só se houver arquivo estranho; UE4SS antigo → erro sem diálogo) e chama `elevate` (UAC no comando; o modo elevado
+/// direto nos testes). Depois, sem elevação: instala o pacote pendente em `cbmp\atual` e confere a ativação (que adota o
+/// manifesto de backups gravado pelo modo elevado).
+pub fn mod_admin_setup_with(
+    game: &GameInstall,
+    mods: &ModInstaller,
+    processes: &dyn Processes,
+    user_sid: &str,
+    confirm: impl FnOnce() -> bool,
+    elevate: impl FnOnce(&admin_setup::AdminArgs) -> AppResult<()>,
+) -> AppResult<ModInfo> {
+    if game_running_with(processes) {
+        return Err(game_running_error());
+    }
+    let package_dir = mods.admin_package_dir()?;
+    let pkg = {
+        let (mut f, sig) = modpkg::open_package(&package_dir)?;
+        modpkg::verify_package(&mut f, &sig, mods.pubkey(), mods.launcher_version())?
+    };
+    // Carregadores nossos que podem estar em `Win64`: o registrado e os anteriores.
+    let mut history = Vec::new();
+    if let Some(r) = mods.installed() {
+        history = r.loader_history.clone();
+        history.extend(r.loader.map(|l| l.sha256));
+    }
+    history.retain(|h| *h != pkg.loader_ref.sha256);
+    let win64 = modpkg::win64_dir(game);
+    let confirm_conflict = match modact::inspect_with(&win64, Some(&pkg.loader_ref), &history)? {
+        Activation::LegacyUe4ss => return Err(modact::legacy_conflict()),
+        Activation::Conflict { .. } => {
+            if !confirm() {
+                log::info!("instalação com permissão de administrador: conflito cancelado");
+                return Ok(mod_info(Some(game), mods));
+            }
+            true
+        }
+        Activation::Active | Activation::Missing { .. } => false,
+    };
+    let replace_loader = modact::win64_loader_sha(&win64)?.filter(|s| history.contains(s));
+    let args = admin_setup::AdminArgs {
+        game_dir: game.dir.clone(),
+        user_sid: user_sid.to_string(),
+        package_dir,
+        confirm_conflict,
+        replace_loader,
+    };
+    elevate(&args)?;
+    mods.install_pending(game)?;
+    if mods
+        .installed()
+        .is_some_and(|r| r.game_dir == game.dir && !r.removed)
+    {
+        modact::ensure_active(game, mods, false)?;
+    }
+    Ok(mod_info(Some(game), mods))
+}
+
+/// Botão `Instalar com permissão de administrador (uma vez)` do `mod_needs_admin`. Sob a trava do play.
+#[tauri::command]
+pub async fn mod_admin_setup(app: AppHandle, gate: State<'_, PlayGate>) -> AppResult<ModInfo> {
+    let _run = gate.try_begin()?;
+    tokio::task::spawn_blocking(move || {
+        let game = resolve_game(&app.state::<AppState>()).ok_or_else(game_not_found)?;
+        let sid = crate::launch::acl::current_user_sid()?;
+        mod_admin_setup_with(
+            &game,
+            &ModInstaller::system(),
+            &SystemProcesses,
+            &sid,
+            || conflict_dialog(&app),
+            admin_setup::request,
+        )
+    })
+    .await
+    .map_err(|_| internal("na instalação com permissão de administrador"))?
 }
 
 fn mod_logs_missing() -> AppError {

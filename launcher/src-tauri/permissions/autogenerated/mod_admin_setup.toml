@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mod-admin-setup"
+description = "Enables the mod_admin_setup command without any pre-configured scope."
+commands.allow = ["mod_admin_setup"]
+
+[[permission]]
+identifier = "deny-mod-admin-setup"
+description = "Denies the mod_admin_setup command without any pre-configured scope."
+commands.deny = ["mod_admin_setup"]

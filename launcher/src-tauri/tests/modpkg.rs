@@ -1182,3 +1182,122 @@ async fn pacote_e_assinatura_ficam_em_mods_package() {
     assert!(e.installer.package_zip().is_file() && e.installer.package_sig().is_file());
     assert_eq!(e.installer.pubkey(), tauri_pubkey(&e.keys));
 }
+
+// ----- Task 10: pacote pendente quando a pasta do jogo pede permissão -----
+
+/// Nega gravação em `dir` para o usuário atual (ACE de negação via `icacls`); tirada no `drop`.
+#[cfg(windows)]
+struct DenyWrite {
+    dir: std::path::PathBuf,
+    sid: String,
+}
+
+#[cfg(windows)]
+impl DenyWrite {
+    fn new(dir: &Path) -> Self {
+        let sid = cbmp_launcher_lib::launch::acl::current_user_sid().unwrap();
+        let out = std::process::Command::new("icacls")
+            .arg(dir)
+            .args(["/deny", &format!("*{sid}:(W)")])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        Self {
+            dir: dir.to_path_buf(),
+            sid,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for DenyWrite {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("icacls")
+            .arg(&self.dir)
+            .args(["/remove:d", &format!("*{}", self.sid)])
+            .output();
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn sem_permissao_o_pacote_fica_em_pending_e_um_ensure_bom_depois_apaga() {
+    let e = env().await;
+    let zip = e.publish("1.0.0", &[]);
+    let pending = e.mods.join("pending");
+    {
+        let _deny = DenyWrite::new(&win64_dir(&e.game));
+        let err = e.ensure(3).await.unwrap_err();
+        assert_eq!(err.code, "mod_needs_admin");
+    }
+    assert_eq!(std::fs::read(pending.join("cbmp-mod.zip")).unwrap(), zip);
+    assert!(pending.join("cbmp-mod.zip.sig").is_file());
+    assert!(
+        !e.package().exists(),
+        "mods\\package é só o da versão registrada"
+    );
+    assert!(!e.mods.join("installed.json").exists());
+    assert_eq!(
+        e.installer.admin_package_dir().unwrap(),
+        pending,
+        "o modo elevado usa o pendente"
+    );
+
+    // Com permissão de novo: o `ensure` instala e o pendente sai.
+    e.ensure(3).await.unwrap();
+    assert!(!pending.exists());
+    assert!(e.package().join("cbmp-mod.zip").is_file());
+    assert_eq!(e.installer.admin_package_dir().unwrap(), e.package());
+}
+
+#[tokio::test]
+async fn pacote_pendente_e_instalado_sem_o_hub_e_vira_o_registrado() {
+    let e = env().await;
+    let zip = v2_zip(3, "1.0.0", LOADER, &[]);
+    let pending = e.mods.join("pending");
+    std::fs::create_dir_all(&pending).unwrap();
+    std::fs::write(pending.join("cbmp-mod.zip"), &zip).unwrap();
+    std::fs::write(
+        pending.join("cbmp-mod.zip.sig"),
+        mod_sig(&e.keys, &zip, 3, "1.0.0"),
+    )
+    .unwrap();
+    assert!(e.installer.install_pending(&e.game).unwrap());
+    assert_eq!(e.latest_calls(), 0);
+    assert!(!pending.exists());
+    assert_eq!(record(&e.mods)["version"], "1.0.0");
+    assert!(e.installer.check_installed(&e.game).unwrap());
+    assert_eq!(
+        std::fs::read(e.package().join("cbmp-mod.zip")).unwrap(),
+        zip
+    );
+    // Sem pendente: nada a fazer.
+    assert!(!e.installer.install_pending(&e.game).unwrap());
+
+    // Pendente menor que o registrado: descartado, sem downgrade.
+    let old = v2_zip(3, "0.9.0", LOADER, &[]);
+    std::fs::create_dir_all(&pending).unwrap();
+    std::fs::write(pending.join("cbmp-mod.zip"), &old).unwrap();
+    std::fs::write(
+        pending.join("cbmp-mod.zip.sig"),
+        mod_sig(&e.keys, &old, 3, "0.9.0"),
+    )
+    .unwrap();
+    assert!(!e.installer.install_pending(&e.game).unwrap());
+    assert_eq!(record(&e.mods)["version"], "1.0.0");
+    assert!(!pending.exists());
+
+    // Assinatura de outra chave: recusado, nada muda.
+    let other = keys();
+    std::fs::create_dir_all(&pending).unwrap();
+    std::fs::write(pending.join("cbmp-mod.zip"), &zip).unwrap();
+    std::fs::write(
+        pending.join("cbmp-mod.zip.sig"),
+        mod_sig(&other, &zip, 3, "1.0.0"),
+    )
+    .unwrap();
+    assert_eq!(
+        e.installer.install_pending(&e.game).unwrap_err().code,
+        "mod_signature_invalid"
+    );
+}

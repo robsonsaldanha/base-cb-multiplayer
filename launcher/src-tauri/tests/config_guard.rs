@@ -582,6 +582,7 @@ fn capability_real_so_tem_o_permitido() {
             "allow-login",
             "allow-logout",
             "allow-me",
+            "allow-mod-admin-setup",
             "allow-mod-status",
             "allow-open-mod-logs",
             "allow-pick-game-dir",
@@ -662,7 +663,7 @@ fn comandos_do_build_rs_batem_com_a_capability() {
         .collect();
     assert_eq!(
         listed.len(),
-        21,
+        22,
         "comando novo precisa ser revisado aqui: {listed:?}"
     );
     let caps = real_capabilities();
@@ -689,6 +690,7 @@ fn comandos_do_build_rs_batem_com_a_capability() {
         "remove_mod",
         "resolve_mod_conflict",
         "open_mod_logs",
+        "mod_admin_setup",
     ] {
         assert!(
             build.contains(&format!("\"{cmd}\"")),
@@ -932,4 +934,23 @@ fn explicacao_do_conflito_na_ui_e_o_texto_do_dialogo() {
         .concat()
         .replace("\\\\", "\\");
     assert_eq!(text, cbmp_launcher_lib::modact::CONFLICT_DIALOG);
+}
+
+/// O modo elevado é tratado em `main.rs` antes de qualquer coisa do Tauri, e só pelo primeiro argumento.
+#[test]
+fn main_trata_o_modo_elevado_antes_do_tauri() {
+    let main_rs = read(&root().join("src/main.rs"));
+    let entry = main_rs
+        .find("admin_setup::entry(std::env::args_os())")
+        .expect("main.rs chama admin_setup::entry");
+    let run = main_rs
+        .find("cbmp_launcher_lib::run()")
+        .expect("main.rs chama run()");
+    assert!(entry < run, "modo elevado depois do Tauri");
+    assert!(main_rs.contains("std::process::exit(code)"));
+    assert_eq!(cbmp_launcher_lib::admin_setup::FLAG, "--mod-admin-setup");
+    assert_eq!(
+        cbmp_launcher_lib::admin_setup::WAIT,
+        std::time::Duration::from_secs(120)
+    );
 }

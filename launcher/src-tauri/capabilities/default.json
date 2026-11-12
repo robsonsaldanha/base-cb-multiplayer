@@ -26,6 +26,7 @@
     "allow-mod-status",
     "allow-remove-mod",
     "allow-resolve-mod-conflict",
-    "allow-open-mod-logs"
+    "allow-open-mod-logs",
+    "allow-mod-admin-setup"
   ]
 }

@@ -75,7 +75,7 @@ export const MOD_CONFLICT_EXPLANATION =
   "launcher. Seus arquivos não são apagados: ficam em Phoenix\\Binaries\\Win64\\cbmp-backup e voltam quando você " +
   "remover o mod do CB Multiplayer nas Configurações. Enquanto isso, seus outros mods do UE4SS ficam desligados.";
 
-/** Caminho manual para `mod_needs_admin` (o botão de elevação entra depois). */
+/** Caminho manual para `mod_needs_admin` (ao lado do botão de instalar com permissão de administrador). */
 export const MOD_ADMIN_HINT =
   "Feche o launcher e abra de novo como administrador uma vez, ou instale o jogo fora de Arquivos de Programas.";
 

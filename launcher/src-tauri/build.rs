@@ -23,6 +23,7 @@ fn main() {
         "remove_mod",
         "resolve_mod_conflict",
         "open_mod_logs",
+        "mod_admin_setup",
     ]);
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(manifest))
         .expect("falha no tauri-build");

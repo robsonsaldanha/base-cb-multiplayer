@@ -323,6 +323,78 @@ describe("Jogar — mod na pasta do jogo", () => {
       "Feche o launcher e abra de novo como administrador uma vez, ou instale o jogo fora de Arquivos de Programas.",
     );
     expect(within(panel).queryByRole("button", { name: "Usar o carregador do CB Multiplayer" })).toBeNull();
+    expect(
+      within(panel).getByRole("button", { name: "Instalar com permissão de administrador (uma vez)" }),
+    ).toBeInTheDocument();
+  });
+
+  const ADMIN_ERR = {
+    code: "mod_needs_admin",
+    message: "O launcher não tem permissão para instalar o mod na pasta do jogo.",
+  };
+  const ADMIN_BUTTON = { name: "Instalar com permissão de administrador (uma vez)" };
+
+  it("sem permissão: instala com permissão de administrador e repete o Jogar", async () => {
+    let plays = 0;
+    const { b } = setup({
+      play: () => {
+        plays += 1;
+        if (plays === 1) throw ADMIN_ERR;
+        return { kind: "started" };
+      },
+      mod_admin_setup: () => ({ state: "installed", version: "0.2.0", otherFolders: [] }),
+    });
+    render(App);
+    await clickPlay("Castelo Bruxo RP");
+    const panel = (await screen.findByRole("alert")).closest("section")!;
+    expect(within(panel).queryByRole("button", { name: "Usar o carregador do CB Multiplayer" })).toBeNull();
+    await fireEvent.click(within(panel).getByRole("button", ADMIN_BUTTON));
+    await vi.waitFor(() => expect(b.calls("mod_admin_setup")).toHaveLength(1));
+    expect(await screen.findByText("Jogo aberto. Bom jogo!")).toBeInTheDocument();
+    expect(b.calls("play")).toEqual([{ serverId: "cb" }, { serverId: "cb" }]);
+  });
+
+  it("instalação com permissão de administrador que falha: mensagem e caminho manual, sem repetir o Jogar", async () => {
+    const { b } = setup({
+      play: () => {
+        throw ADMIN_ERR;
+      },
+      mod_admin_setup: () => {
+        throw { code: "mod_activation_failed", message: "Não foi possível ativar o mod na pasta do jogo." };
+      },
+    });
+    render(App);
+    await clickPlay("Castelo Bruxo RP");
+    const panel = (await screen.findByRole("alert")).closest("section")!;
+    await fireEvent.click(within(panel).getByRole("button", ADMIN_BUTTON));
+    await vi.waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent("Não foi possível ativar o mod na pasta do jogo."),
+    );
+    const after = screen.getByRole("alert").closest("section")!;
+    expect(after).toHaveTextContent(
+      "Feche o launcher e abra de novo como administrador uma vez, ou instale o jogo fora de Arquivos de Programas.",
+    );
+    expect(b.calls("play")).toHaveLength(1);
+  });
+
+  it("UAC recusado ou mod ainda não baixado: continua o caminho manual", async () => {
+    const { b } = setup({
+      play: () => {
+        throw ADMIN_ERR;
+      },
+      mod_admin_setup: () => {
+        throw { code: "mod_unavailable", message: "Clique em Jogar uma vez para baixar o mod e tente de novo." };
+      },
+    });
+    render(App);
+    await clickPlay("Castelo Bruxo RP");
+    const panel = (await screen.findByRole("alert")).closest("section")!;
+    await fireEvent.click(within(panel).getByRole("button", ADMIN_BUTTON));
+    await vi.waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent("Clique em Jogar uma vez para baixar o mod e tente de novo."),
+    );
+    expect(screen.getByRole("alert").closest("section")!).toHaveTextContent(/Arquivos de Programas/);
+    expect(b.calls("play")).toHaveLength(1);
   });
 
   it("texto vindo do Rust/servidor continua texto (sem HTML)", async () => {

@@ -248,6 +248,9 @@ export const modStatus = (): Promise<ModInfo> => call("mod_status");
 export const removeMod = (): Promise<RemoveModResult> => call("remove_mod");
 /** Diálogo nativo do Windows sobre o outro carregador; aceito, o do CB Multiplayer é ativado. */
 export const resolveModConflict = (): Promise<ModInfo> => call("resolve_mod_conflict");
+
+/** `Instalar com permissão de administrador (uma vez)`: UAC + modo elevado no Rust; depois instala o mod sem elevação. */
+export const modAdminSetup = (): Promise<ModInfo> => call("mod_admin_setup");
 /** Abre `Win64\cbmp\logs` no Explorer (o Rust escolhe a pasta). */
 export const openModLogs = (): Promise<void> => call("open_mod_logs");
 

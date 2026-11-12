@@ -117,7 +117,7 @@ fn mod_conflict() -> AppError {
     )
 }
 
-fn legacy_conflict() -> AppError {
+pub(crate) fn legacy_conflict() -> AppError {
     AppError::new(
         "mod_conflict",
         "Já existe outro carregador de mods (UE4SS) na pasta do jogo. Remova o UE4SS antigo \
@@ -245,10 +245,30 @@ fn override_slot(win64: &Path) -> AppResult<Slot> {
 
 /// Estado da ativação em `win64` para o mod registrado em `rec`.
 pub fn inspect(win64: &Path, rec: &Installed) -> AppResult<Activation> {
+    inspect_with(win64, rec.loader.as_ref(), &rec.loader_history)
+}
+
+/// sha256 de `Win64\dwmapi.dll`, se for um arquivo comum.
+pub fn win64_loader_sha(win64: &Path) -> AppResult<Option<String>> {
+    let path = win64.join(LOADER_NAME);
+    match meta(&path)? {
+        Some(m) if m.is_file() && !is_reparse(&m) => {
+            Ok(Some(hash_file(&path).map_err(|e| act_io(&path, &e))?.0))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// [`inspect`] com o carregador esperado (`loader`) e os anteriores nossos (`history`) dados à parte.
+pub fn inspect_with(
+    win64: &Path,
+    loader: Option<&LoaderRef>,
+    history: &[String],
+) -> AppResult<Activation> {
     if exists(&win64.join(LEGACY_PROXY)) && exists(&win64.join(LEGACY_UE4SS)) {
         return Ok(Activation::LegacyUe4ss);
     }
-    let loader = rec_loader_slot(win64, rec)?;
+    let loader = loader_slot(win64, loader, history)?;
     let over = override_slot(win64)?;
     let (lf, of) = (loader == Slot::Foreign, over == Slot::Foreign);
     if lf || of {
@@ -318,6 +338,34 @@ pub fn activate_with(
     confirm_conflict: bool,
     persist: &mut dyn FnMut(&Installed) -> AppResult<()>,
 ) -> AppResult<()> {
+    activate_from(
+        win64,
+        LoaderSource::Current(current),
+        rec,
+        confirm_conflict,
+        persist,
+    )
+}
+
+/// De onde vem o carregador copiado para `Win64\dwmapi.dll`.
+#[derive(Debug, Clone, Copy)]
+pub enum LoaderSource<'a> {
+    /// `cbmp\atual` (o `loader\dwmapi.dll` dentro dele).
+    Current(&'a Path),
+    /// Bytes já conferidos (modo elevado: lidos do zip assinado, nada passa por `cbmp\atual`).
+    Bytes(&'a [u8]),
+}
+
+/// [`activate_with`] com o carregador vindo de `src`. As mesmas regras: ausente → grava sem substituir; nosso de
+/// versão anterior (`rec.loader_history`) → substitui; estranho → só com `confirm_conflict`, movido para
+/// `cbmp-backup\` com `persist` antes e depois; o temporário é conferido contra `rec.loader` antes do rename.
+pub fn activate_from(
+    win64: &Path,
+    src: LoaderSource<'_>,
+    rec: &mut Installed,
+    confirm_conflict: bool,
+    persist: &mut dyn FnMut(&Installed) -> AppResult<()>,
+) -> AppResult<()> {
     let (move_loader, move_override) = match inspect(win64, rec)? {
         Activation::Active => return Ok(()),
         Activation::LegacyUe4ss => {
@@ -343,8 +391,8 @@ pub fn activate_with(
     // Conferido de novo depois de mover: nunca sobrescreve o que não é nosso.
     match rec_loader_slot(win64, rec)? {
         Slot::Ours => {}
-        Slot::Missing => install_loader(win64, current, rec, false)?,
-        Slot::Outdated => install_loader(win64, current, rec, true)?,
+        Slot::Missing => install_loader(win64, src, rec, false)?,
+        Slot::Outdated => install_loader(win64, src, rec, true)?,
         Slot::Foreign => return Err(mod_conflict()),
     }
     match override_slot(win64)? {
@@ -427,24 +475,38 @@ fn tmp_beside(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Copia `atual\loader\dwmapi.dll` para `Win64\dwmapi.dll` (temporário sincronizado + rename), conferindo o hash
+/// Grava o carregador de `src` em `Win64\dwmapi.dll` (temporário novo e sincronizado + rename), conferindo o hash
 /// registrado. `replace` só para o carregador nosso de versão anterior; ausente → nunca substitui.
-fn install_loader(win64: &Path, current: &Path, rec: &Installed, replace: bool) -> AppResult<()> {
+fn install_loader(
+    win64: &Path,
+    src: LoaderSource<'_>,
+    rec: &Installed,
+    replace: bool,
+) -> AppResult<()> {
     let expected = rec.loader.as_ref().ok_or_else(|| {
         log::warn!("registro do mod sem carregador");
         activation_failed()
     })?;
-    let src = current.join("loader").join(LOADER_NAME);
     let dst = win64.join(LOADER_NAME);
     let tmp = tmp_beside(&dst);
     remove_entry(&tmp).map_err(|e| act_io(&tmp, &e))?;
     let copied = (|| {
-        std::fs::copy(&src, &tmp).map_err(|e| act_io(&tmp, &e))?;
-        std::fs::OpenOptions::new()
+        // `create_new`: um link plantado no lugar do temporário faz falhar em vez de ser seguido.
+        let mut out = std::fs::OpenOptions::new()
             .write(true)
+            .create_new(true)
             .open(&tmp)
-            .and_then(|f| f.sync_all())
             .map_err(|e| act_io(&tmp, &e))?;
+        match src {
+            LoaderSource::Current(current) => {
+                let from = current.join("loader").join(LOADER_NAME);
+                let mut f = std::fs::File::open(&from).map_err(|e| act_io(&from, &e))?;
+                std::io::copy(&mut f, &mut out).map_err(|e| act_io(&tmp, &e))?;
+            }
+            LoaderSource::Bytes(b) => out.write_all(b).map_err(|e| act_io(&tmp, &e))?,
+        }
+        out.sync_all().map_err(|e| act_io(&tmp, &e))?;
+        drop(out);
         let (sha, len) = hash_file(&tmp).map_err(|e| act_io(&tmp, &e))?;
         if sha != expected.sha256 || len != expected.size {
             log::warn!("carregador em cbmp\\atual difere do registrado");
@@ -846,7 +908,7 @@ struct ManifestOut<'a> {
 }
 
 /// Ponto de reanálise (link simbólico, junção, arquivo de nuvem…): nunca seguido nem aceito.
-fn is_reparse(m: &std::fs::Metadata) -> bool {
+pub(crate) fn is_reparse(m: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
