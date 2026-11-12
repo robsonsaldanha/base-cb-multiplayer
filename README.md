@@ -9,7 +9,8 @@ Visão geral para quem está chegando, inclusive como a DLL do mod funciona: [`d
 - `packages/contracts`: contratos compartilhados (tickets, mensagens) em TypeScript.
 - `hub/`: API e painel de donos de servidores (Node); veja `hub/README.md`.
 - `launcher/`: launcher Windows "CB Multiplayer" (Tauri 2 + Svelte 5); veja `launcher/README.md`.
-- `client/`: mod spike do cliente.
+- `client/`: o mod `cb-mp` (núcleo do cliente em C++ puro + casca do UE4SS); arquitetura, build e contrato em
+  `client/README.md`. Teste no jogo: `docs/TESTE-NO-JOGO-5A.md`.
 - `proto/`: protocolo binário em C++ (`cbmp`), com vetores compartilhados com o TypeScript.
 - `server/`: `cb-server`, o servidor dedicado; veja `server/README.md`.
 - `bots/`: `cb-bots`, bots de carga e segurança.

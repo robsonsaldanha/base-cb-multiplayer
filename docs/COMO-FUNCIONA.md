@@ -5,6 +5,7 @@ plataforma CB Multiplayer acrescenta quatro peças. Três rodam fora do jogo; a 
 
 - [As quatro peças](#as-quatro-peças)
 - [O que acontece quando você clica em "Jogar"](#o-que-acontece-quando-você-clica-em-jogar)
+- [Do Jogar até ver o outro jogador (mod 0.2.0)](#do-jogar-até-ver-o-outro-jogador-mod-020)
 - [Como a DLL funciona](#como-a-dll-funciona)
 - [O que viaja pela rede](#o-que-viaja-pela-rede)
 - [Por que os outros jogadores não "teleportam"](#por-que-os-outros-jogadores-não-teleportam)
@@ -32,7 +33,7 @@ plataforma CB Multiplayer acrescenta quatro peças. Três rodam fora do jogo; a 
 |---|---|---|---|
 | **Launcher** | PC do jogador | Faz o login, mostra a lista de servidores, baixa o que cada servidor precisa e abre o jogo já apontado para o servidor escolhido. | pronto (`launcher/`) |
 | **Hogwarts Legacy** | PC do jogador | O jogo de cada jogador, comprado normalmente. Os arquivos do jogo não são editados. | original, sem alteração |
-| **Mod (DLL)** | Dentro do jogo | Lê o que o seu personagem faz, manda para o servidor e desenha os outros jogadores no seu mundo. | próximo passo (subprojeto 5) |
+| **Mod (DLL)** | Dentro do jogo | Lê o que o seu personagem faz, manda para o servidor e desenha os outros jogadores no seu mundo. | etapa 5a pronta (conecta e mostra os outros jogadores); falta testar no jogo (`docs/TESTE-NO-JOGO-5A.md`) |
 | **Hub** | Internet | A "portaria": contas (login com Discord), lista de servidores, banimentos e distribuição das atualizações do launcher e do mod. | pronto (`hub/`) |
 | **Servidor (cb-server)** | Internet | Onde a sessão acontece. Recebe a posição e as ações de cada jogador e repassa para os outros. Roda os scripts do servidor em Lua, guarda dados em MySQL e foi feito para até 512 jogadores. | pronto (`server/`) |
 
@@ -51,12 +52,41 @@ A ordem importa: cada passo depende do anterior.
 2. **Launcher → Servidor: busca a lista do que o servidor usa** (o manifesto) e baixa só o que falta. Cada arquivo é
    identificado pelo hash do conteúdo; se o hash não bate, o arquivo é descartado.
 3. **Launcher → Hub: confere o mod.** Se houver versão nova da DLL, baixa e verifica a assinatura digital antes de
-   instalar. Mod sem assinatura válida não é usado.
+   instalar na pasta do jogo e ligar o carregador. Mod sem assinatura válida não é usado.
 4. **Launcher: deixa um bilhete para a DLL**: um arquivo pequeno com o endereço do servidor e o ticket, que só o seu
-   usuário do Windows pode ler e que é apagado em seguida.
+   usuário do Windows pode ler e que é apagado em seguida, e um segundo bilhete, sem segredo, que só diz à DLL onde
+   achar o primeiro.
 5. **Launcher: abre o jogo.** A partir daqui o launcher sai de cena.
 6. **DLL → Servidor: a DLL lê o bilhete e conecta.** O servidor valida o ticket com a chave pública do Hub, sem
    precisar perguntar nada ao Hub, e coloca você na sessão.
+
+## Do Jogar até ver o outro jogador (mod 0.2.0)
+
+O mesmo caminho, agora com o mod de verdade, em linguagem simples:
+
+1. **Você clica em Jogar.** O launcher confere se o jogo está fechado, se consegue gravar na pasta dele (ele nunca
+   pede permissão de administrador: se não puder, avisa e para) e se já tem o mod. Na primeira vez baixa o pacote do
+   mod, confere a assinatura e copia para uma pasta só dele dentro do jogo (`Win64cbmp`). Liga o carregador do mod
+   (`dwmapi.dll` e `override.txt`). Se já houver outro carregador de mods ali, **pergunta** antes de guardar os
+   arquivos dele numa pasta de backup (`cbmp-backup`); eles voltam quando você remove o mod.
+2. **O launcher deixa os dois bilhetes e abre o jogo.** Um tem o endereço e o ticket (válido por poucos minutos); o
+   outro só aponta onde está o primeiro. Se o jogo for aberto **sem** o launcher, não há bilhete novo e o mod fica
+   parado: o jogo é o de sempre.
+3. **O jogo abre duas vezes seguidas.** Na abertura, o Hogwarts Legacy inicia o mod em dois processos, com cerca de 30
+   segundos de diferença, e o primeiro some. Como o ticket só vale uma vez, o mod só pega o bilhete quando é o processo
+   que vai ficar (ou depois de uma espera de segurança), para não perder a entrada.
+4. **Você carrega o save.** Enquanto você está no menu ou numa tela de carregamento o mod não manda nada. Só quando o
+   seu bruxo está de verdade no mundo é que ele começa a avisar a posição ao servidor, 20 vezes por segundo.
+5. **O servidor responde com os outros.** Para cada jogador por perto o mod cria um **boneco**: um clone do seu
+   personagem, com a colisão desligada e feito para os inimigos não o perceberem (a confirmar no jogo), e que o mod move a cada quadro a partir das posições
+   recebidas (desenhadas uma fração de segundo no passado, para não parecer que teleportam).
+6. **Na tela** aparece uma mensagem curta: "CB Multiplayer: conectado (N por perto)". Se algo falha (entrada
+   expirada, servidor fora do ar, expulsão) aparece "CB Multiplayer: desconectado — <motivo>", o jogo segue
+   normalmente como single-player e, para voltar, é preciso **fechar o jogo e clicar em Jogar de novo**.
+
+O que ainda **não** existe: os bonecos não têm aparência nem animação próprias (são clones do seu bruxo, e a
+animação é experimental), não há chat nem comandos no jogo (etapa 5c), nem feitiços (5f). Tudo isso vem nas próximas
+etapas.
 
 ## Como a DLL funciona
 
@@ -84,8 +114,11 @@ HogwartsLegacy.exe  precisa de  version.dll
 
 Nenhum arquivo original do jogo é alterado. Apagar a DLL do mod devolve o jogo ao normal.
 
-> Essa técnica se chama "proxy DLL". A outra opção é o launcher injetar a DLL ao abrir o jogo. A escolha final fica
-> para o design do mod (subprojeto 5).
+> Essa técnica se chama "proxy DLL". No mod 0.2.0 a escolha foi usar o **UE4SS** (uma ferramenta pública de mods
+> para jogos da Unreal Engine): o arquivo da pasta do jogo é o `dwmapi.dll` dele, que carrega o UE4SS e, por ele, o mod
+> `cb-mp`. Por isso o UE4SS fica carregado **sempre** que o jogo abre, mesmo sem o launcher (o `cb-mp` é que fica
+> parado); quem quiser o jogo 100% como antes usa **Remover mod do jogo** nas Configurações do launcher. Um carregador
+> próprio, que só liga quando o launcher pede, está nas pendências (`docs/PENDENCIAS.md`).
 
 ### 2. Achar o caminho dentro da Unreal Engine
 

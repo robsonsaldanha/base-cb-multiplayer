@@ -1,15 +1,16 @@
 # Ambiente de teste online (operação)
 
 Ambiente para testadores **sem ferramentas de desenvolvimento**: eles só instalam o launcher "CB Multiplayer (Teste)",
-entram com o Discord de verdade, veem o servidor de teste e vão até o **Jogar** (modo simular) com downloads reais
-pela internet. Guia do testador: [`TESTE-ONLINE.md`](TESTE-ONLINE.md).
+entram com o Discord de verdade, veem o servidor de teste e apertam **Jogar** com downloads reais pela internet: em
+**modo simular** (guia [`TESTE-ONLINE.md`](TESTE-ONLINE.md)) ou, a partir do launcher 0.2.0 e do mod 0.2.0, **jogando de
+verdade** no Hogwarts Legacy com outra pessoa (roteiro [`TESTE-NO-JOGO-5A.md`](TESTE-NO-JOGO-5A.md)).
 
 | Peça | Onde |
 |---|---|
 | Hub | `https://cbmultiplayer.cntoficial.com.br` (Cloudflare → nginx da VPS → `127.0.0.1:8787`) |
 | Servidor de jogo | `cb-server` em `143.95.209.35:30500` (UDP do jogo + TCP/HTTP de `/info`, manifest e arquivos), conteúdo `hello-client`, sem banco |
 | Launcher | build `--features online-test` + `launcher/src-tauri/tauri.onlinetest.conf.json` ("CB Multiplayer (Teste)", identificador `br.com.castelobruxo.cbmp.teste`, pasta `%LOCALAPPDATA%\CBMultiplayer-Teste`) |
-| Releases | pasta local do Hub (`HUB_STAGING=1` + `HUB_RELEASES_DIR`): launcher 0.1.0/0.1.1/0.1.2/0.1.3 e mod `mod-p1-v0.1.0`, assinados **nesta máquina** com a chave dev |
+| Releases | pasta local do Hub (`HUB_STAGING=1` + `HUB_RELEASES_DIR`): launcher 0.1.0/0.1.1/0.1.2/0.1.3/**0.2.0** e mod `mod-p1-v0.1.0` (só um LEIA-ME) e **`mod-p1-v0.2.0`** (o mod real), assinados **nesta máquina** com a chave dev |
 | Login | app Discord do dono (o secret só existe na VPS, num arquivo que o dono cria) |
 
 O nome do Hub passa pelo proxy da Cloudflare (HTTPS). **UDP não passa pelo proxy da Cloudflare**, por isso o servidor
@@ -105,6 +106,39 @@ usa `arc4random` (`GLIBC_2.36`).
 
 O `cb-server` usa o OpenSSL estático do vcpkg; a unit aponta `SSL_CERT_FILE`/`SSL_CERT_DIR` para as CAs do sistema
 (TLS até o Hub).
+
+## Launcher 0.2.0, mod 0.2.0 e o movimento do servidor de teste
+
+A partir do 0.2.0 o ambiente serve o **mod real** (`mod-p1-v0.2.0`, protocolo 1, UE4SS 3.0.1) e o launcher
+**CB Multiplayer (Teste) 0.2.0**, que instala e ativa o mod na pasta do jogo (`launcher/README.md`). O protocolo e o
+código do `cb-server` **não mudaram**.
+
+- **`--mod-zip`**: o release do mod não se gera sozinho (precisa do UE4SS compilado). Gere o zip com
+  `tools\build.ps1 -Target mod` e `tools\package-mod.ps1` (ou baixe o artefato `cbmp-mod` do `mod.yml`, se o segredo
+  `UE4SS_SUBMODULES_TOKEN` existir) e passe-o: `node tools/teste-online.mjs --build-releases --mod-zip dist/cbmp-mod.zip`.
+  O script confere o zip (`tools/check-mod-zip.mjs`, versão `0.2.0`, protocolo 1) antes de assinar, e só exige
+  `--mod-zip` enquanto `mod-p1-v0.2.0` não existir na pasta de trabalho (`%TEMP%\cbmp-teste-online\releases`). As
+  versões antigas (launcher 0.1.0 a 0.1.3 e `mod-p1-v0.1.0`) não são refeitas.
+- **Movimento do servidor de teste** (`tools/teste-online/server.cfg.json`, levado ao `server.cfg` pelo `--deploy`):
+
+  ```json
+  "movement": { "maxSpeedCmS": { "idle": 50, "walk": 600, "run": 1500, "broom": 12000, "swim": 1500, "fall": 8000,
+                                 "apparate": 100000000 }, "tolerance": 0.2 }
+  ```
+
+  Com `apparate` alto, o primeiro `Input` do cliente (estado `Apparate`, a posição do save) fecha a janela da correção de
+  spawn e passa na validação: o jogador aparece onde está no jogo, e a viagem rápida também funciona. **Consequência
+  aceita no 5a: neste servidor o cliente pode se teleportar à vontade** (declarando `Apparate`), e enquanto o jogador
+  está no menu ele conta como parado na origem. Não use essa configuração num servidor de verdade; um servidor com a
+  configuração padrão (`apparate: 0`) aceita a conexão mas nunca aceita a posição (o mod avisa "o servidor não aceitou
+  sua posição"). Estados de movimento confiáveis e velocidades reais: `docs/PENDENCIAS.md` (subprojeto 5e).
+- **Como conferir**: `node tools/teste-online.mjs --check` (pela internet) confere que `/v1/mod/latest?protocol=1`
+  entrega a 0.2.0, o layout do zip baixado e o resto de sempre; o bloco `movement` aplicado se vê na VPS em
+  `grep -A2 '"movement"' /var/www/html_cbmultiplayer/deploy/server.cfg.json` (cópia, sem segredos, de
+  `tools/teste-online/` enviada no deploy). Depois da rodada de testes, `journalctl -u cbmp-server-teste` não deve ter
+  `movimento inválido`.
+- Depois do deploy, acrescente `launcher-v0.2.0` e `mod-p1-v0.2.0` (sha256) a `PUBLISHED` em `tools/teste-online.mjs`
+  (item em `docs/PENDENCIAS.md`).
 
 ## Deploy e atualização
 
