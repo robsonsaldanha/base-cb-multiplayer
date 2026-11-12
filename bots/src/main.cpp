@@ -1,4 +1,6 @@
 // cb-bots: N jogadores simulados contra um cb-server em modo dev (tickets assinados com a seed dev).
+#include <array>
+#include <chrono>
 #include <cstdio>
 #include <exception>
 #include <fstream>
@@ -13,6 +15,8 @@
 #include <timeapi.h>
 #endif
 
+#include <sodium.h>
+
 #include "bot.hpp"
 
 namespace {
@@ -21,7 +25,9 @@ constexpr const char* kUsage =
     "uso: cb-bots --server HOST:PORT --dev-seed <hex32> --server-id <id> --count N --area <m> --cluster <0..1>\n"
     "             --duration <s> --report <arquivo> [--teleport-every <s>] [--flood] [--ramp <por s>]\n"
     "             [--kid <kid>]   (padrão \"dev\"; outro kid = chave de um Hub local de teste com a mesma seed)\n"
-    "     cb-bots --dev-seed <hex32> --print-dev-key   (chave pública base64url para auth.devPublicKey)\n";
+    "     cb-bots --dev-seed <hex32> --print-dev-key   (chave pública base64url para auth.devPublicKey)\n"
+    "     cb-bots --dev-seed <hex32> --server-id <id> --print-ticket [--index N] [--kid <kid>]\n"
+    "             (ticket dev do bot N, iat = agora, jti aleatório; usado pelo tools/client-e2e.py)\n";
 
 bool parseSeed(const std::string& hex, std::array<uint8_t, 32>& out) {
   if (hex.size() != 64) return false;
@@ -39,6 +45,19 @@ bool parseSeed(const std::string& hex, std::array<uint8_t, 32>& out) {
   return true;
 }
 
+// jti aleatório (16 bytes em hex), como o do Hello dos bots.
+std::string randomJti() {
+  std::array<uint8_t, 16> j{};
+  randombytes_buf(j.data(), j.size());
+  static const char* kHex = "0123456789abcdef";
+  std::string out;
+  for (uint8_t c : j) {
+    out += kHex[c >> 4];
+    out += kHex[c & 15];
+  }
+  return out;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -48,7 +67,8 @@ int main(int argc, char** argv) {
 #endif
   cbbots::BotOptions opt;
   std::string reportPath, seedHex;
-  bool printKey = false;
+  bool printKey = false, printTicket = false;
+  int ticketIndex = 0;
   try {
     for (int i = 1; i < argc; ++i) {
       const std::string a = argv[i];
@@ -89,6 +109,11 @@ int main(int argc, char** argv) {
         opt.rampPerSec = std::stod(val());
       } else if (a == "--print-dev-key") {
         printKey = true;
+      } else if (a == "--print-ticket") {
+        printTicket = true;
+      } else if (a == "--index") {
+        ticketIndex = std::stoi(val());
+        if (ticketIndex < 0 || ticketIndex > 99999) throw std::runtime_error("--index deve estar entre 0 e 99999");
       } else if (a == "--help" || a == "-h") {
         std::printf("%s", kUsage);
         return 0;
@@ -99,6 +124,13 @@ int main(int argc, char** argv) {
     if (!parseSeed(seedHex, opt.seed)) throw std::runtime_error("--dev-seed deve ter 64 dígitos hex");
     if (printKey) {
       std::printf("%s\n", cbbots::devPublicKeyB64(opt.seed).c_str());
+      return 0;
+    }
+    if (printTicket) {
+      if (sodium_init() < 0) throw std::runtime_error("sodium_init falhou");
+      const int64_t iat = std::chrono::duration_cast<std::chrono::seconds>(
+                              std::chrono::system_clock::now().time_since_epoch()).count();
+      std::printf("%s\n", cbbots::makeTicket(opt.seed, ticketIndex, opt.serverId, iat, randomJti(), opt.kid).c_str());
       return 0;
     }
     if (opt.count < 1 || opt.count > 4096) throw std::runtime_error("--count deve estar entre 1 e 4096");

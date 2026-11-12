@@ -67,6 +67,8 @@ add_subdirectory(proto)
 # Núcleo do cliente (mod): C++ puro, sem UE4SS nem Windows.h; testado aqui em toda plataforma.
 add_subdirectory(client/core)
 add_subdirectory(client/tests)
+# Cliente sem o jogo (núcleo real + GnsTransport + jogo roteirizado) para a integração tools/client-e2e.py.
+add_subdirectory(client/headless)
 # Portas Win32 do cliente (sem UE4SS): compiladas e testadas no build nativo do Windows.
 if(WIN32)
   add_subdirectory(client/src/platform)
