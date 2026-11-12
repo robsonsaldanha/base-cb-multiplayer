@@ -913,3 +913,23 @@ fn valores_do_launcher_0_2_0() {
     assert_eq!(ui["version"], "0.2.0");
     assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.0");
 }
+
+/// O texto do diálogo de conflito mostrado pela UI (`MOD_CONFLICT_EXPLANATION`) é exatamente o do Rust.
+#[test]
+fn explicacao_do_conflito_na_ui_e_o_texto_do_dialogo() {
+    let ts = read(&root().join("../ui/src/lib/errors.ts"));
+    let decl = ts
+        .split("export const MOD_CONFLICT_EXPLANATION =")
+        .nth(1)
+        .and_then(|rest| rest.split(';').next())
+        .expect("MOD_CONFLICT_EXPLANATION em errors.ts");
+    // Concatenação de literais "…" + "…" (sem aspas dentro do texto).
+    let text: String = decl
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .collect::<Vec<_>>()
+        .concat()
+        .replace("\\\\", "\\");
+    assert_eq!(text, cbmp_launcher_lib::modact::CONFLICT_DIALOG);
+}

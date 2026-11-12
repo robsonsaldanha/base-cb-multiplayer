@@ -8,10 +8,19 @@
 //!   **movidos** (rename no mesmo volume, sem substituir) para `Win64\cbmp-backup\` (nome repetido ganha `.1`, `.2`…)
 //!   e registrados; nunca sobrescritos nem apagados. `xinput1_3.dll` junto de `UE4SS.dll` (UE4SS antigo por outro
 //!   proxy) é conflito sem opção automática: o launcher não mexe.
-//! - **Backup com registro antes** (write-ahead): a entrada é gravada em `installed.json` como `pending` antes de mover
-//!   e marcada `done` depois. Falha ao gravar o registro aborta antes de mover. Entrada `pending` é resolvida na
-//!   próxima conferência ([`ensure_active`], remoção, abertura do launcher): arquivo em `cbmp-backup\` → `done`; ainda
-//!   em `Win64\` → a entrada sai.
+//! - **Backup com registro antes** (write-ahead): a entrada é gravada como `pending` no manifesto da pasta do jogo e
+//!   em `installed.json` antes de mover, e marcada `done` depois. Falha ao gravar aborta antes de mover. Entrada
+//!   `pending` é resolvida na próxima conferência ([`ensure_active`], remoção, abertura do launcher): arquivo em
+//!   `cbmp-backup\` → `done`; ainda em `Win64\` → a entrada sai.
+//! - **Manifesto dentro da pasta do jogo** (`Win64\cbmp-backup\cbmp-backup.json`, `{v: 1, entries: [{name, stored,
+//!   sha256, state}]}`): a lista de backups viaja com a pasta (Steam "mover pasta de instalação", renomear). Ao
+//!   instalar, ativar, conferir o estado e remover numa pasta, o manifesto dela é **adotado** ([`adopt_folder`]): cada
+//!   entrada é conferida (nome só `dwmapi.dll`/`override.txt`, guardado como `<nome>` ou `<nome>.<N>`, arquivo comum
+//!   dentro de `cbmp-backup\` — que tem de ser pasta de verdade, sem link/junção — com o sha256 do manifesto) e o
+//!   registro passa a conhecê-la; a mesma entrada (nome + sha256) registrada numa pasta que não existe mais sai de lá
+//!   (foi movida). Pasta sumida (`Gone`) com backups que ninguém adotou fica registrada (inacessível), não é
+//!   descartada. O manifesto nunca vale fora do `Win64` da própria pasta: só devolve para os nomes fixos e nunca
+//!   substitui nada. É o mesmo arquivo que o modo elevado (`--mod-admin-setup`) grava.
 //! - **Várias pastas do jogo**: o registro guarda, além da pasta atual, as anteriores onde ainda há algo nosso ou
 //!   backups do jogador (`otherFolders`). Antes de instalar numa pasta nova o mod sai das anteriores
 //!   ([`leave_other_folders`]); pasta inacessível ou falha → o registro dela fica e o Jogar segue.
@@ -25,9 +34,9 @@ use crate::error::{AppError, AppResult};
 use crate::game::{GameInstall, BINARIES};
 use crate::modpkg::{
     hash_file, mod_dir, mod_needs_admin, push_loader_history, win64_dir, BackupEntry, BackupState,
-    Installed, LoaderRef, ModInstaller, CURRENT_FOLDER, LAYOUT, MOD_FOLDER,
+    FolderRecord, Installed, LoaderRef, ModInstaller, CURRENT_FOLDER, LAYOUT, MOD_FOLDER,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -53,6 +62,13 @@ const MAX_BACKUP_SUFFIX: u32 = 999;
 const TMP_SUFFIX: &str = ".cbmp-tmp";
 /// Ponteiro do launcher para o mod (`cbmp\cbmp-run.json`).
 const POINTER_NAME: &str = crate::launch::POINTER_FILE;
+/// Manifesto dos backups dentro da pasta do jogo (`Win64\cbmp-backup\cbmp-backup.json`).
+pub const BACKUP_MANIFEST: &str = "cbmp-backup.json";
+const MANIFEST_VERSION: u32 = 1;
+const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+const MAX_MANIFEST_ENTRIES: usize = 64;
+/// Únicos nomes que vão para `cbmp-backup\` e voltam para `Win64\`.
+const BACKUP_NAMES: [&str; 2] = [LOADER_NAME, OVERRIDE_NAME];
 
 /// Estado da ativação em `Win64`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -280,9 +296,10 @@ pub fn reconcile_backups(win64: &Path, backups: &mut Vec<BackupEntry>) -> bool {
     changed
 }
 
-/// Ativa o mod de `current` (`cbmp\atual`) em `win64`. Conflito só é resolvido com `confirm_conflict` (arquivos
-/// estranhos movidos para `cbmp-backup\` e registrados em `rec.backups`). Sem registro durável: use
-/// [`activate_with`] (ou [`ensure_active`]) quando houver `installed.json`.
+/// Ativa o mod de `current` (`cbmp\atual`) em `win64` **sem gravar nada além dos arquivos** (nem registro nem
+/// manifesto): só para testes. Com registro durável use [`ensure_active`] (ou [`activate_with`] com a gravação), senão
+/// um backup feito aqui fica sem registro.
+#[doc(hidden)]
 pub fn activate(
     win64: &Path,
     current: &Path,
@@ -349,6 +366,11 @@ fn move_to_backup(
     persist: &mut dyn FnMut(&Installed) -> AppResult<()>,
 ) -> AppResult<()> {
     let src = win64.join(name);
+    // sha256 do arquivo do jogador (pasta: sem hash), para o manifesto conferir depois de uma mudança de pasta.
+    let sha256 = match meta(&src)? {
+        Some(m) if m.is_file() => Some(hash_file(&src).map_err(|e| act_io(&src, &e))?.0),
+        _ => None,
+    };
     let stored = (0..=MAX_BACKUP_SUFFIX)
         .map(|i| {
             if i == 0 {
@@ -365,10 +387,14 @@ fn move_to_backup(
     rec.backups.push(BackupEntry {
         name: name.to_string(),
         stored: stored.clone(),
+        sha256,
         state: BackupState::Pending,
     });
     if let Err(e) = persist(rec) {
         rec.backups.pop();
+        // Desfaz o que chegou a ser gravado (ex.: registro gravado e manifesto não); se falhar, a entrada `pending`
+        // sai sozinha na próxima conferência (o arquivo continua em `Win64`).
+        let _ = persist(rec);
         log::warn!(
             "registro do mod não gravado; {name} não foi movido: {}",
             e.code
@@ -488,19 +514,25 @@ pub fn ensure_active(
         activation_failed()
     })?;
     let win64 = win64_dir(game);
-    if reconcile_backups(&win64, &mut rec.backups) {
+    let reconciled = reconcile_backups(&win64, &mut rec.backups);
+    if adopt_into(&mut rec, &game.dir) || reconciled {
         mods.save_record(&rec)?;
     }
     if inspect(&win64, &rec)? == Activation::Active {
         return Ok(());
     }
     let before = rec.clone();
+    // Registro e manifesto da pasta, nessa ordem (registro que não grava não toca na pasta do jogo), antes e depois
+    // de cada movimento.
     let result = activate_with(
         &win64,
         &mod_dir(game),
         &mut rec,
         confirm_conflict,
-        &mut |r| mods.save_record(r),
+        &mut |r| {
+            mods.save_record(r)?;
+            write_manifest(&win64, &r.backups)
+        },
     );
     if rec != before {
         mods.save_record(&rec)?;
@@ -518,7 +550,7 @@ fn restore_backups(win64: &Path, backups: &mut Vec<BackupEntry>) -> AppResult<()
     let backup = win64.join(BACKUP_FOLDER);
     let mut pending = std::mem::take(backups).into_iter();
     while let Some(b) = pending.next() {
-        if !plain_name(&b.name) || !plain_name(&b.stored) {
+        if !backup_names_ok(&b.name, &b.stored) {
             log::warn!("backup com nome inválido no registro; ignorado");
             continue;
         }
@@ -540,8 +572,13 @@ fn restore_backups(win64: &Path, backups: &mut Vec<BackupEntry>) -> AppResult<()
             }
         }
     }
-    // Pasta vazia sai; com algo dentro, fica.
-    let _ = std::fs::remove_dir(&backup);
+    // O manifesto fica com o que não voltou (vazio: sai); a pasta vazia sai, com algo dentro fica.
+    if backup_dir_ok(win64) {
+        if let Err(e) = write_manifest(win64, backups) {
+            log::warn!("manifesto de cbmp-backup não atualizado: {}", e.code);
+        }
+        let _ = std::fs::remove_dir(&backup);
+    }
     Ok(())
 }
 
@@ -580,13 +617,21 @@ fn remove_in(
 ) -> AppResult<()> {
     match reach(dir) {
         Reach::Present => {}
-        Reach::Gone => {
+        // Sem backups do jogador: nada a devolver, o registro dela sai. Com backups: os arquivos podem ter ido junto
+        // com a pasta (movida/renomeada) e voltam quando o manifesto for adotado onde ela estiver; até lá fica.
+        Reach::Gone if backups.is_empty() => {
             log::info!(
                 "pasta do jogo {} não existe mais; registro dela descartado",
                 dir.display()
             );
-            backups.clear();
             return Ok(());
+        }
+        Reach::Gone => {
+            log::warn!(
+                "pasta do jogo {} não existe mais e tinha backups do jogador; registro mantido",
+                dir.display()
+            );
+            return Err(folder_unreachable(dir));
         }
         Reach::Unreachable => return Err(folder_unreachable(dir)),
     }
@@ -611,20 +656,31 @@ fn remove_in(
     let container = win64.join(MOD_FOLDER);
     let staging = format!("{CURRENT_FOLDER}.staging");
     let old = format!("{CURRENT_FOLDER}.old");
-    for name in [CURRENT_FOLDER, &staging, &old, POINTER_NAME] {
+    let pointer_tmp = format!("{POINTER_NAME}.tmp");
+    for name in [CURRENT_FOLDER, &staging, &old, POINTER_NAME, &pointer_tmp] {
         let p = container.join(name);
         remove_entry(&p).map_err(|e| act_io(&p, &e))?;
     }
     Ok(())
 }
 
-/// Remove o mod da pasta do jogo `dir` (a do registro atual ou uma anterior registrada) e grava o registro.
+/// Remove o mod da pasta do jogo `dir` (a do registro atual, uma anterior registrada, ou uma presente que o registro
+/// não conhece: só o que é nosso pelo hash/linha sai) e grava o registro. O manifesto da pasta é adotado antes.
 fn remove_folder(dir: &Path, mods: &ModInstaller) -> AppResult<()> {
     let Some(mut rec) = mods.installed() else {
         log::info!("remover mod: nada registrado");
         return Ok(());
     };
     let before = rec.clone();
+    let present = matches!(reach(dir), Reach::Present);
+    if present {
+        adopt_into(&mut rec, dir);
+    }
+    // Carregadores nossos: o atual e os anteriores (uma pasta adotada não sabe qual foi ativado nela).
+    let mut ours = rec.loader_history.clone();
+    if let Some(l) = &rec.loader {
+        ours.push(l.sha256.clone());
+    }
     let result = if rec.game_dir == dir {
         let (loader, history) = (rec.loader.clone(), rec.loader_history.clone());
         let r = remove_in(dir, loader.as_ref(), &history, &mut rec.backups);
@@ -639,7 +695,7 @@ fn remove_folder(dir: &Path, mods: &ModInstaller) -> AppResult<()> {
         r
     } else if let Some(i) = rec.other_folders.iter().position(|f| f.game_dir == dir) {
         let mut f = rec.other_folders[i].clone();
-        let r = remove_in(dir, f.loader.as_ref(), &rec.loader_history, &mut f.backups);
+        let r = remove_in(dir, f.loader.as_ref(), &ours, &mut f.backups);
         if r.is_ok() {
             f.removed = true;
             log::info!("mod removido da pasta anterior do jogo {}", dir.display());
@@ -650,6 +706,10 @@ fn remove_folder(dir: &Path, mods: &ModInstaller) -> AppResult<()> {
             rec.other_folders[i] = f;
         }
         r
+    } else if present {
+        // Pasta presente sem registro nem manifesto (ex.: movida sem conflito): tira o que é nosso.
+        let mut none = Vec::new();
+        remove_in(dir, None, &ours, &mut none)
     } else {
         log::info!("remover mod: nada registrado nesta pasta do jogo");
         Ok(())
@@ -666,16 +726,41 @@ pub fn remove_mod(game: &GameInstall, mods: &ModInstaller) -> AppResult<()> {
     remove_folder(&game.dir, mods)
 }
 
-/// "Remover mod do jogo": remove de todas as pastas registradas; resultado por pasta.
-pub fn remove_everywhere(mods: &ModInstaller) -> Vec<FolderRemoval> {
-    let Some(rec) = mods.installed() else {
-        return Vec::new();
-    };
+/// Pastas registradas com algo nosso ou backups do jogador.
+fn registered_dirs(rec: &Installed) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if rec.has_traces() {
         dirs.push(rec.game_dir.clone());
     }
     dirs.extend(rec.other_folders.iter().map(|f| f.game_dir.clone()));
+    dirs
+}
+
+/// "Remover mod do jogo": remove de todas as pastas registradas e da pasta do jogo atual (`current`); resultado por
+/// pasta. Antes, adota o manifesto de cada pasta presente: os backups de uma pasta movida são achados antes de a pasta
+/// antiga (sumida) ser julgada.
+pub fn remove_everywhere(mods: &ModInstaller, current: Option<&Path>) -> Vec<FolderRemoval> {
+    let Some(rec) = mods.installed() else {
+        return Vec::new();
+    };
+    let mut seen = registered_dirs(&rec);
+    if let Some(c) = current {
+        if !seen.iter().any(|d| d == c) {
+            seen.push(c.to_path_buf());
+        }
+    }
+    for d in &seen {
+        adopt_folder(d, mods);
+    }
+    let Some(rec) = mods.installed() else {
+        return Vec::new();
+    };
+    let mut dirs = registered_dirs(&rec);
+    if let Some(c) = current {
+        if !dirs.iter().any(|d| d == c) && matches!(reach(c), Reach::Present) {
+            dirs.push(c.to_path_buf());
+        }
+    }
     dirs.into_iter()
         .map(|d| {
             let error = remove_folder(&d, mods).err();
@@ -718,7 +803,8 @@ pub fn leave_other_folders(game: &GameInstall, mods: &ModInstaller) -> Vec<PathB
     leftover_folders(Some(&game.dir), mods)
 }
 
-/// Na abertura do launcher: resolve backups `pending` em todas as pastas registradas que estiverem acessíveis.
+/// Na abertura do launcher: resolve backups `pending` e adota os manifestos de todas as pastas registradas que
+/// estiverem acessíveis.
 pub fn reconcile_all(mods: &ModInstaller) {
     let Some(mut rec) = mods.installed() else {
         return;
@@ -732,9 +818,320 @@ pub fn reconcile_all(mods: &ModInstaller) {
             reconcile_backups(&win64_of(&f.game_dir), &mut f.backups);
         }
     }
+    for d in registered_dirs(&rec) {
+        if matches!(reach(&d), Reach::Present) {
+            adopt_into(&mut rec, &d);
+        }
+    }
     if rec != before {
         if let Err(e) = mods.save_record(&rec) {
             log::warn!("registro do mod não regravado na abertura: {}", e.code);
+        }
+    }
+}
+
+// ----- manifesto dos backups dentro da pasta do jogo -----
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Manifest {
+    v: u32,
+    entries: Vec<BackupEntry>,
+}
+
+#[derive(Serialize)]
+struct ManifestOut<'a> {
+    v: u32,
+    entries: &'a [BackupEntry],
+}
+
+/// Ponto de reanálise (link simbólico, junção, arquivo de nuvem…): nunca seguido nem aceito.
+fn is_reparse(m: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        m.file_type().is_symlink() || m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        m.file_type().is_symlink()
+    }
+}
+
+/// `stored` vale para `name`: `name` da lista fixa e `stored` = `<name>` ou `<name>.<1..999>`.
+fn backup_names_ok(name: &str, stored: &str) -> bool {
+    if !BACKUP_NAMES.contains(&name) {
+        return false;
+    }
+    if stored == name {
+        return true;
+    }
+    stored
+        .strip_prefix(name)
+        .and_then(|s| s.strip_prefix('.'))
+        .is_some_and(|n| {
+            !n.is_empty()
+                && n.len() <= 3
+                && !n.starts_with('0')
+                && n.bytes().all(|b| b.is_ascii_digit())
+        })
+}
+
+fn valid_sha(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// `Win64\cbmp-backup` é pasta de verdade (não link/junção).
+fn backup_dir_ok(win64: &Path) -> bool {
+    std::fs::symlink_metadata(win64.join(BACKUP_FOLDER))
+        .is_ok_and(|m| m.is_dir() && !is_reparse(&m))
+}
+
+/// `cbmp-backup\<stored>` confere com a entrada: arquivo comum com o sha256 dela (ou pasta, quando sem sha256).
+fn backup_matches(backup: &Path, e: &BackupEntry) -> bool {
+    let p = backup.join(&e.stored);
+    let Ok(m) = std::fs::symlink_metadata(&p) else {
+        return false;
+    };
+    if is_reparse(&m) {
+        return false;
+    }
+    match &e.sha256 {
+        Some(sha) => m.is_file() && hash_file(&p).is_ok_and(|(h, _)| h == *sha),
+        None => m.is_dir(),
+    }
+}
+
+/// Entradas do manifesto de `win64` que conferem com o que está em `cbmp-backup\` (todas como `done`). Manifesto
+/// ausente, ilegível, link, grande demais, de outra versão ou com campos desconhecidos → nenhuma; entrada com nome
+/// fora da lista fixa, caminho, sha256 inválido ou arquivo que não confere → ignorada.
+pub fn read_manifest(win64: &Path) -> Vec<BackupEntry> {
+    if !backup_dir_ok(win64) {
+        return Vec::new();
+    }
+    let backup = win64.join(BACKUP_FOLDER);
+    let path = backup.join(BACKUP_MANIFEST);
+    let ok = std::fs::symlink_metadata(&path)
+        .is_ok_and(|m| m.is_file() && !is_reparse(&m) && m.len() <= MAX_MANIFEST_BYTES);
+    if !ok {
+        return Vec::new();
+    }
+    let mut bytes = Vec::new();
+    if std::fs::File::open(&path)
+        .and_then(|f| f.take(MAX_MANIFEST_BYTES + 1).read_to_end(&mut bytes))
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let m = match serde_json::from_slice::<Manifest>(&bytes) {
+        Ok(m) if m.v == MANIFEST_VERSION && m.entries.len() <= MAX_MANIFEST_ENTRIES => m,
+        _ => {
+            log::warn!(
+                "manifesto de cbmp-backup inválido em {}; ignorado",
+                win64.display()
+            );
+            return Vec::new();
+        }
+    };
+    let mut out: Vec<BackupEntry> = Vec::new();
+    for mut e in m.entries {
+        let sha_ok = e.sha256.as_deref().is_none_or(valid_sha);
+        if !backup_names_ok(&e.name, &e.stored)
+            || !sha_ok
+            || out.iter().any(|o| o.stored == e.stored)
+        {
+            log::warn!("entrada inválida no manifesto de cbmp-backup; ignorada");
+            continue;
+        }
+        if !backup_matches(&backup, &e) {
+            log::info!(
+                "cbmp-backup\\{} não confere com o manifesto; ignorado",
+                e.stored
+            );
+            continue;
+        }
+        e.state = BackupState::Done;
+        out.push(e);
+    }
+    out
+}
+
+/// Grava o manifesto de `win64` com `entries` (temporário novo + rename); lista vazia apaga o manifesto. Entrada
+/// `done` sem sha256 (registro antigo) ganha o do arquivo em `cbmp-backup\`, se for arquivo comum.
+pub fn write_manifest(win64: &Path, entries: &[BackupEntry]) -> AppResult<()> {
+    let backup = win64.join(BACKUP_FOLDER);
+    let path = backup.join(BACKUP_MANIFEST);
+    if entries.is_empty() {
+        return match meta(&path)? {
+            None => Ok(()),
+            Some(_) => remove_entry(&path).map_err(|e| act_io(&path, &e)),
+        };
+    }
+    match meta(&backup)? {
+        Some(m) if m.is_dir() && !is_reparse(&m) => {}
+        Some(_) => {
+            log::warn!("cbmp-backup não é uma pasta de verdade; manifesto não gravado");
+            return Err(activation_failed());
+        }
+        None => std::fs::create_dir(&backup).map_err(|e| act_io(&backup, &e))?,
+    }
+    let filled: Vec<BackupEntry> = entries
+        .iter()
+        .map(|e| {
+            let mut e = e.clone();
+            if e.sha256.is_none() && e.state == BackupState::Done {
+                let p = backup.join(&e.stored);
+                let file =
+                    std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file() && !is_reparse(&m));
+                if file && plain_name(&e.stored) {
+                    e.sha256 = hash_file(&p).ok().map(|(h, _)| h);
+                }
+            }
+            e
+        })
+        .collect();
+    let json = serde_json::to_vec_pretty(&ManifestOut {
+        v: MANIFEST_VERSION,
+        entries: &filled,
+    })
+    .expect("manifesto sempre serializa");
+    let tmp = tmp_beside(&path);
+    remove_entry(&tmp).map_err(|e| act_io(&tmp, &e))?;
+    let written = (|| {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        f.write_all(&json)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, &path)
+    })();
+    written.map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        act_io(&path, &e)
+    })
+}
+
+/// Lista de backups da pasta `dir` no registro: a do registro atual, a de uma pasta anterior ou uma pasta nova em
+/// `other_folders` (criada se `create`).
+fn folder_backups<'a>(
+    rec: &'a mut Installed,
+    dir: &Path,
+    create: bool,
+) -> Option<&'a mut Vec<BackupEntry>> {
+    if rec.game_dir == dir {
+        return Some(&mut rec.backups);
+    }
+    let i = match rec.other_folders.iter().position(|f| f.game_dir == dir) {
+        Some(i) => i,
+        None if create => {
+            rec.other_folders.push(FolderRecord {
+                game_dir: dir.to_path_buf(),
+                version: rec.version.clone(),
+                loader: None,
+                backups: Vec::new(),
+                removed: false,
+            });
+            rec.other_folders.len() - 1
+        }
+        None => return None,
+    };
+    Some(&mut rec.other_folders[i].backups)
+}
+
+/// Adota o manifesto da pasta presente `dir` em `rec` (ver o topo do módulo). Devolve `true` se `rec` mudou.
+fn adopt_into(rec: &mut Installed, dir: &Path) -> bool {
+    let win64 = win64_of(dir);
+    let found = read_manifest(&win64);
+    let mut changed = false;
+    if !found.is_empty() {
+        let list = folder_backups(rec, dir, true).expect("criada");
+        for e in &found {
+            if !list.iter().any(|b| b.stored == e.stored) {
+                log::info!(
+                    "backup cbmp-backup\\{} adotado do manifesto de {}",
+                    e.stored,
+                    dir.display()
+                );
+                list.push(e.clone());
+                changed = true;
+            }
+        }
+        changed |= forget_moved(rec, dir, &found);
+    }
+    // Registro com entradas que o manifesto não tem (registro antigo, ou manifesto apagado): grava o manifesto. Falha
+    // (pasta protegida) só loga.
+    if let Some(list) = folder_backups(rec, dir, false) {
+        let missing = list
+            .iter()
+            .any(|b| b.state == BackupState::Done && !found.iter().any(|f| f.stored == b.stored));
+        if missing && backup_dir_ok(&win64) {
+            if let Err(e) = write_manifest(&win64, list) {
+                log::warn!("manifesto de cbmp-backup não gravado: {}", e.code);
+            }
+        }
+    }
+    changed
+}
+
+/// A mesma entrada (nome + sha256) adotada em `dir` sai das pastas registradas que não estão presentes (a pasta foi
+/// movida/renomeada); pasta anterior sumida que fica sem backups sai do registro.
+fn forget_moved(rec: &mut Installed, dir: &Path, found: &[BackupEntry]) -> bool {
+    let same = |b: &BackupEntry| {
+        b.sha256.is_some()
+            && found
+                .iter()
+                .any(|f| f.name == b.name && f.sha256 == b.sha256)
+    };
+    let mut changed = false;
+    if rec.game_dir != dir
+        && rec.backups.iter().any(same)
+        && !matches!(reach(&rec.game_dir), Reach::Present)
+    {
+        rec.backups.retain(|b| !same(b));
+        log::info!(
+            "backups de {} adotados em {}",
+            rec.game_dir.display(),
+            dir.display()
+        );
+        changed = true;
+    }
+    let mut emptied = Vec::new();
+    for f in rec.other_folders.iter_mut().filter(|f| f.game_dir != dir) {
+        if f.backups.iter().any(same) && !matches!(reach(&f.game_dir), Reach::Present) {
+            f.backups.retain(|b| !same(b));
+            log::info!(
+                "backups de {} adotados em {}",
+                f.game_dir.display(),
+                dir.display()
+            );
+            changed = true;
+            if f.backups.is_empty() {
+                emptied.push(f.game_dir.clone());
+            }
+        }
+    }
+    rec.other_folders
+        .retain(|f| !(emptied.contains(&f.game_dir) && matches!(reach(&f.game_dir), Reach::Gone)));
+    changed
+}
+
+/// Adota o manifesto da pasta do jogo `dir` (se presente) no registro e o grava se mudou. Falhas só logam.
+pub fn adopt_folder(dir: &Path, mods: &ModInstaller) {
+    let Some(mut rec) = mods.installed() else {
+        return;
+    };
+    if !matches!(reach(dir), Reach::Present) {
+        return;
+    }
+    if adopt_into(&mut rec, dir) {
+        if let Err(e) = mods.save_record(&rec) {
+            log::warn!(
+                "registro do mod não regravado ao adotar backups: {}",
+                e.code
+            );
         }
     }
 }

@@ -565,7 +565,7 @@ pub fn remove_mod_with(
     if game_running_with(processes) {
         return Err(game_running_error());
     }
-    let folders = modact::remove_everywhere(mods);
+    let folders = modact::remove_everywhere(mods, game.map(|g| g.dir.as_path()));
     for f in &folders {
         if let Some(e) = &f.error {
             log::warn!("mod não removido de {}: {}", f.game_dir.display(), e.code);
@@ -633,15 +633,24 @@ fn internal(what: &str) -> AppError {
     AppError::new("internal_error", format!("Falha interna {what}."))
 }
 
-/// Estado do mod para as Configurações (procura o jogo como o Jogar, fora do executor assíncrono).
+/// Estado do mod para as Configurações (procura o jogo como o Jogar, fora do executor assíncrono). Com a trava do play
+/// livre, adota antes o manifesto de backups da pasta do jogo (pasta movida); ocupada, só lê.
 #[tauri::command]
-pub async fn mod_status(app: AppHandle) -> AppResult<ModInfo> {
-    tokio::task::spawn_blocking(move || {
+pub async fn mod_status(app: AppHandle, gate: State<'_, PlayGate>) -> AppResult<ModInfo> {
+    let run = gate.try_begin().ok();
+    let adopt = run.is_some();
+    let r = tokio::task::spawn_blocking(move || {
         let game = resolve_game(&app.state::<AppState>());
-        mod_info(game.as_ref(), &ModInstaller::system())
+        let mods = ModInstaller::system();
+        if let Some(g) = game.as_ref().filter(|_| adopt) {
+            modact::adopt_folder(&g.dir, &mods);
+        }
+        mod_info(game.as_ref(), &mods)
     })
     .await
-    .map_err(|_| internal("ao conferir o mod"))
+    .map_err(|_| internal("ao conferir o mod"));
+    drop(run);
+    r
 }
 
 /// "Remover mod do jogo" (todas as pastas registradas). Não corre junto com um play; recusa com o jogo aberto.

@@ -168,11 +168,15 @@ pub struct LoaderRef {
 /// Arquivo do jogador em `cbmp-backup\`: `name` em `Win64\` → `stored` em `cbmp-backup\`.
 ///
 /// Gravado no registro **antes** de mover (`Pending`) e marcado `Done` depois: uma queda no meio deixa uma entrada que
-/// a próxima conferência resolve (arquivo em `cbmp-backup\` → `Done`; ainda em `Win64\` → entrada sai).
+/// a próxima conferência resolve (arquivo em `cbmp-backup\` → `Done`; ainda em `Win64\` → entrada sai). A mesma lista
+/// fica no manifesto dentro da pasta do jogo (`cbmp-backup\cbmp-backup.json`, ver [`crate::modact`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupEntry {
     pub name: String,
     pub stored: String,
+    /// sha256 do arquivo do jogador (ausente: era uma pasta, ou registro anterior ao manifesto).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
     /// Ausente (registro antigo) = `Done`.
     #[serde(default)]
     pub state: BackupState,
@@ -892,7 +896,12 @@ impl ModInstaller {
         // inacessível, falha) continua registrado e não impede de jogar aqui.
         {
             let (me, g) = (self.clone(), game.clone());
-            let left = blocking(move || Ok(crate::modact::leave_other_folders(&g, &me))).await?;
+            // Manifesto de backups desta pasta antes (ela pode ter sido movida com os arquivos do jogador dentro).
+            let left = blocking(move || {
+                crate::modact::adopt_folder(&g.dir, &me);
+                Ok(crate::modact::leave_other_folders(&g, &me))
+            })
+            .await?;
             for d in left {
                 log::warn!("mod continua na pasta antiga do jogo {}", d.display());
             }

@@ -541,7 +541,10 @@ async fn fluxo_completo_em_pasta_falsa() {
     ensure_active(&g.game, &mods, true).unwrap();
     assert_eq!(g.read(LOADER_NAME), LOADER);
     assert_eq!(g.read(OVERRIDE_NAME), OVERRIDE_OURS);
-    assert_eq!(files_under(&g.backup()), vec!["dwmapi.dll", "override.txt"]);
+    assert_eq!(
+        files_under(&g.backup()),
+        vec!["cbmp-backup.json", "dwmapi.dll", "override.txt"]
+    );
     assert_eq!(record(&g).backups.len(), 2);
     assert_eq!(
         status(Some(&g.game), &mods),
@@ -569,6 +572,7 @@ fn pending(name: &str) -> BackupEntry {
     BackupEntry {
         name: name.into(),
         stored: name.into(),
+        sha256: None,
         state: BackupState::Pending,
     }
 }
@@ -736,6 +740,7 @@ async fn pasta_antiga_inacessivel_fica_registrada_e_nao_impede_a_nova() {
     old.backups = vec![BackupEntry {
         name: LOADER_NAME.into(),
         stored: LOADER_NAME.into(),
+        sha256: None,
         state: BackupState::Done,
     }];
     mods.save_record(&old).unwrap();
@@ -755,7 +760,7 @@ async fn pasta_antiga_inacessivel_fica_registrada_e_nao_impede_a_nova() {
     );
 
     // "Remover mod do jogo": B sai, A continua inacessível e registrada.
-    let res = remove_everywhere(&mods);
+    let res = remove_everywhere(&mods, None);
     assert_eq!(res.len(), 2);
     assert_eq!(res[0].game_dir, b.game.dir);
     assert!(res[0].error.is_none());
@@ -789,6 +794,7 @@ fn remover_limpa_todas_as_pastas_registradas() {
         backups: vec![BackupEntry {
             name: LOADER_NAME.into(),
             stored: LOADER_NAME.into(),
+            sha256: None,
             state: BackupState::Done,
         }],
         removed: false,
@@ -804,7 +810,7 @@ fn remover_limpa_todas_as_pastas_registradas() {
     });
     b.installer().save_record(&rec).unwrap();
 
-    let res = remove_everywhere(&b.installer());
+    let res = remove_everywhere(&b.installer(), None);
     let dirs: Vec<_> = res.iter().map(|r| r.game_dir.clone()).collect();
     assert_eq!(dirs, vec![b.game.dir.clone(), a.game.dir.clone(), deleted]);
     assert!(res.iter().all(|r| r.error.is_none()), "{res:?}");
@@ -817,7 +823,7 @@ fn remover_limpa_todas_as_pastas_registradas() {
     assert!(r.removed && r.other_folders.is_empty());
     assert!(leftover_folders(None, &b.installer()).is_empty());
     // De novo: nada a fazer.
-    assert!(remove_everywhere(&b.installer()).is_empty());
+    assert!(remove_everywhere(&b.installer(), None).is_empty());
 }
 
 // ----- revisão da Task 8: lacunas de teste (M8) -----
@@ -844,7 +850,7 @@ fn remover_de_novo_depois_de_remover_nao_faz_nada() {
     let after = record(&g);
     remove_mod(&g.game, &g.installer()).unwrap();
     assert_eq!(record(&g), after);
-    assert!(remove_everywhere(&g.installer()).is_empty());
+    assert!(remove_everywhere(&g.installer(), None).is_empty());
 }
 
 // ----- comandos das Configurações (Task 9) -----
@@ -971,4 +977,297 @@ fn aviso_da_pasta_antiga_cita_as_pastas() {
     assert_eq!(w.code, "mod_old_folder");
     assert!(w.message.contains("D:\\Jogos\\HL"), "{}", w.message);
     assert!(w.message.contains("Remover mod do jogo"));
+}
+
+// ----- revisão da Task 9: pasta do jogo movida (F1) — manifesto dentro da pasta do jogo -----
+
+use cbmp_launcher_lib::modact::{adopt_folder, read_manifest, BACKUP_MANIFEST};
+
+fn manifest_json(g: &Game) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(g.backup().join(BACKUP_MANIFEST)).unwrap()).unwrap()
+}
+
+/// A mesma árvore em outro lugar (Steam "mover pasta de instalação", renomear).
+fn moved(a: Game, name: &str) -> Game {
+    let to = a.game.dir.parent().unwrap().join(name);
+    std::fs::rename(&a.game.dir, &to).unwrap();
+    Game {
+        game: GameInstall {
+            exe: to.join("HogwartsLegacy.exe"),
+            dir: to,
+            store: Store::Manual,
+        },
+        mods: a.mods,
+        _tmp: a._tmp,
+    }
+}
+
+#[test]
+fn manifesto_e_gravado_antes_de_mover_com_sha_e_estado() {
+    let g = fake_game();
+    installed(&g);
+    g.put(LOADER_NAME, b"UE4SS do jogador");
+    ensure_active(&g.game, &g.installer(), true).unwrap();
+    let m = manifest_json(&g);
+    assert_eq!(m["v"], 1);
+    assert_eq!(m["entries"][0]["name"], "dwmapi.dll");
+    assert_eq!(m["entries"][0]["stored"], "dwmapi.dll");
+    assert_eq!(
+        m["entries"][0]["sha256"],
+        modzip::sha_hex(b"UE4SS do jogador")
+    );
+    assert_eq!(m["entries"][0]["state"], "done");
+    assert_eq!(
+        record(&g).backups[0].sha256.as_deref(),
+        Some(modzip::sha_hex(b"UE4SS do jogador").as_str())
+    );
+    // Remover devolve o arquivo e apaga o manifesto (e a pasta vazia).
+    remove_mod(&g.game, &g.installer()).unwrap();
+    assert_eq!(g.read(LOADER_NAME), b"UE4SS do jogador");
+    assert!(!g.backup().exists());
+}
+
+#[test]
+fn manifesto_que_nao_grava_nao_move_o_arquivo_do_jogador() {
+    let g = fake_game();
+    installed(&g);
+    g.put(LOADER_NAME, b"UE4SS do jogador");
+    // `cbmp-backup` ocupado por um arquivo: o manifesto não tem onde ser gravado.
+    std::fs::write(g.backup(), b"arquivo no lugar da pasta").unwrap();
+    assert!(ensure_active(&g.game, &g.installer(), true).is_err());
+    assert_eq!(
+        g.read(LOADER_NAME),
+        b"UE4SS do jogador",
+        "nada saiu de Win64"
+    );
+    assert!(record(&g).backups.is_empty());
+}
+
+#[tokio::test]
+async fn pasta_movida_depois_do_jogar_remover_devolve_o_arquivo_do_jogador() {
+    let a = fake_game();
+    let (hub, mods) = hub_with_mod(&a.mods).await;
+    a.put(LOADER_NAME, b"UE4SS do jogador");
+    let before = files_under(&a.win64());
+    mods.ensure(&hub, 1, &a.game, CancellationToken::new())
+        .await
+        .unwrap();
+    ensure_active(&a.game, &mods, true).unwrap();
+    let a_dir = a.game.dir.clone();
+    let b = moved(a, "HL movido");
+
+    // Jogar na pasta nova: a antiga sumiu, mas os backups foram junto e são adotados.
+    mods.ensure(&hub, 1, &b.game, CancellationToken::new())
+        .await
+        .unwrap();
+    ensure_active(&b.game, &mods, false).unwrap();
+    let r = mods.installed().unwrap();
+    assert_eq!(r.game_dir, b.game.dir);
+    assert_eq!(r.backups.len(), 1);
+    assert_eq!(r.backups[0].name, LOADER_NAME);
+    assert!(r.other_folders.iter().all(|f| f.game_dir != a_dir));
+
+    let res = remove_everywhere(&mods, Some(&b.game.dir));
+    assert!(res.iter().all(|f| f.error.is_none()), "{res:?}");
+    assert_eq!(b.read(LOADER_NAME), b"UE4SS do jogador");
+    assert!(!b.backup().exists());
+    assert!(!b.current().exists());
+    assert_eq!(files_under(&b.win64()), before);
+    assert!(leftover_folders(None, &mods).is_empty());
+}
+
+#[tokio::test]
+async fn pasta_movida_sem_jogar_estado_mostra_os_backups_e_remover_devolve() {
+    let a = fake_game();
+    let (hub, mods) = hub_with_mod(&a.mods).await;
+    a.put(LOADER_NAME, b"UE4SS do jogador");
+    a.put(OVERRIDE_NAME, b"ue4ss");
+    let before = files_under(&a.win64());
+    mods.ensure(&hub, 1, &a.game, CancellationToken::new())
+        .await
+        .unwrap();
+    ensure_active(&a.game, &mods, true).unwrap();
+    let b = moved(a, "HL renomeado");
+
+    // Configurações abertas com a pasta nova: o manifesto de B é adotado.
+    adopt_folder(&b.game.dir, &mods);
+    let r = mods.installed().unwrap();
+    let fb = r
+        .other_folders
+        .iter()
+        .find(|f| f.game_dir == b.game.dir)
+        .expect("pasta nova registrada com os backups");
+    assert_eq!(fb.backups.len(), 2);
+    assert!(
+        r.backups.is_empty(),
+        "a pasta antiga (sumiu) não guarda mais esses backups"
+    );
+    assert!(leftover_folders(None, &mods).contains(&b.game.dir));
+
+    // "Remover mod do jogo" com a pasta nova: o do jogador volta, nada nosso fica.
+    let out = remove_mod_with(Some(&b.game), &mods, &closed()).unwrap();
+    assert!(
+        out.folders.iter().all(|f| f.error.is_none()),
+        "{:?}",
+        out.folders
+    );
+    assert_eq!(b.read(LOADER_NAME), b"UE4SS do jogador");
+    assert_eq!(b.read(OVERRIDE_NAME), b"ue4ss");
+    assert!(!b.backup().exists());
+    assert!(!b.current().exists());
+    assert_eq!(files_under(&b.win64()), before);
+    assert!(leftover_folders(None, &mods).is_empty());
+}
+
+#[test]
+fn pasta_sumida_com_backups_fica_registrada() {
+    let g = fake_game();
+    let mut rec = installed(&g);
+    let gone = g.game.dir.parent().unwrap().join("apagada");
+    rec.game_dir = gone.clone();
+    rec.backups = vec![BackupEntry {
+        name: LOADER_NAME.into(),
+        stored: LOADER_NAME.into(),
+        sha256: Some(modzip::sha_hex(b"x")),
+        state: BackupState::Done,
+    }];
+    g.installer().save_record(&rec).unwrap();
+    let res = remove_everywhere(&g.installer(), None);
+    assert_eq!(res.len(), 1);
+    assert_eq!(
+        res[0].error.as_ref().unwrap().code,
+        "mod_folder_unreachable"
+    );
+    let r = record(&g);
+    assert_eq!(
+        r.backups.len(),
+        1,
+        "não descarta: os arquivos podem estar em outro lugar"
+    );
+    assert!(!r.removed);
+}
+
+/// Grava um manifesto à mão em `cbmp-backup\`.
+fn plant_manifest(g: &Game, entries: serde_json::Value) {
+    std::fs::create_dir_all(g.backup()).unwrap();
+    std::fs::write(
+        g.backup().join(BACKUP_MANIFEST),
+        serde_json::json!({ "v": 1, "entries": entries }).to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn manifesto_adulterado_e_recusado() {
+    let g = fake_game();
+    let mut rec = installed(&g);
+    activate(&g.win64(), &g.current(), &mut rec, false).unwrap();
+    g.installer().save_record(&rec).unwrap();
+    let outside = g.game.dir.parent().unwrap().join("fora.dll");
+    std::fs::write(&outside, b"fora").unwrap();
+    std::fs::write(g.win64().join("kernel32.dll"), b"do jogo").unwrap();
+    std::fs::create_dir_all(g.backup()).unwrap();
+    std::fs::write(g.backup().join("dwmapi.dll"), b"backup").unwrap();
+    std::fs::write(g.backup().join("x.dll"), b"x").unwrap();
+    let sha = |d: &[u8]| modzip::sha_hex(d);
+    plant_manifest(
+        &g,
+        serde_json::json!([
+            // Nome fora da lista fixa, caminhos, travessia, sha errado, sufixo inválido.
+            { "name": "kernel32.dll", "stored": "x.dll", "sha256": sha(b"x"), "state": "done" },
+            { "name": "dwmapi.dll", "stored": "..\\fora.dll", "sha256": sha(b"fora"), "state": "done" },
+            { "name": "dwmapi.dll", "stored": "../fora.dll", "sha256": sha(b"fora"), "state": "done" },
+            { "name": "..\\..\\fora.dll", "stored": "dwmapi.dll", "sha256": sha(b"backup"), "state": "done" },
+            { "name": "dwmapi.dll", "stored": "dwmapi.dll", "sha256": sha(b"outro"), "state": "done" },
+            { "name": "dwmapi.dll", "stored": "dwmapi.dll.x", "sha256": sha(b"backup"), "state": "done" },
+            { "name": "override.txt", "stored": "x.dll", "sha256": sha(b"x"), "state": "done" },
+            { "name": "dwmapi.dll", "stored": "C:x", "sha256": sha(b"x"), "state": "done" }
+        ]),
+    );
+    assert!(read_manifest(&g.win64()).is_empty());
+    adopt_folder(&g.game.dir, &g.installer());
+    assert!(record(&g).backups.is_empty());
+    remove_mod(&g.game, &g.installer()).unwrap();
+    assert_eq!(std::fs::read(&outside).unwrap(), b"fora");
+    assert_eq!(g.read("kernel32.dll"), b"do jogo");
+    assert!(!g.win64().join(LOADER_NAME).exists(), "nada devolvido");
+    assert_eq!(
+        std::fs::read(g.backup().join("dwmapi.dll")).unwrap(),
+        b"backup"
+    );
+
+    // Manifesto com uma entrada boa e uma ruim: só a boa vale.
+    plant_manifest(
+        &g,
+        serde_json::json!([
+            { "name": "dwmapi.dll", "stored": "dwmapi.dll", "sha256": sha(b"backup"), "state": "done" },
+            { "name": "override.txt", "stored": "../../x", "sha256": sha(b"x"), "state": "done" }
+        ]),
+    );
+    let got = read_manifest(&g.win64());
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].stored, "dwmapi.dll");
+    // Campos a mais, versão errada ou lixo: recusado inteiro.
+    for bad in [
+        r#"{"v":2,"entries":[]}"#,
+        r#"{"v":1,"entries":[],"x":1}"#,
+        "lixo",
+    ] {
+        std::fs::write(g.backup().join(BACKUP_MANIFEST), bad.as_bytes()).unwrap();
+        assert!(read_manifest(&g.win64()).is_empty(), "{bad}");
+    }
+}
+
+#[cfg(windows)]
+fn junction(link: &Path, target: &Path) {
+    let out = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn manifesto_ou_backup_por_juncao_e_recusado() {
+    let g = fake_game();
+    let elsewhere = g.game.dir.parent().unwrap().join("fora");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("dwmapi.dll"), b"fora").unwrap();
+    std::fs::write(
+        elsewhere.join(BACKUP_MANIFEST),
+        serde_json::json!({ "v": 1, "entries": [
+            { "name": "dwmapi.dll", "stored": "dwmapi.dll", "sha256": modzip::sha_hex(b"fora"), "state": "done" }
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    // `cbmp-backup` é uma junção para fora da pasta do jogo.
+    junction(&g.backup(), &elsewhere);
+    assert!(read_manifest(&g.win64()).is_empty());
+    let mut rec = installed(&g);
+    activate(&g.win64(), &g.current(), &mut rec, false).unwrap();
+    g.installer().save_record(&rec).unwrap();
+    remove_mod(&g.game, &g.installer()).unwrap();
+    assert!(
+        !g.win64().join(LOADER_NAME).exists(),
+        "nada devolvido de fora"
+    );
+    assert_eq!(
+        std::fs::read(elsewhere.join("dwmapi.dll")).unwrap(),
+        b"fora"
+    );
+    std::fs::remove_dir(g.backup()).unwrap();
+
+    // Backup que é uma junção (pasta) para fora.
+    std::fs::create_dir_all(g.backup()).unwrap();
+    junction(&g.backup().join("dwmapi.dll"), &elsewhere);
+    plant_manifest(
+        &g,
+        serde_json::json!([{ "name": "dwmapi.dll", "stored": "dwmapi.dll", "state": "done" }]),
+    );
+    assert!(read_manifest(&g.win64()).is_empty());
+    std::fs::remove_dir(g.backup().join("dwmapi.dll")).unwrap();
 }
