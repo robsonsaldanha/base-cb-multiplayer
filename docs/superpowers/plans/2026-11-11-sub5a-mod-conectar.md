@@ -16,12 +16,12 @@
 
 - Branch `sub5a-mod`; um ou mais commits por task; mensagem em pt-BR no padrão do repositório (`feat(client): …`, `feat(launcher): …`), linha em branco e o trailer `Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>`; ao fim da task `git push origin sub5a-mod`.
 - Sem WSL, Docker ou bancos locais. Nenhuma task roda o Hogwarts Legacy: esta máquina não tem o jogo. Tudo o que depende do jogo vai para o roteiro manual (Task 12).
-- Sem segredos nem chaves privadas no repositório. Chave dev: `C:\Users\robso\.cbmp-devkeys\update.key` (nunca copiar para o repo nem para a VPS, nunca imprimir).
-- Dump do jogo (`C:\Users\robso\cbmp-dumps\...`) é só referência: em código e docs entram apenas nomes curtos de classes, funções e propriedades; nunca cabeçalhos, trechos ou listas em massa.
+- Sem segredos nem chaves privadas no repositório. Chave dev: `<pasta-da-chave-dev>\update.key`, fora do repositório (nunca copiar para o repo nem para a VPS, nunca imprimir).
+- Dump do jogo (`<pasta-do-dump>\...`, fora do repositório) é só referência: em código e docs entram apenas nomes curtos de classes, funções e propriedades; nunca cabeçalhos, trechos ou listas em massa.
 - Nenhum código de MafiaHub, arcane-mp ou HogwartsMP. Nunca tocar repositórios `castelobruxo/*`.
 - UE4SS/Unreal só dentro de `client/src/game/` (e `CbMpMod.*`, `dllmain.cpp`, que são a casca do mod). `client/core` não inclui UE4SS nem `Windows.h` (há teste de guarda).
 - Texto para o usuário e docs em pt-BR; identificadores de código em inglês, como o repositório já faz. Código novo do cliente: namespace `cbmp::client`, cabeçalhos em `<cbmp/client/...>`, métodos em PascalCase (como `IGame`), casos de teste Catch2 com nome começando por `client: `.
-- Ambiente de teste online só por `tools/teste-online.mjs` (VPS: `ssh -p 22022 robson@143.95.209.35`); nunca tocar outros projetos na VPS; nunca imprimir segredos.
+- Ambiente de teste online só por `tools/teste-online.mjs` (VPS: `ssh -p <porta-ssh> <usuario>@<vps>`); nunca tocar outros projetos na VPS; nunca imprimir segredos.
 - Testes que têm de passar antes de cada commit estão no fim de cada task ("Verificação"). CI existente continua verde (`native`, `launcher`, Hub). Se o GitHub Actions não estiver rodando (cobrança da conta), registre no relatório e siga.
 
 **Build local (Windows)**
@@ -926,9 +926,9 @@ export const modAdminSetup = (): Promise<ModStatus> => call("mod_admin_setup");
 - **`dev-env.mjs`**: opção `--mod-zip <zip>`: com ela publica `mod-p1-v0.2.0` assinado com a chave dev no Hub local; sem ela continua o mod de teste 0.1.0 (o cabeçalho avisa que o launcher 0.2.0 só aceita esse mod no modo simular).
 - **Publicação** (depois de tudo verde e commitado):
   1. `tools\build.ps1 -Target mod`; `tools\package-mod.ps1`; `node tools/check-mod-zip.mjs dist/cbmp-mod.zip --version 0.2.0 --protocol 1`.
-  2. Releases antigas na pasta de trabalho (`%TEMP%\cbmp-teste-online\releases`): se faltar alguma `launcher-v0.1.x` ou `mod-p1-v0.1.0`, copiar da VPS só para leitura: `scp -P 22022 -r robson@143.95.209.35:/var/www/html_cbmultiplayer/releases/<tag> <pasta>\releases\`.
+  2. Releases antigas na pasta de trabalho (`%TEMP%\cbmp-teste-online\releases`): se faltar alguma `launcher-v0.1.x` ou `mod-p1-v0.1.0`, copiar da VPS só para leitura: `scp -P <porta-ssh> -r <usuario>@<vps>:/var/www/html_cbmultiplayer/releases/<tag> <pasta>\releases\`.
   3. `node tools/teste-online.mjs --build-releases --mod-zip dist/cbmp-mod.zip` (gera `mod-p1-v0.2.0` e `launcher-v0.2.0`, assinados com a chave dev local).
-  4. `$env:CBMP_TESTE_SSH='robson@143.95.209.35'; $env:CBMP_TESTE_SSH_PORT='22022'; node tools/teste-online.mjs --deploy` (sem `--server-tar`: o servidor não muda de código; o `server.cfg` novo vai junto e o serviço reinicia).
+  4. `$env:CBMP_TESTE_SSH='<usuario>@<vps>'; $env:CBMP_TESTE_SSH_PORT='<porta-ssh>'; node tools/teste-online.mjs --deploy` (sem `--server-tar`: o servidor não muda de código; o `server.cfg` novo vai junto e o serviço reinicia).
   5. `node tools/teste-online.mjs --status` e `node tools/teste-online.mjs --check` → tudo ok (inclui `0.1.3 → 0.2.0`, mod `v0.2.0`, layout do zip).
   6. Confirmar pelo `--status` que o `cb-server` está ativo depois do deploy (o `server.cfg` novo foi aceito). Que o servidor aceita a posição com `Apparate` é conferido no roteiro manual (o servidor de teste só aceita ticket do Hub, então o `cbmp-headless` não entra nele).
   Se a VPS, a chave ou a rede não estiverem disponíveis: **não improvisar**; terminar com `DONE_WITH_CONCERNS` listando exatamente quais dos passos 2–5 faltam.
