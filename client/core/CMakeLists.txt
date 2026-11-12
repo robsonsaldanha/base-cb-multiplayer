@@ -9,6 +9,9 @@ add_library(cbmp_client_core STATIC
     src/ModConfig.cpp
     src/ConnectFile.cpp
     src/ClaimPolicy.cpp
+    src/NetClient.cpp
+    src/SnapshotMirror.cpp
+    src/RemoteStore.cpp
 )
 target_include_directories(cbmp_client_core PUBLIC include)
 target_compile_features(cbmp_client_core PUBLIC cxx_std_23)
