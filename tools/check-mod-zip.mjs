@@ -13,8 +13,15 @@ function main(argv) {
   let zip; const opts = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--version') opts.version = argv[++i];
-    else if (a === '--protocol') opts.protocol = Number(argv[++i]);
+    if (a === '--version' || a === '--protocol') {
+      const v = argv[++i];
+      if (!v || v.startsWith('--')) { console.error(`${a} exige um valor`); return 2; }
+      if (a === '--version') opts.version = v;
+      else {
+        opts.protocol = Number(v);
+        if (!Number.isInteger(opts.protocol)) { console.error(`--protocol inválido: ${v}`); return 2; }
+      }
+    }
     else if (a.startsWith('--')) { console.error(`opção desconhecida: ${a}`); return 2; }
     else zip = a;
   }

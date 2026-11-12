@@ -83,3 +83,19 @@ test('ações de terceiros fixadas por commit; vcpkg e UE4SS nos commits certos'
   assert.ok(t.includes('ec48c11eae9448c8c6e7739d93e06fa2433aa95f'));
   assert.ok(t.includes('4fb9b615a24c724041ef23e2c4073f2610c4c6d0'));
 });
+
+test('todo passo depois do passo token tem if: steps.token.outputs.have == true', () => {
+  const l = lines();
+  const starts = l.map((x, i) => (/^\s{6}- /.test(x) ? i : -1)).filter((i) => i >= 0);
+  const steps = starts.map((s, k) => l.slice(s, k + 1 < starts.length ? starts[k + 1] : l.length).join('\n'));
+  const tokenIdx = steps.findIndex((s) => /^\s{6}- name: token\b/.test(s));
+  assert.ok(tokenIdx >= 0, 'passo token');
+  assert.ok(steps.length > tokenIdx + 1);
+  for (const s of steps.slice(tokenIdx + 1)) {
+    assert.match(s, /if: (always\(\) && )?steps\.token\.outputs\.have == 'true'/, `passo sem if do token:\n${s}`);
+  }
+});
+
+test('o checkout não guarda credenciais', () => {
+  assert.match(text(), /actions\/checkout@\S+\s*\n\s+with:\s*\n\s+persist-credentials: false/);
+});
