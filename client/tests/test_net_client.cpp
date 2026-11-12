@@ -103,6 +103,13 @@ TEST_CASE("client: SendInput e SendAck nao sao confiaveis") {
     REQUIRE(std::get<cbmp::SnapshotAck>(msgs[1]).tick == 42);
     REQUIRE(net.Counters().inputs == 1);
     REQUIRE(net.Counters().acks == 1);
+
+    // transporte recusando: nada é contado
+    t.sendOk = false;
+    net.SendInput(8, s);
+    net.SendAck(43);
+    REQUIRE(net.Counters().inputs == 1);
+    REQUIRE(net.Counters().acks == 1);
 }
 
 TEST_CASE("client: Pump despacha cada tipo para o sink") {

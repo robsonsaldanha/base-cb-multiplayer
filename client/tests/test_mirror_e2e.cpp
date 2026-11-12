@@ -152,7 +152,12 @@ TEST_CASE("client: teste espelho com perda, embaralhamento, baseline e saidas") 
             REQUIRE(r->changed == ids);
             if (u(rng) >= kLoss && !AckBlackout(tick) && tick > server.lastAck) server.lastAck = tick;
         }
-        if (!applied && delivered.size() == parts.front().partCount) ++baselineDrops;  // todas chegaram, sem ack
+        if (!applied && delivered.size() == parts.front().partCount) {  // todas chegaram, sem ack
+            // o único motivo possível hoje: a baseline saiu do anel
+            REQUIRE(parts.front().baselineTick != 0);
+            REQUIRE(mirror.Find(parts.front().baselineTick) == nullptr);
+            ++baselineDrops;
+        }
         REQUIRE(mirror.LastAppliedTick() == (confirmed.empty() ? 0u : *confirmed.rbegin()));
     }
 

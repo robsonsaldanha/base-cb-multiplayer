@@ -41,9 +41,9 @@ std::string SanitizeText(std::string_view raw, size_t maxBytes) {
 
 NetClient::NetClient(ITransport& transport, INetSink& sink) : m_transport(transport), m_sink(sink) {}
 
-void NetClient::Send(const cbmp::Message& m) {
+bool NetClient::Send(const cbmp::Message& m) {
     const auto bytes = cbmp::encode(m);
-    m_transport.Send(bytes, cbmp::isReliable(cbmp::typeOf(m)));
+    return m_transport.Send(bytes, cbmp::isReliable(cbmp::typeOf(m)));
 }
 
 bool NetClient::SendHello(const std::array<uint8_t, 32>& buildHash, std::string& ticket) {
@@ -63,13 +63,11 @@ bool NetClient::SendHello(const std::array<uint8_t, 32>& buildHash, std::string&
 }
 
 void NetClient::SendInput(uint32_t seq, const cbmp::PlayerState& s) {
-    Send(cbmp::Input{seq, s});
-    ++m_counters.inputs;
+    if (Send(cbmp::Input{seq, s})) ++m_counters.inputs;
 }
 
 void NetClient::SendAck(uint32_t tick) {
-    Send(cbmp::SnapshotAck{tick});
-    ++m_counters.acks;
+    if (Send(cbmp::SnapshotAck{tick})) ++m_counters.acks;
 }
 
 bool NetClient::NoteDecodeError(double now) {

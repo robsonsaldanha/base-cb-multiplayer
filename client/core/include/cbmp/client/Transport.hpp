@@ -20,7 +20,10 @@ public:
     virtual ~ITransport() = default;
     virtual bool Connect(const std::string& ipLiteral, uint16_t port) = 0;              // false = falha imediata
     virtual bool Send(std::span<const uint8_t> bytes, bool reliable) = 0;
-    virtual size_t Receive(std::vector<std::vector<uint8_t>>& out, size_t max) = 0;     // acrescenta até `max` mensagens
+    // Acrescenta até `max` mensagens. O transporte real limita o tamanho de cada mensagem já na recepção (GNS:
+    // k_ESteamNetworkingConfig_RecvMaxMessageSize = kMaxMessageBytes), para um lote de 512 não alocar centenas de MiB
+    // antes de o NetClient descartar o que passa de 8 KiB.
+    virtual size_t Receive(std::vector<std::vector<uint8_t>>& out, size_t max) = 0;
     virtual size_t Pending() const = 0;                                                  // ainda na fila local depois do Receive
     virtual LinkState State() = 0;
     virtual LinkEnd End() const = 0;                                                     // válido em Closed

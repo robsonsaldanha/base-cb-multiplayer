@@ -244,3 +244,59 @@ TEST_CASE("client: partes do mesmo tick com baselines diferentes") {
     REQUIRE(m.Dropped() == 1);
     REQUIRE(m.OnSnapshot(Snap(12, 10, 1, 2, {Full(2, St(2))})).has_value());
 }
+
+namespace {
+std::vector<cbmp::SnapshotEntity> Range(uint16_t first, uint16_t count, int32_t x) {
+    std::vector<cbmp::SnapshotEntity> v;
+    for (uint16_t i = 0; i < count; ++i) v.push_back(Full(static_cast<uint16_t>(first + i), St(x)));
+    return v;
+}
+// Teto do trabalho de um tick com 8 × 255 entidades recebidas e baseline de 255: recolher + ordenar (≤ 32
+// comparações por entidade, folgado para qualquer stable_sort) + merge. O merge por inserção antigo passava de 10^6.
+constexpr uint64_t kWorkBound = 8u * 255u * 32u;
+}  // namespace
+
+TEST_CASE("client: tick com mais de 255 ids distintos e descartado cedo com custo limitado") {
+    SnapshotMirror m;
+    REQUIRE(m.OnSnapshot(Snap(1, 0, 0, 1, Range(3000, 255, 1))).has_value());  // baseline cheia
+    const uint64_t before = m.MergeWork();
+    // 8 partes × 255 ids distintos, cada parte com ids menores que a anterior (o pior caso do merge por inserção)
+    for (uint8_t p = 0; p < 8; ++p) {
+        const auto first = static_cast<uint16_t>((7 - p) * 255 + 1);
+        REQUIRE_FALSE(m.OnSnapshot(Snap(2, 1, p, 8, Range(first, 255, 2))).has_value());
+    }
+    REQUIRE(m.Dropped() == 1);
+    REQUIRE(m.Find(2) == nullptr);
+    REQUIRE(m.LastAppliedTick() == 1);
+    const uint64_t work = m.MergeWork() - before;
+    CAPTURE(work);
+    REQUIRE(work <= kWorkBound);
+    // recolheu as 2040 recebidas (e não fez merge: o tick caiu antes)
+    REQUIRE(work >= 8u * 255u);
+
+    // o tick seguinte sobre a mesma baseline continua normal
+    REQUIRE(m.OnSnapshot(Snap(3, 1, 0, 1, {Delta(3000, 5)})).has_value());
+}
+
+TEST_CASE("client: recebidas mais baseline passando de 255 descartam no merge com custo limitado") {
+    SnapshotMirror m;
+    REQUIRE(m.OnSnapshot(Snap(1, 0, 0, 1, Range(3000, 255, 1))).has_value());
+    const uint64_t before = m.MergeWork();
+    REQUIRE_FALSE(m.OnSnapshot(Snap(2, 1, 0, 1, Range(1, 255, 2))).has_value());  // 255 + 255 ids diferentes
+    REQUIRE(m.Dropped() == 1);
+    REQUIRE(m.Find(2) == nullptr);
+    REQUIRE(m.MergeWork() - before <= kWorkBound);
+}
+
+TEST_CASE("client: ids repetidos entre partes contam uma vez e a ultima parte vence") {
+    SnapshotMirror m;
+    REQUIRE(m.OnSnapshot(Snap(1, 0, 0, 1, Range(1, 255, 1))).has_value());
+    const uint64_t before = m.MergeWork();
+    for (uint8_t p = 0; p < 7; ++p) REQUIRE_FALSE(m.OnSnapshot(Snap(2, 1, p, 8, Range(1, 255, 10 + p))).has_value());
+    auto r = m.OnSnapshot(Snap(2, 1, 7, 8, Range(1, 255, 99)));
+    REQUIRE(r.has_value());
+    REQUIRE(r->record->ents.size() == 255);
+    REQUIRE(r->changed.size() == 255);
+    for (const auto& e : r->record->ents) REQUIRE(e.s.pos.x == 99);
+    REQUIRE(m.MergeWork() - before <= kWorkBound);
+}

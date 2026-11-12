@@ -17,6 +17,8 @@ struct NetCounters {
              enters = 0, leaves = 0, inputs = 0;
 };
 
+// Os métodos não devem lançar: uma exceção sai do Pump no meio do lote e as mensagens restantes já recebidas do
+// transporte (inclusive confiáveis, como EntityLeave) se perdem. Quem implementa contém as próprias falhas.
 class INetSink {
 public:
     virtual ~INetSink() = default;
@@ -37,14 +39,14 @@ public:
     // Confiável. Depois do Send, zera o buffer codificado, a cópia na mensagem e `ticket` (que fica vazio), mesmo se
     // falhar. false = não codificou ou o transporte recusou.
     bool SendHello(const std::array<uint8_t, 32>& buildHash, std::string& ticket);
-    void SendInput(uint32_t seq, const cbmp::PlayerState& s);  // não confiável
-    void SendAck(uint32_t tick);                               // não confiável
+    void SendInput(uint32_t seq, const cbmp::PlayerState& s);  // não confiável; `inputs` conta só os aceitos
+    void SendAck(uint32_t tick);                               // não confiável; `acks` conta só os aceitos
     // Processa até kMaxMessagesPerTick mensagens recebidas. Diferente de None: desconecte.
     NetFault Pump(double now);
     const NetCounters& Counters() const;
 
 private:
-    void Send(const cbmp::Message& m);
+    bool Send(const cbmp::Message& m);  // false = o transporte recusou
     bool NoteDecodeError(double now);  // true = passou do limite na janela
 
     ITransport& m_transport;

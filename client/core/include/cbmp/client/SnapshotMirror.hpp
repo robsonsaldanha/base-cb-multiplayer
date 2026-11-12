@@ -35,6 +35,9 @@ public:
     uint32_t LastAppliedTick() const;
     const TickRecord* Find(uint32_t tick) const;
     uint64_t Dropped() const;  // partes/ticks descartados
+    // Passos da montagem de registros (entidades recolhidas + comparações da ordenação + passos do merge), acumulado.
+    // Diagnóstico: os testes conferem que o trabalho por tick é limitado pela entrada (≤ 8 × 255 recebidas).
+    uint64_t MergeWork() const;
 
 private:
     void Drop();
@@ -44,6 +47,7 @@ private:
     size_t m_next = 0;  // próxima posição do anel (a mais velha quando cheio)
     uint32_t m_lastApplied = 0;
     uint64_t m_dropped = 0;
+    uint64_t m_mergeWork = 0;
 
     // Montagem do tick em curso.
     uint32_t m_asmTick = 0;
