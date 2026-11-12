@@ -6,13 +6,9 @@
 #include <string>
 
 namespace cbmp::client {
-namespace {
-constexpr size_t kMaxModConfigBytes = 4096;
-}
-
 ModConfig ParseModConfig(std::span<const uint8_t> bytes) {
     ModConfig cfg;
-    if (bytes.size() > kMaxModConfigBytes) return cfg;
+    if (bytes.size() > limits::kMaxModConfigBytes) return cfg;
     const auto j = nlohmann::json::parse(bytes.begin(), bytes.end(), nullptr, /*allow_exceptions=*/false);
     if (j.is_discarded() || !j.is_object()) return cfg;
 

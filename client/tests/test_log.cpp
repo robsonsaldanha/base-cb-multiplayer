@@ -75,6 +75,7 @@ TEST_CASE("client: PruneLogs mantem os mais novos pelo nome e ignora outros arqu
     // Criados fora de ordem: a ordem vem do nome, não da data de modificação.
     for (int i = 11; i >= 0; --i) std::ofstream(dir / names[static_cast<size_t>(i)]) << "x";
     std::ofstream(dir / "outro.txt") << "x";
+    std::ofstream(dir / "cb-mp-x.log") << "x";  // fora do formato de LogFileName: não conta nem é apagado
 
     PruneLogs(dir, 10);
 
@@ -82,6 +83,7 @@ TEST_CASE("client: PruneLogs mantem os mais novos pelo nome e ignora outros arqu
     for (const auto& e : fs::directory_iterator(dir)) left.insert(e.path().filename().string());
     std::set<std::string> expected(names.begin() + 2, names.end());
     expected.insert("outro.txt");
+    expected.insert("cb-mp-x.log");
     CHECK(left == expected);
     fs::remove_all(dir);
 }
@@ -125,6 +127,76 @@ TEST_CASE("client: FileLogger ignora segredo curto") {
     CHECK(content.find("INFO  valor 12345678 aparece\n") != std::string::npos);
     CHECK(content.find("omitida") == std::string::npos);
     fs::remove(path);
+}
+
+TEST_CASE("client: SetSecret curto nao desliga o segredo atual") {
+    const auto path = fs::temp_directory_path() / "cbmp_client_test_secret_keep.txt";
+    fs::remove(path);
+    const std::string secret = "0123456789abcdefTICKET";
+    {
+        FileLogger log;
+        REQUIRE(log.Open(path));
+        log.SetSecret(secret);
+        log.SetSecret("12345678");
+        log.SetSecret("");
+        log.Write(Level::Info, "ticket=" + secret);
+    }
+    const std::string content = ReadAll(path);
+    CHECK(content.find(secret) == std::string::npos);
+    CHECK(content.ends_with("INFO  linha omitida (continha segredo)\n"));
+    fs::remove(path);
+}
+
+TEST_CASE("client: SetSecret valido troca o segredo") {
+    const auto path = fs::temp_directory_path() / "cbmp_client_test_secret_swap.txt";
+    fs::remove(path);
+    const std::string first = "0123456789abcdefPRIMEIRO";
+    const std::string second = "fedcba9876543210SEGUNDO";
+    {
+        FileLogger log;
+        REQUIRE(log.Open(path));
+        log.SetSecret(first);
+        log.SetSecret(second);
+        log.Write(Level::Info, "a " + first);
+        log.Write(Level::Info, "b " + second);
+    }
+    const std::string content = ReadAll(path);
+    CHECK(content.find("INFO  a " + first + "\n") != std::string::npos);
+    CHECK(content.find(second) == std::string::npos);
+    CHECK(content.ends_with("INFO  linha omitida (continha segredo)\n"));
+    fs::remove(path);
+}
+
+TEST_CASE("client: FileLogger aberto duas vezes continua gravando") {
+    const auto a = fs::temp_directory_path() / "cbmp_client_test_reopen_a.txt";
+    const auto b = fs::temp_directory_path() / "cbmp_client_test_reopen_b.txt";
+    fs::remove(a);
+    fs::remove(b);
+    {
+        FileLogger log;
+        REQUIRE(log.Open(a));
+        REQUIRE(log.Open(b));
+        REQUIRE(log.IsOpen());
+        log.Write(Level::Info, "no segundo");
+    }
+    CHECK(ReadAll(b).ends_with("INFO  no segundo\n"));
+    CHECK(ReadAll(a).empty());
+    fs::remove(a);
+    fs::remove(b);
+}
+
+TEST_CASE("client: PruneLogs com pasta ausente ou poucos arquivos nao apaga nada") {
+    const auto dir = fs::temp_directory_path() / "cbmp_client_prune_few";
+    fs::remove_all(dir);
+    PruneLogs(dir, 10);  // pasta ausente: sem exceção
+    fs::create_directories(dir);
+    for (int i = 0; i < 3; ++i) std::ofstream(dir / std::format("cb-mp-20261111-20140{}-1.log", i)) << "x";
+    PruneLogs(dir, 3);
+    PruneLogs(dir, 10);
+    size_t n = 0;
+    for ([[maybe_unused]] const auto& e : fs::directory_iterator(dir)) ++n;
+    CHECK(n == 3);
+    fs::remove_all(dir);
 }
 
 TEST_CASE("client: FileLogger fechado nao grava nada") {

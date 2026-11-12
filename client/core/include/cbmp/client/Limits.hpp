@@ -17,6 +17,8 @@ inline constexpr size_t kMaxPointerBytes = 4096;       // cbmp-run.json
 inline constexpr size_t kMaxConnectBytes = 16384;      // connect.json
 inline constexpr size_t kInterpQueue = 32;             // amostras por entidade
 inline constexpr size_t kLogKeep = 10;                 // cb-mp-*.log mantidos
+inline constexpr size_t kMaxModConfigBytes = 4096;     // cb-mp.json
+inline constexpr size_t kMinSecretBytes = 16;          // segredo menor não é filtrado do log
 
 // Contagens e frequências
 inline constexpr int kMaxDecodeErrors = 20;            // em kDecodeErrorWindowSec → desconecta

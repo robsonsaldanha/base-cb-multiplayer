@@ -7,8 +7,7 @@ add_executable(cbmp_client_tests
     test_guard.cpp
 )
 target_link_libraries(cbmp_client_tests PRIVATE cbmp_client_core Catch2::Catch2WithMain)
-# Pasta do núcleo para o teste de guarda (test_guard.cpp), em caminho absoluto.
-cmake_path(ABSOLUTE_PATH CMAKE_CURRENT_SOURCE_DIR OUTPUT_VARIABLE _cbmp_client_dir)
-cmake_path(GET _cbmp_client_dir PARENT_PATH _cbmp_client_dir)
-target_compile_definitions(cbmp_client_tests PRIVATE CBMP_CLIENT_CORE_DIR="${_cbmp_client_dir}/core")
+# Pasta do núcleo para o teste de guarda (test_guard.cpp), em caminho absoluto (UTF-8 com /utf-8 no MSVC).
+cmake_path(SET _cbmp_client_core_dir NORMALIZE "${CMAKE_CURRENT_SOURCE_DIR}/../core")
+target_compile_definitions(cbmp_client_tests PRIVATE CBMP_CLIENT_CORE_DIR="${_cbmp_client_core_dir}")
 catch_discover_tests(cbmp_client_tests)

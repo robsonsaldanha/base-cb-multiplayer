@@ -1,6 +1,8 @@
 #include <cbmp/client/Log.hpp>
+#include <cbmp/client/Limits.hpp>
 #include <cbmp/log_text.hpp>
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <format>
 #include <system_error>
@@ -8,7 +10,6 @@
 
 namespace cbmp::client {
 namespace {
-constexpr size_t kMinSecretBytes = 16;
 constexpr std::string_view kOmitted = "linha omitida (continha segredo)";
 
 const char* LevelTag(Level l) {
@@ -30,11 +31,24 @@ std::tm LocalTime(std::time_t tt) {
     return local;
 }
 
+// Avança sobre `n` dígitos (n = 0: um ou mais) a partir de `i`; false se não houver.
+bool Digits(std::string_view s, size_t& i, size_t n) {
+    const size_t start = i;
+    while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i])) && (n == 0 || i - start < n)) ++i;
+    return n == 0 ? i > start : i - start == n;
+}
+
+// Só nomes no formato de LogFileName: cb-mp-<8 dígitos>-<6 dígitos>-<pid>.log.
 bool IsLogName(const std::filesystem::path& p) {
     // Nomes de LogFileName são ASCII; u8string evita conversão pela página de código no Windows.
     const auto u8 = p.filename().u8string();
     const std::string_view name(reinterpret_cast<const char*>(u8.data()), u8.size());
-    return name.size() > 10 && name.starts_with("cb-mp-") && name.ends_with(".log");
+    constexpr std::string_view kPrefix = "cb-mp-", kExt = ".log";
+    if (!name.starts_with(kPrefix) || !name.ends_with(kExt)) return false;
+    const std::string_view mid = name.substr(kPrefix.size(), name.size() - kPrefix.size() - kExt.size());
+    size_t i = 0;
+    return Digits(mid, i, 8) && i < mid.size() && mid[i++] == '-' && Digits(mid, i, 6) && i < mid.size() &&
+           mid[i++] == '-' && Digits(mid, i, 0) && i == mid.size();
 }
 }  // namespace
 
@@ -71,6 +85,9 @@ FileLogger::~FileLogger() {
 
 bool FileLogger::Open(const std::filesystem::path& path) {
     std::lock_guard lock(m_mutex);
+    // Um segundo Open (ou um erro de escrita anterior) não pode deixar o stream em falha com IsOpen() verdadeiro.
+    if (m_out.is_open()) m_out.close();
+    m_out.clear();
     m_out.open(path, std::ios::out | std::ios::app | std::ios::binary);
     return m_out.is_open();
 }
@@ -94,9 +111,11 @@ void FileLogger::Write(Level level, std::string_view msg) {
 }
 
 void FileLogger::SetSecret(std::string_view secret) {
+    // Curto demais: a chamada é ignorada e o segredo atual continua valendo (desligar o filtro é só ClearSecret).
+    if (secret.size() < limits::kMinSecretBytes) return;
     std::lock_guard lock(m_mutex);
     WipeSecretLocked();
-    if (secret.size() >= kMinSecretBytes) m_secret.assign(secret);
+    m_secret.assign(secret);
 }
 
 void FileLogger::ClearSecret() {

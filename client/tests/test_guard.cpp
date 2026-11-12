@@ -27,6 +27,8 @@ std::string Lower(std::string_view s) {
 std::vector<Hit> FindForbiddenIncludes(std::string_view text) {
     static constexpr std::string_view kForbidden[] = {"<Unreal/", "\"Unreal/", "<Mod/", "\"Mod/", "DynamicOutput",
                                                       "UE4SS", "<Helpers/", "\"Helpers/"};
+    // Cabeçalhos Win32 que puxam Windows.h por trás (comparados em minúsculas).
+    static constexpr std::string_view kWin32[] = {"windows.h", "winsock2.h", "windef.h", "winbase.h"};
     std::vector<Hit> hits;
     std::istringstream in{std::string(text)};
     std::string line;
@@ -38,7 +40,9 @@ std::vector<Hit> FindForbiddenIncludes(std::string_view text) {
         const auto kw = line.find_first_not_of(" \t", first + 1);
         if (kw == std::string::npos || line.compare(kw, 7, "include") != 0) continue;
         const std::string_view rest = std::string_view(line).substr(kw + 7);
-        bool bad = Lower(rest).find("windows.h") != std::string::npos;
+        const std::string lower = Lower(rest);
+        bool bad = false;
+        for (const auto w : kWin32) bad = bad || lower.find(w) != std::string::npos;
         for (const auto f : kForbidden) bad = bad || rest.find(f) != std::string_view::npos;
         if (bad) hits.push_back({n, line});
     }
@@ -56,23 +60,25 @@ TEST_CASE("client: detector de include proibido") {
         "#include <DynamicOutput/DynamicOutput.hpp>\n"
         "#include <UE4SSProgram.hpp>\n"
         "#include <Helpers/String.hpp>\n"
+        "#include <WinSock2.h>\n"
         "// Windows.h e UE4SS citados em comentário não contam\n"
         "#include <string>\n";
     const auto hits = FindForbiddenIncludes(sample);
-    REQUIRE(hits.size() == 7);
+    REQUIRE(hits.size() == 8);
     CHECK(hits.front().line == 2);
-    CHECK(hits.back().line == 8);
+    CHECK(hits.back().line == 9);
 }
 
 TEST_CASE("client: nucleo nao inclui UE4SS, Unreal nem Windows.h") {
-    const fs::path root = CBMP_CLIENT_CORE_DIR;
+    // O literal é UTF-8; construir de char8_t evita a página ANSI no Windows (pasta com acento).
+    const fs::path root{std::u8string_view(reinterpret_cast<const char8_t*>(CBMP_CLIENT_CORE_DIR))};
     REQUIRE(fs::is_directory(root));
     int files = 0;
     std::string report;
     for (const auto& e : fs::recursive_directory_iterator(root)) {
         if (!e.is_regular_file()) continue;
         const auto ext = e.path().extension();
-        if (ext != ".hpp" && ext != ".cpp") continue;
+        if (ext != ".hpp" && ext != ".cpp" && ext != ".h" && ext != ".inl" && ext != ".ipp") continue;
         ++files;
         std::ifstream in(e.path(), std::ios::binary);
         std::stringstream ss;

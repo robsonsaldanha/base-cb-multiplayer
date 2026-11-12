@@ -1,5 +1,6 @@
 #pragma once
 // cb-mp.json (opcional, em Win64\cbmp\, do jogador; nunca vem do servidor).
+#include <cbmp/client/Limits.hpp>
 #include <cstdint>
 #include <span>
 
@@ -10,7 +11,7 @@ struct ModConfig {
     bool statusOnScreen = true;               // statusNaTela
     bool extraNeutralization = false;         // neutralizacaoExtra
     PuppetAnim puppetAnim = PuppetAnim::Velocity;  // animacaoBoneco
-    int maxPuppets = 32;                      // maxBonecos (0..64)
+    int maxPuppets = limits::kDefaultMaxPuppets;  // maxBonecos (0..kHardMaxPuppets)
 };
 
 // JSON inválido, que não é objeto ou com mais de 4 KiB → padrões. Campo ausente ou inválido → padrão daquele campo.
