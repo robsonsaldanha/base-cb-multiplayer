@@ -77,12 +77,16 @@ pub fn run() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 // Sobras de downloads e arquivos do cache fora do índice, sob a trava do play (não corre junto
-                // com o primeiro download).
+                // com o primeiro download). Também: backups do mod que ficaram `pending` numa queda.
                 {
                     let gate = handle.state::<play::PlayGate>();
                     let _run = gate.begin().await;
                     let store = content.clone();
                     let _ = tokio::task::spawn_blocking(move || store.startup()).await;
+                    let _ = tokio::task::spawn_blocking(|| {
+                        modact::reconcile_all(&modpkg::ModInstaller::system())
+                    })
+                    .await;
                 }
                 // Jogo ainda não configurado: procura na Steam/Epic (fora da trava e do executor) e grava se achar.
                 let h = handle.clone();

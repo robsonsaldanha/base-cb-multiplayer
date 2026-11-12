@@ -117,6 +117,45 @@ pub struct Installed {
     /// Mod removido do jogo (Configurações); a versão continua valendo como piso do anti-downgrade.
     #[serde(default)]
     pub removed: bool,
+    /// Pastas do jogo anteriores onde ainda há algo nosso (carregador, `override.txt`, `cbmp\atual`) ou backups do
+    /// jogador: a troca de pasta não as abandona. Registro antigo (uma pasta só) carrega com a lista vazia.
+    #[serde(default)]
+    pub other_folders: Vec<FolderRecord>,
+}
+
+impl Installed {
+    /// Ainda há algo nosso ou do jogador a devolver na pasta deste registro.
+    pub fn has_traces(&self) -> bool {
+        !self.removed || !self.backups.is_empty()
+    }
+}
+
+/// Pasta do jogo anterior com algo nosso ou backups do jogador (ver [`Installed::other_folders`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderRecord {
+    pub game_dir: PathBuf,
+    pub version: String,
+    /// Carregador que foi ativado nessa pasta (reconhecido como nosso ao remover).
+    #[serde(default)]
+    pub loader: Option<LoaderRef>,
+    #[serde(default)]
+    pub backups: Vec<BackupEntry>,
+    /// O que era nosso já saiu; só restam backups que não puderam voltar (destino ocupado).
+    #[serde(default)]
+    pub removed: bool,
+}
+
+impl FolderRecord {
+    pub fn of(r: &Installed) -> Self {
+        Self {
+            game_dir: r.game_dir.clone(),
+            version: r.version.clone(),
+            loader: r.loader.clone(),
+            backups: r.backups.clone(),
+            removed: r.removed,
+        }
+    }
 }
 
 /// Carregador instalado.
@@ -127,10 +166,27 @@ pub struct LoaderRef {
 }
 
 /// Arquivo do jogador em `cbmp-backup\`: `name` em `Win64\` → `stored` em `cbmp-backup\`.
+///
+/// Gravado no registro **antes** de mover (`Pending`) e marcado `Done` depois: uma queda no meio deixa uma entrada que
+/// a próxima conferência resolve (arquivo em `cbmp-backup\` → `Done`; ainda em `Win64\` → entrada sai).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupEntry {
     pub name: String,
     pub stored: String,
+    /// Ausente (registro antigo) = `Done`.
+    #[serde(default)]
+    pub state: BackupState,
+}
+
+/// Situação de um backup.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BackupState {
+    /// Movido para `cbmp-backup\`.
+    #[default]
+    Done,
+    /// Registrado; o arquivo talvez ainda não tenha saído de `Win64\`.
+    Pending,
 }
 
 /// `cbmp-mod.json` do pacote.
@@ -445,6 +501,21 @@ fn install_package(
         }
     }
     loader_history.retain(|h| *h != loader.sha256);
+    let mut backups = same_game.map(|p| p.backups.clone()).unwrap_or_default();
+    // Pastas anteriores com algo nosso continuam registradas; a pasta de antes entra na lista se ainda tiver algo.
+    let mut other_folders = prev.map(|p| p.other_folders.clone()).unwrap_or_default();
+    if let Some(p) = prev.filter(|p| p.game_dir != game.dir && p.has_traces()) {
+        other_folders.retain(|f| f.game_dir != p.game_dir);
+        other_folders.push(FolderRecord::of(p));
+    }
+    // De volta a uma pasta anterior: os backups dela voltam ao registro atual.
+    if let Some(i) = other_folders.iter().position(|f| f.game_dir == game.dir) {
+        let back = other_folders.remove(i);
+        backups.extend(back.backups);
+        if let Some(l) = back.loader.filter(|l| l.sha256 != loader.sha256) {
+            push_loader_history(&mut loader_history, &l.sha256);
+        }
+    }
     Ok(Installed {
         version: signed.version.to_string(),
         protocol: signed.protocol,
@@ -454,8 +525,9 @@ fn install_package(
         layout: LAYOUT,
         loader: Some(loader),
         loader_history,
-        backups: same_game.map(|p| p.backups.clone()).unwrap_or_default(),
+        backups,
         removed: false,
+        other_folders,
     })
 }
 
@@ -723,6 +795,7 @@ enum Failure {
 }
 
 /// Baixa, verifica e instala o mod. `mods_dir` = `%LOCALAPPDATA%\CBMultiplayer\mods`.
+#[derive(Clone)]
 pub struct ModInstaller {
     mods_dir: PathBuf,
     pubkey: String,
@@ -814,6 +887,15 @@ impl ModInstaller {
     ) -> AppResult<ModState> {
         if cancel.is_cancelled() {
             return Err(cancelled());
+        }
+        // Pasta do jogo trocada: antes de instalar nesta, o mod sai das pastas anteriores. O que não sair (pasta
+        // inacessível, falha) continua registrado e não impede de jogar aqui.
+        {
+            let (me, g) = (self.clone(), game.clone());
+            let left = blocking(move || Ok(crate::modact::leave_other_folders(&g, &me))).await?;
+            for d in left {
+                log::warn!("mod continua na pasta antiga do jogo {}", d.display());
+            }
         }
         let dest = mod_dir(game);
         {

@@ -689,9 +689,9 @@ pub fn vdf_get(v: &Vdf, keys: &[&str]) -> Option<String> {
 
 // ----- jogo aberto -----
 
-/// Nomes dos executáveis em execução (injetável nos testes).
+/// Nomes dos executáveis em execução (injetável nos testes). `None`: a lista não pôde ser lida.
 pub trait Processes {
-    fn names(&self) -> Vec<String>;
+    fn names(&self) -> Option<Vec<String>>;
 }
 
 /// Processos reais do sistema (`CreateToolhelp32Snapshot`).
@@ -699,7 +699,7 @@ pub struct SystemProcesses;
 
 impl Processes for SystemProcesses {
     #[cfg(windows)]
-    fn names(&self) -> Vec<String> {
+    fn names(&self) -> Option<Vec<String>> {
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
@@ -711,13 +711,18 @@ impl Processes for SystemProcesses {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if snap == INVALID_HANDLE_VALUE || snap.is_null() {
                 log::warn!("lista de processos indisponível");
-                return out;
+                return None;
             }
             let mut e = PROCESSENTRY32W {
                 dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
                 ..Default::default()
             };
             let mut ok = Process32FirstW(snap, &mut e);
+            if ok == 0 {
+                CloseHandle(snap);
+                log::warn!("lista de processos vazia ou ilegível");
+                return None;
+            }
             while ok != 0 {
                 let len = e
                     .szExeFile
@@ -729,18 +734,22 @@ impl Processes for SystemProcesses {
             }
             CloseHandle(snap);
         }
-        out
+        Some(out)
     }
 
     #[cfg(not(windows))]
-    fn names(&self) -> Vec<String> {
-        Vec::new()
+    fn names(&self) -> Option<Vec<String>> {
+        Some(Vec::new())
     }
 }
 
-/// Algum processo se chama `HogwartsLegacy.exe` (sem diferenciar maiúsculas).
+/// Algum processo se chama `HogwartsLegacy.exe` (sem diferenciar maiúsculas). Lista ilegível conta como jogo aberto
+/// (trava de segurança: falha fechada).
 pub fn game_running_with(p: &dyn Processes) -> bool {
-    p.names().iter().any(|n| n.eq_ignore_ascii_case(GAME_EXE))
+    match p.names() {
+        Some(names) => names.iter().any(|n| n.eq_ignore_ascii_case(GAME_EXE)),
+        None => true,
+    }
 }
 
 /// [`game_running_with`] com os processos reais.
