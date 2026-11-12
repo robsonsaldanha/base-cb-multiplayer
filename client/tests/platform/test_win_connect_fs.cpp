@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -121,4 +122,22 @@ TEST_CASE("client: WinConnectFs pasta no lugar do arquivo nao e apagada") {
     CHECK(r.bytes.empty());
     CHECK(fs::is_directory(folder));
     CHECK(fs::exists(folder / "dentro.txt"));
+}
+
+TEST_CASE("client: WinConnectFs hard link e Rejected e o alvo fica") {
+    TempDir dir;
+    const auto target = dir.path / "alvo.json";
+    const auto file = dir.path / "connect.json";
+    const std::string content = R"({"host":"127.0.0.1","port":27015})";
+    WriteFile(target, content);
+    REQUIRE(CreateHardLinkW(file.c_str(), target.c_str(), nullptr));
+
+    WinConnectFs cfs(file);
+    const auto r = cfs.ClaimAndDelete();
+    CHECK(r.status == ClaimRead::Rejected);
+    CHECK(r.bytes.empty());
+    CHECK_FALSE(fs::exists(file));  // só o nome do link some
+    REQUIRE(fs::exists(target));
+    std::ifstream in(target, std::ios::binary);
+    CHECK(std::string(std::istreambuf_iterator<char>(in), {}) == content);
 }

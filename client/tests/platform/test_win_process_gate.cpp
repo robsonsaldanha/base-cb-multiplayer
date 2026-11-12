@@ -78,6 +78,10 @@ TEST_CASE("client: WinProcessGate recomeca em 1 depois de destruir todos") {
 
 TEST_CASE("client: WinProcessGate libera o dono no destrutor") {
     const auto names = UniqueNames();
+    // `keeper` segura um handle dos mesmos objetos durante todo o teste: sem ele, destruir `a` (único handle) tiraria o
+    // nome do kernel e `b` criaria um mutex novo, passando com ou sem ReleaseMutex. Ele nunca chama TryOwn.
+    WinProcessGate keeper(names.epoch, names.owner);
+    REQUIRE(keeper.Ok());
     {
         WinProcessGate a(names.epoch, names.owner);
         REQUIRE(a.TryOwn());

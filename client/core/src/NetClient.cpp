@@ -10,12 +10,6 @@
 
 namespace cbmp::client {
 namespace {
-void SecureZeroBytes(std::vector<uint8_t>& b) {
-    volatile uint8_t* p = b.data();
-    for (size_t i = 0; i < b.size(); ++i) p[i] = 0;
-    b.clear();
-}
-
 // Tamanho da sequência UTF-8 que começa em `lead` (1 para byte inválido: passa sozinho, como no escapeLogText).
 size_t Utf8Len(unsigned char lead) {
     if (lead >= 0xF0 && lead <= 0xF4) return 4;
@@ -62,7 +56,7 @@ bool NetClient::SendHello(const std::array<uint8_t, 32>& buildHash, std::string&
     } catch (const std::exception&) {
         ok = false;
     }
-    SecureZeroBytes(bytes);
+    SecureZero(bytes);
     SecureZero(std::get<cbmp::Hello>(msg).ticket);
     SecureZero(ticket);
     return ok;

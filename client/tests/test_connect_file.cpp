@@ -87,14 +87,23 @@ std::string Connect(const ConnectFields& f = {}) {
 
 ConnectParse ParseC(const std::string& text, int64_t now = kNow) { return ParseConnect(Bytes(text), kLaunchId, now); }
 
-fs::path FreshDir() {
-    static std::atomic<int> n{0};
-    std::random_device rd;
-    const auto p = fs::temp_directory_path() / std::format("cbmp-client-test-{}-{}", rd(), n++);
-    fs::remove_all(p);
-    fs::create_directories(p);
-    return p;
-}
+// Pasta temporária apagada no destrutor (também quando um REQUIRE falha no meio do teste).
+struct TempDir {
+    fs::path path;
+    TempDir() {
+        static std::atomic<int> n{0};
+        std::random_device rd;
+        path = fs::temp_directory_path() / std::format("cbmp-client-test-{}-{}", rd(), n++);
+        fs::remove_all(path);
+        fs::create_directories(path);
+    }
+    ~TempDir() {
+        std::error_code ec;
+        fs::remove_all(path, ec);
+    }
+    TempDir(const TempDir&) = delete;
+    TempDir& operator=(const TempDir&) = delete;
+};
 
 void Touch(const fs::path& p) { std::ofstream(p, std::ios::binary) << "{}"; }
 }  // namespace
@@ -192,7 +201,8 @@ TEST_CASE("client: IsLaunchId") {
 }
 
 TEST_CASE("client: FindPointerFile sobe ate 5 pastas") {
-    const auto root = FreshDir();
+    const TempDir tmp;
+    const auto& root = tmp.path;
     const auto win64 = root / "Win64";
     const auto cbmp = win64 / "cbmp";
     const auto dlls = cbmp / "atual" / "ue4ss" / "Mods" / "cb-mp" / "dlls";
@@ -219,7 +229,6 @@ TEST_CASE("client: FindPointerFile sobe ate 5 pastas") {
         fs::create_directories(cbmp / "cbmp-run.json");
         CHECK_FALSE(FindPointerFile(dlls).has_value());
     }
-    fs::remove_all(root);
 }
 
 TEST_CASE("client: ConnectPathFor") {
@@ -304,6 +313,21 @@ TEST_CASE("client: ParseConnect recusa") {
     SECTION("launchId diferente") {
         f.launchIdLine = R"(,
   "launchId": "ffffffffffffffffffffffffffffffff")";
+        text = Connect(f);
+    }
+    SECTION("protocol ausente") {
+        text = Connect(f);
+        constexpr std::string_view kLine = "  \"protocol\": 1,\n";
+        const auto at = text.find(kLine);
+        REQUIRE(at != std::string::npos);
+        text.erase(at, kLine.size());
+    }
+    SECTION("protocol negativo") {
+        f.protocol = "-1";
+        text = Connect(f);
+    }
+    SECTION("protocol texto") {
+        f.protocol = "\"1\"";
         text = Connect(f);
     }
     SECTION("protocolo 2") {

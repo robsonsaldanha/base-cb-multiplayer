@@ -15,6 +15,8 @@ inline constexpr size_t kMaxNameBytes = 64;
 inline constexpr size_t kMaxReasonBytes = 255;         // textos de Reject/Kick
 inline constexpr size_t kMaxPointerBytes = 4096;       // cbmp-run.json
 inline constexpr size_t kMaxConnectBytes = 16384;      // connect.json
+inline constexpr size_t kMaxTicketBytes = 2048;        // connect.json "ticket" (= cbmp::kMaxTicketLen)
+inline constexpr size_t kMaxServerIdBytes = 64;        // connect.json "serverId"
 inline constexpr size_t kInterpQueue = 32;             // amostras por entidade
 inline constexpr size_t kLogKeep = 10;                 // cb-mp-*.log mantidos
 inline constexpr size_t kMaxModConfigBytes = 4096;     // cb-mp.json

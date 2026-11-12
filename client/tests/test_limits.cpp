@@ -18,6 +18,8 @@ TEST_CASE("client: limites de mensagens e entidades") {
     REQUIRE(kMaxReasonBytes == 255);
     REQUIRE(kMaxPointerBytes == 4096);
     REQUIRE(kMaxConnectBytes == 16384);
+    REQUIRE(kMaxTicketBytes == 2048);
+    REQUIRE(kMaxServerIdBytes == 64);
     REQUIRE(kInterpQueue == 32);
     REQUIRE(kLogKeep == 10);
     REQUIRE(kMaxModConfigBytes == 4096);

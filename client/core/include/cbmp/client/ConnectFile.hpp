@@ -61,6 +61,7 @@ std::optional<int64_t> TicketExp(std::string_view ticket);
 
 // Sobrescreve com zeros (escrita volátil) e limpa.
 void SecureZero(std::string& s);
+void SecureZero(std::vector<uint8_t>& bytes);
 
 enum class ClaimRead { Ok, Missing, Busy, Rejected };
 struct ClaimResult {
@@ -72,6 +73,8 @@ class IConnectFs {
 public:
     virtual ~IConnectFs() = default;
     virtual bool Exists() = 0;                 // só consulta
-    virtual ClaimResult ClaimAndDelete() = 0;  // abre exclusivo, confere, lê e apaga
+    // Abre exclusivo, confere, lê e apaga. Os bytes de um Ok trazem o ticket em claro: quem chama passa por
+    // ParseConnect e depois zera o buffer com SecureZero.
+    virtual ClaimResult ClaimAndDelete() = 0;
 };
 }  // namespace cbmp::client

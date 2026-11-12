@@ -13,8 +13,6 @@ namespace fs = std::filesystem;
 using nlohmann::json;
 
 namespace {
-constexpr size_t kMaxTicketBytes = 2048;
-constexpr size_t kMaxServerIdBytes = 64;
 constexpr std::string_view kPointerFileName = "cbmp-run.json";
 
 bool IsSep(char c) { return c == '\\' || c == '/'; }
@@ -254,11 +252,11 @@ ConnectParse ParseConnect(std::span<const uint8_t> bytes, std::string_view expec
     info.port = static_cast<uint16_t>(*port);
 
     const auto* ticket = StringField(j, "ticket");
-    if (!ticket || ticket->empty() || ticket->size() > kMaxTicketBytes) return fail(ConnectError::Invalid, "ticket");
+    if (!ticket || ticket->empty() || ticket->size() > limits::kMaxTicketBytes) return fail(ConnectError::Invalid, "ticket");
     info.ticket = *ticket;
 
     const auto* serverId = StringField(j, "serverId");
-    if (!serverId || serverId->empty() || serverId->size() > kMaxServerIdBytes) {
+    if (!serverId || serverId->empty() || serverId->size() > limits::kMaxServerIdBytes) {
         return fail(ConnectError::Invalid, "serverId");
     }
     info.serverId = *serverId;
@@ -299,5 +297,11 @@ void SecureZero(std::string& s) {
     volatile char* p = s.data();
     for (size_t i = 0; i < s.size(); ++i) p[i] = 0;
     s.clear();
+}
+
+void SecureZero(std::vector<uint8_t>& bytes) {
+    volatile uint8_t* p = bytes.data();
+    for (size_t i = 0; i < bytes.size(); ++i) p[i] = 0;
+    bytes.clear();
 }
 }  // namespace cbmp::client

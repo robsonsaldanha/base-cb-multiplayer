@@ -32,8 +32,10 @@ bool TokenSidEquals(HANDLE token, TOKEN_INFORMATION_CLASS cls, PSID sid) {
     return mine && IsValidSid(mine) && EqualSid(mine, sid);
 }
 
-// Dono do arquivo = usuário do token do processo. Também vale o dono padrão do token (TokenOwner): num processo de
-// administrador elevado os arquivos que ele cria ficam com o grupo Administradores como dono.
+// Dono do arquivo = usuário do token do processo. Também vale o dono padrão do token (TokenOwner): um launcher aberto
+// "como administrador" grava o connect.json com o grupo Administradores como dono, e o jogo que ele abre herda a
+// elevação. Efeito colateral aceito: com o jogo elevado, um arquivo de dono BUILTIN\Administrators criado por outro
+// processo elevado (ou serviço SYSTEM) também passa; uma conta comum não consegue criar arquivo com esse dono.
 bool OwnerIsCurrentUser(HANDLE file) {
     PSID owner = nullptr;
     PSECURITY_DESCRIPTOR sd = nullptr;
@@ -49,11 +51,6 @@ bool OwnerIsCurrentUser(HANDLE file) {
     return TokenSidEquals(rawToken, TokenUser, owner) || TokenSidEquals(rawToken, TokenOwner, owner);
 }
 
-void Wipe(std::vector<uint8_t>& bytes) {
-    volatile uint8_t* p = bytes.data();
-    for (size_t i = 0; i < bytes.size(); ++i) p[i] = 0;
-    bytes.clear();
-}
 }  // namespace
 
 WinConnectFs::WinConnectFs(std::filesystem::path connectJson) : path_(std::move(connectJson)) {}
@@ -81,6 +78,8 @@ ClaimResult WinConnectFs::ClaimAndDelete() {
     if (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) return {ClaimRead::Rejected, {}};
     const uint64_t size = (static_cast<uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
     if (size > limits::kMaxConnectBytes) return {ClaimRead::Rejected, {}};
+    // Hard link (não precisa de privilégio): o dono é do arquivo, não do nome. Só o nome é apagado; o alvo fica.
+    if (info.nNumberOfLinks != 1) return {ClaimRead::Rejected, {}};
     if (!OwnerIsCurrentUser(raw)) return {ClaimRead::Rejected, {}};
 
     std::vector<uint8_t> bytes(static_cast<size_t>(size));
@@ -88,7 +87,7 @@ ClaimResult WinConnectFs::ClaimAndDelete() {
     while (total < bytes.size()) {
         DWORD got = 0;
         if (!ReadFile(raw, bytes.data() + total, static_cast<DWORD>(bytes.size() - total), &got, nullptr)) {
-            Wipe(bytes);
+            SecureZero(bytes);
             return {ClaimRead::Rejected, {}};
         }
         if (got == 0) break;
