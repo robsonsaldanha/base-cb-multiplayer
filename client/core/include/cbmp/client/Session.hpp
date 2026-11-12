@@ -145,6 +145,7 @@ private:
 
     // Online
     uint32_t m_seq = 0;
+    int m_apparateLeft = 0;  // Input seguintes que ainda repetem o Apparate do último salto
     bool m_connectedShown = false;
     double m_nextStats = 0;
     std::optional<double> m_lastTeleport;

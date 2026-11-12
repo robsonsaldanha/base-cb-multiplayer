@@ -79,6 +79,10 @@ inline constexpr double kStatsIntervalSec = 10;
 // suprimidos (revisão da Task 5, I3: um servidor malicioso não pode encher o disco nem travar o game thread com
 // flush por linha).
 inline constexpr int kServerLogLinesPerSec = 5;
+// Input é não confiável: o Apparate de um salto (entrada no mundo, ressincronização) vai nos 5 primeiros Input depois
+// dele (250 ms a 20 Hz), não só no primeiro. Achado pelo client-e2e com 20% de perda: o único Input com Apparate se
+// perdeu e o servidor deixou o jogador na origem até a carência de 30 s.
+inline constexpr int kApparateRepeatInputs = 5;
 inline constexpr double kServerLogWindowSec = 1;
 
 // Códigos de fim de conexão da aplicação (k_ESteamNetConnectionEnd_App_Min = 1000)

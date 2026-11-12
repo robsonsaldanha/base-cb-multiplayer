@@ -302,3 +302,35 @@ TEST_CASE("client: Interp limita o numero de entidades a 255") {
     in.PushNow(5, St(10), 0.1);  // id já existente continua aceitando amostras
     REQUIRE(in.Sample(5, 0.5));
 }
+
+TEST_CASE("client: Interp muda o atraso devagar quando o intervalo oscila (perda de pacotes)") {
+    // Entidade a 300 cm/s; ~25% dos ticks não chegam (perda), então o intervalo observado oscila entre 50 e 150+ ms
+    // e o atraso-alvo pula entre 100 e 300 ms. A pose desenhada a cada 16 ms nunca pode saltar nem voltar.
+    Interp in;
+    in.SetTickRate(20);
+    std::mt19937 rng(5u);
+    std::vector<uint32_t> ticks;
+    for (uint32_t k = 0; k < 240; ++k)
+        if (k < 4 || rng() % 4u != 0) ticks.push_back(k);
+    size_t next = 0;
+    double prevX = std::numeric_limits<double>::quiet_NaN(), maxStep = 0, minStep = 1e9;
+    for (int frame = 0; frame < 700; ++frame) {
+        const double now = frame * 0.016;
+        while (next < ticks.size() && ticks[next] / 20.0 + 0.030 <= now) {
+            const uint32_t k = ticks[next++];
+            in.OnTick(k, k / 20.0 + 0.030);
+            in.Push(1, k, St(static_cast<int32_t>(k * 15), 300));
+        }
+        const auto p = in.Sample(1, now);
+        if (!p || now < 1.0 || now > 11.5) {
+            if (p) prevX = p->pos.x;
+            continue;
+        }
+        const double step = p->pos.x - prevX;
+        maxStep = std::max(maxStep, step);
+        minStep = std::min(minStep, step);
+        prevX = p->pos.x;
+    }
+    CHECK(maxStep <= 4.8 * 1.25);  // 300 cm/s × 16 ms, com folga para o ajuste do atraso
+    CHECK(minStep >= 0.0);
+}

@@ -12,6 +12,9 @@ namespace {
 constexpr size_t kMaxClockWindow = 4096;
 constexpr size_t kDelayIntervals = 4;     // últimos intervalos válidos usados no atraso
 constexpr double kMaxIntervalSec = 1.0;   // intervalo válido: < 1 s
+// O atraso em uso anda no máximo 0,1 s por segundo em direção ao alvo: a reprodução fica entre 0,9× e 1,1× da
+// velocidade real em vez de saltar (alvo caindo) ou voltar (alvo subindo) quando um tick se perde.
+constexpr double kDelaySlewPerSec = 0.1;
 
 Vec3 PosOf(const cbmp::PlayerState& s) {
     return {static_cast<double>(s.pos.x), static_cast<double>(s.pos.y), static_cast<double>(s.pos.z)};
@@ -114,7 +117,16 @@ std::optional<InterpPose> Interp::Sample(uint16_t id, double now) {
     if (it == m_tracks.end() || it->second.q.empty()) return std::nullopt;
     Track& tr = it->second;
     const auto& q = tr.q;
-    const double r = now - DelayOf(id);
+    const double target = DelayOf(id);
+    if (!tr.hasDelay) {
+        tr.delay = target;
+    } else {
+        const double step = kDelaySlewPerSec * std::max(0.0, now - tr.delayAt);
+        tr.delay += std::clamp(target - tr.delay, -step, step);
+    }
+    tr.hasDelay = true;
+    tr.delayAt = now;
+    const double r = now - tr.delay;
 
     InterpPose pose;
     if (r < q.front().t) {

@@ -345,9 +345,18 @@ void Session::TickOnline(double now) {
             RunPendingTeleport(pos, now);
         }
         if (m_sched.Due(now)) {
-            if (const auto st = m_sampler.Sample(*m_local)) {
+            if (auto st = m_sampler.Sample(*m_local)) {
+                // O Input não é confiável: o salto (Apparate) se repete nos Input seguintes, senão um único pacote
+                // perdido deixa o servidor com a posição antiga (spawn na origem) até a carência de 30 s.
+                const bool jump = st->state == cbmp::MoveState::Apparate;
+                if (jump) {
+                    m_apparateLeft = limits::kApparateRepeatInputs - 1;
+                } else if (m_apparateLeft > 0) {
+                    st->state = cbmp::MoveState::Apparate;
+                    --m_apparateLeft;
+                }
                 m_net.SendInput(++m_seq, *st);
-                if (st->state == cbmp::MoveState::Apparate) Log(Level::Info, "Input Apparate seq=" + std::to_string(m_seq));
+                if (jump) Log(Level::Info, "Input Apparate seq=" + std::to_string(m_seq));
             }
         }
         m_puppets.Update(now, m_local->pos);
@@ -381,6 +390,7 @@ void Session::EnterPlaying(double) {
 }
 
 void Session::LeavePlaying(bool worldChanged) {
+    m_apparateLeft = 0;
     m_phase = OnlinePhase::AwaitWorld;
     m_pendingTeleport.reset();
     m_puppets.ReleaseAll(worldChanged);

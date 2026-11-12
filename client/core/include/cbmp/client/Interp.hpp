@@ -32,7 +32,7 @@ public:
     void Remove(uint16_t id);
     void Clear();                                                              // filas, poses e relógio
     std::optional<InterpPose> Sample(uint16_t id, double now);                 // nullopt = sem amostra
-    double DelayOf(uint16_t id) const;
+    double DelayOf(uint16_t id) const;                                         // atraso-alvo (Sample chega nele aos poucos)
 
 private:
     struct Point {
@@ -43,6 +43,10 @@ private:
         std::deque<Point> q;
         bool hasLast = false;
         Vec3 last;  // última pose devolvida
+        // Atraso em uso: segue DelayOf devagar (kDelaySlewPerSec), para a pose não saltar nem voltar quando o
+        // intervalo observado oscila (perda de pacotes).
+        bool hasDelay = false;
+        double delay = 0, delayAt = 0;
     };
     struct Candidate {
         double arrival = 0, value = 0;

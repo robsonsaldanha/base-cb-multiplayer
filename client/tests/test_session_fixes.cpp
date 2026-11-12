@@ -286,3 +286,18 @@ TEST_CASE("client: Session Correction in AwaitWorld makes the first Input an App
     CHECK(inputs[0].s.state == cbmp::MoveState::Apparate);
     CHECK(inputs[0].s.pos == cbmp::Vec3i{10000, 20000, 500});
 }
+
+// ---------------------------------------------------------------- client-e2e (perda de 20%)
+
+TEST_CASE("client: Session repeats Apparate on the first Input after a jump because Input is unreliable") {
+    SessionFixture fx;
+    fx.EnterWorld();
+    fx.GoHandshake();
+    fx.PushWelcome();
+    REQUIRE(fx.RunUntil([&] { return fx.CountSent<cbmp::Input>() >= 8; }, 10));
+    const auto inputs = fx.SentOf<cbmp::Input>();
+    for (int i = 0; i < limits::kApparateRepeatInputs; ++i) CHECK(inputs[i].s.state == cbmp::MoveState::Apparate);
+    for (size_t i = limits::kApparateRepeatInputs; i < inputs.size(); ++i)
+        CHECK(inputs[i].s.state != cbmp::MoveState::Apparate);
+    CHECK(fx.LogCount("Input Apparate") == 1);
+}
