@@ -496,8 +496,8 @@ async fn hub_with_mod(mods: &Path) -> (HubClient, ModInstaller) {
     pkg.lock().unwrap().base = base.clone();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let hub = HubClient::new(&base).unwrap();
-    let mods = ModInstaller::new(mods.to_path_buf(), modzip::pubkey(&k))
-        .with_launcher_version(semver::Version::new(0, 2, 0));
+    // Sem fixar versão: o launcher já é 0.2.0 (o `minLauncher` do pacote).
+    let mods = ModInstaller::new(mods.to_path_buf(), modzip::pubkey(&k));
     (hub, mods)
 }
 
@@ -845,4 +845,130 @@ fn remover_de_novo_depois_de_remover_nao_faz_nada() {
     remove_mod(&g.game, &g.installer()).unwrap();
     assert_eq!(record(&g), after);
     assert!(remove_everywhere(&g.installer()).is_empty());
+}
+
+// ----- comandos das Configurações (Task 9) -----
+
+use cbmp_launcher_lib::commands::{
+    mod_info, mod_logs_dir, old_folder_warning, remove_mod_with, resolve_conflict_with,
+};
+
+fn closed() -> FakeProcesses {
+    FakeProcesses(vec!["steam.exe"])
+}
+
+fn game_open() -> FakeProcesses {
+    FakeProcesses(vec!["HogwartsLegacy.exe"])
+}
+
+#[test]
+fn remover_recusa_com_o_jogo_aberto_e_nao_mexe_em_nada() {
+    let g = fake_game();
+    let mut rec = installed(&g);
+    activate(&g.win64(), &g.current(), &mut rec, false).unwrap();
+    let e = remove_mod_with(Some(&g.game), &g.installer(), &game_open()).unwrap_err();
+    assert_eq!(e.code, "game_running");
+    assert_eq!(g.read(LOADER_NAME), LOADER);
+    assert!(!record(&g).removed);
+}
+
+#[test]
+fn remover_devolve_estado_e_resultado_por_pasta() {
+    let g = fake_game();
+    let mut rec = installed(&g);
+    g.put(LOADER_NAME, b"UE4SS do jogador");
+    cbmp_launcher_lib::modact::activate_with(&g.win64(), &g.current(), &mut rec, true, &mut |r| {
+        g.installer().save_record(r)
+    })
+    .unwrap();
+    let before = mod_info(Some(&g.game), &g.installer());
+    assert_eq!(
+        serde_json::to_value(&before).unwrap(),
+        serde_json::json!({ "state": "installed", "version": "0.2.0", "otherFolders": [] })
+    );
+    let out = remove_mod_with(Some(&g.game), &g.installer(), &closed()).unwrap();
+    assert_eq!(out.status.status, ModStatus::NotInstalled);
+    assert_eq!(out.folders.len(), 1);
+    assert!(out.folders[0].error.is_none());
+    assert_eq!(g.read(LOADER_NAME), b"UE4SS do jogador");
+    let v = serde_json::to_value(&out).unwrap();
+    assert_eq!(v["status"]["state"], "notInstalled");
+    assert_eq!(v["folders"][0]["gameDir"], g.game.dir.display().to_string());
+    assert_eq!(v["folders"][0]["error"], serde_json::Value::Null);
+}
+
+#[test]
+fn resolver_conflito_so_com_confirmacao() {
+    let g = fake_game();
+    installed(&g);
+    g.put(LOADER_NAME, b"UE4SS do jogador");
+    // Jogo aberto: nem pergunta.
+    let e = resolve_conflict_with(&g.game, &g.installer(), &game_open(), || {
+        panic!("não pode abrir o diálogo com o jogo aberto")
+    })
+    .unwrap_err();
+    assert_eq!(e.code, "game_running");
+    // Cancelado: nada muda.
+    let mut asked = 0;
+    let st = resolve_conflict_with(&g.game, &g.installer(), &closed(), || {
+        asked += 1;
+        false
+    })
+    .unwrap();
+    assert_eq!(asked, 1);
+    assert_eq!(st.status, ModStatus::Conflict);
+    assert_eq!(g.read(LOADER_NAME), b"UE4SS do jogador");
+    // Aceito: o do jogador vai para `cbmp-backup\` e o nosso entra.
+    let st = resolve_conflict_with(&g.game, &g.installer(), &closed(), || true).unwrap();
+    assert_eq!(
+        st.status,
+        ModStatus::Installed {
+            version: "0.2.0".into()
+        }
+    );
+    assert_eq!(g.read(LOADER_NAME), LOADER);
+    assert_eq!(
+        std::fs::read(g.backup().join(LOADER_NAME)).unwrap(),
+        b"UE4SS do jogador"
+    );
+    // Sem conflito: não pergunta.
+    resolve_conflict_with(&g.game, &g.installer(), &closed(), || {
+        panic!("sem conflito não há diálogo")
+    })
+    .unwrap();
+}
+
+#[test]
+fn ue4ss_antigo_nao_abre_o_dialogo() {
+    let g = fake_game();
+    installed(&g);
+    g.put("xinput1_3.dll", b"x");
+    g.put("UE4SS.dll", b"x");
+    let e = resolve_conflict_with(&g.game, &g.installer(), &closed(), || {
+        panic!("UE4SS antigo não tem saída automática")
+    })
+    .unwrap_err();
+    assert_eq!(e.code, "mod_conflict");
+    assert!(e.message.contains("xinput1_3.dll"));
+}
+
+#[test]
+fn pasta_de_logs_do_mod() {
+    let g = fake_game();
+    assert_eq!(mod_logs_dir(None).unwrap_err().code, "mod_logs_missing");
+    let e = mod_logs_dir(Some(&g.game)).unwrap_err();
+    assert_eq!(e.code, "mod_logs_missing");
+    assert_eq!(e.message, "A pasta de logs do mod ainda não existe.");
+    let logs = container_dir(&g.game).join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    assert_eq!(mod_logs_dir(Some(&g.game)).unwrap(), logs);
+}
+
+#[test]
+fn aviso_da_pasta_antiga_cita_as_pastas() {
+    assert!(old_folder_warning(&[]).is_none());
+    let w = old_folder_warning(&[PathBuf::from("D:\\Jogos\\HL")]).unwrap();
+    assert_eq!(w.code, "mod_old_folder");
+    assert!(w.message.contains("D:\\Jogos\\HL"), "{}", w.message);
+    assert!(w.message.contains("Remover mod do jogo"));
 }

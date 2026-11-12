@@ -52,7 +52,7 @@ const MAX_BACKUP_SUFFIX: u32 = 999;
 /// Arquivo temporário ao lado do destino (cópia + rename).
 const TMP_SUFFIX: &str = ".cbmp-tmp";
 /// Ponteiro do launcher para o mod (`cbmp\cbmp-run.json`).
-const POINTER_NAME: &str = "cbmp-run.json";
+const POINTER_NAME: &str = crate::launch::POINTER_FILE;
 
 /// Estado da ativação em `Win64`.
 #[derive(Debug, Clone, PartialEq, Eq)]

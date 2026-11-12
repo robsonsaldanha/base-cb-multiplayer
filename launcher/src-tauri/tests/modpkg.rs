@@ -390,8 +390,7 @@ async fn env() -> Env {
     let k = keys();
     let mods = tmp.path().join("mods");
     let installer = ModInstaller::new(mods.clone(), tauri_pubkey(&k))
-        .with_retry_delay(Duration::from_millis(5))
-        .with_launcher_version(semver::Version::new(0, 2, 0));
+        .with_retry_delay(Duration::from_millis(5));
     Env {
         hub: HubClient::new(&base).unwrap(),
         _tmp: tmp,

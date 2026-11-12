@@ -18,6 +18,7 @@ const settings: Settings = {
   cacheLimitMB: 10240,
   maxServerContentMB: 2048,
   simulateLaunch: true,
+  settingsVersion: 2,
 };
 
 const profile: Profile = { name: "Robson", discordId: "123", avatar: "data:image/png;base64,iVBORw==" };

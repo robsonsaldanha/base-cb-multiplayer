@@ -6,6 +6,8 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 export interface Settings extends SettingsUpdate {
   readonly hubUrl: string;
   readonly gameDir: string | null;
+  /** Versão do formato do arquivo (2 desde o launcher 0.2.0). */
+  readonly settingsVersion: number;
 }
 
 /** Espelha `settings::SettingsUpdate`: o que a UI pode mudar. A pasta do jogo só muda pelo seletor (Rust). */
@@ -216,4 +218,39 @@ export const installUpdate = (): Promise<void> => call("install_update");
 
 export function onUpdateAvailable(cb: (s: UpdateStatus) => void): Promise<UnlistenFn> {
   return listen<UpdateStatus>(UPDATE_AVAILABLE, (e) => cb(e.payload));
+}
+
+// ----- mod do jogo -----
+
+/** Espelha `modact::ModStatus`. */
+export type ModStatus = { state: "notInstalled" } | { state: "installed"; version: string } | { state: "conflict" };
+
+/** Espelha `commands::ModInfo`: estado na pasta do jogo atual + pastas anteriores do jogo onde o mod ainda está. */
+export type ModInfo = ModStatus & { otherFolders: string[] };
+
+/** Espelha `modact::FolderRemoval`: `error` nulo = removido dessa pasta. */
+export interface FolderRemoval {
+  gameDir: string;
+  error: { code: string; message: string } | null;
+}
+
+/** Espelha `commands::RemoveModResult`. */
+export interface RemoveModResult {
+  status: ModInfo;
+  folders: FolderRemoval[];
+}
+
+/** Aviso que não para nada (`AppError`): o mod continua numa pasta anterior do jogo. */
+export const MOD_WARNING = "mod://warning";
+
+export const modStatus = (): Promise<ModInfo> => call("mod_status");
+/** Remove de todas as pastas do jogo registradas; recusa com o jogo aberto (`game_running`). */
+export const removeMod = (): Promise<RemoveModResult> => call("remove_mod");
+/** Diálogo nativo do Windows sobre o outro carregador; aceito, o do CB Multiplayer é ativado. */
+export const resolveModConflict = (): Promise<ModInfo> => call("resolve_mod_conflict");
+/** Abre `Win64\cbmp\logs` no Explorer (o Rust escolhe a pasta). */
+export const openModLogs = (): Promise<void> => call("open_mod_logs");
+
+export function onModWarning(cb: (e: { code: string; message: string }) => void): Promise<UnlistenFn> {
+  return listen<{ code: string; message: string }>(MOD_WARNING, (e) => cb(e.payload));
 }

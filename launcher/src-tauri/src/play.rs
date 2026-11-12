@@ -4,15 +4,22 @@
 //!   junto com uma montagem. "Limpar cache" usa a mesma trava.
 //! - O manifest sempre passa por `validate_manifest` antes de `missing`/`download`/`mount`.
 //! - Métodos de disco do `ContentStore` (missing, mount, enforce_limit) rodam em `spawn_blocking`.
-//! - O ticket (TTL 300 s no Hub) é pedido de novo se passaram mais de [`TICKET_RENEW_AFTER_SECS`] desde a emissão.
+//! - O ticket (TTL 300 s no Hub) é pedido de novo se passaram mais de [`TICKET_RENEW_AFTER_SECS`] desde a emissão: o mod
+//!   pode demorar até ~80 s para resgatar (duas partidas do processo + espera de 45 s) e desiste a 10 s do `exp`.
+//! - Sem simular: jogo aberto → `game_running` antes de qualquer pedido (e de novo antes do mod), porque o Windows não
+//!   deixa trocar a DLL que o jogo carregou. Depois do `ensure`, a ativação ([`modact::ensure_active`]): conflito,
+//!   permissão ou falha param o Jogar.
+//! - Conexão: `host` resolvido para IP literal pela regra de endereços do build; `connect.json` com `launchId` e, sem
+//!   simular, **depois** o ponteiro `Win64\cbmp\cbmp-run.json` com o mesmo `launchId`; os dois saem no fim do prazo.
 //! - Cancelamento: conferido entre as etapas e repassado ao download do conteúdo e do mod.
 
 use crate::auth::{Auth, Clock};
 use crate::content::{self, ContentStore, Limits, Progress};
 use crate::error::{AppError, AppResult};
-use crate::game::{game_not_found, GameInstall};
+use crate::game::{game_not_found, game_running_error, game_running_with, GameInstall, Processes};
 use crate::launch::{self, ConnectInfo, LaunchOutcome};
-use crate::modpkg::ModInstaller;
+use crate::modact;
+use crate::modpkg::{admin_if_denied, container_dir, ModInstaller};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -21,7 +28,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 /// Ticket com mais tempo que isso desde a emissão é renovado antes de gravar a conexão.
-pub const TICKET_RENEW_AFTER_SECS: i64 = 240;
+pub const TICKET_RENEW_AFTER_SECS: i64 = 30;
 
 /// Etapas para a UI (`play://stage`), na ordem em que acontecem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -52,6 +59,12 @@ pub struct PlayContext {
     /// Servidores cujo conteúdo o limite do cache não apaga (favoritos + recentes); o atual é somado.
     pub keep: HashSet<String>,
     pub connect_ttl: Duration,
+    /// Processos em execução (jogo aberto); injetável nos testes.
+    pub processes: Arc<dyn Processes + Send + Sync>,
+    /// Versão do launcher gravada no ponteiro.
+    pub launcher_version: String,
+    /// Conflito com outro carregador já confirmado pelo jogador (o Jogar comum passa `false`).
+    pub confirm_conflict: bool,
 }
 
 /// Trava "um play por vez" + cancelamento do play em andamento.
@@ -161,6 +174,21 @@ async fn blocking<T: Send + 'static>(
         .map_err(|_| AppError::new("internal_error", "Falha interna na entrada no servidor."))?
 }
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn ensure_game_closed(ctx: &PlayContext) -> AppResult<()> {
+    if game_running_with(ctx.processes.as_ref()) {
+        log::info!("jogar recusado: o jogo está aberto");
+        return Err(game_running_error());
+    }
+    Ok(())
+}
+
 /// Executa o play de `server_id`. `on_stage` recebe cada etapa ao começar; `progress` o progresso do download.
 pub async fn play(
     ctx: &PlayContext,
@@ -177,9 +205,12 @@ pub async fn play(
         }
     };
     check()?;
-    // Sem simular, o jogo precisa existir antes de baixar qualquer coisa.
-    if !ctx.simulate && ctx.game.is_none() {
-        return Err(game_not_found());
+    // Sem simular, o jogo precisa existir e estar fechado antes de pedir ou baixar qualquer coisa.
+    if !ctx.simulate {
+        if ctx.game.is_none() {
+            return Err(game_not_found());
+        }
+        ensure_game_closed(ctx)?;
     }
 
     let hub = ctx.auth.hub();
@@ -241,27 +272,60 @@ pub async fn play(
     on_stage(Stage::Mod);
     if !ctx.simulate {
         let game = ctx.game.as_ref().ok_or_else(game_not_found)?;
+        // De novo: o jogo pode ter sido aberto durante o download.
+        ensure_game_closed(ctx)?;
         ctx.mods.ensure(hub, protocol, game, cancel.clone()).await?;
+        check()?;
+        let (g, m, confirm) = (game.clone(), ctx.mods.clone(), ctx.confirm_conflict);
+        blocking(move || modact::ensure_active(&g, &m, confirm)).await?;
     }
     check()?;
 
     on_stage(Stage::Connect);
+    // O mod só aceita IP literal: o nome anunciado pelo Hub é resolvido aqui, com a mesma regra de endereços.
+    let ip = cancellable(
+        &cancel,
+        content::resolve_game_ip(&host, crate::profile::RELAXED_NETWORK),
+    )
+    .await?;
     if (ctx.clock)() - issued_at > TICKET_RENEW_AFTER_SECS {
         log::info!("ticket renovado antes de abrir");
         ticket = cancellable(&cancel, ctx.auth.ticket(server_id)).await?;
     }
+    let launch_id = launch::new_launch_id();
     let info = ConnectInfo {
-        host,
+        host: ip.to_string(),
         port: game_port,
         ticket,
         server_id: server_id.to_string(),
         content_dir,
         protocol,
+        launch_id: launch_id.clone(),
     };
+    let written = launch::connect_json(&info);
     let path = launch::write_connect_file(&ctx.run_dir, &info)?;
-    tokio::spawn(launch::remove_after(
+    // Ponteiro depois do `connect.json`: quando o mod o acha, o arquivo de conexão já está lá.
+    let container = if ctx.simulate {
+        None
+    } else {
+        let c = container_dir(ctx.game.as_ref().ok_or_else(game_not_found)?);
+        if let Err(e) = launch::write_pointer(
+            &c,
+            &ctx.run_dir,
+            &launch_id,
+            unix_now(),
+            &ctx.launcher_version,
+        ) {
+            launch::remove_if_unchanged(&path, &written);
+            return Err(admin_if_denied(e));
+        }
+        Some(c)
+    };
+    tokio::spawn(launch::expire_launch(
         path,
-        launch::connect_json(&info),
+        written,
+        container,
+        launch_id,
         ctx.connect_ttl,
     ));
 

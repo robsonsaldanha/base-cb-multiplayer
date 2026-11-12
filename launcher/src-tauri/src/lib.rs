@@ -134,7 +134,11 @@ pub fn run() {
             commands::install_update,
             commands::list_servers,
             commands::cached_servers,
-            commands::ping_servers
+            commands::ping_servers,
+            commands::mod_status,
+            commands::remove_mod,
+            commands::resolve_mod_conflict,
+            commands::open_mod_logs
         ])
         .run(tauri::generate_context!())
         .expect("falha ao iniciar o CB Multiplayer");

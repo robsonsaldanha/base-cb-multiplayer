@@ -22,6 +22,10 @@
     "allow-install-update",
     "allow-list-servers",
     "allow-cached-servers",
-    "allow-ping-servers"
+    "allow-ping-servers",
+    "allow-mod-status",
+    "allow-remove-mod",
+    "allow-resolve-mod-conflict",
+    "allow-open-mod-logs"
   ]
 }

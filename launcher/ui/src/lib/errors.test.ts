@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ApiError } from "./api";
-import { blocksPlay, describeError, ERROR_TEXT } from "./errors";
+import { blocksPlay, describeError, ERROR_TEXT, GENERIC_ERROR } from "./errors";
 
 describe("erros por código", () => {
   it("códigos do contrato têm texto pt-BR próprio", () => {
@@ -21,6 +21,29 @@ describe("erros por código", () => {
       expect(d.title).toBe(ERROR_TEXT[code]);
       expect(d.code).toBe(code);
     }
+  });
+
+  it("erros do mod e do jogo aberto com as mensagens exatas", () => {
+    const exact: Record<string, string> = {
+      mod_conflict: "Já existe outro carregador de mods (UE4SS) na pasta do jogo.",
+      mod_needs_admin: "O launcher não tem permissão para instalar o mod na pasta do jogo.",
+      mod_incompatible: "Este mod precisa de uma versão mais nova do launcher. Atualize e tente de novo.",
+      mod_activation_failed: "Não foi possível ativar o mod na pasta do jogo.",
+      game_running: "O Hogwarts Legacy está aberto. Feche o jogo e tente de novo.",
+      mod_logs_missing: "A pasta de logs do mod ainda não existe.",
+    };
+    for (const [code, text] of Object.entries(exact)) {
+      expect(ERROR_TEXT[code], code).toBe(text);
+      // A mesma frase vinda do Rust não vira detalhe repetido.
+      expect(describeError(new ApiError(code, text)).detail, code).toBeNull();
+    }
+    // Pastas anteriores do jogo: título próprio, caminho no detalhe do Rust.
+    const unreachable = describeError(
+      new ApiError("mod_folder_unreachable", "A pasta do jogo D:\\HL não está acessível agora."),
+    );
+    expect(unreachable.title).not.toBe(GENERIC_ERROR);
+    expect(unreachable.detail).toContain("D:\\HL");
+    expect(ERROR_TEXT.mod_old_folder).toBeTruthy();
   });
 
   it("mostra o detalhe do Rust (resource, pasta) quando ele acrescenta algo", () => {

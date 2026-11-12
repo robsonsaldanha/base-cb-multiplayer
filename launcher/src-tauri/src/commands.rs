@@ -3,10 +3,14 @@
 use crate::auth::{self, Auth};
 use crate::content::{ContentStore, Limits, Progress};
 use crate::error::{AppError, AppResult};
-use crate::game::{self, Detection, GameCandidate, GameInstall};
+use crate::game::{
+    self, game_not_found, game_running_error, game_running_with, Detection, GameCandidate,
+    GameInstall, Processes, SystemProcesses,
+};
 use crate::hub::ServerListing;
 use crate::launch::{LaunchOutcome, CONNECT_TTL};
-use crate::modpkg::ModInstaller;
+use crate::modact::{self, Activation, FolderRemoval, ModStatus};
+use crate::modpkg::{self, ModInstaller};
 use crate::paths;
 use crate::ping::{PingResult, Pinger};
 use crate::play::{PlayContext, PlayGate, Stage};
@@ -25,6 +29,8 @@ pub const AUTH_CHANGED: &str = "auth://changed";
 pub const CONTENT_PROGRESS: &str = "content://progress";
 /// Etapa do Jogar que começou ([`PlayStageEvent`]).
 pub const PLAY_STAGE: &str = "play://stage";
+/// Aviso que não para nada (carga `AppError`): o mod continua numa pasta anterior do jogo.
+pub const MOD_WARNING: &str = "mod://warning";
 
 pub struct AppState {
     settings_path: PathBuf,
@@ -473,6 +479,10 @@ pub async fn play(
         cache_limit_bytes: cache_limit_bytes(&settings),
         keep: keep_servers(&settings),
         connect_ttl: CONNECT_TTL,
+        processes: Arc::new(SystemProcesses),
+        launcher_version: app.package_info().version.to_string(),
+        // Conflito só se resolve pela confirmação nativa (`resolve_mod_conflict`), nunca pelo Jogar.
+        confirm_conflict: false,
     };
     let stage_app = app.clone();
     let id = server_id.clone();
@@ -489,14 +499,242 @@ pub async fn play(
         &ctx,
         &server_id,
         &on_stage,
-        progress_emitter(app),
+        progress_emitter(app.clone()),
         run.cancel.clone(),
     )
     .await;
     if let Err(e) = &r {
         log::warn!("jogar em {server_id:?} falhou: {}", e.code);
     }
+    if let Some(g) = ctx.game.as_ref().filter(|_| !ctx.simulate) {
+        if let Some(w) = old_folder_warning(&modact::leftover_folders(Some(&g.dir), &ctx.mods)) {
+            let _ = app.emit(MOD_WARNING, w);
+        }
+    }
     r
+}
+
+/// Aviso de [`MOD_WARNING`] quando o mod ficou em pastas anteriores do jogo (inacessíveis ou com falha ao remover).
+pub fn old_folder_warning(left: &[PathBuf]) -> Option<AppError> {
+    if left.is_empty() {
+        return None;
+    }
+    let dirs: Vec<String> = left.iter().map(|d| d.display().to_string()).collect();
+    Some(AppError::new(
+        "mod_old_folder",
+        format!(
+            "O mod do CB Multiplayer continua na pasta anterior do jogo: {}. Ele sai de lá no próximo Jogar em que a \
+             pasta estiver acessível, ou em Configurações → Remover mod do jogo.",
+            dirs.join("; ")
+        ),
+    ))
+}
+
+// ----- mod do jogo (Configurações) -----
+
+/// Estado do mod na pasta do jogo atual + pastas anteriores do jogo onde ele ainda está.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModInfo {
+    #[serde(flatten)]
+    pub status: ModStatus,
+    pub other_folders: Vec<PathBuf>,
+}
+
+/// Resposta de "Remover mod do jogo": estado depois e resultado por pasta.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveModResult {
+    pub status: ModInfo,
+    pub folders: Vec<FolderRemoval>,
+}
+
+pub fn mod_info(game: Option<&GameInstall>, mods: &ModInstaller) -> ModInfo {
+    ModInfo {
+        status: modact::status(game, mods),
+        other_folders: modact::leftover_folders(game.map(|g| g.dir.as_path()), mods),
+    }
+}
+
+/// "Remover mod do jogo": recusa com o jogo aberto; senão remove de todas as pastas registradas.
+pub fn remove_mod_with(
+    game: Option<&GameInstall>,
+    mods: &ModInstaller,
+    processes: &dyn Processes,
+) -> AppResult<RemoveModResult> {
+    if game_running_with(processes) {
+        return Err(game_running_error());
+    }
+    let folders = modact::remove_everywhere(mods);
+    for f in &folders {
+        if let Some(e) = &f.error {
+            log::warn!("mod não removido de {}: {}", f.game_dir.display(), e.code);
+        }
+    }
+    Ok(RemoveModResult {
+        status: mod_info(game, mods),
+        folders,
+    })
+}
+
+/// "Usar o carregador do CB Multiplayer": recusa com o jogo aberto; sem conflito só ativa; com conflito comum pede
+/// `confirm` (diálogo nativo com [`modact::CONFLICT_DIALOG`]) e, aceito, ativa movendo os arquivos do jogador para
+/// `cbmp-backup\`. UE4SS antigo (`xinput1_3.dll`) não tem saída automática: o erro volta sem diálogo.
+pub fn resolve_conflict_with(
+    game: &GameInstall,
+    mods: &ModInstaller,
+    processes: &dyn Processes,
+    confirm: impl FnOnce() -> bool,
+) -> AppResult<ModInfo> {
+    if game_running_with(processes) {
+        return Err(game_running_error());
+    }
+    match modact::ensure_active(game, mods, false) {
+        Ok(()) => return Ok(mod_info(Some(game), mods)),
+        Err(e) if e.code != "mod_conflict" => return Err(e),
+        Err(e) => {
+            let legacy = mods
+                .installed()
+                .filter(|r| r.game_dir == game.dir)
+                .and_then(|r| modact::inspect(&modpkg::win64_dir(game), &r).ok())
+                == Some(Activation::LegacyUe4ss);
+            if legacy {
+                return Err(e);
+            }
+        }
+    }
+    if !confirm() {
+        log::info!("conflito do mod: jogador cancelou");
+        return Ok(mod_info(Some(game), mods));
+    }
+    log::info!("conflito do mod: jogador confirmou usar o carregador do CB Multiplayer");
+    modact::ensure_active(game, mods, true)?;
+    Ok(mod_info(Some(game), mods))
+}
+
+fn mod_logs_missing() -> AppError {
+    AppError::new(
+        "mod_logs_missing",
+        "A pasta de logs do mod ainda não existe.",
+    )
+}
+
+/// `Win64\cbmp\logs` da pasta do jogo, se for uma pasta de verdade (não link).
+pub fn mod_logs_dir(game: Option<&GameInstall>) -> AppResult<PathBuf> {
+    let g = game.ok_or_else(mod_logs_missing)?;
+    let dir = modpkg::container_dir(g).join("logs");
+    match std::fs::symlink_metadata(&dir) {
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => Ok(dir),
+        _ => Err(mod_logs_missing()),
+    }
+}
+
+fn internal(what: &str) -> AppError {
+    AppError::new("internal_error", format!("Falha interna {what}."))
+}
+
+/// Estado do mod para as Configurações (procura o jogo como o Jogar, fora do executor assíncrono).
+#[tauri::command]
+pub async fn mod_status(app: AppHandle) -> AppResult<ModInfo> {
+    tokio::task::spawn_blocking(move || {
+        let game = resolve_game(&app.state::<AppState>());
+        mod_info(game.as_ref(), &ModInstaller::system())
+    })
+    .await
+    .map_err(|_| internal("ao conferir o mod"))
+}
+
+/// "Remover mod do jogo" (todas as pastas registradas). Não corre junto com um play; recusa com o jogo aberto.
+#[tauri::command]
+pub async fn remove_mod(app: AppHandle, gate: State<'_, PlayGate>) -> AppResult<RemoveModResult> {
+    let _run = gate.try_begin()?;
+    tokio::task::spawn_blocking(move || {
+        let game = resolve_game(&app.state::<AppState>());
+        remove_mod_with(game.as_ref(), &ModInstaller::system(), &SystemProcesses)
+    })
+    .await
+    .map_err(|_| internal("ao remover o mod"))?
+}
+
+/// Conflito com outro carregador: diálogo nativo e, aceito, ativação com backup. Sob a trava do play.
+#[tauri::command]
+pub async fn resolve_mod_conflict(app: AppHandle, gate: State<'_, PlayGate>) -> AppResult<ModInfo> {
+    let _run = gate.try_begin()?;
+    tokio::task::spawn_blocking(move || {
+        let game = resolve_game(&app.state::<AppState>()).ok_or_else(game_not_found)?;
+        resolve_conflict_with(&game, &ModInstaller::system(), &SystemProcesses, || {
+            conflict_dialog(&app)
+        })
+    })
+    .await
+    .map_err(|_| internal("ao resolver o conflito do mod"))?
+}
+
+/// Diálogo nativo de conflito (bloqueia esta thread, nunca a principal): a UI não consegue responder por ele.
+fn conflict_dialog(app: &AppHandle) -> bool {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    let mut dialog = app
+        .dialog()
+        .message(modact::CONFLICT_DIALOG)
+        .title("Outro carregador de mods")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Usar o carregador do CB Multiplayer".into(),
+            "Cancelar".into(),
+        ));
+    if let Some(w) = app.get_webview_window("main") {
+        dialog = dialog.parent(&w);
+    }
+    dialog.blocking_show()
+}
+
+/// Abre `Win64\cbmp\logs` no Explorer (só pelo Rust). Pasta ausente → `mod_logs_missing`.
+#[tauri::command]
+pub async fn open_mod_logs(app: AppHandle) -> AppResult<()> {
+    tokio::task::spawn_blocking(move || {
+        let game = resolve_game(&app.state::<AppState>());
+        let dir = mod_logs_dir(game.as_ref())?;
+        open_folder_os(&dir)
+    })
+    .await
+    .map_err(|_| internal("ao abrir a pasta de logs"))?
+}
+
+#[cfg(windows)]
+fn open_folder_os(dir: &Path) -> AppResult<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let verb: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+    let target: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: strings UTF-16 terminadas em zero que vivem até o fim da chamada; demais ponteiros nulos.
+    let r = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecuteW: valor > 32 = sucesso.
+    if r as isize > 32 {
+        Ok(())
+    } else {
+        Err(AppError::new(
+            "open_folder_failed",
+            "Não foi possível abrir a pasta.",
+        ))
+    }
+}
+
+#[cfg(not(windows))]
+fn open_folder_os(_dir: &Path) -> AppResult<()> {
+    Err(AppError::new(
+        "open_folder_failed",
+        "Não foi possível abrir a pasta.",
+    ))
 }
 
 /// Cancela o play em andamento (`false` se não houver).

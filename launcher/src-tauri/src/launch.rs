@@ -1,11 +1,16 @@
-//! Arquivo de conexão e abertura do jogo.
+//! Arquivo de conexão, ponteiro do mod e abertura do jogo.
 //!
-//! `run\connect.json` = `{host, port, ticket, serverId, contentDir, protocol, contentReadOnly}`:
+//! `run\connect.json` = `{host, port, ticket, serverId, contentDir, protocol, contentReadOnly, launchId}`:
+//! - `host` é IP literal (resolvido e conferido pelo launcher); `launchId` (32 hex aleatórios) é o mesmo do ponteiro;
 //! - criado com DACL protegida só do usuário atual (`SetNamedSecurityInfoW`) **antes** de receber o ticket, e
 //!   trocado por rename (o arquivo final já nasce restrito);
 //! - o mod lê e apaga; o launcher apaga depois de [`CONNECT_TTL`] se ainda for o mesmo conteúdo;
 //! - `contentDir` (`servers\<id>`) é **somente leitura** para o mod: os arquivos são hard links do cache verificado,
 //!   então escrever neles alteraria o cache de todos os servidores (`contentReadOnly: true` deixa isso explícito).
+//!
+//! Ponteiro `Win64\cbmp\cbmp-run.json` = `{v: 1, runDir, launchId, writtenAt, launcher}` (sem segredo): diz ao mod
+//! onde está o `run\` do launcher que abriu o jogo. Gravado depois do `connect.json` (temporário + rename) e apagado
+//! junto com ele no fim do prazo, se ainda for o nosso (com ou sem `connect.json`).
 //!
 //! O ticket nunca vai para linha de comando nem variável de ambiente: o executável é aberto sem argumentos
 //! (`CreateProcessW` via `std::process::Command`), com a pasta do jogo como diretório atual. No modo simular nada
@@ -19,8 +24,22 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const CONNECT_FILE: &str = "connect.json";
-/// Depois disso o launcher apaga o arquivo se o mod ainda não o leu.
-pub const CONNECT_TTL: Duration = Duration::from_secs(60);
+/// Depois disso o launcher apaga o arquivo (se o mod ainda não o leu) e o ponteiro (se ainda for o nosso). O mod
+/// pode iniciar duas vezes (~33 s entre elas) e só resgata depois de 45 s: o prazo cobre os dois.
+pub const CONNECT_TTL: Duration = Duration::from_secs(240);
+/// Ponteiro em `Win64\cbmp\`.
+pub const POINTER_FILE: &str = "cbmp-run.json";
+/// Versão do formato do ponteiro.
+pub const POINTER_VERSION: u32 = 1;
+/// Ponteiro maior que isto não é o nosso (o mod recusa acima de 4 KiB).
+const MAX_POINTER_BYTES: u64 = 4096;
+
+/// Identificador desta abertura: 16 bytes aleatórios do sistema em 32 hex minúsculos.
+pub fn new_launch_id() -> String {
+    let mut raw = [0u8; 16];
+    getrandom::fill(&mut raw).expect("gerador aleatório do sistema");
+    raw.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 /// Dados de conexão gravados para o mod.
 #[derive(Clone, PartialEq, Eq)]
@@ -31,6 +50,8 @@ pub struct ConnectInfo {
     pub server_id: String,
     pub content_dir: PathBuf,
     pub protocol: u32,
+    /// Mesmo valor do ponteiro.
+    pub launch_id: String,
 }
 
 impl fmt::Debug for ConnectInfo {
@@ -42,6 +63,7 @@ impl fmt::Debug for ConnectInfo {
             .field("server_id", &self.server_id)
             .field("content_dir", &self.content_dir)
             .field("protocol", &self.protocol)
+            .field("launch_id", &self.launch_id)
             .finish()
     }
 }
@@ -86,6 +108,7 @@ struct ConnectFileBody<'a> {
     content_dir: &'a Path,
     protocol: u32,
     content_read_only: bool,
+    launch_id: &'a str,
 }
 
 /// Bytes exatos de `connect.json` para `info`.
@@ -98,8 +121,84 @@ pub fn connect_json(info: &ConnectInfo) -> Vec<u8> {
         content_dir: &info.content_dir,
         protocol: info.protocol,
         content_read_only: true,
+        launch_id: &info.launch_id,
     })
     .expect("connect.json sempre serializa")
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PointerBody<'a> {
+    v: u32,
+    run_dir: &'a Path,
+    launch_id: &'a str,
+    written_at: u64,
+    launcher: &'a str,
+}
+
+/// Bytes exatos do ponteiro (`v`, `runDir`, `launchId`, `writtenAt` em segundos Unix, `launcher`). Sem ticket nem
+/// endereço.
+pub fn pointer_json(run_dir: &Path, launch_id: &str, written_at: u64, launcher: &str) -> Vec<u8> {
+    serde_json::to_vec_pretty(&PointerBody {
+        v: POINTER_VERSION,
+        run_dir,
+        launch_id,
+        written_at,
+        launcher,
+    })
+    .expect("ponteiro sempre serializa")
+}
+
+/// Grava `<container>\cbmp-run.json` (temporário + rename, por cima do anterior). Devolve o caminho. Erro de disco
+/// sai como [`AppError::io`] (quem chama converte permissão negada em `mod_needs_admin`).
+pub fn write_pointer(
+    container: &Path,
+    run_dir: &Path,
+    launch_id: &str,
+    written_at: u64,
+    launcher: &str,
+) -> AppResult<PathBuf> {
+    use std::io::Write;
+    std::fs::create_dir_all(container).map_err(|e| AppError::io(container, &e))?;
+    let path = container.join(POINTER_FILE);
+    let tmp = container.join(format!("{POINTER_FILE}.tmp"));
+    let _ = std::fs::remove_file(&tmp);
+    let written = (|| {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        f.write_all(&pointer_json(run_dir, launch_id, written_at, launcher))?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, &path)
+    })();
+    written.map(|()| path.clone()).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        AppError::io(&path, &e)
+    })
+}
+
+/// Apaga `<container>\cbmp-run.json` só se o `launchId` dele for `launch_id` (um play mais novo pode ter regravado).
+/// Ausente, ilegível ou de outra abertura: fica.
+pub fn remove_pointer_if_ours(container: &Path, launch_id: &str) {
+    use std::io::Read;
+    let path = container.join(POINTER_FILE);
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(&path)
+        .and_then(|f| f.take(MAX_POINTER_BYTES + 1).read_to_end(&mut bytes));
+    if read.is_err() || bytes.len() as u64 > MAX_POINTER_BYTES {
+        return;
+    }
+    let ours = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .is_some_and(|v| v["launchId"].as_str() == Some(launch_id));
+    if ours {
+        match std::fs::remove_file(&path) {
+            Ok(()) => log::info!("ponteiro do mod apagado no fim do prazo"),
+            Err(e) => log::warn!("ponteiro do mod não apagado: {e}"),
+        }
+    }
 }
 
 /// Grava `<run_dir>\connect.json` com ACL só do usuário atual. Devolve o caminho.
@@ -144,10 +243,20 @@ pub fn remove_if_unchanged(path: &Path, written: &[u8]) {
     }
 }
 
-/// Espera `delay` (relógio do tokio: pausável nos testes) e apaga o arquivo se o mod não o leu.
-pub async fn remove_after(path: PathBuf, written: Vec<u8>, delay: Duration) {
+/// Espera `delay` (relógio do tokio: pausável nos testes), apaga `connect` se ainda tiver `written` (o mod não leu) e
+/// o ponteiro em `container` se ainda for desta abertura (com ou sem `connect.json`). `container` nulo: simulado.
+pub async fn expire_launch(
+    connect: PathBuf,
+    written: Vec<u8>,
+    container: Option<PathBuf>,
+    launch_id: String,
+    delay: Duration,
+) {
     tokio::time::sleep(delay).await;
-    remove_if_unchanged(&path, &written);
+    remove_if_unchanged(&connect, &written);
+    if let Some(c) = container {
+        remove_pointer_if_ours(&c, &launch_id);
+    }
 }
 
 /// Na abertura do launcher: `connect.json` que sobrou de uma execução anterior (ticket velho) sai.

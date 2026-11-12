@@ -582,9 +582,13 @@ fn capability_real_so_tem_o_permitido() {
             "allow-login",
             "allow-logout",
             "allow-me",
+            "allow-mod-status",
+            "allow-open-mod-logs",
             "allow-pick-game-dir",
             "allow-ping-servers",
             "allow-play",
+            "allow-remove-mod",
+            "allow-resolve-mod-conflict",
             "allow-set-settings",
             "allow-use-detected-game",
             "core:event:allow-listen",
@@ -645,6 +649,22 @@ fn tauri_conf_tem_os_valores_exigidos() {
 #[test]
 fn comandos_do_build_rs_batem_com_a_capability() {
     let build = read(&root().join("build.rs"));
+    let lib_rs = read(&root().join("src/lib.rs"));
+    // Nenhum comando além da lista: cada `"x",` dentro de `.commands(&[...])` está nela.
+    let listed: Vec<&str> = build
+        .split(".commands(&[")
+        .nth(1)
+        .and_then(|rest| rest.split("])").next())
+        .unwrap()
+        .split(',')
+        .map(|c| c.trim().trim_matches('"'))
+        .filter(|c| !c.is_empty())
+        .collect();
+    assert_eq!(
+        listed.len(),
+        21,
+        "comando novo precisa ser revisado aqui: {listed:?}"
+    );
     let caps = real_capabilities();
     let perms = permission_ids(&caps[0].1);
     for cmd in [
@@ -665,10 +685,18 @@ fn comandos_do_build_rs_batem_com_a_capability() {
         "list_servers",
         "cached_servers",
         "ping_servers",
+        "mod_status",
+        "remove_mod",
+        "resolve_mod_conflict",
+        "open_mod_logs",
     ] {
         assert!(
             build.contains(&format!("\"{cmd}\"")),
             "{cmd} fora do build.rs"
+        );
+        assert!(
+            lib_rs.contains(&format!("commands::{cmd}")),
+            "{cmd} fora do generate_handler!"
         );
         let perm = format!("allow-{}", cmd.replace('_', "-"));
         assert!(perms.contains(&perm), "{perm} fora da capability");
@@ -866,4 +894,22 @@ fn feature_local_test_so_por_flag_explicita() {
             "CBMultiplayer"
         }
     );
+}
+
+#[test]
+fn valores_do_launcher_0_2_0() {
+    use cbmp_launcher_lib::{launch, modact, modpkg, play, settings};
+    assert_eq!(launch::CONNECT_TTL, std::time::Duration::from_secs(240));
+    assert_eq!(launch::POINTER_FILE, "cbmp-run.json");
+    assert_eq!(play::TICKET_RENEW_AFTER_SECS, 30);
+    assert_eq!(modact::OVERRIDE_LINE, "cbmp\\atual\\ue4ss");
+    assert_eq!(modpkg::LAYOUT, 2);
+    assert_eq!(settings::SETTINGS_VERSION, 2);
+    // Versão igual no Cargo.toml, no tauri.conf.json e na UI.
+    let manifest: toml::Table = toml::from_str(&read(&root().join("Cargo.toml"))).unwrap();
+    assert_eq!(manifest["package"]["version"].as_str(), Some("0.2.0"));
+    assert_eq!(conf()["version"], "0.2.0");
+    let ui: Value = serde_json::from_str(&read(&root().join("../ui/package.json"))).unwrap();
+    assert_eq!(ui["version"], "0.2.0");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.0");
 }
