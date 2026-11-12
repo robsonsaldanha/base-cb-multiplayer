@@ -48,7 +48,7 @@ export const ERROR_TEXT: Readonly<Record<string, string>> = {
   mod_signature_invalid: "O mod baixado não tem assinatura válida e foi recusado.",
   mod_altered: "Os arquivos do mod foram alterados e não puderam ser reparados.",
   mod_conflict: "Já existe outro carregador de mods (UE4SS) na pasta do jogo.",
-  mod_folder_protected: "O launcher não tem permissão para gravar na pasta do jogo.",
+  mod_folder_protected: "Pasta do jogo sem permissão de gravação.",
   mod_folder_present: "Esta pasta do jogo ainda existe ou só está inacessível agora; ela não pode ser esquecida.",
   mod_incompatible: "Este mod precisa de uma versão mais nova do launcher. Atualize e tente de novo.",
   mod_activation_failed: "Não foi possível ativar o mod na pasta do jogo.",

@@ -510,7 +510,11 @@ pub async fn play(
         log::warn!("jogar em {server_id:?} falhou: {}", e.code);
     }
     if let Some(g) = ctx.game.as_ref().filter(|_| !ctx.simulate) {
-        let left = modact::leftover_folders(Some(&g.dir), &ctx.mods);
+        // Disco (resolver caminhos de pastas registradas) fora do executor assíncrono.
+        let (dir, mods) = (g.dir.clone(), ctx.mods.clone());
+        let left = tokio::task::spawn_blocking(move || modact::leftover_folders(Some(&dir), &mods))
+            .await
+            .unwrap_or_default();
         if let Some(w) = old_folder_warning_once(&OLD_FOLDER_WARNED, &left) {
             let _ = app.emit(MOD_WARNING, w);
         }
@@ -518,7 +522,6 @@ pub async fn play(
     r
 }
 
-/// Aviso de [`MOD_WARNING`] quando o mod ficou em pastas anteriores do jogo (inacessíveis ou com falha ao remover).
 /// O aviso de pasta anterior sai no máximo uma vez por execução do launcher.
 static OLD_FOLDER_WARNED: AtomicBool = AtomicBool::new(false);
 
@@ -528,6 +531,7 @@ pub fn old_folder_warning_once(flag: &AtomicBool, left: &[PathBuf]) -> Option<Ap
     (!flag.swap(true, Ordering::SeqCst)).then_some(w)
 }
 
+/// Aviso de [`MOD_WARNING`] quando o mod ficou em pastas anteriores do jogo (inacessíveis ou com falha ao remover).
 pub fn old_folder_warning(left: &[PathBuf]) -> Option<AppError> {
     if left.is_empty() {
         return None;

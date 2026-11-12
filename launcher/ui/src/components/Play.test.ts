@@ -319,7 +319,7 @@ describe("Jogar — mod na pasta do jogo", () => {
     render(App);
     await clickPlay("Castelo Bruxo RP");
     const panel = (await screen.findByRole("alert")).closest("section")!;
-    expect(panel).toHaveTextContent("O launcher não tem permissão para gravar na pasta do jogo.");
+    expect(panel).toHaveTextContent("Pasta do jogo sem permissão de gravação.");
     expect(panel).toHaveTextContent(message);
     expect(panel).not.toHaveTextContent(/administrador/);
     expect(within(panel).queryByRole("button", { name: "Usar o carregador do CB Multiplayer" })).toBeNull();

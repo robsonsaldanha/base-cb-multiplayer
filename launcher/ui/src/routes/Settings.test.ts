@@ -281,7 +281,7 @@ describe("Configurações", () => {
     await fireEvent.click(within(sec).getByRole("button", { name: "Esquecer pasta" }));
     expect(b.calls("forget_mod_folder")).toHaveLength(0);
     expect(within(sec).getByText(/dwmapi\.dll, override\.txt/)).toHaveTextContent(
-      "Os seus arquivos guardados pelo launcher (dwmapi.dll, override.txt) estavam nesta pasta e o launcher não consegue devolvê-los. Esquecer a pasta assim mesmo?",
+      "Os seus arquivos guardados pelo launcher (dwmapi.dll, override.txt) estavam nesta pasta. Se ela foi apagada, o launcher não consegue devolvê-los; se foi movida, o launcher os encontra de novo no próximo Jogar a partir da pasta nova. Esquecer a pasta assim mesmo?",
     );
     // Cancelar não chama o Rust.
     await fireEvent.click(within(sec).getByRole("button", { name: "Cancelar" }));

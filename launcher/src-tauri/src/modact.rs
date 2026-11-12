@@ -620,11 +620,13 @@ enum Reach {
 fn reach(dir: &Path) -> Reach {
     let win64 = win64_of(dir);
     match std::fs::symlink_metadata(&win64) {
+        // `Win64` que é link/junção: nunca "sumida" (o alvo pode estar só num disco ausente).
+        Ok(m) if m.file_type().is_symlink() => Reach::Unreachable,
         Ok(m) if m.is_dir() => Reach::Present,
         Ok(_) => Reach::Gone,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let root = dir.ancestors().last().unwrap_or(dir);
-            if dir.is_absolute() && root.is_dir() {
+            if dir.is_absolute() && root.is_dir() && !dangling_link_above(&win64) {
                 Reach::Gone
             } else {
                 Reach::Unreachable
@@ -632,6 +634,16 @@ fn reach(dir: &Path) -> Reach {
         }
         Err(_) => Reach::Unreachable,
     }
+}
+
+/// A primeira parte existente de `path` (de baixo para cima) é um link/junção: o caminho passa por um link cujo alvo
+/// não está lá (ex.: junção para um disco desconectado) — inacessível, não apagado. Só links de nome (`is_symlink`:
+/// link simbólico e junção); pastas do OneDrive (outro tipo de ponto de reanálise) contam como pastas comuns.
+fn dangling_link_above(path: &Path) -> bool {
+    path.ancestors()
+        .skip(1)
+        .find_map(|a| std::fs::symlink_metadata(a).ok())
+        .is_some_and(|m| m.file_type().is_symlink())
 }
 
 /// Tira da pasta do jogo `dir` tudo o que é nosso e devolve os backups. `backups` fica com o que não voltou.
@@ -853,16 +865,34 @@ pub fn gone_folders(except: Option<&Path>, mods: &ModInstaller) -> Vec<GoneFolde
 /// `cbmp-backup\` dela não podem mais ser devolvidos pelo launcher (a UI diz isso antes). Pasta que existe ou que
 /// só está inacessível (disco ausente) não é esquecida.
 pub fn forget_folder(dir: &Path, mods: &ModInstaller) -> AppResult<()> {
+    forget_folder_with(dir, mods, |d| matches!(reach(d), Reach::Gone))
+}
+
+/// [`forget_folder`] com a conferência "não existe mais" dada à parte (`is_gone`, a única que toca no disco). `dir` vem
+/// da UI: antes de qualquer acesso a disco ele tem de ser, texto igual, uma pasta do registro; senão nada acontece
+/// (um caminho arbitrário, como `\\servidor\x`, nunca chega ao sistema de arquivos).
+pub fn forget_folder_with(
+    dir: &Path,
+    mods: &ModInstaller,
+    is_gone: impl FnOnce(&Path) -> bool,
+) -> AppResult<()> {
     let Some(mut rec) = mods.installed() else {
         return Ok(());
     };
-    if !matches!(reach(dir), Reach::Gone) {
+    let same = |p: &Path| p.as_os_str() == dir.as_os_str();
+    let current = rec.has_traces() && same(&rec.game_dir);
+    let other = rec.other_folders.iter().position(|f| same(&f.game_dir));
+    if !current && other.is_none() {
+        log::warn!("esquecer pasta: pasta fora do registro recusada");
+        return Ok(());
+    }
+    if !is_gone(dir) {
         return Err(AppError::new(
             "mod_folder_present",
             "Esta pasta do jogo ainda existe ou só está inacessível agora; ela não pode ser esquecida.",
         ));
     }
-    if rec.game_dir == dir {
+    if current {
         log::warn!(
             "pasta do jogo {} esquecida; {} backup(s) do jogador sem devolução",
             dir.display(),
@@ -874,15 +904,13 @@ pub fn forget_folder(dir: &Path, mods: &ModInstaller) -> AppResult<()> {
         if let Some(l) = rec.loader.take() {
             push_loader_history(&mut rec.loader_history, &l.sha256);
         }
-    } else if let Some(i) = rec.other_folders.iter().position(|f| f.game_dir == dir) {
+    } else if let Some(i) = other {
         let f = rec.other_folders.remove(i);
         log::warn!(
             "pasta anterior do jogo {} esquecida; {} backup(s) do jogador sem devolução",
             dir.display(),
             f.backups.len()
         );
-    } else {
-        return Ok(());
     }
     mods.save_record(&rec)
 }
@@ -920,18 +948,46 @@ pub fn rebase_record(game: &Path, mods: &ModInstaller) {
         );
         rec.game_dir = game.to_path_buf();
     }
-    if !rec.other_folders.iter().any(|f| f.game_dir == game) {
-        if let Some(f) = rec
-            .other_folders
-            .iter_mut()
-            .find(|f| same_dir(&f.game_dir, game))
-        {
-            f.game_dir = game.to_path_buf();
+    // Entradas de `other_folders` que são esta mesma pasta: com o registro atual nela, os backups (sem repetir) e o
+    // carregador entram no registro atual e a entrada sai; senão viram uma entrada só, com o caminho final.
+    let mut kept: Vec<FolderRecord> = Vec::new();
+    let mut merged: Option<usize> = None;
+    for f in std::mem::take(&mut rec.other_folders) {
+        if !same_dir(&f.game_dir, game) {
+            kept.push(f);
+        } else if rec.game_dir == game {
+            merge_backups(&mut rec.backups, f.backups);
+            if let Some(l) = f.loader {
+                if rec.loader.as_ref().is_none_or(|x| x.sha256 != l.sha256) {
+                    push_loader_history(&mut rec.loader_history, &l.sha256);
+                }
+            }
+        } else if let Some(i) = merged {
+            merge_backups(&mut kept[i].backups, f.backups);
+        } else {
+            merged = Some(kept.len());
+            kept.push(FolderRecord {
+                game_dir: game.to_path_buf(),
+                ..f
+            });
         }
     }
+    rec.other_folders = kept;
     if rec != before {
         if let Err(e) = mods.save_record(&rec) {
             log::warn!("registro do mod não regravado: {}", e.code);
+        }
+    }
+}
+
+/// Acrescenta a `into` as entradas de `from` que ainda não estão lá (mesmo nome e mesmo arquivo guardado).
+fn merge_backups(into: &mut Vec<BackupEntry>, from: Vec<BackupEntry>) {
+    for b in from {
+        if !into
+            .iter()
+            .any(|x| x.name == b.name && x.stored == b.stored)
+        {
+            into.push(b);
         }
     }
 }

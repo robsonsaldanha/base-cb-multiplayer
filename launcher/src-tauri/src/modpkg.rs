@@ -17,7 +17,9 @@
 //!   nunca renomeado (`cbmp-run.json`, `logs\`, `crash\` e `cb-mp.json` ficam); extrai em `atual.staging`, relê cada
 //!   arquivo e confere o hash, e só então troca (`atual` → `atual.old`, `atual.staging` → `atual`, apaga `atual.old`).
 //!   Qualquer falha antes da troca deixa o mod que funciona intacto; sobras de uma queda são resolvidas na próxima vez
-//!   ([`recover_mod_dir`]). Permissão negada no jogo → `mod_folder_protected` (conferida antes de baixar por [`probe_writable`]; o launcher nunca pede elevação nem muda permissões). Ativar o carregador é do [`crate::modact`].
+//!   ([`recover_mod_dir`]). Permissão negada no jogo → `mod_folder_protected` (conferida antes de baixar por
+//!   [`probe_writable`]; o launcher nunca pede elevação nem muda permissões). Ativar o carregador é do
+//!   [`crate::modact`].
 //! - `mods\installed.json` guarda versão (assinada), protocolo, pasta do jogo, sha256 de cada arquivo, `layout`, o
 //!   carregador (`loader`, com os anteriores em `loaderHistory`), os arquivos do jogador movidos para
 //!   `cbmp-backup\` e `removed`; o zip assinado e o `.sig` ficam em `mods\package\` para reparo local (arquivos
@@ -321,9 +323,36 @@ pub fn probe_writable(game: &GameInstall) -> AppResult<()> {
             if let Err(e) = std::fs::remove_file(&probe) {
                 log::warn!("arquivo de teste {} não apagado: {e}", probe.display());
             }
+            remove_stale_probes(&win64);
             Ok(())
         }
         Err(e) => Err(protected_if_denied(AppError::io(&win64, &e), &game.dir)),
+    }
+}
+
+/// Apaga arquivos de teste `.cbmp-probe-<16 hex>` que sobraram em `win64` (apagar falhou numa vez anterior). Só
+/// arquivos comuns com exatamente esse nome; links e o resto ficam.
+fn remove_stale_probes(win64: &Path) {
+    let Ok(entries) = std::fs::read_dir(win64) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(hexpart) = name.to_str().and_then(|n| n.strip_prefix(".cbmp-probe-")) else {
+            continue;
+        };
+        let plain = hexpart.len() == 16
+            && hexpart
+                .bytes()
+                .all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'));
+        let p = e.path();
+        let file = std::fs::symlink_metadata(&p)
+            .is_ok_and(|m| m.is_file() && !crate::modact::is_reparse(&m));
+        if plain && file {
+            if let Err(err) = std::fs::remove_file(&p) {
+                log::warn!("arquivo de teste antigo {} não apagado: {err}", p.display());
+            }
+        }
     }
 }
 
@@ -976,7 +1005,10 @@ impl ModInstaller {
         {
             let (me, g) = (self.clone(), game.clone());
             // Manifesto de backups desta pasta antes (ela pode ter sido movida com os arquivos do jogador dentro).
+            // Registro gravado por uma junção para esta mesma pasta passa ao caminho final primeiro: senão a adoção
+            // criaria uma segunda entrada da mesma pasta.
             let left = blocking(move || {
+                crate::modact::rebase_record(&g.dir, &me);
                 crate::modact::adopt_folder(&g.dir, &me);
                 Ok(crate::modact::leave_other_folders(&g, &me))
             })

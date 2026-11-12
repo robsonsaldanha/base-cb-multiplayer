@@ -300,7 +300,8 @@ O instalador NSIS é por usuário (sem administrador). Ele **não** tem assinatu
 - **Backups do jogador e pastas anteriores**: arquivos de outro carregador (`dwmapi.dll`, `override.txt`) vão para
   `Win64\cbmp-backup\` com um manifesto `cbmp-backup.json` dentro da própria pasta do jogo (viaja com ela se a pasta for
   movida). Pasta anterior que não existe mais e tinha backups fica registrada; nas Configurações aparece "Esquecer
-  pasta", com uma confirmação que lista os arquivos do jogador que estavam lá. O aviso de pasta anterior
+  pasta", com uma confirmação que lista os arquivos do jogador que estavam lá (o comando só aceita, texto igual, uma
+  pasta do registro; outro caminho vindo da UI nunca chega ao disco). O aviso de pasta anterior
   (`mod://warning`) aparece no máximo uma vez por execução do launcher.
 - **Jogar** (`play(serverId)`, um por vez; outro pedido → `busy`; `cancel_play` interrompe, inclusive pedidos ao Hub
   em andamento): detalhe do servidor → ticket → manifest (validado) → download → montagem (+ limite do cache, sem

@@ -997,6 +997,8 @@ fn launcher_nao_tem_caminho_de_elevacao() {
         "mod_admin_setup",
         "admin_setup",
         "ShellExecuteExW",
+        "ShellExecuteExA",
+        "ShellExecuteA",
         "grant_modify",
         "GRANT_ACCESS",
         "SetKernelObjectSecurity",
@@ -1020,6 +1022,39 @@ fn launcher_nao_tem_caminho_de_elevacao() {
     // A única troca de DACL do launcher é a dos arquivos dele em `run\` (restringir ao usuário atual).
     let launch = read(&root().join("src/launch.rs"));
     assert_eq!(launch.matches("SetNamedSecurityInfoW(").count(), 1);
+    // `ShellExecuteW` só nos dois lugares conhecidos (abrir link no navegador, abrir a pasta de logs), cada um com o
+    // verbo fixo `"open"` montado logo antes e passado como `verb`: nada monta outro verbo (ex.: `runas` em UTF-16).
+    let mut calls = 0;
+    for f in files
+        .iter()
+        .filter(|f| f.extension().is_some_and(|x| x == "rs"))
+    {
+        let text = std::fs::read_to_string(f).unwrap_or_default();
+        for (at, _) in text.match_indices("ShellExecuteW(") {
+            calls += 1;
+            let mut start = at.saturating_sub(600);
+            while !text.is_char_boundary(start) {
+                start -= 1;
+            }
+            let mut end = (at + 200).min(text.len());
+            while !text.is_char_boundary(end) {
+                end += 1;
+            }
+            let (before, after) = (&text[start..at], &text[at..end]);
+            let verb_line = before
+                .lines()
+                .rev()
+                .find(|l| l.contains("verb") && l.contains('='))
+                .unwrap_or_else(|| panic!("{}: ShellExecuteW sem verbo antes", f.display()));
+            assert!(
+                verb_line.contains("\"open\"") && !verb_line.contains("runas"),
+                "{}: verbo do ShellExecuteW: {verb_line}",
+                f.display()
+            );
+            assert!(after.contains("verb.as_ptr()"), "{}", f.display());
+        }
+    }
+    assert_eq!(calls, 2, "chamadas de ShellExecuteW");
     for f in &files {
         if f.ends_with("launch.rs") {
             continue;

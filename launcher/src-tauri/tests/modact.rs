@@ -1404,6 +1404,164 @@ fn registro_gravado_pela_juncao_e_a_mesma_pasta_do_jogo() {
 
 #[cfg(windows)]
 #[test]
+fn registro_pela_juncao_com_backups_nao_vira_dois_registros_da_mesma_pasta() {
+    use cbmp_launcher_lib::modact::{leave_other_folders, rebase_record};
+    let g = fake_game();
+    let real_parent = g.game.dir.parent().unwrap().to_path_buf();
+    let links = tempfile::tempdir().unwrap();
+    let via = links.path().join("via-juncao-3");
+    junction(&via, &real_parent);
+    let through = GameInstall {
+        dir: via.join("Hogwarts Legacy"),
+        exe: via.join("Hogwarts Legacy").join("HogwartsLegacy.exe"),
+        store: Store::Manual,
+    };
+    let real = resolve_final(&g.game);
+    let gj = Game {
+        game: through.clone(),
+        mods: g.mods.clone(),
+        _tmp: tempfile::tempdir().unwrap(),
+    };
+    // Registro antigo pela junção, com o UE4SS do jogador em `cbmp-backup` e o manifesto da pasta.
+    g.put(LOADER_NAME, b"UE4SS do jogador");
+    installed(&gj);
+    ensure_active(&gj.game, &gj.installer(), true).unwrap();
+    assert_eq!(record(&g).backups.len(), 1);
+    assert_eq!(read_manifest(&g.win64()).len(), 1);
+    // Pior ordem (a adoção antes do rebase cria `otherFolders` com o caminho final): o rebase junta tudo de novo.
+    adopt_folder(&real.dir, &g.installer());
+    assert!(leave_other_folders(&real, &g.installer()).is_empty());
+    let r = record(&g);
+    assert_eq!(r.game_dir, real.dir);
+    assert!(r.other_folders.is_empty(), "{:?}", r.other_folders);
+    assert_eq!(r.backups.len(), 1);
+    assert!(!r.removed);
+    assert_eq!(g.read(LOADER_NAME), LOADER);
+    assert_eq!(
+        std::fs::read(g.backup().join(LOADER_NAME)).unwrap(),
+        b"UE4SS do jogador"
+    );
+    // Ordem do `ensure` (rebase, depois adoção): continua um registro só.
+    rebase_record(&real.dir, &g.installer());
+    adopt_folder(&real.dir, &g.installer());
+    let r = record(&g);
+    assert!(r.other_folders.is_empty() && r.backups.len() == 1);
+    // Remover devolve o arquivo do jogador uma vez só.
+    remove_mod(&real, &g.installer()).unwrap();
+    assert_eq!(g.read(LOADER_NAME), b"UE4SS do jogador");
+    std::fs::remove_dir(&via).unwrap();
+}
+
+#[test]
+fn esquecer_pasta_fora_do_registro_nao_toca_no_disco() {
+    use cbmp_launcher_lib::modact::forget_folder_with;
+    let g = fake_game();
+    let mut rec = installed(&g);
+    let gone = g.game.dir.parent().unwrap().join("desinstalada");
+    rec.other_folders = vec![FolderRecord {
+        game_dir: gone.clone(),
+        version: "0.2.0".into(),
+        loader: None,
+        backups: vec![],
+        removed: false,
+    }];
+    g.installer().save_record(&rec).unwrap();
+    let before = record(&g);
+    let probes = std::cell::Cell::new(0);
+    let with_slash = format!("{}\\", gone.display());
+    let upper = gone.display().to_string().to_uppercase();
+    for dir in [
+        r"\\atacante.invalid\share",
+        r"\\?\UNC\atacante.invalid\share",
+        r"\\.\pipe\x",
+        r"D:\Qualquer\Hogwarts Legacy",
+        "",
+        with_slash.as_str(),
+        upper.as_str(),
+    ] {
+        forget_folder_with(Path::new(dir), &g.installer(), |_| {
+            probes.set(probes.get() + 1);
+            true
+        })
+        .unwrap();
+    }
+    assert_eq!(probes.get(), 0, "caminho fora do registro chegou ao disco");
+    assert_eq!(record(&g), before);
+    // A pasta registrada (texto igual) é conferida uma vez e esquecida.
+    forget_folder_with(&gone, &g.installer(), |d| {
+        probes.set(probes.get() + 1);
+        assert_eq!(d, gone.as_path());
+        true
+    })
+    .unwrap();
+    assert_eq!(probes.get(), 1);
+    assert!(record(&g).other_folders.is_empty());
+}
+
+#[cfg(windows)]
+#[test]
+fn pasta_por_juncao_pendente_ou_win64_juncao_nao_e_sumida() {
+    let g = fake_game();
+    let mut rec = installed(&g);
+    // Junção cujo alvo sumiu (disco desconectado): inacessível, não apagada.
+    let links = tempfile::tempdir().unwrap();
+    let target = links.path().join("alvo");
+    std::fs::create_dir_all(&target).unwrap();
+    let dangling = links.path().join("biblioteca");
+    junction(&dangling, &target);
+    std::fs::remove_dir(&target).unwrap();
+    let via_dangling = dangling.join("Hogwarts Legacy");
+    // `Win64` que é junção.
+    let odd = links.path().join("estranha").join("Hogwarts Legacy");
+    let bin = odd.join("Phoenix").join("Binaries");
+    std::fs::create_dir_all(&bin).unwrap();
+    let elsewhere = links.path().join("fora");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    junction(&bin.join("Win64"), &elsewhere);
+    let folder = |d: &Path| FolderRecord {
+        game_dir: d.to_path_buf(),
+        version: "0.2.0".into(),
+        loader: None,
+        backups: vec![BackupEntry {
+            name: LOADER_NAME.into(),
+            stored: LOADER_NAME.into(),
+            sha256: None,
+            state: BackupState::Done,
+        }],
+        removed: false,
+    };
+    rec.other_folders = vec![folder(&via_dangling), folder(&odd)];
+    g.installer().save_record(&rec).unwrap();
+    assert!(gone_folders(Some(&g.game.dir), &g.installer()).is_empty());
+    for d in [&via_dangling, &odd] {
+        assert_eq!(
+            forget_folder(d, &g.installer()).unwrap_err().code,
+            "mod_folder_present"
+        );
+    }
+    assert_eq!(record(&g).other_folders.len(), 2);
+    std::fs::remove_dir(bin.join("Win64")).unwrap();
+    std::fs::remove_dir(&dangling).unwrap();
+}
+
+#[test]
+fn sonda_apaga_arquivos_de_teste_que_sobraram() {
+    use cbmp_launcher_lib::modpkg::probe_writable;
+    let g = fake_game();
+    g.put(".cbmp-probe-0123456789abcdef", b"");
+    g.put(".cbmp-probe-nao-e-nosso", b"x");
+    g.put("outro.txt", b"y");
+    probe_writable(&g.game).unwrap();
+    let mut names: Vec<String> = std::fs::read_dir(g.win64())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec![".cbmp-probe-nao-e-nosso", "outro.txt"]);
+}
+
+#[cfg(windows)]
+#[test]
 fn cbmp_backup_por_juncao_nao_recebe_o_arquivo_do_jogador() {
     let g = fake_game();
     installed(&g);

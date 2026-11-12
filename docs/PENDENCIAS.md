@@ -60,7 +60,11 @@ das tasks).
   operações por handle (pastas presas sem `FILE_SHARE_DELETE`, criação/renomeação relativas ao handle, DACL pelo
   handle), recusa de pasta do jogo gravável pelo chamador; (6) "carregador nosso anterior" só por evidência assinada
   (ex.: hashes anteriores no `cbmp-mod.json` assinado). O resultado do passo 12 de `docs/TESTES-EM-CASA-SUB4.md` diz o
-  que acontece numa instalação real.
+  que acontece numa instalação real. **Resíduo de um kit com o modo elevado** (commit `98d15eb` da branch
+  `sub5a-launcher`, se algum build dele chegou a um testador e o botão foi usado): `Win64\cbmp` ficou com uma ACE de
+  Modificar herdável para o usuário e `Win64\dwmapi.dll`/`override.txt`/`cbmp-backup\` com dono administrador. Limpeza
+  manual num prompt de administrador: `icacls "<jogo>\Phoenix\Binaries\Win64\cbmp" /remove:g <usuário> /T` e, se for
+  remover o mod, apagar esses arquivos como administrador (os backups do jogador estão em `cbmp-backup\`).
 - **Abrir `HogwartsLegacy.exe` direto** (sem argumentos): na Steam o jogo costuma se reabrir pela Steam; na Epic pode
   exigir os parâmetros de autenticação que o launcher da Epic passa. Conferir no subprojeto 5 (passo 12 do roteiro
   em casa).

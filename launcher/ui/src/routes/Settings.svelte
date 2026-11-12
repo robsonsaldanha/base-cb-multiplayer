@@ -186,8 +186,9 @@
               {#if confirmForget === dir}
                 {#if goneBackups(dir).length > 0}
                   <p class="warn">
-                    Os seus arquivos guardados pelo launcher ({goneBackups(dir).join(", ")}) estavam nesta pasta e o
-                    launcher não consegue devolvê-los. Esquecer a pasta assim mesmo?
+                    Os seus arquivos guardados pelo launcher ({goneBackups(dir).join(", ")}) estavam nesta pasta. Se
+                    ela foi apagada, o launcher não consegue devolvê-los; se foi movida, o launcher os encontra de novo no
+                    próximo Jogar a partir da pasta nova. Esquecer a pasta assim mesmo?
                   </p>
                 {:else}
                   <p class="warn">O launcher não guardou arquivos seus nesta pasta. Esquecer a pasta?</p>
