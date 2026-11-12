@@ -78,9 +78,31 @@ arquivo mais novo (ou "não existe"). Isso serve para o passo 8.
 **Antivírus**: se o Windows Defender ou outro antivírus apontar `dwmapi.dll` ou `UE4SS.dll`, **anote** o aviso (e
 mande um print). Não desligue a proteção do computador sem avisar quem conduz o teste.
 
+**Se o jogo mostrar a janela "UE4SS Error" e fechar** (por exemplo "Failed to load UE4SS.dll", quando o antivírus
+apagou ou pôs em quarentena o `UE4SS.dll`; acontece também abrindo pela Steam/Epic): aperte **Jogar** de novo no
+launcher (ele confere os arquivos do mod e reinstala o que falta) ou use **Remover mod do jogo** (seção 5). Se o
+jogo **continuar sem abrir**, feche o launcher e apague à mão, em **Win64** (`<pasta do jogo>\Phoenix\Binaries\Win64`),
+os arquivos `dwmapi.dll` e `override.txt`; se existir a pasta `cbmp-backup`, devolva os arquivos dela para Win64
+(seção 5). Anote o que aconteceu e avise quem conduz o teste.
+
 ## 3. Os 10 passos
 
 Para cada passo: **Fazer**, **Esperado** e **Anotar**. Marque o resultado na tabela da seção 6.
+
+**Guardar os arquivos** (quando um passo pedir, sempre com o jogo **fechado**): crie na **Área de Trabalho** a pasta
+`cbmp-teste-5a` e, dentro dela, uma pasta com o nome que o passo indicar (por exemplo `1-passo-6`). **Copie** para
+ela (copiar, não mover):
+
+- a pasta `Win64\cbmp\logs` inteira (logs do mod);
+- a pasta `Win64\cbmp\crash`, se existir (relatórios de falha `.dmp`);
+- o arquivo `Win64\cbmp\atual\ue4ss\UE4SS.log`;
+- a pasta `%LOCALAPPDATA%\CBMultiplayer-Teste\logs` (log do launcher; **Win + R**, cole o caminho, **Enter**).
+
+Por que copiar na hora: cada vez que o jogo abre, o UE4SS **recomeça** o `UE4SS.log` do zero; o mod guarda só os
+**10 logs mais novos** (dois por abertura, ou seja, umas 5 aberturas) e apaga os mais antigos; e **Remover mod do
+jogo** (passo 9) apaga `cbmp\atual`, com o `UE4SS.log` dentro. **Regra**: se precisar fechar o jogo e apertar
+**Jogar** de novo fora do roteiro (entrada expirou, "desconectado", travou), guarde os arquivos **antes** de abrir de
+novo, numa pasta `extra-1`, `extra-2`, … e anote o porquê.
 
 ### Passo 1. Abrir o launcher e apertar Jogar (as duas pessoas)
 
@@ -111,8 +133,8 @@ Em **Configurações**, **Mod do jogo** mostra **Instalado 0.2.0**.
 **pátio de Hogsmeade**. As duas pessoas vão para o **mesmo lugar**, mas **não precisam chegar juntas** agora.
 
 **Importante**: se uma pessoa demorar **mais de 4 minutos** entre apertar **Jogar** e chegar ao menu (por exemplo,
-compilação de shaders na primeira abertura), a entrada expira. Nesse caso **feche o jogo e aperte Jogar de novo**, e
-**anote** quanto demorou (Anexo A, item A32).
+compilação de shaders na primeira abertura), a entrada expira. Nesse caso **feche o jogo**, **guarde os arquivos**
+(início da seção 3, pasta `extra-1`), **aperte Jogar de novo** e **anote** quanto demorou (Anexo A, item A32).
 
 **Esperado**: o jogo carrega normalmente, sem engasgos fora do comum (compare com o que o jogo faz sem o mod).
 
@@ -130,11 +152,18 @@ compilação de shaders na primeira abertura), a entrada expira. Nesse caso **fe
 **Esperado**: a mensagem aparece uma vez quando o personagem entra no mundo; ao chegarem perto, cada tela mostra o
 outro jogador como um bruxo (aparência provavelmente igual à do seu próprio personagem: é um clone).
 
+O **N** é quantos jogadores o servidor já tinha anunciado **no instante em que a mensagem aparece**. Na primeira
+entrada ele costuma ser **0**, mesmo com o outro jogador ao lado: o servidor só sabe onde você está depois que o mod
+manda a sua posição, o que acontece logo depois da mensagem. **0 aqui não reprova o passo**; o bruxo extra aparece
+alguns segundos depois. O log do mod repete a mensagem com o mesmo N (`status: CB Multiplayer: conectado (N por
+perto)`), e os números que contam vêm depois: `EntityEnter id=<n>` quando o outro é anunciado e `bonecos=<n>` na
+linha `contadores …` a cada 10 s.
+
 **Se a mensagem não aparecer**, isso **não** reprova o passo sozinho: o log diz se a conexão aconteceu (Anexo A, item
 A18). O que reprova é **não ver o outro jogador**.
 
-**Anotar**: a mensagem apareceu? Com quantos "por perto"? A que distância o bruxo extra aparece? A aparência
-(roupa, varinha, parado em pose estranha?).
+**Anotar**: a mensagem apareceu? Com quantos "por perto" (o N exato da tela)? A que distância o bruxo extra
+aparece? A aparência (roupa, varinha, parado em pose estranha?).
 
 ### Passo 4. Andar, correr, pular, parar; trocar (as duas pessoas)
 
@@ -175,6 +204,9 @@ os 2 minutos, sem travar, sem mensagem de erro e sem perder o controle.
 **Anotar**: em quanto tempo o bruxo sumiu? O jogo da Pessoa B teve algum problema? A Pessoa A: o jogo fechou
 normalmente, travou, deu mensagem de erro? Havia arquivo novo em `Win64\cbmp\crash` (Anexo A, itens A21 e A22)?
 
+**Depois** (só a **Pessoa A**, com o jogo fechado, **antes** do passo 7): **guarde os arquivos** (início da seção 3)
+na pasta `1-passo-6`. O passo 7 abre o jogo de novo e apaga o `UE4SS.log` desta sessão.
+
 ### Passo 7. Reabrir pelo launcher (as duas pessoas)
 
 **Fazer**: a **Pessoa A** abre o launcher e aperta **Jogar** de novo (o mod já está instalado: não baixa de novo).
@@ -185,10 +217,15 @@ Todos voltam ao mundo e repetem o passo 3 (mensagem e bruxo extra).
 **Anotar**: funcionou de primeira? Se não, qual mensagem apareceu na tela (as mensagens possíveis estão no Anexo
 A, item A18)?
 
+**Depois** (as duas pessoas): **feche o jogo** e **guarde os arquivos** (início da seção 3) na pasta `2-passo-7`.
+Anote a data e a hora do log mais novo de `Win64\cbmp\logs` (serve para o passo 8).
+
 ### Passo 8. Abrir o jogo pela Steam ou Epic, SEM o launcher
 
-**Fazer**: feche o jogo e o **launcher**. Abra o Hogwarts Legacy **pela Steam ou pela Epic**, como você sempre abriu
-(**não** pelo botão Jogar do launcher). Carregue o save e jogue uns 2 minutos.
+**Fazer**: com o jogo fechado (fim do passo 7), feche também o **launcher**. Abra o Hogwarts Legacy **pela Steam ou
+pela Epic**, como você sempre abriu (**não** pelo botão Jogar do launcher). Carregue o save, jogue uns 2 minutos e
+**feche o jogo**. Depois **guarde os arquivos** (início da seção 3) na pasta `3-passo-8`: o `UE4SS.log` desta abertura
+é a prova do item A1 e o passo 9 o apaga.
 
 **Esperado**: o jogo roda **normal**, **sem** a mensagem "CB Multiplayer" e **sem nenhum arquivo novo** em
 `Win64\cbmp\logs` (os logs dos passos anteriores continuam lá; compare com o mais novo que você anotou depois do
@@ -199,7 +236,8 @@ passo 7: nenhum arquivo mais novo pode aparecer).
 
 ### Passo 9. Remover o mod do jogo
 
-**Fazer**: **feche o jogo**. No launcher: **Configurações** → **Mod do jogo** → **Remover mod do jogo** →
+**Fazer**: confira que a pasta `cbmp-teste-5a` da Área de Trabalho tem as cópias dos passos 6 (só a Pessoa A), 7 e 8:
+este passo **apaga** `cbmp\atual`, com o `UE4SS.log` dentro. Com o jogo **fechado**, no launcher: **Configurações** → **Mod do jogo** → **Remover mod do jogo** →
 **Remover agora**. Depois abra a pasta **Win64**.
 
 **Esperado**: aparece "Mod removido do jogo." O `dwmapi.dll` e o `override.txt` **saíram** de Win64 e a pasta
@@ -210,20 +248,23 @@ lugar. `cbmp\logs` e `cbmp\crash` **continuam** (são seus logs). Abra o jogo pe
 
 ### Passo 10. Mandar os arquivos
 
-Siga a seção 4. **Mande sempre**, mesmo que tudo tenha funcionado: com tudo certo, os logs são a prova do
-Anexo A.
+Compacte a pasta `cbmp-teste-5a` da Área de Trabalho (botão direito → **Enviar para** → **Pasta compactada**) e
+mande para quem conduz o teste, junto com a sua tabela da seção 6 e os prints. **Mande sempre**, mesmo que tudo
+tenha funcionado: com tudo certo, os logs são a prova do Anexo A. Não tire os arquivos de dentro do jogo de novo:
+depois do passo 9 o `UE4SS.log` já não existe lá, e as cópias dos passos 6, 7 e 8 são o que vale.
 
 ## 4. Quando algo falha: o que mandar
 
-Mande **todos** estes (para quem conduz o teste). Compacte cada pasta (botão direito → **Enviar para** → **Pasta
-compactada**).
+Se algo falhar **no meio** do teste: feche o jogo, **guarde os arquivos** (início da seção 3) numa pasta com o nome
+do passo (por exemplo `falha-passo-4`) **antes** de abrir o jogo de novo, e mande a pasta `cbmp-teste-5a`
+compactada. A tabela abaixo diz o que cada cópia contém e onde o original fica.
 
 | Arquivo | Onde fica | Para quê |
 |---|---|---|
 | Logs do mod | `<jogo>\Phoenix\Binaries\Win64\cbmp\logs\` (todos os `cb-mp-AAAAMMDD-HHMMSS-<pid>.log`) | **dois arquivos por abertura**: um por processo do jogo. A hora começa cada linha. No launcher: **Configurações** → **Abrir pasta de logs do mod** |
 | Relatório de falha | `<jogo>\Phoenix\Binaries\Win64\cbmp\crash\` (arquivos `cb-mp-AAAAMMDD-HHMMSS.dmp`, **só existem se o jogo caiu**) | a única prova de que o jogo caiu por causa do mod |
-| `UE4SS.log` | `<jogo>\Phoenix\Binaries\Win64\cbmp\atual\ue4ss\UE4SS.log` (se não achar, procure por `UE4SS.log` dentro de `Win64\cbmp`) | o que o UE4SS carregou e se o `cb-mp` subiu |
-| Log do launcher | `%LOCALAPPDATA%\CBMultiplayer-Teste\logs\launcher.log` (Win + R, cole o caminho) | o que o launcher fez no Jogar, no conflito e na remoção |
+| `UE4SS.log` | `<jogo>\Phoenix\Binaries\Win64\cbmp\atual\ue4ss\UE4SS.log` (recomeça a cada abertura do jogo e some com **Remover mod do jogo**: só vale a cópia feita na hora) | o que o UE4SS carregou e se o `cb-mp` subiu |
+| Log do launcher | `%LOCALAPPDATA%\CBMultiplayer-Teste\logs\` (`launcher.log` e os antigos `launcher.log.1`, …; Win + R, cole o caminho) | o que o launcher fez no Jogar, no conflito e na remoção |
 | Prints e anotações | a sua tabela da seção 6 | as mensagens exatas da tela |
 
 **Privacidade**: os logs têm o endereço do servidor de teste, caminhos de pastas do seu PC e (o do launcher) o seu
@@ -244,14 +285,16 @@ nome do Discord. **Nunca** têm senha, ticket nem token (o mod e o launcher troc
 - `CB Multiplayer: o servidor não aceitou sua posição`
 - `CB Multiplayer: desconectado — <texto do servidor>` (quando você é expulso)
 
-Depois de qualquer "desconectado", **o mod não reconecta**: feche o jogo e aperte **Jogar** de novo.
+Depois de qualquer "desconectado", **o mod não reconecta**: feche o jogo, **guarde os arquivos** (pasta `extra-<n>`)
+e aperte **Jogar** de novo.
 
 ## 5. Remover o mod e voltar ao jogo original
 
-1. Feche o jogo.
+1. Feche o jogo. Se ainda vai mandar logs, **guarde os arquivos** antes (início da seção 3): o próximo item apaga o
+   `UE4SS.log`.
 2. No launcher: **Configurações** → **Mod do jogo** → **Remover mod do jogo** → **Remover agora** (passo 9). Isso apaga
    `dwmapi.dll` e `override.txt` **se forem os do CB Multiplayer**, devolve os seus arquivos guardados em
-   `cbmp-backup` e apaga `cbmp\atual`.
+   `cbmp-backup` e apaga `cbmp\atual` (com o `UE4SS.log` dentro).
 3. Para **limpar tudo** o que sobrou (só depois de mandar os logs): apague a pasta `Win64\cbmp` (logs, relatórios de
    falha, `cb-mp.json`) e, se estiver vazia, a pasta `Win64\cbmp-backup`.
 4. Para tirar também o launcher: **Configurações do Windows** → **Aplicativos** → **CB Multiplayer (Teste)** →
@@ -264,6 +307,9 @@ Se o launcher **não** abrir (ou o botão de remover falhar), apague à mão, co
 `dwmapi.dll`, `override.txt` e a pasta `cbmp`; e, se existir `cbmp-backup`, devolva os arquivos dele (`dwmapi.dll`,
 `override.txt`) para Win64 antes de apagar a pasta. Se você usava outro mod do UE4SS, ele só volta a funcionar com
 os seus arquivos de volta.
+
+Se o jogo mostrar a janela **"UE4SS Error"** e fechar (antivírus tirou o `UE4SS.dll`), veja o que fazer na seção 2,
+em **Se o jogo mostrar a janela "UE4SS Error" e fechar**.
 
 ## 6. Tabela de resultados
 
@@ -281,7 +327,7 @@ Copie, marque **OK** ou **FALHOU** e escreva o que viu na **Observação**. Uma 
 | P7 Reabrir | repete o passo 3 pelo launcher; dois logs novos | | | |
 | P8 Sem launcher | jogo normal, sem mensagem e sem log novo | | | |
 | P9 Remover | `dwmapi.dll` e `override.txt` saíram; jogo abre normal | | | |
-| P10 Arquivos | logs, `.dmp` (se houver), `UE4SS.log` e `launcher.log` enviados | | | |
+| P10 Arquivos | pasta `cbmp-teste-5a` enviada, com as cópias dos passos 6 (Pessoa A), 7 e 8 (logs, `.dmp` se houver, `UE4SS.log`, logs do launcher) | | | |
 
 Complete também a tabela do **Anexo A** (quem conduz o teste confere com os logs) e diga: versão do Windows, Steam
 ou Epic, placa de vídeo, e o que achou estranho ou confuso.
@@ -416,6 +462,9 @@ launcher nunca o altera.
 3. Mude **uma** chave por vez, abra o jogo pelo launcher e confira no log a linha `config: statusNaTela=…
    neutralizacaoExtra=… animacaoBoneco=… maxBonecos=…`. Arquivo ausente ou inválido volta aos padrões (o log diz
    `cb-mp.json ausente (ou > 4 KiB): padrões`).
+4. **Guarde os arquivos** (início da seção 3) **antes de começar este anexo** (se os passos 6 a 8 ainda não foram
+   guardados) e **depois de cada abertura**, com o jogo fechado, numa pasta `anexo-c-<chave>`: cada abertura gera
+   dois logs e o mod guarda só os 10 mais novos, então os logs dos passos 1 a 7 somem depois de umas 5 aberturas.
 
 | Chave | Valores | Para que serve no teste |
 |---|---|---|
