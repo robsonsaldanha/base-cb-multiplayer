@@ -5,6 +5,8 @@ add_executable(cbmp_client_tests
     test_mod_config.cpp
     test_limits.cpp
     test_guard.cpp
+    test_connect_file.cpp
+    test_claim_policy.cpp
 )
 target_link_libraries(cbmp_client_tests PRIVATE cbmp_client_core Catch2::Catch2WithMain)
 # Pasta do núcleo para o teste de guarda (test_guard.cpp), em caminho absoluto (UTF-8 com /utf-8 no MSVC).

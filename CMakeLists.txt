@@ -67,6 +67,11 @@ add_subdirectory(proto)
 # Núcleo do cliente (mod): C++ puro, sem UE4SS nem Windows.h; testado aqui em toda plataforma.
 add_subdirectory(client/core)
 add_subdirectory(client/tests)
+# Portas Win32 do cliente (sem UE4SS): compiladas e testadas no build nativo do Windows.
+if(WIN32)
+  add_subdirectory(client/src/platform)
+  add_subdirectory(client/tests/platform)
+endif()
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/server/script/CMakeLists.txt)
   add_subdirectory(server/script)
 endif()
