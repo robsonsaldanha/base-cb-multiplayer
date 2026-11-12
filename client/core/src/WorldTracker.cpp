@@ -27,7 +27,8 @@ WorldPhase WorldTracker::Update(const WorldSample& w, const std::optional<LocalS
 
     const bool menu = IsMenuWorld(w.worldName);
     const bool stable = now - m_stableSince >= limits::kInWorldStableSec;
-    const bool awayFromOrigin = local && std::hypot(local->pos.x, local->pos.y) > limits::kOriginRadiusCm;
+    const bool finite = local && std::isfinite(local->pos.x) && std::isfinite(local->pos.y) && std::isfinite(local->pos.z);
+    const bool awayFromOrigin = finite && std::hypot(local->pos.x, local->pos.y) > limits::kOriginRadiusCm;
     if (w.hasPawn && local && !menu && !w.frontendHint && stable && awayFromOrigin) {
         m_phase = WorldPhase::InWorld;
     } else if (menu || w.frontendHint) {

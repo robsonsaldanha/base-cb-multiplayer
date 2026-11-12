@@ -74,6 +74,8 @@ void Interp::PushNow(uint16_t id, const cbmp::PlayerState& s, double arrival) {
 }
 
 void Interp::Add(uint16_t id, double t, const cbmp::PlayerState& s) {
+    // Teto de faixas (defesa em profundidade: o chamador só empurra ids conhecidos, ≤ 255).
+    if (!m_tracks.contains(id) && m_tracks.size() >= limits::kMaxEntities) return;
     Track& tr = m_tracks[id];
     if (!tr.q.empty() && t <= tr.q.back().t) return;
     tr.q.push_back({t, s});

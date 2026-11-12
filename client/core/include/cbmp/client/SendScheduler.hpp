@@ -8,7 +8,10 @@ class SendScheduler {
 public:
     void SetRate(int hz);   // período = 1/hz (hz ≤ 0: ignorado)
     void Reset();           // próximo Due é verdadeiro
-    bool Due(double now);   // verdadeiro no máximo 1x por período, sem rajada
+    // Cadência fixa do bot de referência: em média 1 verdadeiro por período, sem rajada de compensação. Um quadro
+    // atrasado menos de um período pode dar dois verdadeiros com um quadro de intervalo (a média continua 1/período);
+    // atraso de um período ou mais gera um só verdadeiro e a cadência recomeça dali.
+    bool Due(double now);
 
 private:
     double m_period = 1.0 / limits::kDefaultSendHz;

@@ -26,6 +26,16 @@ TEST_CASE("client: SendScheduler tick atrasado nao gera rajada") {
     REQUIRE_FALSE(s.Due(1.06));
 }
 
+TEST_CASE("client: SendScheduler quadro atrasado menos de um periodo mantem a cadencia fixa") {
+    SendScheduler s;
+    s.SetRate(20);
+    REQUIRE(s.Due(0.0));   // próximo = 0,05
+    REQUIRE(s.Due(0.09));  // atrasado 40 ms: próximo = 0,10 (cadência fixa)
+    REQUIRE(s.Due(0.10));  // dois verdadeiros com um quadro de intervalo; a média segue em 20 Hz
+    REQUIRE_FALSE(s.Due(0.149));
+    REQUIRE(s.Due(0.15));
+}
+
 TEST_CASE("client: SendScheduler mantem 20 Hz com quadros de 16 ms") {
     SendScheduler s;
     s.SetRate(20);

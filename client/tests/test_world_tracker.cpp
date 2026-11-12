@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <cbmp/client/WorldTracker.hpp>
 
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -120,4 +121,15 @@ TEST_CASE("client: WorldTracker acumula mudancas ate o TakeChange") {
     const auto c = wt.TakeChange();
     REQUIRE(c.worldChanged);
     REQUIRE(c.pawnChanged);
+}
+
+TEST_CASE("client: WorldTracker posicao nao finita nao conta como InWorld") {
+    WorldTracker wt;
+    const double inf = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    REQUIRE(wt.Update(World(1, "Overland", 10), At(inf, 0, 0), 0.0) == WorldPhase::Loading);
+    REQUIRE(wt.Update(World(1, "Overland", 10), At(inf, 0, 0), 5.0) == WorldPhase::Loading);
+    REQUIRE(wt.Update(World(1, "Overland", 10), At(5000, nan, 0), 6.0) == WorldPhase::Loading);
+    REQUIRE(wt.Update(World(1, "Overland", 10), At(5000, 0, inf), 7.0) == WorldPhase::Loading);
+    REQUIRE(wt.Update(World(1, "Overland", 10), At(5000, 0, 0), 8.0) == WorldPhase::InWorld);
 }

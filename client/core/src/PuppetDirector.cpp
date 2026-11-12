@@ -123,9 +123,12 @@ void PuppetDirector::Spawn(uint16_t id, Slot& slot, const PuppetPose& pose, doub
     try {
         intact = m_game.PlayerSingletonIntact();
     } catch (const GameError& e) {
+        // Sem resposta, a trava falha fechada: o boneco não fica no mundo sem conferência e os bonecos desligam.
         Warn(std::string("PlayerSingletonIntact falhou: ") + e.what());
         CountError(now);
-        return;  // sem resposta: o boneco fica; confere de novo no próximo boneco criado
+        Destroy(id, slot, " (singleton sem conferência)");
+        m_disableRequest = "singleton_indisponivel";
+        return;
     }
     if (intact) {
         if (!m_singletonLogged) {

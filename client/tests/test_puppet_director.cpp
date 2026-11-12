@@ -5,7 +5,6 @@
 
 #include <cstdint>
 #include <limits>
-#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -343,6 +342,25 @@ TEST_CASE("client: PuppetDirector singleton trocado desliga os bonecos") {
         REQUIRE(f.dir.Stats().disabledWhy == "singleton");
         REQUIRE(f.dir.Stats().alive == 0);
     }
+}
+
+TEST_CASE("client: PuppetDirector conferencia do singleton que lanca falha fechada") {
+    Fx f;
+    f.game.throwOnSingleton = true;
+    f.Add(2, 1000);
+    f.Add(3, 2000);
+    f.dir.Update(0.0, f.me);
+    REQUIRE(f.game.spawnCalls == 1);
+    REQUIRE(f.game.destroyCalls == 1);  // o boneco sem conferência sai na hora
+    REQUIRE(f.game.puppets.empty());
+    REQUIRE(f.dir.Stats().disabled);
+    REQUIRE(f.dir.Stats().disabledWhy == "singleton_indisponivel");
+    REQUIRE(f.dir.Stats().alive == 0);
+    REQUIRE(f.LogCount("bonecos_desligados: singleton_indisponivel") == 1);
+    REQUIRE_FALSE(f.LogHas("singleton=ok"));
+    f.game.throwOnSingleton = false;
+    f.Run(0.1, 5);
+    REQUIRE(f.game.spawnCalls == 1);  // nenhum SpawnPuppet depois
 }
 
 TEST_CASE("client: PuppetDirector ReleaseAll true esquece todos sem DestroyPuppet") {

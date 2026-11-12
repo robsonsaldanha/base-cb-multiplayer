@@ -24,7 +24,7 @@ struct FakeGame : IGame {
     std::set<uint32_t> gone;    // MovePuppet desses ids → Gone (o "jogo" destruiu o ator)
     std::set<uint32_t> failMove;  // MovePuppet desses ids → Failed
     bool throwOnMove = false, throwOnSpawn = false, throwOnSample = false;
-    bool singletonIntact = true, statusOk = true;
+    bool singletonIntact = true, statusOk = true, throwOnSingleton = false;
     std::vector<std::string> statuses;
     std::vector<Vec3> teleports;
     bool teleportOk = true;
@@ -90,6 +90,7 @@ struct FakeGame : IGame {
     }
     bool PlayerSingletonIntact() override {
         ++singletonCalls;
+        if (throwOnSingleton) throw GameError("PlayerSingletonIntact falhou (teste)");
         return singletonIntact;
     }
     bool ShowStatus(std::string_view utf8) override {

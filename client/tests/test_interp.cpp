@@ -289,3 +289,16 @@ TEST_CASE("client: Interp Remove, Clear e now nao finito") {
     Feed(in, 2, 6, St(0));
     REQUIRE(in.Sample(2, 1.0)->snapped);  // primeira pose depois do Clear
 }
+
+TEST_CASE("client: Interp limita o numero de entidades a 255") {
+    Interp in;
+    for (uint16_t id = 1; id <= 300; ++id) in.PushNow(id, St(0), 0.0);
+    REQUIRE(in.Sample(255, 0.5));
+    REQUIRE_FALSE(in.Sample(256, 0.5));
+    REQUIRE_FALSE(in.Sample(300, 0.5));
+    in.Remove(1);
+    in.PushNow(1000, St(0), 0.0);  // vaga liberada
+    REQUIRE(in.Sample(1000, 0.5));
+    in.PushNow(5, St(10), 0.1);  // id já existente continua aceitando amostras
+    REQUIRE(in.Sample(5, 0.5));
+}

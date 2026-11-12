@@ -20,7 +20,7 @@ struct PuppetStats {
     int alive = 0;
     uint64_t created = 0, destroyed = 0, recreated = 0, givenUp = 0, gameErrors = 0;
     bool disabled = false;
-    std::string disabledWhy;  // "singleton" ou "erros"
+    std::string disabledWhy;  // "singleton", "singleton_indisponivel" (conferência lançou) ou "erros"
 };
 
 class PuppetDirector {
