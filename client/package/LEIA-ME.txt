@@ -15,7 +15,8 @@ Como remover
 
 Onde ficam os logs
   Phoenix\Binaries\Win64\cbmp\logs\cb-mp-AAAAMMDD-HHMMSS-<pid>.log
-  Se o jogo fechar sozinho, o relatório de falha (.dmp) também fica ali. Mande esses arquivos a quem estiver
+  Se o jogo fechar sozinho, o relatório de falha (.dmp) fica em Phoenix\Binaries\Win64\cbmp\crash.
+  Mande esses arquivos a quem estiver
   acompanhando o teste.
 
 Licenças
