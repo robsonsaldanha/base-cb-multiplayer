@@ -3,7 +3,10 @@
 //
 //   node tools/dev-env.mjs --build-releases   gera em <pasta>/releases: launcher "Teste local" 0.1.0 e 0.1.1 assinados com
 //                                             a chave dev e o mod de teste mod-p1-v0.1.0 (lento: dois builds release)
-//   node tools/dev-env.mjs --run              sobe Hub (dev login, servidores privados, HUB_RELEASES_DIR) e cb-server
+//                                             Com --mod-zip <zip> (dist/cbmp-mod.zip, de tools/package-mod.ps1) publica no lugar dele
+//                                             o mod real mod-p1-v0.2.0, assinado com a chave dev. Sem ele o mod de teste 0.1.0 só
+//                                             tem um LEIA-ME: o launcher 0.2.0 recusa esse mod (mod_invalid) fora do modo simular.
+//   node tools/dev-env.mjs --run            sobe Hub (dev login, servidores privados, HUB_RELEASES_DIR) e cb-server
 //                                             (modo Hub, hello-client); servidor "Castelo Bruxo (teste)" em destaque.
 //                                             Ctrl+C encerra tudo.
 //   node tools/dev-env.mjs --stop             encerra o que um --run anterior deixou rodando (janela fechada etc.)
@@ -30,6 +33,7 @@ import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rm
 import { createServer } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, relative, resolve, isAbsolute } from 'node:path';
+import { checkModZip } from './lib/mod-zip-check.mjs';
 import { fileURLToPath } from 'node:url';
 import { sourceStamp as stampOf } from './lib/source-stamp.mjs';
 
@@ -43,7 +47,8 @@ const SERVER_NAME = 'Castelo Bruxo (teste)';
 const DEV_DID = '111111111111111111';
 const DEV_NAME = 'Dev Local';
 const MOD_PROTOCOL = 1;
-const MOD_VERSION = '0.1.0';
+const MOD_VERSION_TEST = '0.1.0'; // mod de teste (só LEIA-ME)
+const REAL_MOD_VERSION = '0.2.0'; // mod real, com --mod-zip
 const LAUNCHER_VERSIONS = ['0.1.0', '0.1.1'];
 const PRODUCT = 'CB Multiplayer (Teste local)';
 // Kit de teste (tools/make-test-kit.mjs): a raiz tem kit.json e não é um repositório git. Um kit.json perdido no
@@ -73,6 +78,7 @@ function parseArgs(argv) {
       case '--force': o.force = true; break;
       case '--dir': o.dir = val(); break;
       case '--key': o.key = val(); break;
+      case '--mod-zip': o.modZip = resolve(val()); break;
       case '--cb-server': o.cbServer = val(); break;
       case '--hub-port': o.hubPort = port(a, val()); break;
       case '--game-port': o.gamePort = port(a, val()); break;
@@ -183,6 +189,7 @@ function trustedComment(sigB64) {
 }
 
 function buildMod(p, o) {
+  const MOD_VERSION = o.modZip ? REAL_MOD_VERSION : MOD_VERSION_TEST;
   const tag = `mod-p${MOD_PROTOCOL}-v${MOD_VERSION}`;
   const out = join(p.releases, tag);
   const zip = `cbmp-mod-p${MOD_PROTOCOL}-v${MOD_VERSION}.zip`;
@@ -190,12 +197,21 @@ function buildMod(p, o) {
     log(`${tag}: já existe (use --force para refazer)`);
     return;
   }
+  const extra = [];
+  if (o.modZip) {
+    if (!existsSync(o.modZip)) fail(`--mod-zip não encontrado: ${o.modZip}`);
+    const problems = checkModZip(readFileSync(o.modZip), { version: MOD_VERSION, protocol: MOD_PROTOCOL });
+    if (problems.length) fail(`o zip do mod ${o.modZip} tem problemas:\n  - ${problems.join('\n  - ')}`);
+    extra.push('--zip', o.modZip);
+  }
   rmSync(out, { recursive: true, force: true });
-  log(`${tag}: gerando e assinando o mod de teste…`);
+  log(`${tag}: ${o.modZip ? 'assinando o mod real' : 'gerando e assinando o mod de teste'}…`);
   runSync('cargo', ['run', '--quiet', '--locked', '--example', 'dev_sign_mod', '--',
-    '--key', p.key, '--protocol', String(MOD_PROTOCOL), '--version', MOD_VERSION, '--out', out],
+    '--key', p.key, '--protocol', String(MOD_PROTOCOL), '--version', MOD_VERSION, ...extra, '--out', out],
   { cwd: join(REPO, 'launcher', 'src-tauri') });
-  writeFileSync(join(out, 'notes.txt'), `Mod de teste ${MOD_VERSION} (protocolo ${MOD_PROTOCOL}), gerado por tools/dev-env.mjs.\n`);
+  writeFileSync(join(out, 'notes.txt'), o.modZip
+    ? `Mod ${MOD_VERSION} (protocolo ${MOD_PROTOCOL}), gerado por tools/dev-env.mjs --mod-zip.\n`
+    : `Mod de teste ${MOD_VERSION} (protocolo ${MOD_PROTOCOL}), gerado por tools/dev-env.mjs.\n`);
 }
 
 /** Carimbo do código do launcher (tools/lib/source-stamp.mjs). */
@@ -531,6 +547,7 @@ if (o.help || (!o.buildReleases && !o.run && !o.stop)) {
   process.exit(o.help ? 0 : 1);
 }
 if (KIT && (o.key || o.force)) fail('no kit de teste não há chave nem builds: --key/--force não se aplicam.');
+if (KIT && o.modZip) fail('no kit de teste não há builds: --mod-zip não se aplica.');
 if (o.hubPort) { HUB_PORT = o.hubPort; HUB_URL = `http://127.0.0.1:${HUB_PORT}`; }
 if (o.gamePort) GAME_PORT = o.gamePort;
 const p = paths(o);

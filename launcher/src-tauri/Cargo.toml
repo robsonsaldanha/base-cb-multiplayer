@@ -83,6 +83,11 @@ minisign = "=0.10.0"
 name = "release_sign"
 test = true
 
+# O exemplo que assina o mod (`--zip`) tem testes próprios.
+[[example]]
+name = "dev_sign_mod"
+test = true
+
 [profile.release]
 codegen-units = 1
 lto = true

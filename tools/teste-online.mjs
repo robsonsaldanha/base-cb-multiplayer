@@ -2,8 +2,12 @@
 // Ambiente de TESTE ONLINE do CB Multiplayer (Hub https://cbmultiplayer.cntoficial.com.br + cb-server na VPS).
 // Ops em docs/AMBIENTE-TESTE-ONLINE.md; guia do testador em docs/TESTE-ONLINE.md.
 //
-//   node tools/teste-online.mjs --build-releases   launcher "CB Multiplayer (Teste)" 0.1.0 … 0.1.3 + mod de teste
-//                                                  mod-p1-v0.1.0, assinados com a chave dev (LOCAL; a chave nunca
+//   node tools/teste-online.mjs --build-releases --mod-zip <zip>
+//                                                  launcher "CB Multiplayer (Teste)" 0.1.0 … 0.2.0 + mod real
+//                                                  mod-p1-v0.2.0 (o zip de tools/package-mod.ps1, conferido por
+//                                                  check-mod-zip; o --mod-zip só é exigido enquanto o release
+//                                                  mod-p1-v0.2.0 não existe na pasta de trabalho; o mod-p1-v0.1.0
+//                                                  antigo não é tocado), assinados com a chave dev (LOCAL; a chave nunca
 //                                                  sai desta máquina). Versões antigas ficam como foram publicadas
 //                                                  (sha256 fixado em PUBLISHED; faltando ou diferente = erro); só a
 //                                                  mais nova é refeita quando o código muda. Copia o instalador da
@@ -13,12 +17,14 @@
 //   node tools/teste-online.mjs --cert             emite o certificado (certbot --webroot) e liga o HTTPS (1ª vez)
 //   node tools/teste-online.mjs --firewall         libera 30500/udp e 30500/tcp no ufw (1ª vez)
 //   node tools/teste-online.mjs --status           estado dos serviços na VPS
-//   node tools/teste-online.mjs --check            valida pela internet (Hub, lista, conteúdo, mod, update, login)
+//   node tools/teste-online.mjs --check            valida pela internet (Hub, lista, conteúdo, mod 0.2.0 + layout do
+//                                                  zip, update, login)
 //
 // Opções: --ssh <usuario@host> (ou CBMP_TESTE_SSH; porta em CBMP_TESTE_SSH_PORT, padrão 22)
 //         --server-tar <cb-server-linux-x64.tar.gz>  pacote do workflow server-linux-dist (gh run download ...)
 //         --server-sha256 <hex> --server-commit <sha>  obrigatórios com --server-tar: sha256 e commit do resumo do run;
 //                        conferidos aqui e de novo na VPS antes de instalar
+//         --mod-zip <zip>  zip do mod (dist/cbmp-mod.zip): tools/build.ps1 -Target mod e tools/package-mod.ps1
 //         --dir <pasta>  trabalho local (padrão %TEMP%\cbmp-teste-online; releases em <pasta>\releases)
 //         --key <arquivo> chave privada dev (padrão %USERPROFILE%\.cbmp-devkeys\update.key; ou CBMP_DEV_KEY).
 //                         Lida só para assinar; nunca copiada, enviada ou impressa. Recusada dentro do repositório.
@@ -34,6 +40,7 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { sourceStamp } from './lib/source-stamp.mjs';
 import { hubLockfile } from './lib/hub-lockfile.mjs';
+import { checkModZip } from './lib/mod-zip-check.mjs';
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const HOST = 'cbmultiplayer.cntoficial.com.br';
@@ -44,7 +51,7 @@ const ROOT = '/var/www/html_cbmultiplayer';
 const SERVER_NAME = 'CB Multiplayer – Servidor de teste';
 const PRODUCT = 'CB Multiplayer (Teste)';
 // Em ordem. A última é a atual (refeita quando o código muda); as anteriores são histórico já publicado.
-const LAUNCHER_VERSIONS = ['0.1.0', '0.1.1', '0.1.2', '0.1.3'];
+const LAUNCHER_VERSIONS = ['0.1.0', '0.1.1', '0.1.2', '0.1.3', '0.2.0'];
 const LATEST_VERSION = LAUNCHER_VERSIONS.at(-1);
 // O instalador oferecido para download é sempre o da versão mais nova.
 const INSTALLER_VERSION = LATEST_VERSION;
@@ -54,10 +61,11 @@ const PUBLISHED = {
   '0.1.0': 'b541e1415e70b37218ed9d243143a36bc8156d4d1d65467a40b86f7434f70528',
   '0.1.1': '1376e4c916b3493e64f6d57f5c4b650e28b87e6c28d95c5e2d6ecd097466592b',
   '0.1.2': '3679d8438a8f1596a853913f798e76407d9d114bacc3ae81a82c0b85dcee56ce',
+  '0.1.3': '10bf8d809032bdf465caf6cfa4956c883730743b90d5577e75dcda27c6dfa0ae',
 };
 const sha256File = (f) => createHash('sha256').update(readFileSync(f)).digest('hex');
 const MOD_PROTOCOL = 1;
-const MOD_VERSION = '0.1.0';
+const MOD_VERSION = '0.2.0';
 const OVERLAY = join(REPO, 'launcher', 'src-tauri', 'tauri.onlinetest.conf.json');
 
 const log = (m) => console.log(`[teste-online] ${m}`);
@@ -75,6 +83,7 @@ function parseArgs(argv) {
       case '--server-tar': o.serverTar = resolve(val()); break;
       case '--server-sha256': o.serverSha = val().toLowerCase(); break;
       case '--server-commit': o.serverCommit = val().toLowerCase(); break;
+      case '--mod-zip': o.modZip = resolve(val()); break;
       case '--dir': o.dir = val(); break;
       case '--key': o.key = val(); break;
       case '--force': o.force = true; break;
@@ -114,11 +123,17 @@ function buildMod(rel, key, o) {
   const out = join(rel, tag);
   const zip = `cbmp-mod-p${MOD_PROTOCOL}-v${MOD_VERSION}.zip`;
   if (!o.force && [zip, `${zip}.sig`, `${zip}.sha256`].every((f) => existsSync(join(out, f)))) { log(`${tag}: já existe`); return; }
+  if (!o.modZip) {
+    fail(`${tag} ainda não existe em ${rel}: gere o zip do mod com tools/build.ps1 -Target mod e tools/package-mod.ps1 e passe --mod-zip dist/cbmp-mod.zip`);
+  }
+  if (!existsSync(o.modZip)) fail(`--mod-zip não encontrado: ${o.modZip}`);
+  const problems = checkModZip(readFileSync(o.modZip), { version: MOD_VERSION, protocol: MOD_PROTOCOL });
+  if (problems.length) fail(`o zip do mod ${o.modZip} tem problemas:\n  - ${problems.join('\n  - ')}`);
   rmSync(out, { recursive: true, force: true });
-  log(`${tag}: gerando e assinando o mod de teste…`);
+  log(`${tag}: assinando ${o.modZip}…`);
   run('cargo', ['run', '--quiet', '--locked', '--example', 'dev_sign_mod', '--', '--key', key, '--protocol', String(MOD_PROTOCOL),
-    '--version', MOD_VERSION, '--out', out], { cwd: join(REPO, 'launcher', 'src-tauri') });
-  writeFileSync(join(out, 'notes.txt'), `Mod de teste ${MOD_VERSION} (protocolo ${MOD_PROTOCOL}): só um LEIA-ME, sem código.\n`);
+    '--version', MOD_VERSION, '--zip', o.modZip, '--out', out], { cwd: join(REPO, 'launcher', 'src-tauri') });
+  writeFileSync(join(out, 'notes.txt'), `Mod ${MOD_VERSION} (protocolo ${MOD_PROTOCOL}): conectar e se ver.\n`);
 }
 
 function buildLauncher(rel, key, version, stamp, o) {
@@ -315,7 +330,10 @@ async function check() {
     const d = await get(m.url, { timeout: 60000 });
     must(d.status === 200, `download HTTP ${d.status}`);
     must(createHash('sha256').update(d.buf).digest('hex') === m.sha256, 'sha256 do zip difere');
-    return `v${m.version}, ${d.buf.length} bytes`;
+    must(m.version === MOD_VERSION, `oferece o mod ${m.version}, esperado ${MOD_VERSION}`);
+    const problems = checkModZip(d.buf, { version: MOD_VERSION, protocol: MOD_PROTOCOL });
+    must(problems.length === 0, `layout do zip: ${problems.join('; ')}`);
+    return `v${m.version}, ${d.buf.length} bytes, layout do zip ok`;
   });
   let latestSha;
   for (const from of LAUNCHER_VERSIONS.slice(0, -1)) {
