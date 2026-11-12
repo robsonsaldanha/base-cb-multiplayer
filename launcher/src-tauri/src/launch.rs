@@ -150,7 +150,7 @@ pub fn pointer_json(run_dir: &Path, launch_id: &str, written_at: u64, launcher: 
 }
 
 /// Grava `<container>\cbmp-run.json` (temporário + rename, por cima do anterior). Devolve o caminho. Erro de disco
-/// sai como [`AppError::io`] (quem chama converte permissão negada em `mod_needs_admin`).
+/// sai como [`AppError::io`] (quem chama converte permissão negada em `mod_folder_protected`).
 pub fn write_pointer(
     container: &Path,
     run_dir: &Path,
@@ -510,84 +510,6 @@ pub mod acl {
             Ok(())
         }
 
-        /// Acrescenta à DACL atual de `path` uma ACE de permissão `mask` para `sid`, herdada por pastas e arquivos
-        /// criados dentro; as ACEs existentes ficam.
-        pub fn grant(path: &Path, sid: &str, mask: u32) -> AppResult<()> {
-            use windows_sys::Win32::Security::Authorization::{
-                ConvertStringSidToSidW, GRANT_ACCESS,
-            };
-            let sid_w: Vec<u16> = sid.encode_utf16().chain(Some(0)).collect();
-            let mut psid: PSID = std::ptr::null_mut();
-            // SAFETY: string terminada em zero; `psid` recebe buffer LocalAlloc liberado abaixo.
-            if unsafe { ConvertStringSidToSidW(sid_w.as_ptr(), &mut psid) } == 0 {
-                return Err(acl_error("sid", unsafe { GetLastError() }));
-            }
-            let w = wide(path);
-            let mut old: *mut ACL = std::ptr::null_mut();
-            let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-            // SAFETY: caminho terminado em zero; `sd` alocado pela API (LocalFree abaixo), `old` aponta para dentro.
-            let r = unsafe {
-                GetNamedSecurityInfoW(
-                    w.as_ptr(),
-                    SE_FILE_OBJECT,
-                    DACL_SECURITY_INFORMATION,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    &mut old,
-                    std::ptr::null_mut(),
-                    &mut sd,
-                )
-            };
-            if r != ERROR_SUCCESS {
-                // SAFETY: alocado por ConvertStringSidToSidW.
-                unsafe { LocalFree(psid as HLOCAL) };
-                return Err(acl_error("leitura", r));
-            }
-            let ea = EXPLICIT_ACCESS_W {
-                grfAccessPermissions: mask,
-                grfAccessMode: GRANT_ACCESS,
-                grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-                Trustee: TRUSTEE_W {
-                    pMultipleTrustee: std::ptr::null_mut(),
-                    MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
-                    TrusteeForm: TRUSTEE_IS_SID,
-                    TrusteeType: TRUSTEE_IS_USER,
-                    ptstrName: psid.cast(),
-                },
-            };
-            let mut new: *mut ACL = std::ptr::null_mut();
-            // SAFETY: uma entrada válida sobre a DACL atual; ACL nova alocada pela API (LocalFree abaixo).
-            let r = unsafe { SetEntriesInAclW(1, &ea, old, &mut new) };
-            let r = if r == ERROR_SUCCESS {
-                // SAFETY: caminho terminado em zero; só a DACL (a proteção/herança atual não muda).
-                let s = unsafe {
-                    SetNamedSecurityInfoW(
-                        w.as_ptr(),
-                        SE_FILE_OBJECT,
-                        DACL_SECURITY_INFORMATION,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        new,
-                        std::ptr::null(),
-                    )
-                };
-                // SAFETY: alocada por SetEntriesInAclW.
-                unsafe { LocalFree(new as HLOCAL) };
-                s
-            } else {
-                r
-            };
-            // SAFETY: alocados acima pela API.
-            unsafe {
-                LocalFree(sd as HLOCAL);
-                LocalFree(psid as HLOCAL);
-            }
-            if r != ERROR_SUCCESS {
-                return Err(acl_error("dacl", r));
-            }
-            Ok(())
-        }
-
         pub fn read_security(path: &Path) -> AppResult<Security> {
             let w = wide(path);
             let mut owner: PSID = std::ptr::null_mut();
@@ -701,30 +623,6 @@ pub mod acl {
     #[cfg(windows)]
     pub fn restrict_dir_to_current_user(path: &Path) -> AppResult<()> {
         win::restrict(path, true)
-    }
-
-    /// "Modificar" (leitura, gravação, execução e apagar; sem trocar ACL nem dono).
-    pub const MODIFY: u32 = 0x0013_01BF;
-    /// `OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE`.
-    pub const INHERIT_TO_CHILDREN: u8 = 0x03;
-
-    /// Dá a `sid` (`S-1-5-21-…`) uma ACE de Modificar em `path`, herdada por tudo o que for criado dentro, sem tirar
-    /// as entradas existentes (modo elevado: a pasta `Win64\cbmp` passa a ser gravável pelo jogador).
-    #[cfg(windows)]
-    pub fn grant_modify(path: &Path, sid: &str) -> AppResult<()> {
-        win::grant(path, sid, MODIFY)
-    }
-
-    /// Fora do Windows (não suportado).
-    #[cfg(not(windows))]
-    pub fn grant_modify(_path: &Path, _sid: &str) -> AppResult<()> {
-        Err(acl_error("grant", 0))
-    }
-
-    /// Fora do Windows (não suportado).
-    #[cfg(not(windows))]
-    pub fn current_user_sid() -> AppResult<String> {
-        Err(acl_error("sid", 0))
     }
 
     /// Lê dono e DACL de `path` (`GetNamedSecurityInfoW`).

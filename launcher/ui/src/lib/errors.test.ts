@@ -26,7 +26,7 @@ describe("erros por código", () => {
   it("erros do mod e do jogo aberto com as mensagens exatas", () => {
     const exact: Record<string, string> = {
       mod_conflict: "Já existe outro carregador de mods (UE4SS) na pasta do jogo.",
-      mod_needs_admin: "O launcher não tem permissão para instalar o mod na pasta do jogo.",
+      mod_folder_protected: "O launcher não tem permissão para gravar na pasta do jogo.",
       mod_incompatible: "Este mod precisa de uma versão mais nova do launcher. Atualize e tente de novo.",
       mod_activation_failed: "Não foi possível ativar o mod na pasta do jogo.",
       game_running: "O Hogwarts Legacy está aberto. Feche o jogo e tente de novo.",

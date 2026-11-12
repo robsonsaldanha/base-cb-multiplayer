@@ -14,27 +14,31 @@
 //!   `cbmp-backup\` → `done`; ainda em `Win64\` → a entrada sai.
 //! - **Manifesto dentro da pasta do jogo** (`Win64\cbmp-backup\cbmp-backup.json`, `{v: 1, entries: [{name, stored,
 //!   sha256, state}]}`): a lista de backups viaja com a pasta (Steam "mover pasta de instalação", renomear). Ao
-//!   instalar, ativar, conferir o estado e remover numa pasta, o manifesto dela é **adotado** ([`adopt_folder`]): cada
+//!   instalar, ativar, remover e na abertura do launcher, o manifesto da pasta é **adotado** ([`adopt_folder`]): cada
 //!   entrada é conferida (nome só `dwmapi.dll`/`override.txt`, guardado como `<nome>` ou `<nome>.<N>`, arquivo comum
 //!   dentro de `cbmp-backup\` — que tem de ser pasta de verdade, sem link/junção — com o sha256 do manifesto) e o
 //!   registro passa a conhecê-la; a mesma entrada (nome + sha256) registrada numa pasta que não existe mais sai de lá
 //!   (foi movida). Pasta sumida (`Gone`) com backups que ninguém adotou fica registrada (inacessível), não é
-//!   descartada. O manifesto nunca vale fora do `Win64` da própria pasta: só devolve para os nomes fixos e nunca
-//!   substitui nada. É o mesmo arquivo que o modo elevado (`--mod-admin-setup`) grava.
+//!   descartada até o jogador escolher "Esquecer pasta" ([`forget_folder`]). O manifesto nunca vale fora do `Win64`
+//!   da própria pasta: só devolve para os nomes fixos e nunca substitui nada.
+//! - **Junções/links**: a pasta do jogo escolhida pode passar por junções (resolvida uma vez para o caminho final por
+//!   [`crate::game::resolve_final`]); dentro de `cbmp\` e `cbmp-backup\` pontos de reanálise são sempre recusados.
 //! - **Várias pastas do jogo**: o registro guarda, além da pasta atual, as anteriores onde ainda há algo nosso ou
 //!   backups do jogador (`otherFolders`). Antes de instalar numa pasta nova o mod sai das anteriores
 //!   ([`leave_other_folders`]); pasta inacessível ou falha → o registro dela fica e o Jogar segue.
 //! - **Remover**: apaga só os nossos, devolve os backups (só para destino vazio), apaga `cbmp\atual*`, o ponteiro e
 //!   temporários nossos; `cbmp\logs\`, `crash\`, `cb-mp.json` e `mods\package\` ficam; o registro fica com `removed`.
 //!   [`remove_everywhere`] faz isso em todas as pastas registradas e devolve o resultado de cada uma.
-//! - Permissão negada em `Win64` → `mod_needs_admin`; outra falha → `mod_activation_failed`.
+//! - Permissão negada em `Win64` → `mod_folder_protected` (com a pasta do jogo); outra falha → `mod_activation_failed`.
+//!   O launcher nunca pede elevação nem muda permissões; arquivo preso pelo jogo aberto é barrado antes por `game_running`.
 
 use crate::content::{remove_entry, safe_rel_path};
 use crate::error::{AppError, AppResult};
-use crate::game::{GameInstall, BINARIES};
+use crate::game::{same_dir, GameInstall, BINARIES};
 use crate::modpkg::{
-    hash_file, mod_dir, mod_needs_admin, push_loader_history, win64_dir, BackupEntry, BackupState,
-    FolderRecord, Installed, LoaderRef, ModInstaller, CURRENT_FOLDER, LAYOUT, MOD_FOLDER,
+    game_dir_of, hash_file, mod_dir, mod_folder_protected, push_loader_history, win64_dir,
+    BackupEntry, BackupState, FolderRecord, Installed, LoaderRef, ModInstaller, CURRENT_FOLDER,
+    LAYOUT, MOD_FOLDER,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
@@ -117,7 +121,7 @@ fn mod_conflict() -> AppError {
     )
 }
 
-pub(crate) fn legacy_conflict() -> AppError {
+fn legacy_conflict() -> AppError {
     AppError::new(
         "mod_conflict",
         "Já existe outro carregador de mods (UE4SS) na pasta do jogo. Remova o UE4SS antigo \
@@ -143,11 +147,11 @@ pub fn folder_unreachable(dir: &Path) -> AppError {
     )
 }
 
-/// Falha de disco em `Win64`: permissão negada → `mod_needs_admin`; o resto → `mod_activation_failed`.
+/// Falha de disco em `Win64`: permissão negada → `mod_folder_protected`; o resto → `mod_activation_failed`.
 fn act_io(path: &Path, e: &std::io::Error) -> AppError {
     if e.kind() == std::io::ErrorKind::PermissionDenied {
         log::warn!("sem permissão em {}: {e}", path.display());
-        mod_needs_admin()
+        mod_folder_protected(&game_dir_of(path))
     } else {
         log::warn!("falha em {}: {e}", path.display());
         activation_failed()
@@ -245,30 +249,10 @@ fn override_slot(win64: &Path) -> AppResult<Slot> {
 
 /// Estado da ativação em `win64` para o mod registrado em `rec`.
 pub fn inspect(win64: &Path, rec: &Installed) -> AppResult<Activation> {
-    inspect_with(win64, rec.loader.as_ref(), &rec.loader_history)
-}
-
-/// sha256 de `Win64\dwmapi.dll`, se for um arquivo comum.
-pub fn win64_loader_sha(win64: &Path) -> AppResult<Option<String>> {
-    let path = win64.join(LOADER_NAME);
-    match meta(&path)? {
-        Some(m) if m.is_file() && !is_reparse(&m) => {
-            Ok(Some(hash_file(&path).map_err(|e| act_io(&path, &e))?.0))
-        }
-        _ => Ok(None),
-    }
-}
-
-/// [`inspect`] com o carregador esperado (`loader`) e os anteriores nossos (`history`) dados à parte.
-pub fn inspect_with(
-    win64: &Path,
-    loader: Option<&LoaderRef>,
-    history: &[String],
-) -> AppResult<Activation> {
     if exists(&win64.join(LEGACY_PROXY)) && exists(&win64.join(LEGACY_UE4SS)) {
         return Ok(Activation::LegacyUe4ss);
     }
-    let loader = loader_slot(win64, loader, history)?;
+    let loader = rec_loader_slot(win64, rec)?;
     let over = override_slot(win64)?;
     let (lf, of) = (loader == Slot::Foreign, over == Slot::Foreign);
     if lf || of {
@@ -338,34 +322,6 @@ pub fn activate_with(
     confirm_conflict: bool,
     persist: &mut dyn FnMut(&Installed) -> AppResult<()>,
 ) -> AppResult<()> {
-    activate_from(
-        win64,
-        LoaderSource::Current(current),
-        rec,
-        confirm_conflict,
-        persist,
-    )
-}
-
-/// De onde vem o carregador copiado para `Win64\dwmapi.dll`.
-#[derive(Debug, Clone, Copy)]
-pub enum LoaderSource<'a> {
-    /// `cbmp\atual` (o `loader\dwmapi.dll` dentro dele).
-    Current(&'a Path),
-    /// Bytes já conferidos (modo elevado: lidos do zip assinado, nada passa por `cbmp\atual`).
-    Bytes(&'a [u8]),
-}
-
-/// [`activate_with`] com o carregador vindo de `src`. As mesmas regras: ausente → grava sem substituir; nosso de
-/// versão anterior (`rec.loader_history`) → substitui; estranho → só com `confirm_conflict`, movido para
-/// `cbmp-backup\` com `persist` antes e depois; o temporário é conferido contra `rec.loader` antes do rename.
-pub fn activate_from(
-    win64: &Path,
-    src: LoaderSource<'_>,
-    rec: &mut Installed,
-    confirm_conflict: bool,
-    persist: &mut dyn FnMut(&Installed) -> AppResult<()>,
-) -> AppResult<()> {
     let (move_loader, move_override) = match inspect(win64, rec)? {
         Activation::Active => return Ok(()),
         Activation::LegacyUe4ss => {
@@ -391,8 +347,8 @@ pub fn activate_from(
     // Conferido de novo depois de mover: nunca sobrescreve o que não é nosso.
     match rec_loader_slot(win64, rec)? {
         Slot::Ours => {}
-        Slot::Missing => install_loader(win64, src, rec, false)?,
-        Slot::Outdated => install_loader(win64, src, rec, true)?,
+        Slot::Missing => install_loader(win64, current, rec, false)?,
+        Slot::Outdated => install_loader(win64, current, rec, true)?,
         Slot::Foreign => return Err(mod_conflict()),
     }
     match override_slot(win64)? {
@@ -414,6 +370,11 @@ fn move_to_backup(
     persist: &mut dyn FnMut(&Installed) -> AppResult<()>,
 ) -> AppResult<()> {
     let src = win64.join(name);
+    // `cbmp-backup` que existe e não é pasta de verdade (link/junção): nunca move para lá.
+    if exists(backup) && !backup_dir_ok(win64) {
+        log::warn!("cbmp-backup não é uma pasta de verdade; {name} não foi movido");
+        return Err(activation_failed());
+    }
     // sha256 do arquivo do jogador (pasta: sem hash), para o manifesto conferir depois de uma mudança de pasta.
     let sha256 = match meta(&src)? {
         Some(m) if m.is_file() => Some(hash_file(&src).map_err(|e| act_io(&src, &e))?.0),
@@ -475,18 +436,14 @@ fn tmp_beside(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Grava o carregador de `src` em `Win64\dwmapi.dll` (temporário novo e sincronizado + rename), conferindo o hash
+/// Copia `atual\loader\dwmapi.dll` para `Win64\dwmapi.dll` (temporário sincronizado + rename), conferindo o hash
 /// registrado. `replace` só para o carregador nosso de versão anterior; ausente → nunca substitui.
-fn install_loader(
-    win64: &Path,
-    src: LoaderSource<'_>,
-    rec: &Installed,
-    replace: bool,
-) -> AppResult<()> {
+fn install_loader(win64: &Path, current: &Path, rec: &Installed, replace: bool) -> AppResult<()> {
     let expected = rec.loader.as_ref().ok_or_else(|| {
         log::warn!("registro do mod sem carregador");
         activation_failed()
     })?;
+    let src = current.join("loader").join(LOADER_NAME);
     let dst = win64.join(LOADER_NAME);
     let tmp = tmp_beside(&dst);
     remove_entry(&tmp).map_err(|e| act_io(&tmp, &e))?;
@@ -497,14 +454,8 @@ fn install_loader(
             .create_new(true)
             .open(&tmp)
             .map_err(|e| act_io(&tmp, &e))?;
-        match src {
-            LoaderSource::Current(current) => {
-                let from = current.join("loader").join(LOADER_NAME);
-                let mut f = std::fs::File::open(&from).map_err(|e| act_io(&from, &e))?;
-                std::io::copy(&mut f, &mut out).map_err(|e| act_io(&tmp, &e))?;
-            }
-            LoaderSource::Bytes(b) => out.write_all(b).map_err(|e| act_io(&tmp, &e))?,
-        }
+        let mut from = std::fs::File::open(&src).map_err(|e| act_io(&src, &e))?;
+        std::io::copy(&mut from, &mut out).map_err(|e| act_io(&tmp, &e))?;
         out.sync_all().map_err(|e| act_io(&tmp, &e))?;
         drop(out);
         let (sha, len) = hash_file(&tmp).map_err(|e| act_io(&tmp, &e))?;
@@ -610,6 +561,19 @@ fn plain_name(s: &str) -> bool {
 /// Devolve cada backup para `Win64\` se o destino estiver vazio; o que não volta fica em `backups`.
 fn restore_backups(win64: &Path, backups: &mut Vec<BackupEntry>) -> AppResult<()> {
     let backup = win64.join(BACKUP_FOLDER);
+    if backups.is_empty() {
+        return Ok(());
+    }
+    if !exists(&backup) {
+        log::warn!("cbmp-backup não existe mais; registro dos backups descartado");
+        backups.clear();
+        return Ok(());
+    }
+    // Link/junção no lugar de `cbmp-backup`: nada é trazido de fora; as entradas ficam.
+    if !backup_dir_ok(win64) {
+        log::warn!("cbmp-backup não é uma pasta de verdade; backups não devolvidos");
+        return Ok(());
+    }
     let mut pending = std::mem::take(backups).into_iter();
     while let Some(b) = pending.next() {
         if !backup_names_ok(&b.name, &b.stored) {
@@ -807,7 +771,7 @@ pub fn remove_everywhere(mods: &ModInstaller, current: Option<&Path>) -> Vec<Fol
     };
     let mut seen = registered_dirs(&rec);
     if let Some(c) = current {
-        if !seen.iter().any(|d| d == c) {
+        if !seen.iter().any(|d| same_dir(d, c)) {
             seen.push(c.to_path_buf());
         }
     }
@@ -819,7 +783,7 @@ pub fn remove_everywhere(mods: &ModInstaller, current: Option<&Path>) -> Vec<Fol
     };
     let mut dirs = registered_dirs(&rec);
     if let Some(c) = current {
-        if !dirs.iter().any(|d| d == c) && matches!(reach(c), Reach::Present) {
+        if !dirs.iter().any(|d| same_dir(d, c)) && matches!(reach(c), Reach::Present) {
             dirs.push(c.to_path_buf());
         }
     }
@@ -837,21 +801,96 @@ pub fn leftover_folders(except: Option<&Path>, mods: &ModInstaller) -> Vec<PathB
         return Vec::new();
     };
     let mut out = Vec::new();
-    if rec.has_traces() && Some(rec.game_dir.as_path()) != except {
+    if rec.has_traces() && !is_except(&rec.game_dir, except) {
         out.push(rec.game_dir.clone());
     }
     out.extend(
         rec.other_folders
             .iter()
-            .filter(|f| Some(f.game_dir.as_path()) != except)
+            .filter(|f| !is_except(&f.game_dir, except))
             .map(|f| f.game_dir.clone()),
     );
     out
 }
 
+/// `dir` é a pasta `except` (pelo mesmo caminho ou pelo caminho final, com junções resolvidas).
+fn is_except(dir: &Path, except: Option<&Path>) -> bool {
+    except.is_some_and(|e| same_dir(dir, e))
+}
+
+/// Pasta registrada que não existe mais (o volume existe, `Win64` sumiu) e os nomes dos arquivos do jogador que estavam
+/// guardados no `cbmp-backup\` dela.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoneFolder {
+    pub game_dir: PathBuf,
+    pub backups: Vec<String>,
+}
+
+/// Pastas registradas (fora `except`) que não existem mais, para "Esquecer pasta" nas Configurações.
+pub fn gone_folders(except: Option<&Path>, mods: &ModInstaller) -> Vec<GoneFolder> {
+    let Some(rec) = mods.installed() else {
+        return Vec::new();
+    };
+    let names = |b: &[BackupEntry]| b.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+    let mut out = Vec::new();
+    if rec.has_traces() && !is_except(&rec.game_dir, except) {
+        out.push((rec.game_dir.clone(), names(&rec.backups)));
+    }
+    out.extend(
+        rec.other_folders
+            .iter()
+            .filter(|f| !is_except(&f.game_dir, except))
+            .map(|f| (f.game_dir.clone(), names(&f.backups))),
+    );
+    out.into_iter()
+        .filter(|(d, _)| matches!(reach(d), Reach::Gone))
+        .map(|(game_dir, backups)| GoneFolder { game_dir, backups })
+        .collect()
+}
+
+/// "Esquecer pasta": tira do registro uma pasta registrada que não existe mais. Os arquivos do jogador que estavam no
+/// `cbmp-backup\` dela não podem mais ser devolvidos pelo launcher (a UI diz isso antes). Pasta que existe ou que
+/// só está inacessível (disco ausente) não é esquecida.
+pub fn forget_folder(dir: &Path, mods: &ModInstaller) -> AppResult<()> {
+    let Some(mut rec) = mods.installed() else {
+        return Ok(());
+    };
+    if !matches!(reach(dir), Reach::Gone) {
+        return Err(AppError::new(
+            "mod_folder_present",
+            "Esta pasta do jogo ainda existe ou só está inacessível agora; ela não pode ser esquecida.",
+        ));
+    }
+    if rec.game_dir == dir {
+        log::warn!(
+            "pasta do jogo {} esquecida; {} backup(s) do jogador sem devolução",
+            dir.display(),
+            rec.backups.len()
+        );
+        rec.backups.clear();
+        rec.removed = true;
+        rec.files.clear();
+        if let Some(l) = rec.loader.take() {
+            push_loader_history(&mut rec.loader_history, &l.sha256);
+        }
+    } else if let Some(i) = rec.other_folders.iter().position(|f| f.game_dir == dir) {
+        let f = rec.other_folders.remove(i);
+        log::warn!(
+            "pasta anterior do jogo {} esquecida; {} backup(s) do jogador sem devolução",
+            dir.display(),
+            f.backups.len()
+        );
+    } else {
+        return Ok(());
+    }
+    mods.save_record(&rec)
+}
+
 /// Antes de instalar em `game`: tenta tirar o mod de todas as outras pastas registradas. Devolve as que ainda têm
 /// algo (inacessíveis ou com falha); o registro delas fica.
 pub fn leave_other_folders(game: &GameInstall, mods: &ModInstaller) -> Vec<PathBuf> {
+    rebase_record(&game.dir, mods);
     for d in leftover_folders(Some(&game.dir), mods) {
         match remove_folder(&d, mods) {
             Ok(()) => log::info!("pasta do jogo trocada: mod removido de {}", d.display()),
@@ -863,6 +902,38 @@ pub fn leave_other_folders(game: &GameInstall, mods: &ModInstaller) -> Vec<PathB
         }
     }
     leftover_folders(Some(&game.dir), mods)
+}
+
+/// Registro gravado por outro caminho para a mesma pasta do jogo `game` (ex.: por uma junção, antes de o launcher
+/// resolver o caminho final): passa a usar `game`, para a pasta não ser tratada como "anterior" (o mod sairia e voltaria,
+/// com o conflito perguntado de novo).
+pub fn rebase_record(game: &Path, mods: &ModInstaller) {
+    let Some(mut rec) = mods.installed() else {
+        return;
+    };
+    let before = rec.clone();
+    if rec.game_dir != game && same_dir(&rec.game_dir, game) {
+        log::info!(
+            "registro do mod: {} é a pasta do jogo {}",
+            rec.game_dir.display(),
+            game.display()
+        );
+        rec.game_dir = game.to_path_buf();
+    }
+    if !rec.other_folders.iter().any(|f| f.game_dir == game) {
+        if let Some(f) = rec
+            .other_folders
+            .iter_mut()
+            .find(|f| same_dir(&f.game_dir, game))
+        {
+            f.game_dir = game.to_path_buf();
+        }
+    }
+    if rec != before {
+        if let Err(e) = mods.save_record(&rec) {
+            log::warn!("registro do mod não regravado: {}", e.code);
+        }
+    }
 }
 
 /// Na abertura do launcher: resolve backups `pending` e adota os manifestos de todas as pastas registradas que
@@ -1025,6 +1096,9 @@ pub fn write_manifest(win64: &Path, entries: &[BackupEntry]) -> AppResult<()> {
     let backup = win64.join(BACKUP_FOLDER);
     let path = backup.join(BACKUP_MANIFEST);
     if entries.is_empty() {
+        if !backup_dir_ok(win64) {
+            return Ok(());
+        }
         return match meta(&path)? {
             None => Ok(()),
             Some(_) => remove_entry(&path).map_err(|e| act_io(&path, &e)),
@@ -1270,7 +1344,12 @@ mod tests {
         assert_eq!(OVERRIDE_LINE, r"cbmp\atual\ue4ss");
         assert!(CONFLICT_DIALOG.contains(r"Phoenix\Binaries\Win64\cbmp-backup"));
         let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-        assert_eq!(act_io(Path::new("x"), &denied).code, "mod_needs_admin");
+        let e = act_io(
+            Path::new(r"D:\HL\Phoenix\Binaries\Win64\dwmapi.dll"),
+            &denied,
+        );
+        assert_eq!(e.code, "mod_folder_protected");
+        assert!(e.message.contains(r"(D:\HL)"), "{}", e.message);
         let other = std::io::Error::other("x");
         assert_eq!(act_io(Path::new("x"), &other).code, "mod_activation_failed");
     }

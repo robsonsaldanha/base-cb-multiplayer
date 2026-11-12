@@ -44,11 +44,23 @@ das tasks).
 - **Margem de renovação do ticket** (revisão 7, M-1): o launcher renova o ticket com mais de 240 s (TTL 300 − 60;
   `play::TICKET_RENEW_AFTER_SECS`) antes de gravar o `connect.json`, mas o tempo entre abrir o jogo e o mod resgatar o
   ticket não é medido. Medir com o mod real e ajustar a margem (ou renovar pelo mod).
-- **Mod na pasta do jogo sem administrador** (kit de teste em casa): o launcher roda sem elevação e grava o mod em
-  `<jogo>\Phoenix\Binaries\Win64\cbmp`. Na Steam a biblioteca costuma permitir; na **Epic** (`C:\Program Files\Epic
-  Games`) o usuário comum em geral não pode gravar e o `play` para em `permission_denied`. Decidir no subprojeto 5
-  (ex.: elevação só para instalar o mod, pasta do mod fora do jogo com o loader apontando para ela). O resultado do
-  passo 12 de `docs/TESTES-EM-CASA-SUB4.md` diz o que acontece numa instalação real.
+- **Instalação em pasta protegida (adiado)** (sub5a, revisão da Task 10): o launcher nunca pede elevação. Numa pasta do
+  jogo em que o usuário não grava (ex.: `C:\Program Files\Epic Games`), o Jogar para em `mod_folder_protected` e pede
+  para instalar o jogo numa pasta gravável. A instalação elevada "uma vez" foi **retirada** do 5a porque o próprio
+  desenho era uma escalada de privilégio: dar ao jogador permissão de gravar em `Win64\cbmp` deixa gravável por uma
+  conta o código que o jogo de **todas** as contas carrega (`override.txt` → `cbmp\atual\ue4ss`); o processo elevado
+  agia por nome em pastas que quem o chamou controlava (junção trocada depois da conferência → ACL, movimento e
+  exclusão como administrador em qualquer lugar); o hash do "carregador nosso anterior" vinha do chamador; e não havia
+  remoção elevada. As instalações vistas até agora (Steam em `Program Files (x86)`, Epic) já são graváveis pelo
+  usuário. Direção para um desenho futuro: (1) o processo elevado faz a instalação **inteira** sozinho, toda vez (pacote
+  em `cbmp\atual` incluso), conferindo a assinatura pelo mesmo handle que lê; (2) **nada** na pasta do jogo fica
+  gravável pelo jogador; (3) ponteiro, logs, `crash\` e `cb-mp.json` vão para uma pasta por usuário, que o mod acha por
+  um arquivo só leitura e de dono administrador na pasta do jogo contendo um caminho com variável de ambiente (ex.:
+  `%LOCALAPPDATA%\CBMultiplayer\run`); (4) remoção também elevada (e conflito só com remoção elevada pronta); (5)
+  operações por handle (pastas presas sem `FILE_SHARE_DELETE`, criação/renomeação relativas ao handle, DACL pelo
+  handle), recusa de pasta do jogo gravável pelo chamador; (6) "carregador nosso anterior" só por evidência assinada
+  (ex.: hashes anteriores no `cbmp-mod.json` assinado). O resultado do passo 12 de `docs/TESTES-EM-CASA-SUB4.md` diz o
+  que acontece numa instalação real.
 - **Abrir `HogwartsLegacy.exe` direto** (sem argumentos): na Steam o jogo costuma se reabrir pela Steam; na Epic pode
   exigir os parâmetros de autenticação que o launcher da Epic passa. Conferir no subprojeto 5 (passo 12 do roteiro
   em casa).

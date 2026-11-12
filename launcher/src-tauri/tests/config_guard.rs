@@ -576,13 +576,13 @@ fn capability_real_so_tem_o_permitido() {
             "allow-check-update",
             "allow-clear-cache",
             "allow-detect-game",
+            "allow-forget-mod-folder",
             "allow-get-settings",
             "allow-install-update",
             "allow-list-servers",
             "allow-login",
             "allow-logout",
             "allow-me",
-            "allow-mod-admin-setup",
             "allow-mod-status",
             "allow-open-mod-logs",
             "allow-pick-game-dir",
@@ -690,7 +690,7 @@ fn comandos_do_build_rs_batem_com_a_capability() {
         "remove_mod",
         "resolve_mod_conflict",
         "open_mod_logs",
-        "mod_admin_setup",
+        "forget_mod_folder",
     ] {
         assert!(
             build.contains(&format!("\"{cmd}\"")),
@@ -936,21 +936,95 @@ fn explicacao_do_conflito_na_ui_e_o_texto_do_dialogo() {
     assert_eq!(text, cbmp_launcher_lib::modact::CONFLICT_DIALOG);
 }
 
-/// O modo elevado é tratado em `main.rs` antes de qualquer coisa do Tauri, e só pelo primeiro argumento.
+/// Arquivos de texto sob `dir` (recursivo) com estas extensões.
+fn sources(dir: &Path, exts: &[&str], out: &mut Vec<PathBuf>) {
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        let name = p.file_name().unwrap().to_string_lossy().to_string();
+        if p.is_dir() {
+            if !matches!(name.as_str(), "node_modules" | "dist" | "target" | "gen") {
+                sources(&p, exts, out);
+            }
+        } else if exts.iter().any(|x| name.ends_with(x)) {
+            out.push(p);
+        }
+    }
+}
+
+/// O launcher nunca pede elevação (decisão do lead na revisão da Task 10): nenhum caminho de código com UAC, modo
+/// elevado, manifesto pedindo administrador ou concessão de permissão em pasta do jogo.
 #[test]
-fn main_trata_o_modo_elevado_antes_do_tauri() {
-    let main_rs = read(&root().join("src/main.rs"));
-    let entry = main_rs
-        .find("admin_setup::entry(std::env::args_os())")
-        .expect("main.rs chama admin_setup::entry");
-    let run = main_rs
-        .find("cbmp_launcher_lib::run()")
-        .expect("main.rs chama run()");
-    assert!(entry < run, "modo elevado depois do Tauri");
-    assert!(main_rs.contains("std::process::exit(code)"));
-    assert_eq!(cbmp_launcher_lib::admin_setup::FLAG, "--mod-admin-setup");
-    assert_eq!(
-        cbmp_launcher_lib::admin_setup::WAIT,
-        std::time::Duration::from_secs(120)
+fn launcher_nao_tem_caminho_de_elevacao() {
+    let mut files = Vec::new();
+    sources(&root().join("src"), &[".rs"], &mut files);
+    sources(
+        &root().join("capabilities"),
+        &[".json", ".toml"],
+        &mut files,
     );
+    sources(&root().join("permissions"), &[".toml"], &mut files);
+    sources(
+        &root().join("../ui/src"),
+        &[".ts", ".svelte", ".js"],
+        &mut files,
+    );
+    for f in [
+        "build.rs",
+        "Cargo.toml",
+        "tauri.conf.json",
+        "tauri.localtest.conf.json",
+        "tauri.onlinetest.conf.json",
+    ] {
+        files.push(root().join(f));
+    }
+    files.extend(
+        std::fs::read_dir(root())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "manifest" || x == "rc")),
+    );
+    assert!(
+        files.len() > 40,
+        "poucos arquivos conferidos: {}",
+        files.len()
+    );
+    let forbidden = [
+        "runas",
+        "requireAdministrator",
+        "highestAvailable",
+        "mod-admin-setup",
+        "mod_admin_setup",
+        "admin_setup",
+        "ShellExecuteExW",
+        "grant_modify",
+        "GRANT_ACCESS",
+        "SetKernelObjectSecurity",
+        "Instalar com permissão de administrador",
+    ];
+    let mut hits = Vec::new();
+    for f in &files {
+        let Ok(text) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        for word in forbidden {
+            if text.contains(word) {
+                hits.push(format!("{}: {word}", f.display()));
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "caminho de elevação no launcher: {hits:#?}"
+    );
+    // A única troca de DACL do launcher é a dos arquivos dele em `run\` (restringir ao usuário atual).
+    let launch = read(&root().join("src/launch.rs"));
+    assert_eq!(launch.matches("SetNamedSecurityInfoW(").count(), 1);
+    for f in &files {
+        if f.ends_with("launch.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(f).unwrap_or_default();
+        assert!(!text.contains("SetNamedSecurityInfoW"), "{}", f.display());
+    }
 }

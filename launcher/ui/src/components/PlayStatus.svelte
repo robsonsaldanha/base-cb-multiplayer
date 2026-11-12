@@ -1,11 +1,10 @@
 <script lang="ts">
   // Resultado do Jogar: "Pronto para abrir" (modo simular, conexão sem o ticket), jogo aberto, ou erro por código.
   // Conflito com outro carregador de mods: explica e oferece usar o do CB Multiplayer (diálogo nativo no Rust) e
-  // repetir o Jogar. Sem permissão na pasta do jogo: instalar com permissão de administrador (UAC no Rust) e repetir
-  // o Jogar, com o caminho manual ao lado.
-  import { modAdminSetup, pickGameDir, resolveModConflict, toApiError, type ApiError } from "../lib/api";
+  // repetir o Jogar. Sem permissão na pasta do jogo (`mod_folder_protected`): a mensagem do Rust já diz o que fazer.
+  import { pickGameDir, resolveModConflict, toApiError } from "../lib/api";
   import GameSuggestion from "./GameSuggestion.svelte";
-  import { describeError, MOD_ADMIN_HINT, MOD_CONFLICT_EXPLANATION } from "../lib/errors";
+  import { describeError, MOD_CONFLICT_EXPLANATION } from "../lib/errors";
   import { dismissPlay, playState, startPlay } from "../lib/play";
   import { notify } from "../lib/notice";
   import { settings } from "../lib/settings";
@@ -13,27 +12,18 @@
   const err = $derived($playState.status === "failed" ? describeError($playState.error) : null);
   const needsGame = $derived(err?.code === "game_not_found" || err?.code === "game_invalid");
   const conflict = $derived(err?.code === "mod_conflict");
-  const needsAdmin = $derived(err?.code === "mod_needs_admin");
   let picking = $state(false);
   let resolving = $state(false);
-  // Erro devolvido pela instalação com permissão de administrador: o caminho manual continua à vista.
-  let adminError = $state.raw<ApiError | null>(null);
-  const showAdminHint = $derived(
-    needsAdmin || ($playState.status === "failed" && adminError !== null && $playState.error === adminError),
-  );
 
-  // Conflito e permissão: a ação nativa resolve; mod instalado → repete o Jogar; erro → vira o erro do painel.
-  async function resolveWith(action: typeof resolveModConflict) {
+  async function resolveConflict() {
     if ($playState.status !== "failed") return;
     const server = $playState.server;
     resolving = true;
     try {
-      const st = await action();
+      const st = await resolveModConflict();
       if (st.state === "installed") await startPlay(server);
     } catch (e) {
-      const error = toApiError(e);
-      adminError = action === modAdminSetup ? error : null;
-      playState.set({ status: "failed", server, error });
+      playState.set({ status: "failed", server, error: toApiError(e) });
     } finally {
       resolving = false;
     }
@@ -91,20 +81,14 @@
           <button type="button" class="primary" disabled={picking} onclick={pick}>Escolher pasta do jogo</button>
         {/if}
         {#if conflict}
-          <button type="button" class="primary" disabled={resolving} onclick={() => resolveWith(resolveModConflict)}
+          <button type="button" class="primary" disabled={resolving} onclick={resolveConflict}
             >Usar o carregador do CB Multiplayer</button
-          >
-        {/if}
-        {#if needsAdmin}
-          <button type="button" class="primary" disabled={resolving} onclick={() => resolveWith(modAdminSetup)}
-            >Instalar com permissão de administrador (uma vez)</button
           >
         {/if}
         <button type="button" onclick={dismissPlay}>Fechar</button>
       </div>
     </div>
     {#if conflict}<p class="explain">{MOD_CONFLICT_EXPLANATION}</p>{/if}
-    {#if showAdminHint}<p class="explain">{MOD_ADMIN_HINT}</p>{/if}
   </section>
   {#if needsGame}
     <GameSuggestion />

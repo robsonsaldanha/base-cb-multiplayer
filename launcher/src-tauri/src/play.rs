@@ -19,7 +19,7 @@ use crate::error::{AppError, AppResult};
 use crate::game::{game_not_found, game_running_error, game_running_with, GameInstall, Processes};
 use crate::launch::{self, ConnectInfo, LaunchOutcome};
 use crate::modact;
-use crate::modpkg::{admin_if_denied, container_dir, ModInstaller};
+use crate::modpkg::{container_dir, protected_if_denied, ModInstaller};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -308,7 +308,8 @@ pub async fn play(
     let container = if ctx.simulate {
         None
     } else {
-        let c = container_dir(ctx.game.as_ref().ok_or_else(game_not_found)?);
+        let game = ctx.game.as_ref().ok_or_else(game_not_found)?;
+        let c = container_dir(game);
         if let Err(e) = launch::write_pointer(
             &c,
             &ctx.run_dir,
@@ -317,7 +318,7 @@ pub async fn play(
             &ctx.launcher_version,
         ) {
             launch::remove_if_unchanged(&path, &written);
-            return Err(admin_if_denied(e));
+            return Err(protected_if_denied(e, &game.dir));
         }
         Some(c)
     };

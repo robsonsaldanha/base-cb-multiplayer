@@ -171,6 +171,43 @@ pub fn validate_game_dir(dir: &Path) -> AppResult<GameInstall> {
     })
 }
 
+/// A mesma instalação pelo caminho final: a pasta escolhida pode passar por junções/links (biblioteca da Steam movida
+/// por junção); o launcher resolve uma vez e trabalha nesse caminho (o registro do mod também). `\\?\C:\…` vira
+/// `C:\…` e `\\?\UNC\s\x` vira `\\s\x`. Falha ao resolver → a instalação como veio.
+pub fn resolve_final(game: &GameInstall) -> GameInstall {
+    let Some(dir) = resolve_dir(&game.dir) else {
+        return game.clone();
+    };
+    if dir != game.dir {
+        log::info!("pasta do jogo resolvida para {}", dir.display());
+    }
+    GameInstall {
+        exe: dir.join(GAME_EXE),
+        dir,
+        store: game.store,
+    }
+}
+
+/// Caminho final de `dir` (junções/links resolvidos), sem o prefixo `\\?\`. Falha ao resolver (pasta ausente, nome
+/// que não é Unicode válido) → `None`.
+pub fn resolve_dir(dir: &Path) -> Option<PathBuf> {
+    let real = std::fs::canonicalize(dir).ok()?;
+    let s = real.as_os_str().to_str()?;
+    Some(if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{unc}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        real.clone()
+    })
+}
+
+/// `a` e `b` são a mesma pasta: o mesmo caminho, ou o mesmo caminho final depois de resolver junções/links (registro
+/// gravado antes por outro caminho para a mesma pasta).
+pub fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b || matches!((resolve_dir(a), resolve_dir(b)), (Some(x), Some(y)) if x == y)
+}
+
 /// Qual verificação de confiança falhou num caminho achado pelo manifest da Epic (vai para o log).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TrustCheck {

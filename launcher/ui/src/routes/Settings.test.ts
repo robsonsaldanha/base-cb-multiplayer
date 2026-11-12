@@ -26,9 +26,9 @@ function setup(extra: Record<string, Handler> = {}) {
   return { b, saved: () => saved };
 }
 
-const NOT_INSTALLED = { state: "notInstalled", otherFolders: [] };
-const INSTALLED = { state: "installed", version: "0.2.0", otherFolders: [] };
-const CONFLICT = { state: "conflict", otherFolders: [] };
+const NOT_INSTALLED = { state: "notInstalled", otherFolders: [], goneFolders: [] };
+const INSTALLED = { state: "installed", version: "0.2.0", otherFolders: [], goneFolders: [] };
+const CONFLICT = { state: "conflict", otherFolders: [], goneFolders: [] };
 
 function modSection() {
   return screen.getByRole("region", { name: "Mod do jogo" });
@@ -239,9 +239,9 @@ describe("Configurações", () => {
   it("mod em pasta anterior do jogo: aparece, deixa remover e mostra o resultado por pasta", async () => {
     const OLD = "E:\\Jogos\\Hogwarts Legacy";
     setup({
-      mod_status: () => ({ ...NOT_INSTALLED, otherFolders: [OLD] }),
+      mod_status: () => ({ ...NOT_INSTALLED, otherFolders: [OLD], goneFolders: [] }),
       remove_mod: () => ({
-        status: { ...NOT_INSTALLED, otherFolders: [OLD] },
+        status: { ...NOT_INSTALLED, otherFolders: [OLD], goneFolders: [] },
         folders: [
           {
             gameDir: OLD,
@@ -261,6 +261,58 @@ describe("Configurações", () => {
     expect(failed).toHaveTextContent(OLD);
     expect(failed).toHaveTextContent(/não está acessível/);
     expect(within(sec).queryByText("Mod removido do jogo.")).toBeNull();
+  });
+
+  it("pasta anterior que não existe mais: esquecer só depois de confirmar, citando os arquivos guardados", async () => {
+    const GONE = "E:\\Jogos\\Desinstalado";
+    const { b } = setup({
+      mod_status: () => ({
+        ...INSTALLED,
+        otherFolders: [GONE],
+        goneFolders: [{ gameDir: GONE, backups: ["dwmapi.dll", "override.txt"] }],
+      }),
+      forget_mod_folder: () => ({ ...INSTALLED }),
+    });
+    await loadSettings();
+    render(Settings);
+    const sec = modSection();
+    expect(await within(sec).findByText(GONE)).toBeInTheDocument();
+    expect(within(sec).getByText("Esta pasta não existe mais.")).toBeInTheDocument();
+    await fireEvent.click(within(sec).getByRole("button", { name: "Esquecer pasta" }));
+    expect(b.calls("forget_mod_folder")).toHaveLength(0);
+    expect(within(sec).getByText(/dwmapi\.dll, override\.txt/)).toHaveTextContent(
+      "Os seus arquivos guardados pelo launcher (dwmapi.dll, override.txt) estavam nesta pasta e o launcher não consegue devolvê-los. Esquecer a pasta assim mesmo?",
+    );
+    // Cancelar não chama o Rust.
+    await fireEvent.click(within(sec).getByRole("button", { name: "Cancelar" }));
+    expect(b.calls("forget_mod_folder")).toHaveLength(0);
+    await fireEvent.click(within(sec).getByRole("button", { name: "Esquecer pasta" }));
+    await fireEvent.click(within(sec).getByRole("button", { name: "Esquecer pasta" }));
+    await vi.waitFor(() => expect(b.calls("forget_mod_folder")).toEqual([{ dir: GONE }]));
+    await vi.waitFor(() => expect(within(sec).queryByText(GONE)).toBeNull());
+  });
+
+  it("pasta que não existe mais sem arquivos guardados: confirmação sem lista", async () => {
+    const GONE = "E:\\Jogos\\Vazia";
+    setup({
+      mod_status: () => ({ ...INSTALLED, otherFolders: [GONE], goneFolders: [{ gameDir: GONE, backups: [] }] }),
+    });
+    await loadSettings();
+    render(Settings);
+    const sec = modSection();
+    await fireEvent.click(await within(sec).findByRole("button", { name: "Esquecer pasta" }));
+    expect(within(sec).getByText("O launcher não guardou arquivos seus nesta pasta. Esquecer a pasta?")).toBeInTheDocument();
+    expect(within(sec).queryByText(/não consegue devolvê-los/)).toBeNull();
+  });
+
+  it("pasta anterior que existe (ou está inacessível) não tem o botão de esquecer", async () => {
+    const OLD = "E:\\Jogos\\Hogwarts Legacy";
+    setup({ mod_status: () => ({ ...NOT_INSTALLED, otherFolders: [OLD], goneFolders: [] }) });
+    await loadSettings();
+    render(Settings);
+    const sec = modSection();
+    expect(await within(sec).findByText(OLD)).toBeInTheDocument();
+    expect(within(sec).queryByRole("button", { name: "Esquecer pasta" })).toBeNull();
   });
 
   it("abrir a pasta de logs do mod chama o Rust; pasta ausente avisa", async () => {

@@ -17,16 +17,13 @@
 //!   nunca renomeado (`cbmp-run.json`, `logs\`, `crash\` e `cb-mp.json` ficam); extrai em `atual.staging`, relê cada
 //!   arquivo e confere o hash, e só então troca (`atual` → `atual.old`, `atual.staging` → `atual`, apaga `atual.old`).
 //!   Qualquer falha antes da troca deixa o mod que funciona intacto; sobras de uma queda são resolvidas na próxima vez
-//!   ([`recover_mod_dir`]). Permissão negada no jogo → `mod_needs_admin`. Ativar o carregador é do [`crate::modact`].
+//!   ([`recover_mod_dir`]). Permissão negada no jogo → `mod_folder_protected` (conferida antes de baixar por [`probe_writable`]; o launcher nunca pede elevação nem muda permissões). Ativar o carregador é do [`crate::modact`].
 //! - `mods\installed.json` guarda versão (assinada), protocolo, pasta do jogo, sha256 de cada arquivo, `layout`, o
 //!   carregador (`loader`, com os anteriores em `loaderHistory`), os arquivos do jogador movidos para
 //!   `cbmp-backup\` e `removed`; o zip assinado e o `.sig` ficam em `mods\package\` para reparo local (arquivos
 //!   alterados ou mod removido → reinstala do pacote, com a assinatura conferida de novo, sem depender do Hub).
 //! - Migração do layout 1 (arquivos direto em `cbmp\`): antes da primeira instalação em `atual\` saem só os arquivos
 //!   do registro antigo (e as pastas que ficarem vazias).
-//! - **Pasta do jogo sem permissão** (`mod_needs_admin` ao instalar): o zip já conferido e o `.sig` ficam em
-//!   `mods\pending\` (nunca em `mods\package\`) para o modo elevado ([`crate::admin_setup`]), que só ativa o carregador e
-//!   libera `cbmp\`; depois [`ModInstaller::install_pending`] instala sem elevação. Um `ensure` bom apaga `mods\pending`.
 //! - Nunca faz downgrade: versão menor (semver) que a instalada no mesmo protocolo mantém a instalada (também depois
 //!   de remover o mod: a versão registrada continua sendo o piso).
 
@@ -86,13 +83,6 @@ const PACKAGE_SIG: &str = "cbmp-mod.zip.sig";
 pub const MOD_COMMENT_PREFIX: &str = "cbmp-mod";
 /// Assinatura minisign antiga (sem pré-hash) exige o arquivo inteiro na memória: só até este tamanho.
 const MAX_LEGACY_SIGNED: u64 = 64 * 1024 * 1024;
-/// Pacote baixado e conferido que não pôde ser instalado por falta de permissão na pasta do jogo (para o modo
-/// elevado); nunca é o pacote da versão registrada (`package`).
-const PENDING_DIR: &str = "pending";
-/// `.sig` lido do disco (o de verdade tem centenas de bytes).
-const MAX_SIG_BYTES: u64 = 16 * 1024;
-/// Teto do carregador (`loader/dwmapi.dll`) lido para a memória pelo modo elevado.
-pub const MAX_LOADER_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Um arquivo instalado (caminho relativo com `/`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,21 +236,94 @@ pub fn mod_dir(game: &GameInstall) -> PathBuf {
     container_dir(game).join(CURRENT_FOLDER)
 }
 
-/// Sem permissão para gravar na pasta do jogo.
-pub fn mod_needs_admin() -> AppError {
+/// Sem permissão para gravar na pasta do jogo `game_dir` (o launcher nunca pede elevação nem mexe em permissões).
+pub fn mod_folder_protected(game_dir: &Path) -> AppError {
     AppError::new(
-        "mod_needs_admin",
-        "O launcher não tem permissão para instalar o mod na pasta do jogo.",
+        "mod_folder_protected",
+        format!(
+            "O launcher não tem permissão para gravar na pasta do jogo ({}). Nesta versão de testes, instale o jogo \
+             numa pasta em que o seu usuário possa gravar (por exemplo, outra biblioteca da Steam ou outra pasta na \
+             Epic Games) e tente de novo.",
+            game_dir.display()
+        ),
     )
 }
 
-/// `permission_denied` (de [`AppError::io`]) na pasta do jogo vira `mod_needs_admin`; o resto passa.
-pub fn admin_if_denied(e: AppError) -> AppError {
+/// `Win64\cbmp`, se existir, é pasta de verdade: link/junção (para fora da pasta do jogo) é recusado, nada é gravado
+/// através dele.
+pub fn container_ok(container: &Path) -> AppResult<()> {
+    match std::fs::symlink_metadata(container) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(m) if m.is_dir() && !crate::modact::is_reparse(&m) => Ok(()),
+        _ => {
+            log::warn!(
+                "{} não é uma pasta de verdade (link/junção?); nada gravado",
+                container.display()
+            );
+            Err(AppError::new(
+                "mod_activation_failed",
+                "Não foi possível ativar o mod na pasta do jogo.",
+            ))
+        }
+    }
+}
+
+/// Pasta do jogo dona de `p` (o que está acima de `Phoenix\Binaries\Win64`), ou o próprio `p`.
+pub fn game_dir_of(p: &Path) -> PathBuf {
+    let is = |c: Option<&std::ffi::OsStr>, name: &str| {
+        c.is_some_and(|c| c.to_string_lossy().eq_ignore_ascii_case(name))
+    };
+    for a in p.ancestors() {
+        let bin = a.parent();
+        let phoenix = bin.and_then(Path::parent);
+        if is(a.file_name(), BINARIES[2])
+            && is(bin.and_then(Path::file_name), BINARIES[1])
+            && is(phoenix.and_then(Path::file_name), BINARIES[0])
+        {
+            if let Some(game) = phoenix.and_then(Path::parent) {
+                return game.to_path_buf();
+            }
+        }
+    }
+    p.to_path_buf()
+}
+
+/// `permission_denied` (de [`AppError::io`]) na pasta do jogo `game_dir` vira `mod_folder_protected`; o resto passa.
+pub fn protected_if_denied(e: AppError, game_dir: &Path) -> AppError {
     if e.code == "permission_denied" {
         log::warn!("sem permissão na pasta do jogo: {}", e.message);
-        mod_needs_admin()
+        mod_folder_protected(game_dir)
     } else {
         e
+    }
+}
+
+/// Confere, sem mexer em permissões, se dá para gravar em `Win64` do jogo: cria um arquivo temporário novo e o apaga.
+/// Sem permissão → `mod_folder_protected`.
+pub fn probe_writable(game: &GameInstall) -> AppResult<()> {
+    let win64 = win64_dir(game);
+    container_ok(&container_dir(game))?;
+    let mut raw = [0u8; 8];
+    getrandom::fill(&mut raw).map_err(|_| {
+        AppError::new(
+            "internal_error",
+            "Falha interna ao conferir a pasta do jogo.",
+        )
+    })?;
+    let probe = win64.join(format!(".cbmp-probe-{}", hex(&raw)));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(f) => {
+            drop(f);
+            if let Err(e) = std::fs::remove_file(&probe) {
+                log::warn!("arquivo de teste {} não apagado: {e}", probe.display());
+            }
+            Ok(())
+        }
+        Err(e) => Err(protected_if_denied(AppError::io(&win64, &e), &game.dir)),
     }
 }
 
@@ -338,26 +401,13 @@ pub fn verify_minisign(data: &[u8], sig: &str, pubkey: &str) -> AppResult<String
 
 /// Como [`verify_minisign`], lendo o arquivo em blocos. Devolve o comentário confiável e o sha256 do arquivo.
 pub fn verify_minisign_file(path: &Path, sig: &str, pubkey: &str) -> AppResult<(String, String)> {
-    let mut f = std::fs::File::open(path).map_err(|e| AppError::io(path, &e))?;
-    verify_minisign_reader(&mut f, path, sig, pubkey)
-}
-
-/// Como [`verify_minisign_file`], lendo de `f` desde o começo (o mesmo handle depois é lido como zip: o que foi
-/// conferido é o que é extraído). `path` só nomeia o arquivo nos erros.
-fn verify_minisign_reader(
-    f: &mut std::fs::File,
-    path: &Path,
-    sig: &str,
-    pubkey: &str,
-) -> AppResult<(String, String)> {
-    use std::io::Seek;
     let pk = decode_pubkey(pubkey)?;
     let signature = decode_signature(sig)?;
     let io = |e: std::io::Error| AppError::io(path, &e);
     let comment = signature.trusted_comment().to_string();
-    f.rewind().map_err(io)?;
     match pk.verify_stream(&signature) {
         Ok(mut v) => {
+            let mut f = std::fs::File::open(path).map_err(io)?;
             let mut hasher = Sha256::new();
             let mut buf = vec![0u8; 256 * 1024];
             loop {
@@ -375,14 +425,11 @@ fn verify_minisign_reader(
             Ok((comment, hex(&hasher.finalize())))
         }
         Err(minisign_verify::Error::UnsupportedLegacyMode) => {
-            let mut data = Vec::new();
-            (&mut *f)
-                .take(MAX_LEGACY_SIGNED + 1)
-                .read_to_end(&mut data)
-                .map_err(io)?;
-            if data.len() as u64 > MAX_LEGACY_SIGNED {
+            let len = std::fs::metadata(path).map_err(io)?.len();
+            if len > MAX_LEGACY_SIGNED {
                 return Err(signature_invalid());
             }
+            let data = std::fs::read(path).map_err(io)?;
             pk.verify(&data, &signature, true)
                 .map_err(|_| signature_invalid())?;
             Ok((comment, hex(&Sha256::digest(&data))))
@@ -431,11 +478,7 @@ pub fn parse_mod_comment(comment: &str) -> Option<SignedMod> {
 /// Confere a assinatura do zip em `path` e devolve o que ela garante. O sha256 assinado tem de ser o do arquivo.
 pub fn verify_mod_file(path: &Path, sig: &str, pubkey: &str) -> AppResult<SignedMod> {
     let (comment, sha) = verify_minisign_file(path, sig, pubkey)?;
-    signed_from(&comment, &sha)
-}
-
-fn signed_from(comment: &str, sha: &str) -> AppResult<SignedMod> {
-    let signed = parse_mod_comment(comment).ok_or_else(|| {
+    let signed = parse_mod_comment(&comment).ok_or_else(|| {
         log::warn!("assinatura do mod sem o comentário confiável cbmp-mod");
         signature_invalid()
     })?;
@@ -479,15 +522,6 @@ pub fn check_mod_meta(
 /// Valida o zip inteiro (sem gravar nada): arquivos obrigatórios do layout 2 e `cbmp-mod.json`.
 fn check_package(zip: &Path, signed: &SignedMod, launcher: &semver::Version) -> AppResult<ModMeta> {
     let (mut ar, planned) = open_planned(zip)?;
-    check_archive(&mut ar, &planned, signed, launcher)
-}
-
-fn check_archive<R: Read + std::io::Seek>(
-    ar: &mut zip::ZipArchive<R>,
-    planned: &[Planned],
-    signed: &SignedMod,
-    launcher: &semver::Version,
-) -> AppResult<ModMeta> {
     for name in REQUIRED_IN_ZIP {
         if !planned.iter().any(|p| !p.dir && p.rel == name) {
             return Err(mod_invalid(&format!("sem {name}")));
@@ -511,90 +545,6 @@ fn check_archive<R: Read + std::io::Seek>(
     check_mod_meta(&bytes, signed, launcher)
 }
 
-/// Pacote conferido de uma vez só pelo mesmo handle: assinatura, sha256 assinado, zip inteiro, `cbmp-mod.json` e o
-/// carregador já lido (o que vai para `Win64\dwmapi.dll`).
-#[derive(Debug, Clone)]
-pub struct VerifiedPackage {
-    pub signed: SignedMod,
-    pub meta: ModMeta,
-    pub loader: Vec<u8>,
-    pub loader_ref: LoaderRef,
-}
-
-/// Abre `<dir>\cbmp-mod.zip` para leitura **sem deixar ninguém gravar, renomear ou apagar** enquanto o handle vive
-/// (compartilhamento só de leitura) e sem seguir link (`FILE_FLAG_OPEN_REPARSE_POINT`; arquivo comum obrigatório), e
-/// lê `<dir>\cbmp-mod.zip.sig` (arquivo comum, ≤ 16 KiB).
-pub fn open_package(dir: &Path) -> AppResult<(std::fs::File, String)> {
-    let zip = dir.join(PACKAGE_ZIP);
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-        };
-        opts.share_mode(FILE_SHARE_READ)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let f = opts.open(&zip).map_err(|e| AppError::io(&zip, &e))?;
-    let m = f.metadata().map_err(|e| AppError::io(&zip, &e))?;
-    if !m.is_file() || crate::modact::is_reparse(&m) || m.len() > MAX_MOD_BYTES {
-        return Err(mod_invalid("pacote local inválido"));
-    }
-    let sig_path = dir.join(PACKAGE_SIG);
-    let sm = std::fs::symlink_metadata(&sig_path).map_err(|e| AppError::io(&sig_path, &e))?;
-    if !sm.is_file() || crate::modact::is_reparse(&sm) || sm.len() > MAX_SIG_BYTES {
-        return Err(signature_invalid());
-    }
-    let mut sig = String::new();
-    std::fs::File::open(&sig_path)
-        .and_then(|s| s.take(MAX_SIG_BYTES).read_to_string(&mut sig))
-        .map_err(|_| signature_invalid())?;
-    Ok((f, sig))
-}
-
-/// Confere o pacote aberto por [`open_package`] (assinatura com `pubkey`, sha256 assinado, zip, `cbmp-mod.json`) e lê
-/// `loader/dwmapi.dll` (≤ [`MAX_LOADER_BYTES`]) do mesmo handle.
-pub fn verify_package(
-    f: &mut std::fs::File,
-    sig: &str,
-    pubkey: &str,
-    launcher: &semver::Version,
-) -> AppResult<VerifiedPackage> {
-    let (comment, sha) = verify_minisign_reader(f, Path::new(PACKAGE_ZIP), sig, pubkey)?;
-    let signed = signed_from(&comment, &sha)?;
-    let mut ar = zip::ZipArchive::new(&mut *f).map_err(|_| mod_invalid("pacote corrompido"))?;
-    let planned = plan(&mut ar)?;
-    let meta = check_archive(&mut ar, &planned, &signed, launcher)?;
-    let entry = planned
-        .iter()
-        .find(|p| !p.dir && p.rel == LOADER_IN_ZIP)
-        .ok_or_else(|| mod_invalid("sem o carregador"))?;
-    if entry.size > MAX_LOADER_BYTES {
-        return Err(mod_invalid("carregador grande demais"));
-    }
-    let mut loader = Vec::new();
-    ar.by_index(entry.index)
-        .map_err(|_| mod_invalid("pacote corrompido"))?
-        .take(entry.size + 1)
-        .read_to_end(&mut loader)
-        .map_err(|_| mod_invalid("pacote corrompido"))?;
-    if loader.len() as u64 != entry.size {
-        return Err(mod_invalid("tamanho diferente do declarado"));
-    }
-    let loader_ref = LoaderRef {
-        sha256: hex(&Sha256::digest(&loader)),
-        size: entry.size,
-    };
-    Ok(VerifiedPackage {
-        signed,
-        meta,
-        loader,
-        loader_ref,
-    })
-}
-
 /// Instala `zip` (assinatura já conferida: `signed`) em `cbmp\atual` e devolve o registro novo. `prev` é o registro
 /// anterior (qualquer protocolo): dá a migração do layout 1, o histórico de carregadores e os backups.
 fn install_package(
@@ -606,13 +556,14 @@ fn install_package(
 ) -> AppResult<Installed> {
     check_package(zip, signed, launcher)?;
     let container = container_dir(game);
+    container_ok(&container)?;
     std::fs::create_dir_all(&container)
-        .map_err(|e| admin_if_denied(AppError::io(&container, &e)))?;
+        .map_err(|e| protected_if_denied(AppError::io(&container, &e), &game.dir))?;
     let same_game = prev.filter(|p| p.game_dir == game.dir);
     if let Some(old) = same_game.filter(|p| p.layout < LAYOUT) {
-        migrate_legacy(&container, old).map_err(admin_if_denied)?;
+        migrate_legacy(&container, old).map_err(|e| protected_if_denied(e, &game.dir))?;
     }
-    let files = extract_zip(zip, &mod_dir(game)).map_err(admin_if_denied)?;
+    let files = extract_zip(zip, &mod_dir(game)).map_err(|e| protected_if_denied(e, &game.dir))?;
     let loader = files
         .iter()
         .find(|f| f.path == LOADER_IN_ZIP)
@@ -969,66 +920,6 @@ impl ModInstaller {
         &self.pubkey
     }
 
-    /// Versão do launcher comparada com o `minLauncher`.
-    pub fn launcher_version(&self) -> &semver::Version {
-        &self.launcher_version
-    }
-
-    /// `mods\pending` (pacote conferido que esbarrou na permissão da pasta do jogo).
-    pub fn pending_dir(&self) -> PathBuf {
-        self.mods_dir.join(PENDING_DIR)
-    }
-
-    /// Pacote para o modo elevado: `mods\pending` se tiver o zip, senão `mods\package`; nenhum → `mod_unavailable`.
-    pub fn admin_package_dir(&self) -> AppResult<PathBuf> {
-        [self.pending_dir(), self.package_dir()]
-            .into_iter()
-            .find(|d| d.join(PACKAGE_ZIP).is_file())
-            .ok_or_else(|| {
-                AppError::new(
-                    "mod_unavailable",
-                    "Clique em Jogar uma vez para baixar o mod e tente de novo.",
-                )
-            })
-    }
-
-    /// Depois do modo elevado (que só ativou o carregador e liberou `cbmp\`): instala o pacote de `mods\pending` em
-    /// `cbmp\atual` sem elevação, com a assinatura e o `cbmp-mod.json` conferidos de novo, guarda-o como o pacote da
-    /// versão registrada e apaga `mods\pending`. Sem pacote pendente → `false`. Nunca faz downgrade.
-    pub fn install_pending(&self, game: &GameInstall) -> AppResult<bool> {
-        let dir = self.pending_dir();
-        let zip = dir.join(PACKAGE_ZIP);
-        if !zip.is_file() {
-            return Ok(false);
-        }
-        let sig_path = dir.join(PACKAGE_SIG);
-        let sig = std::fs::read_to_string(&sig_path).map_err(|e| AppError::io(&sig_path, &e))?;
-        let signed = verify_mod_file(&zip, &sig, &self.pubkey)?;
-        let prev = self.installed();
-        let floor = prev
-            .as_ref()
-            .filter(|p| p.protocol == signed.protocol)
-            .and_then(|p| semver::Version::parse(&p.version).ok());
-        if floor.is_some_and(|v| signed.version < v) {
-            log::warn!(
-                "pacote pendente {} menor que o registrado; descartado",
-                signed.version
-            );
-            remove_entry(&dir).map_err(|e| AppError::io(&dir, &e))?;
-            return Ok(false);
-        }
-        let new = install_package(&zip, &signed, &self.launcher_version, game, prev.as_ref())?;
-        if let Err(e) = keep_package(&self.package_dir(), &zip, &sig) {
-            log::warn!("pacote do mod não guardado para reparo: {}", e.code);
-        }
-        write_record(&self.record_path(), &new)?;
-        if let Err(e) = remove_entry(&dir) {
-            log::warn!("mods\\pending não apagado: {e}");
-        }
-        log::info!("mod {} instalado do pacote pendente", signed.version);
-        Ok(true)
-    }
-
     /// Pastas e chave reais do launcher.
     pub fn system() -> Self {
         Self::new(
@@ -1060,29 +951,12 @@ impl ModInstaller {
             .is_some_and(|r| r.game_dir == game.dir && files_intact(&r, game)))
     }
 
-    /// `mods\package` (pacote da versão registrada).
-    pub fn package_dir(&self) -> PathBuf {
+    fn package_dir(&self) -> PathBuf {
         self.mods_dir.join(PACKAGE_DIR)
     }
 
-    /// Garante o mod mais novo do Hub para `protocol` em `game` (ver o topo do módulo). Deu certo → `mods\pending`
-    /// sai (o pacote pendente só serve enquanto a pasta do jogo pede permissão).
+    /// Garante o mod mais novo do Hub para `protocol` em `game` (ver o topo do módulo).
     pub async fn ensure(
-        &self,
-        hub: &HubClient,
-        protocol: u32,
-        game: &GameInstall,
-        cancel: CancellationToken,
-    ) -> AppResult<ModState> {
-        let st = self.ensure_inner(hub, protocol, game, cancel).await?;
-        let pending = self.pending_dir();
-        if let Err(e) = remove_entry(&pending) {
-            log::warn!("mods\\pending não apagado: {e}");
-        }
-        Ok(st)
-    }
-
-    async fn ensure_inner(
         &self,
         hub: &HubClient,
         protocol: u32,
@@ -1091,6 +965,11 @@ impl ModInstaller {
     ) -> AppResult<ModState> {
         if cancel.is_cancelled() {
             return Err(cancelled());
+        }
+        // Pasta do jogo sem permissão de gravação: erro claro antes de baixar qualquer coisa.
+        {
+            let g = game.clone();
+            blocking(move || probe_writable(&g)).await?;
         }
         // Pasta do jogo trocada: antes de instalar nesta, o mod sai das pastas anteriores. O que não sair (pasta
         // inacessível, falha) continua registrado e não impede de jogar aqui.
@@ -1109,7 +988,8 @@ impl ModInstaller {
         let dest = mod_dir(game);
         {
             let d = dest.clone();
-            blocking(move || recover_mod_dir(&d).map_err(admin_if_denied)).await?;
+            let g = game.dir.clone();
+            blocking(move || recover_mod_dir(&d).map_err(|e| protected_if_denied(e, &g))).await?;
         }
         // Removido nas Configurações: volta do pacote local, sem o Hub.
         if let Some(r) = self
@@ -1284,26 +1164,13 @@ impl ModInstaller {
 
         let record_path = self.record_path();
         let pkg = self.package_dir();
-        let pending = self.pending_dir();
         let prev = self.installed();
         let (launcher, game, signed_c) =
             (self.launcher_version.clone(), game.clone(), signed.clone());
         let sig = info.signature.clone();
         blocking(move || -> AppResult<()> {
             // Troca atômica: em qualquer falha o mod atual e o registro ficam como estavam.
-            let new = match install_package(&zip_path, &signed_c, &launcher, &game, prev.as_ref()) {
-                Ok(n) => n,
-                Err(e) => {
-                    // Sem permissão na pasta do jogo: o pacote já conferido fica em `mods\pending` para o modo
-                    // elevado (nunca em `mods\package`, que é o da versão registrada).
-                    if e.code == "mod_needs_admin" {
-                        if let Err(k) = keep_package(&pending, &zip_path, &sig) {
-                            log::warn!("pacote pendente não guardado: {}", k.code);
-                        }
-                    }
-                    return Err(e);
-                }
-            };
+            let new = install_package(&zip_path, &signed_c, &launcher, &game, prev.as_ref())?;
             // Pacote para reparo local (falha aqui só perde o reparo, não a instalação).
             if let Err(e) = keep_package(&pkg, &zip_path, &sig) {
                 log::warn!("pacote do mod não guardado para reparo: {}", e.code);
@@ -1649,15 +1516,38 @@ mod tests {
     }
 
     #[test]
-    fn permissao_negada_vira_mod_needs_admin() {
+    fn permissao_negada_vira_mod_folder_protected() {
         let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-        let e = admin_if_denied(AppError::io(Path::new("C:/x"), &denied));
-        assert_eq!(e.code, "mod_needs_admin");
+        let e = protected_if_denied(
+            AppError::io(Path::new("C:/x"), &denied),
+            Path::new(r"D:\HL"),
+        );
+        assert_eq!(e.code, "mod_folder_protected");
         assert_eq!(
             e.message,
-            "O launcher não tem permissão para instalar o mod na pasta do jogo."
+            r"O launcher não tem permissão para gravar na pasta do jogo (D:\HL). Nesta versão de testes, instale o jogo numa pasta em que o seu usuário possa gravar (por exemplo, outra biblioteca da Steam ou outra pasta na Epic Games) e tente de novo."
         );
         let other = AppError::new("io_error", "x");
-        assert_eq!(admin_if_denied(other.clone()), other);
+        assert_eq!(
+            protected_if_denied(other.clone(), Path::new(r"D:\HL")),
+            other
+        );
+    }
+
+    #[test]
+    fn pasta_do_jogo_a_partir_de_um_caminho_dentro_de_win64() {
+        let game = Path::new(r"C:\Jogos\Hogwarts Legacy");
+        let inside = game
+            .join("Phoenix")
+            .join("Binaries")
+            .join("Win64")
+            .join("cbmp")
+            .join("atual");
+        assert_eq!(game_dir_of(&inside), game);
+        assert_eq!(
+            game_dir_of(&game.join(r"phoenix\binaries\win64\dwmapi.dll")),
+            game
+        );
+        assert_eq!(game_dir_of(Path::new(r"C:\x\y")), Path::new(r"C:\x\y"));
     }
 }

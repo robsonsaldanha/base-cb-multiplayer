@@ -856,7 +856,8 @@ fn remover_de_novo_depois_de_remover_nao_faz_nada() {
 // ----- comandos das Configurações (Task 9) -----
 
 use cbmp_launcher_lib::commands::{
-    mod_info, mod_logs_dir, old_folder_warning, remove_mod_with, resolve_conflict_with,
+    mod_info, mod_logs_dir, old_folder_warning, old_folder_warning_once, remove_mod_with,
+    resolve_conflict_with,
 };
 
 fn closed() -> FakeProcesses {
@@ -890,7 +891,7 @@ fn remover_devolve_estado_e_resultado_por_pasta() {
     let before = mod_info(Some(&g.game), &g.installer());
     assert_eq!(
         serde_json::to_value(&before).unwrap(),
-        serde_json::json!({ "state": "installed", "version": "0.2.0", "otherFolders": [] })
+        serde_json::json!({ "state": "installed", "version": "0.2.0", "otherFolders": [], "goneFolders": [] })
     );
     let out = remove_mod_with(Some(&g.game), &g.installer(), &closed()).unwrap();
     assert_eq!(out.status.status, ModStatus::NotInstalled);
@@ -1270,4 +1271,250 @@ fn manifesto_ou_backup_por_juncao_e_recusado() {
     );
     assert!(read_manifest(&g.win64()).is_empty());
     std::fs::remove_dir(g.backup().join("dwmapi.dll")).unwrap();
+}
+
+// ----- Task 10 revisada: pasta protegida, junções e "Esquecer pasta" -----
+
+#[cfg(windows)]
+#[path = "common/deny.rs"]
+mod deny;
+
+use cbmp_launcher_lib::game::resolve_final;
+use cbmp_launcher_lib::modact::{forget_folder, gone_folders, GoneFolder};
+
+#[cfg(windows)]
+fn protected_message(g: &Game) -> String {
+    format!(
+        "O launcher não tem permissão para gravar na pasta do jogo ({}). Nesta versão de testes, instale o jogo numa \
+         pasta em que o seu usuário possa gravar (por exemplo, outra biblioteca da Steam ou outra pasta na Epic Games) \
+         e tente de novo.",
+        g.game.dir.display()
+    )
+}
+
+#[cfg(windows)]
+#[test]
+fn ativar_sem_permissao_em_win64_da_mod_folder_protected() {
+    let g = fake_game();
+    installed(&g);
+    let _deny = deny::Deny::new(&g.win64(), "(W)");
+    let e = ensure_active(&g.game, &g.installer(), false).unwrap_err();
+    assert_eq!(e.code, "mod_folder_protected");
+    assert_eq!(e.message, protected_message(&g));
+    assert!(!g.win64().join(LOADER_NAME).exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn remover_sem_permissao_da_mod_folder_protected_e_nao_marca_removido() {
+    let g = fake_game();
+    let mut rec = installed(&g);
+    activate(&g.win64(), &g.current(), &mut rec, false).unwrap();
+    g.installer().save_record(&rec).unwrap();
+    let e = {
+        let _deny_file = deny::Deny::new(&g.win64().join(LOADER_NAME), "(D)");
+        let _deny_dir = deny::Deny::new(&g.win64(), "(DC)");
+        remove_mod(&g.game, &g.installer()).unwrap_err()
+    };
+    // (O `icacls /deny` também nega SYNCHRONIZE: as leituras de conferência vêm depois de tirar a negação.)
+    assert_eq!(e.code, "mod_folder_protected");
+    assert_eq!(e.message, protected_message(&g));
+    assert_eq!(g.read(LOADER_NAME), LOADER);
+    assert!(!record(&g).removed);
+}
+
+#[cfg(windows)]
+#[test]
+fn pasta_do_jogo_por_juncao_e_resolvida_para_o_caminho_final() {
+    let g = fake_game();
+    let real_parent = g.game.dir.parent().unwrap().to_path_buf();
+    // Junção numa pasta temporária própria (nunca direto no %TEMP%): o `drop` apaga só o link, não o alvo.
+    let links = tempfile::tempdir().unwrap();
+    let via = links.path().join("via-juncao");
+    junction(&via, &real_parent);
+    let through = GameInstall {
+        dir: via.join("Hogwarts Legacy"),
+        exe: via.join("Hogwarts Legacy").join("HogwartsLegacy.exe"),
+        store: Store::Manual,
+    };
+    let r = resolve_final(&through);
+    assert_eq!(
+        r.dir.canonicalize().unwrap(),
+        g.game.dir.canonicalize().unwrap()
+    );
+    assert!(!r.dir.starts_with(&via), "{}", r.dir.display());
+    assert!(
+        !r.dir.to_string_lossy().starts_with(r"\\?\"),
+        "{}",
+        r.dir.display()
+    );
+    assert_eq!(r.exe, r.dir.join("HogwartsLegacy.exe"));
+    // Ativar e remover pelo caminho resolvido funcionam normalmente (junção só no caminho escolhido).
+    let gr = Game {
+        game: r.clone(),
+        mods: g.mods.clone(),
+        _tmp: tempfile::tempdir().unwrap(),
+    };
+    let mut rec = installed(&gr);
+    assert_eq!(rec.game_dir, r.dir);
+    activate(&gr.win64(), &gr.current(), &mut rec, false).unwrap();
+    gr.installer().save_record(&rec).unwrap();
+    remove_mod(&gr.game, &gr.installer()).unwrap();
+    assert!(!g.win64().join(LOADER_NAME).exists());
+    std::fs::remove_dir(&via).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn registro_gravado_pela_juncao_e_a_mesma_pasta_do_jogo() {
+    use cbmp_launcher_lib::modact::{leave_other_folders, rebase_record};
+    let g = fake_game();
+    let real_parent = g.game.dir.parent().unwrap().to_path_buf();
+    // Junção numa pasta temporária própria (nunca direto no %TEMP%): o `drop` apaga só o link, não o alvo.
+    let links = tempfile::tempdir().unwrap();
+    let via = links.path().join("via-juncao-2");
+    junction(&via, &real_parent);
+    let through = GameInstall {
+        dir: via.join("Hogwarts Legacy"),
+        exe: via.join("Hogwarts Legacy").join("HogwartsLegacy.exe"),
+        store: Store::Manual,
+    };
+    let real = resolve_final(&g.game);
+    // Registro antigo pelo caminho da junção (antes de o launcher resolver o caminho final).
+    let gj = Game {
+        game: through.clone(),
+        mods: g.mods.clone(),
+        _tmp: tempfile::tempdir().unwrap(),
+    };
+    let mut rec = installed(&gj);
+    activate(&gj.win64(), &gj.current(), &mut rec, false).unwrap();
+    gj.installer().save_record(&rec).unwrap();
+    // Não aparece como pasta anterior, nem como sumida.
+    assert!(leftover_folders(Some(&real.dir), &g.installer()).is_empty());
+    assert!(gone_folders(Some(&real.dir), &g.installer()).is_empty());
+    // Antes de instalar: o registro passa ao caminho final e nada sai da pasta.
+    assert!(leave_other_folders(&real, &g.installer()).is_empty());
+    assert_eq!(record(&g).game_dir, real.dir);
+    assert!(!record(&g).removed);
+    assert_eq!(g.read(LOADER_NAME), LOADER);
+    rebase_record(&real.dir, &g.installer());
+    assert_eq!(record(&g).game_dir, real.dir);
+    std::fs::remove_dir(&via).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn cbmp_backup_por_juncao_nao_recebe_o_arquivo_do_jogador() {
+    let g = fake_game();
+    installed(&g);
+    g.put(LOADER_NAME, b"UE4SS do jogador");
+    let elsewhere = g.game.dir.parent().unwrap().join("fora");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    junction(&g.backup(), &elsewhere);
+    assert!(ensure_active(&g.game, &g.installer(), true).is_err());
+    assert_eq!(
+        g.read(LOADER_NAME),
+        b"UE4SS do jogador",
+        "não saiu de Win64"
+    );
+    assert_eq!(
+        std::fs::read_dir(&elsewhere).unwrap().count(),
+        0,
+        "nada fora"
+    );
+    std::fs::remove_dir(g.backup()).unwrap();
+}
+
+#[test]
+fn esquecer_pasta_que_nao_existe_mais() {
+    let g = fake_game();
+    let mut rec = installed(&g);
+    let gone = g.game.dir.parent().unwrap().join("desinstalada");
+    rec.other_folders = vec![FolderRecord {
+        game_dir: gone.clone(),
+        version: "0.2.0".into(),
+        loader: None,
+        backups: vec![
+            BackupEntry {
+                name: LOADER_NAME.into(),
+                stored: LOADER_NAME.into(),
+                sha256: Some(modzip::sha_hex(b"x")),
+                state: BackupState::Done,
+            },
+            BackupEntry {
+                name: OVERRIDE_NAME.into(),
+                stored: OVERRIDE_NAME.into(),
+                sha256: Some(modzip::sha_hex(b"y")),
+                state: BackupState::Done,
+            },
+        ],
+        removed: false,
+    }];
+    g.installer().save_record(&rec).unwrap();
+    assert_eq!(
+        gone_folders(Some(&g.game.dir), &g.installer()),
+        vec![GoneFolder {
+            game_dir: gone.clone(),
+            backups: vec!["dwmapi.dll".into(), "override.txt".into()],
+        }]
+    );
+    let info = serde_json::to_value(mod_info(Some(&g.game), &g.installer())).unwrap();
+    assert_eq!(info["goneFolders"][0]["backups"][1], "override.txt");
+    // A pasta que existe não pode ser esquecida.
+    assert_eq!(
+        forget_folder(&g.game.dir, &g.installer()).unwrap_err().code,
+        "mod_folder_present"
+    );
+    forget_folder(&gone, &g.installer()).unwrap();
+    let r = record(&g);
+    assert!(r.other_folders.is_empty());
+    assert!(!r.removed, "a pasta atual continua");
+    assert!(gone_folders(None, &g.installer()).is_empty());
+    assert!(leftover_folders(Some(&g.game.dir), &g.installer()).is_empty());
+}
+
+#[cfg(windows)]
+#[test]
+fn pasta_inacessivel_ou_registro_atual_sumido() {
+    let g = fake_game();
+    let mut rec = installed(&g);
+    // Disco ausente: não é "sumida", não pode ser esquecida.
+    let offline = missing_drive().join("Jogos").join("HL");
+    rec.game_dir = offline.clone();
+    g.installer().save_record(&rec).unwrap();
+    assert!(gone_folders(None, &g.installer()).is_empty());
+    assert_eq!(
+        forget_folder(&offline, &g.installer()).unwrap_err().code,
+        "mod_folder_present"
+    );
+    // Registro atual numa pasta apagada: esquecer marca removido e limpa os backups.
+    let gone = g.game.dir.parent().unwrap().join("apagada");
+    rec.game_dir = gone.clone();
+    rec.backups = vec![BackupEntry {
+        name: LOADER_NAME.into(),
+        stored: LOADER_NAME.into(),
+        sha256: None,
+        state: BackupState::Done,
+    }];
+    g.installer().save_record(&rec).unwrap();
+    assert_eq!(gone_folders(None, &g.installer())[0].game_dir, gone);
+    forget_folder(&gone, &g.installer()).unwrap();
+    let r = record(&g);
+    assert!(r.removed && r.backups.is_empty() && r.loader.is_none());
+    assert!(leftover_folders(None, &g.installer()).is_empty());
+}
+
+#[test]
+fn aviso_de_pasta_anterior_sai_uma_vez_por_execucao() {
+    let flag = std::sync::atomic::AtomicBool::new(false);
+    assert!(
+        old_folder_warning_once(&flag, &[]).is_none(),
+        "sem pasta não gasta o aviso"
+    );
+    let left = [PathBuf::from("D:\\HL")];
+    assert_eq!(
+        old_folder_warning_once(&flag, &left).unwrap().code,
+        "mod_old_folder"
+    );
+    assert!(old_folder_warning_once(&flag, &left).is_none());
 }

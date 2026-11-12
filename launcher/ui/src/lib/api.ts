@@ -226,7 +226,13 @@ export function onUpdateAvailable(cb: (s: UpdateStatus) => void): Promise<Unlist
 export type ModStatus = { state: "notInstalled" } | { state: "installed"; version: string } | { state: "conflict" };
 
 /** Espelha `commands::ModInfo`: estado na pasta do jogo atual + pastas anteriores do jogo onde o mod ainda está. */
-export type ModInfo = ModStatus & { otherFolders: string[] };
+export type ModInfo = ModStatus & { otherFolders: string[]; goneFolders: GoneFolder[] };
+
+/** Espelha `modact::GoneFolder`: pasta anterior do jogo que não existe mais e os arquivos do jogador guardados nela. */
+export interface GoneFolder {
+  gameDir: string;
+  backups: string[];
+}
 
 /** Espelha `modact::FolderRemoval`: `error` nulo = removido dessa pasta. */
 export interface FolderRemoval {
@@ -248,11 +254,11 @@ export const modStatus = (): Promise<ModInfo> => call("mod_status");
 export const removeMod = (): Promise<RemoveModResult> => call("remove_mod");
 /** Diálogo nativo do Windows sobre o outro carregador; aceito, o do CB Multiplayer é ativado. */
 export const resolveModConflict = (): Promise<ModInfo> => call("resolve_mod_conflict");
-
-/** `Instalar com permissão de administrador (uma vez)`: UAC + modo elevado no Rust; depois instala o mod sem elevação. */
-export const modAdminSetup = (): Promise<ModInfo> => call("mod_admin_setup");
 /** Abre `Win64\cbmp\logs` no Explorer (o Rust escolhe a pasta). */
 export const openModLogs = (): Promise<void> => call("open_mod_logs");
+
+/** "Esquecer pasta": tira do registro uma pasta anterior do jogo que não existe mais (a confirmação é da UI). */
+export const forgetModFolder = (dir: string): Promise<ModInfo> => call("forget_mod_folder", { dir });
 
 export function onModWarning(cb: (e: { code: string; message: string }) => void): Promise<UnlistenFn> {
   return listen<{ code: string; message: string }>(MOD_WARNING, (e) => cb(e.payload));

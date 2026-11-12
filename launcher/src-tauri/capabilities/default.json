@@ -27,6 +27,6 @@
     "allow-remove-mod",
     "allow-resolve-mod-conflict",
     "allow-open-mod-logs",
-    "allow-mod-admin-setup"
+    "allow-forget-mod-folder"
   ]
 }

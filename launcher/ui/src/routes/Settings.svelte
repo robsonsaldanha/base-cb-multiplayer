@@ -6,6 +6,7 @@
     appVersion,
     checkUpdate,
     clearCache,
+    forgetModFolder,
     installUpdate,
     modStatus,
     openModLogs,
@@ -26,13 +27,20 @@
   let limitsMsg = $state("");
   let confirmClear = $state(false);
   let clearMsg = $state("");
-  let busy = $state<"" | "pick" | "limits" | "clear" | "check" | "install" | "remove" | "logs">("");
+  let busy = $state<"" | "pick" | "limits" | "clear" | "check" | "install" | "remove" | "logs" | "forget">("");
   let updateMsg = $state("");
   let error = $state<ErrorView | null>(null);
   let mod = $state<ModInfo | null>(null);
   let confirmRemove = $state(false);
   let removeMsg = $state("");
   let removeFailures = $state<FolderRemoval[]>([]);
+  // Pasta que não existe mais à espera da confirmação de "Esquecer pasta".
+  let confirmForget = $state<string | null>(null);
+
+  const gone = $derived(new Set(mod?.goneFolders.map((g) => g.gameDir) ?? []));
+  function goneBackups(dir: string): string[] {
+    return mod?.goneFolders.find((g) => g.gameDir === dir)?.backups ?? [];
+  }
 
   const modText = $derived(
     !mod
@@ -108,6 +116,12 @@
     if (removeFailures.length === 0) removeMsg = "Mod removido do jogo.";
   }
 
+  async function doForget(dir: string) {
+    confirmForget = null;
+    const out = await run("forget", () => forgetModFolder(dir));
+    if (out) mod = out;
+  }
+
   async function openLogs() {
     await run("logs", openModLogs);
   }
@@ -164,7 +178,32 @@
     {#if mod && mod.otherFolders.length > 0}
       <p class="warn">O mod também continua em pasta anterior do jogo:</p>
       <ul class="paths">
-        {#each mod.otherFolders as dir (dir)}<li class="path">{dir}</li>{/each}
+        {#each mod.otherFolders as dir (dir)}
+          <li>
+            <span class="path">{dir}</span>
+            {#if gone.has(dir)}
+              <span class="hint">Esta pasta não existe mais.</span>
+              {#if confirmForget === dir}
+                {#if goneBackups(dir).length > 0}
+                  <p class="warn">
+                    Os seus arquivos guardados pelo launcher ({goneBackups(dir).join(", ")}) estavam nesta pasta e o
+                    launcher não consegue devolvê-los. Esquecer a pasta assim mesmo?
+                  </p>
+                {:else}
+                  <p class="warn">O launcher não guardou arquivos seus nesta pasta. Esquecer a pasta?</p>
+                {/if}
+                <div class="row">
+                  <button type="button" class="danger" disabled={busy === "forget"} onclick={() => doForget(dir)}
+                    >Esquecer pasta</button
+                  >
+                  <button type="button" onclick={() => (confirmForget = null)}>Cancelar</button>
+                </div>
+              {:else}
+                <button type="button" onclick={() => (confirmForget = dir)}>Esquecer pasta</button>
+              {/if}
+            {/if}
+          </li>
+        {/each}
       </ul>
     {/if}
     {#if confirmRemove}

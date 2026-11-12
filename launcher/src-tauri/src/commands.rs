@@ -1,6 +1,5 @@
 //! Superfície única exposta à UI. Cada comando aqui precisa constar em `build.rs` e na capability.
 
-use crate::admin_setup;
 use crate::auth::{self, Auth};
 use crate::content::{ContentStore, Limits, Progress};
 use crate::error::{AppError, AppResult};
@@ -21,6 +20,7 @@ use crate::update::{self, UpdateStatus};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -255,7 +255,9 @@ pub fn resolve_game_with(state: &AppState, detect: impl FnOnce() -> Detection) -
 /// [`resolve_game_with`] com a procura real; só a instalação utilizável.
 pub fn resolve_game(state: &AppState) -> Option<GameInstall> {
     match resolve_game_with(state, system_detect) {
-        Detection::Trusted(g) => Some(g),
+        // Junções/links no caminho escolhido (biblioteca da Steam movida) são resolvidos aqui, uma vez; dentro de
+        // `cbmp\` e `cbmp-backup\` pontos de reanálise continuam recusados.
+        Detection::Trusted(g) => Some(game::resolve_final(&g)),
         Detection::Candidate(_) | Detection::Ambiguous { .. } | Detection::NotFound => None,
     }
 }
@@ -508,7 +510,8 @@ pub async fn play(
         log::warn!("jogar em {server_id:?} falhou: {}", e.code);
     }
     if let Some(g) = ctx.game.as_ref().filter(|_| !ctx.simulate) {
-        if let Some(w) = old_folder_warning(&modact::leftover_folders(Some(&g.dir), &ctx.mods)) {
+        let left = modact::leftover_folders(Some(&g.dir), &ctx.mods);
+        if let Some(w) = old_folder_warning_once(&OLD_FOLDER_WARNED, &left) {
             let _ = app.emit(MOD_WARNING, w);
         }
     }
@@ -516,6 +519,15 @@ pub async fn play(
 }
 
 /// Aviso de [`MOD_WARNING`] quando o mod ficou em pastas anteriores do jogo (inacessíveis ou com falha ao remover).
+/// O aviso de pasta anterior sai no máximo uma vez por execução do launcher.
+static OLD_FOLDER_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// [`old_folder_warning`] só na primeira vez em que há pastas a avisar (`flag` marca que já avisou).
+pub fn old_folder_warning_once(flag: &AtomicBool, left: &[PathBuf]) -> Option<AppError> {
+    let w = old_folder_warning(left)?;
+    (!flag.swap(true, Ordering::SeqCst)).then_some(w)
+}
+
 pub fn old_folder_warning(left: &[PathBuf]) -> Option<AppError> {
     if left.is_empty() {
         return None;
@@ -540,6 +552,8 @@ pub struct ModInfo {
     #[serde(flatten)]
     pub status: ModStatus,
     pub other_folders: Vec<PathBuf>,
+    /// Das `other_folders`, as que não existem mais ("Esquecer pasta"), com os nomes dos arquivos do jogador.
+    pub gone_folders: Vec<modact::GoneFolder>,
 }
 
 /// Resposta de "Remover mod do jogo": estado depois e resultado por pasta.
@@ -554,6 +568,7 @@ pub fn mod_info(game: Option<&GameInstall>, mods: &ModInstaller) -> ModInfo {
     ModInfo {
         status: modact::status(game, mods),
         other_folders: modact::leftover_folders(game.map(|g| g.dir.as_path()), mods),
+        gone_folders: modact::gone_folders(game.map(|g| g.dir.as_path()), mods),
     }
 }
 
@@ -613,85 +628,6 @@ pub fn resolve_conflict_with(
     Ok(mod_info(Some(game), mods))
 }
 
-/// "Instalar com permissão de administrador (uma vez)": recusa com o jogo aberto; escolhe o pacote (`mods\pending`, senão
-/// `mods\package`; nenhum → `mod_unavailable`), confere-o, decide o conflito como a ativação (`confirm` = diálogo nativo,
-/// só se houver arquivo estranho; UE4SS antigo → erro sem diálogo) e chama `elevate` (UAC no comando; o modo elevado
-/// direto nos testes). Depois, sem elevação: instala o pacote pendente em `cbmp\atual` e confere a ativação (que adota o
-/// manifesto de backups gravado pelo modo elevado).
-pub fn mod_admin_setup_with(
-    game: &GameInstall,
-    mods: &ModInstaller,
-    processes: &dyn Processes,
-    user_sid: &str,
-    confirm: impl FnOnce() -> bool,
-    elevate: impl FnOnce(&admin_setup::AdminArgs) -> AppResult<()>,
-) -> AppResult<ModInfo> {
-    if game_running_with(processes) {
-        return Err(game_running_error());
-    }
-    let package_dir = mods.admin_package_dir()?;
-    let pkg = {
-        let (mut f, sig) = modpkg::open_package(&package_dir)?;
-        modpkg::verify_package(&mut f, &sig, mods.pubkey(), mods.launcher_version())?
-    };
-    // Carregadores nossos que podem estar em `Win64`: o registrado e os anteriores.
-    let mut history = Vec::new();
-    if let Some(r) = mods.installed() {
-        history = r.loader_history.clone();
-        history.extend(r.loader.map(|l| l.sha256));
-    }
-    history.retain(|h| *h != pkg.loader_ref.sha256);
-    let win64 = modpkg::win64_dir(game);
-    let confirm_conflict = match modact::inspect_with(&win64, Some(&pkg.loader_ref), &history)? {
-        Activation::LegacyUe4ss => return Err(modact::legacy_conflict()),
-        Activation::Conflict { .. } => {
-            if !confirm() {
-                log::info!("instalação com permissão de administrador: conflito cancelado");
-                return Ok(mod_info(Some(game), mods));
-            }
-            true
-        }
-        Activation::Active | Activation::Missing { .. } => false,
-    };
-    let replace_loader = modact::win64_loader_sha(&win64)?.filter(|s| history.contains(s));
-    let args = admin_setup::AdminArgs {
-        game_dir: game.dir.clone(),
-        user_sid: user_sid.to_string(),
-        package_dir,
-        confirm_conflict,
-        replace_loader,
-    };
-    elevate(&args)?;
-    mods.install_pending(game)?;
-    if mods
-        .installed()
-        .is_some_and(|r| r.game_dir == game.dir && !r.removed)
-    {
-        modact::ensure_active(game, mods, false)?;
-    }
-    Ok(mod_info(Some(game), mods))
-}
-
-/// Botão `Instalar com permissão de administrador (uma vez)` do `mod_needs_admin`. Sob a trava do play.
-#[tauri::command]
-pub async fn mod_admin_setup(app: AppHandle, gate: State<'_, PlayGate>) -> AppResult<ModInfo> {
-    let _run = gate.try_begin()?;
-    tokio::task::spawn_blocking(move || {
-        let game = resolve_game(&app.state::<AppState>()).ok_or_else(game_not_found)?;
-        let sid = crate::launch::acl::current_user_sid()?;
-        mod_admin_setup_with(
-            &game,
-            &ModInstaller::system(),
-            &SystemProcesses,
-            &sid,
-            || conflict_dialog(&app),
-            admin_setup::request,
-        )
-    })
-    .await
-    .map_err(|_| internal("na instalação com permissão de administrador"))?
-}
-
 fn mod_logs_missing() -> AppError {
     AppError::new(
         "mod_logs_missing",
@@ -713,24 +649,36 @@ fn internal(what: &str) -> AppError {
     AppError::new("internal_error", format!("Falha interna {what}."))
 }
 
-/// Estado do mod para as Configurações (procura o jogo como o Jogar, fora do executor assíncrono). Com a trava do play
-/// livre, adota antes o manifesto de backups da pasta do jogo (pasta movida); ocupada, só lê.
+/// Estado do mod para as Configurações (procura o jogo como o Jogar, fora do executor assíncrono). Só lê: não pega a
+/// trava do play (um Jogar clicado ao mesmo tempo não recebe `busy`) nem grava o registro; o manifesto de backups da
+/// pasta é adotado no Jogar, na remoção e na abertura do launcher.
 #[tauri::command]
-pub async fn mod_status(app: AppHandle, gate: State<'_, PlayGate>) -> AppResult<ModInfo> {
-    let run = gate.try_begin().ok();
-    let adopt = run.is_some();
-    let r = tokio::task::spawn_blocking(move || {
+pub async fn mod_status(app: AppHandle) -> AppResult<ModInfo> {
+    tokio::task::spawn_blocking(move || {
         let game = resolve_game(&app.state::<AppState>());
-        let mods = ModInstaller::system();
-        if let Some(g) = game.as_ref().filter(|_| adopt) {
-            modact::adopt_folder(&g.dir, &mods);
-        }
-        mod_info(game.as_ref(), &mods)
+        mod_info(game.as_ref(), &ModInstaller::system())
     })
     .await
-    .map_err(|_| internal("ao conferir o mod"));
-    drop(run);
-    r
+    .map_err(|_| internal("ao conferir o mod"))
+}
+
+/// "Esquecer pasta": tira do registro uma pasta anterior do jogo que não existe mais (ver
+/// [`modact::forget_folder`]). A confirmação, com os nomes dos arquivos do jogador, é da UI. Sob a trava do play.
+#[tauri::command]
+pub async fn forget_mod_folder(
+    app: AppHandle,
+    gate: State<'_, PlayGate>,
+    dir: String,
+) -> AppResult<ModInfo> {
+    let _run = gate.try_begin()?;
+    tokio::task::spawn_blocking(move || {
+        let game = resolve_game(&app.state::<AppState>());
+        let mods = ModInstaller::system();
+        modact::forget_folder(Path::new(&dir), &mods)?;
+        Ok(mod_info(game.as_ref(), &mods))
+    })
+    .await
+    .map_err(|_| internal("ao esquecer a pasta do jogo"))?
 }
 
 /// "Remover mod do jogo" (todas as pastas registradas). Não corre junto com um play; recusa com o jogo aberto.
