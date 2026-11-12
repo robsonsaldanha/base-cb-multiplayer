@@ -377,6 +377,12 @@ std::string Session::CountersLine() const {
            " entradas=" + std::to_string(c.enters) + " saidas=" + std::to_string(c.leaves);
 }
 
+size_t Session::KnownRemotes() const {
+    size_t n = 0;
+    for (const auto& kv : m_store.All()) n += kv.first != m_playerId ? 1 : 0;
+    return n;
+}
+
 void Session::EnterPlaying(double) {
     m_phase = OnlinePhase::Playing;
     m_sampler.MarkJump();
@@ -384,8 +390,9 @@ void Session::EnterPlaying(double) {
     m_pendingTeleport.reset();
     if (!m_connectedShown) {
         m_connectedShown = true;
-        QueueStatus(std::string(kStatusPrefix) + "conectado (" + std::to_string(m_puppets.Stats().alive) +
-                    " por perto)");
+        // N = jogadores que o servidor já anunciou (EntityEnter), não bonecos: os bonecos só nascem em Playing, mais
+        // adiante neste tick (revisão final, M1).
+        QueueStatus(std::string(kStatusPrefix) + "conectado (" + std::to_string(KnownRemotes()) + " por perto)");
     }
 }
 

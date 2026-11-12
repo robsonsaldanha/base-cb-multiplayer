@@ -358,6 +358,21 @@ TEST_CASE("client: Session shows the connected status once on entering Playing")
     CHECK(fx.game.statuses[0] == "CB Multiplayer: conectado (0 por perto)");
 }
 
+TEST_CASE("client: Session connected status counts the remotes already announced in AwaitWorld") {
+    SessionFixture fx;
+    fx.GoAwaitWorld();
+    fx.transport.Push(Enter(3, 12000, 20000));
+    fx.transport.Push(Enter(4, 13000, 20000));
+    fx.transport.Push(Enter(5, 14000, 20000));
+    fx.transport.Push(cbmp::EntityLeave{5});
+    fx.RunFor(1);
+    fx.EnterWorld();
+    REQUIRE(fx.RunUntil([&] { return fx.S().Phase() == OnlinePhase::Playing; }, 5));
+    fx.RunFor(1);
+    REQUIRE(fx.game.statuses.size() == 1);
+    CHECK(fx.game.statuses[0] == "CB Multiplayer: conectado (2 por perto)");
+}
+
 TEST_CASE("client: Session shows no status when statusOnScreen is false") {
     SessionFixture fx(false);
     fx.GoOnline();

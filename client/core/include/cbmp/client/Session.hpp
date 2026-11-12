@@ -105,6 +105,7 @@ private:
     void NoteException(double now, const char* what);
     void MaybeSummarizeExceptions(double now);
     std::string CountersLine() const;
+    size_t KnownRemotes() const;  // entidades anunciadas (EntityEnter) e ainda não saídas, sem o próprio jogador
 
     SessionDeps m_deps;
     SessionConfig m_cfg;
