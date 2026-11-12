@@ -10,14 +10,22 @@
 //! - Zip validado inteiro antes de gravar: só caminhos relativos seguros (sem `..`, absolutos, `\`, `:`, segmentos
 //!   vazios), sem links, sem criptografia, só stored/deflate, cada arquivo até 512 MiB declarados e o total até 2 GiB.
 //!   A extração confere que cada arquivo tem exatamente o tamanho declarado.
-//! - **Instalação atômica** em `<jogo>\Phoenix\Binaries\Win64\cbmp\` (pasta inteira do launcher; nada fora dela no
-//!   jogo): extrai em `cbmp.staging` (mesma pasta pai), relê cada arquivo e confere o hash, e só então troca
-//!   (`cbmp` → `cbmp.old`, `cbmp.staging` → `cbmp`, apaga `cbmp.old`). Qualquer falha antes da troca deixa o mod que
-//!   funciona intacto; sobras de uma queda são resolvidas na próxima vez ([`recover_mod_dir`]).
-//! - `mods\installed.json` guarda versão (assinada), protocolo, pasta do jogo e sha256 de cada arquivo; o zip
-//!   assinado e o `.sig` ficam em `mods\package\` para reparo local (arquivos alterados → reinstala do pacote, com a
-//!   assinatura conferida de novo, sem depender do Hub).
-//! - Nunca faz downgrade: versão menor (semver) que a instalada no mesmo protocolo mantém a instalada.
+//! - **Layout 2**: o zip traz `cbmp-mod.json` (`layout` 2, `version` e `protocol` iguais aos assinados, `minLauncher`
+//!   ≤ versão deste launcher), `loader/dwmapi.dll`, `ue4ss/UE4SS.dll` e `ue4ss/Mods/cb-mp/dlls/main.dll`; senão
+//!   `mod_invalid` (ou `mod_incompatible` pelo `minLauncher`). Conferido antes de extrair, também no reparo.
+//! - **Instalação atômica** em `<jogo>\Phoenix\Binaries\Win64\cbmp\atual\`: o contêiner `cbmp\` é criado se faltar e
+//!   nunca renomeado (`cbmp-run.json`, `logs\`, `crash\` e `cb-mp.json` ficam); extrai em `atual.staging`, relê cada
+//!   arquivo e confere o hash, e só então troca (`atual` → `atual.old`, `atual.staging` → `atual`, apaga `atual.old`).
+//!   Qualquer falha antes da troca deixa o mod que funciona intacto; sobras de uma queda são resolvidas na próxima vez
+//!   ([`recover_mod_dir`]). Permissão negada no jogo → `mod_needs_admin`. Ativar o carregador é do [`crate::modact`].
+//! - `mods\installed.json` guarda versão (assinada), protocolo, pasta do jogo, sha256 de cada arquivo, `layout`, o
+//!   carregador (`loader`, com os anteriores em `loaderHistory`), os arquivos do jogador movidos para
+//!   `cbmp-backup\` e `removed`; o zip assinado e o `.sig` ficam em `mods\package\` para reparo local (arquivos
+//!   alterados ou mod removido → reinstala do pacote, com a assinatura conferida de novo, sem depender do Hub).
+//! - Migração do layout 1 (arquivos direto em `cbmp\`): antes da primeira instalação em `atual\` saem só os arquivos
+//!   do registro antigo (e as pastas que ficarem vazias).
+//! - Nunca faz downgrade: versão menor (semver) que a instalada no mesmo protocolo mantém a instalada (também depois
+//!   de remover o mod: a versão registrada continua sendo o piso).
 
 use crate::content::{hex, remove_entry, safe_rel_path};
 use crate::error::{AppError, AppResult};
@@ -43,8 +51,26 @@ pub const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_ENTRIES: usize = 10_000;
 /// Tentativas de download.
 pub const ATTEMPTS: u32 = 3;
-/// Pasta do mod dentro de `Phoenix\Binaries\Win64`.
+/// Contêiner do mod dentro de `Phoenix\Binaries\Win64` (nunca renomeado).
 pub const MOD_FOLDER: &str = "cbmp";
+/// Pacote em uso dentro do contêiner.
+pub const CURRENT_FOLDER: &str = "atual";
+/// Layout do pacote que este launcher instala.
+pub const LAYOUT: u32 = 2;
+/// Metadados do pacote, na raiz do zip.
+pub const MOD_META_FILE: &str = "cbmp-mod.json";
+/// Carregador (proxy do UE4SS) dentro do zip; a ativação o copia para `Win64\`.
+pub const LOADER_IN_ZIP: &str = "loader/dwmapi.dll";
+/// Hashes de carregadores anteriores guardados no registro.
+pub const MAX_LOADER_HISTORY: usize = 8;
+/// O que todo pacote do layout 2 tem de trazer.
+const REQUIRED_IN_ZIP: [&str; 3] = [
+    LOADER_IN_ZIP,
+    "ue4ss/UE4SS.dll",
+    "ue4ss/Mods/cb-mp/dlls/main.dll",
+];
+/// Tamanho máximo do `cbmp-mod.json`.
+const MAX_META_BYTES: u64 = 64 * 1024;
 /// Espera antes da 2ª tentativa; dobra a cada falha.
 const RETRY_DELAY: Duration = Duration::from_secs(3);
 const INSTALLED_FILE: &str = "installed.json";
@@ -76,6 +102,54 @@ pub struct Installed {
     /// sha256 do zip instalado.
     pub sha256: String,
     pub files: Vec<InstalledFile>,
+    /// Layout do pacote instalado (ausente = 1, arquivos direto em `cbmp\`).
+    #[serde(default)]
+    pub layout: u32,
+    /// `atual\loader\dwmapi.dll` instalado.
+    #[serde(default)]
+    pub loader: Option<LoaderRef>,
+    /// sha256 de carregadores anteriores (ainda reconhecidos como nossos em `Win64\`), o mais velho primeiro.
+    #[serde(default)]
+    pub loader_history: Vec<String>,
+    /// Arquivos do jogador movidos de `Win64\` para `Win64\cbmp-backup\`.
+    #[serde(default)]
+    pub backups: Vec<BackupEntry>,
+    /// Mod removido do jogo (Configurações); a versão continua valendo como piso do anti-downgrade.
+    #[serde(default)]
+    pub removed: bool,
+}
+
+/// Carregador instalado.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoaderRef {
+    pub sha256: String,
+    pub size: u64,
+}
+
+/// Arquivo do jogador em `cbmp-backup\`: `name` em `Win64\` → `stored` em `cbmp-backup\`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupEntry {
+    pub name: String,
+    pub stored: String,
+}
+
+/// `cbmp-mod.json` do pacote.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModMeta {
+    pub layout: u32,
+    pub version: String,
+    pub protocol: u32,
+    pub ue4ss: String,
+    pub min_launcher: String,
+}
+
+/// Junta `hash` ao histórico de carregadores: sem repetir, no máximo [`MAX_LOADER_HISTORY`], o mais velho sai.
+pub fn push_loader_history(history: &mut Vec<String>, hash: &str) {
+    history.retain(|h| h != hash);
+    history.push(hash.to_string());
+    let excess = history.len().saturating_sub(MAX_LOADER_HISTORY);
+    history.drain(..excess);
 }
 
 /// Resultado de [`ModInstaller::ensure`]: versão em uso e se algo foi (re)instalado agora.
@@ -87,12 +161,44 @@ pub struct ModState {
     pub changed: bool,
 }
 
-/// `<jogo>\Phoenix\Binaries\Win64\cbmp`.
+/// `<jogo>\Phoenix\Binaries\Win64`.
+pub fn win64_dir(game: &GameInstall) -> PathBuf {
+    BINARIES.iter().fold(game.dir.clone(), |p, s| p.join(s))
+}
+
+/// `<jogo>\Phoenix\Binaries\Win64\cbmp` (contêiner).
+pub fn container_dir(game: &GameInstall) -> PathBuf {
+    win64_dir(game).join(MOD_FOLDER)
+}
+
+/// `<jogo>\Phoenix\Binaries\Win64\cbmp\atual` (pacote em uso).
 pub fn mod_dir(game: &GameInstall) -> PathBuf {
-    BINARIES
-        .iter()
-        .fold(game.dir.clone(), |p, s| p.join(s))
-        .join(MOD_FOLDER)
+    container_dir(game).join(CURRENT_FOLDER)
+}
+
+/// Sem permissão para gravar na pasta do jogo.
+pub fn mod_needs_admin() -> AppError {
+    AppError::new(
+        "mod_needs_admin",
+        "O launcher não tem permissão para instalar o mod na pasta do jogo.",
+    )
+}
+
+/// `permission_denied` (de [`AppError::io`]) na pasta do jogo vira `mod_needs_admin`; o resto passa.
+pub fn admin_if_denied(e: AppError) -> AppError {
+    if e.code == "permission_denied" {
+        log::warn!("sem permissão na pasta do jogo: {}", e.message);
+        mod_needs_admin()
+    } else {
+        e
+    }
+}
+
+fn mod_incompatible() -> AppError {
+    AppError::new(
+        "mod_incompatible",
+        "Este mod precisa de uma versão mais nova do launcher. Atualize e tente de novo.",
+    )
 }
 
 fn signature_invalid() -> AppError {
@@ -102,7 +208,7 @@ fn signature_invalid() -> AppError {
     )
 }
 
-fn mod_invalid(detail: &str) -> AppError {
+pub(crate) fn mod_invalid(detail: &str) -> AppError {
     AppError::new(
         "mod_invalid",
         format!("Pacote do mod recusado ({detail}); nada foi instalado."),
@@ -248,6 +354,134 @@ pub fn verify_mod_file(path: &Path, sig: &str, pubkey: &str) -> AppResult<Signed
         return Err(signature_invalid());
     }
     Ok(signed)
+}
+
+/// Confere o `cbmp-mod.json` contra o que a assinatura garante e a versão deste launcher.
+pub fn check_mod_meta(
+    bytes: &[u8],
+    signed: &SignedMod,
+    launcher: &semver::Version,
+) -> AppResult<ModMeta> {
+    let meta: ModMeta =
+        serde_json::from_slice(bytes).map_err(|_| mod_invalid("cbmp-mod.json inválido"))?;
+    if meta.layout != LAYOUT {
+        return Err(mod_invalid("layout do pacote não suportado"));
+    }
+    let version = semver::Version::parse(&meta.version).ok();
+    if version.as_ref() != Some(&signed.version) || meta.protocol != signed.protocol {
+        log::warn!(
+            "cbmp-mod.json (p{} v{}) diferente do assinado (p{} v{})",
+            meta.protocol,
+            meta.version,
+            signed.protocol,
+            signed.version
+        );
+        return Err(mod_invalid("cbmp-mod.json diferente do assinado"));
+    }
+    let min = semver::Version::parse(&meta.min_launcher).map_err(|_| mod_incompatible())?;
+    if min > *launcher {
+        log::warn!("mod pede o launcher {min}; este é {launcher}");
+        return Err(mod_incompatible());
+    }
+    Ok(meta)
+}
+
+/// Valida o zip inteiro (sem gravar nada): arquivos obrigatórios do layout 2 e `cbmp-mod.json`.
+fn check_package(zip: &Path, signed: &SignedMod, launcher: &semver::Version) -> AppResult<ModMeta> {
+    let (mut ar, planned) = open_planned(zip)?;
+    for name in REQUIRED_IN_ZIP {
+        if !planned.iter().any(|p| !p.dir && p.rel == name) {
+            return Err(mod_invalid(&format!("sem {name}")));
+        }
+    }
+    let meta = planned
+        .iter()
+        .find(|p| !p.dir && p.rel == MOD_META_FILE)
+        .ok_or_else(|| mod_invalid("sem cbmp-mod.json"))?;
+    if meta.size > MAX_META_BYTES {
+        return Err(mod_invalid("cbmp-mod.json grande demais"));
+    }
+    let entry = ar
+        .by_index(meta.index)
+        .map_err(|_| mod_invalid("pacote corrompido"))?;
+    let mut bytes = Vec::new();
+    entry
+        .take(MAX_META_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| mod_invalid("pacote corrompido"))?;
+    check_mod_meta(&bytes, signed, launcher)
+}
+
+/// Instala `zip` (assinatura já conferida: `signed`) em `cbmp\atual` e devolve o registro novo. `prev` é o registro
+/// anterior (qualquer protocolo): dá a migração do layout 1, o histórico de carregadores e os backups.
+fn install_package(
+    zip: &Path,
+    signed: &SignedMod,
+    launcher: &semver::Version,
+    game: &GameInstall,
+    prev: Option<&Installed>,
+) -> AppResult<Installed> {
+    check_package(zip, signed, launcher)?;
+    let container = container_dir(game);
+    std::fs::create_dir_all(&container)
+        .map_err(|e| admin_if_denied(AppError::io(&container, &e)))?;
+    let same_game = prev.filter(|p| p.game_dir == game.dir);
+    if let Some(old) = same_game.filter(|p| p.layout < LAYOUT) {
+        migrate_legacy(&container, old).map_err(admin_if_denied)?;
+    }
+    let files = extract_zip(zip, &mod_dir(game)).map_err(admin_if_denied)?;
+    let loader = files
+        .iter()
+        .find(|f| f.path == LOADER_IN_ZIP)
+        .map(|f| LoaderRef {
+            sha256: f.sha256.clone(),
+            size: f.size,
+        })
+        .ok_or_else(|| mod_invalid("sem o carregador"))?;
+    let mut loader_history = prev.map(|p| p.loader_history.clone()).unwrap_or_default();
+    if let Some(old) = prev.and_then(|p| p.loader.as_ref()) {
+        if old.sha256 != loader.sha256 {
+            push_loader_history(&mut loader_history, &old.sha256);
+        }
+    }
+    loader_history.retain(|h| *h != loader.sha256);
+    Ok(Installed {
+        version: signed.version.to_string(),
+        protocol: signed.protocol,
+        game_dir: game.dir.clone(),
+        sha256: signed.sha256.clone(),
+        files,
+        layout: LAYOUT,
+        loader: Some(loader),
+        loader_history,
+        backups: same_game.map(|p| p.backups.clone()).unwrap_or_default(),
+        removed: false,
+    })
+}
+
+/// Layout 1 → 2: apaga de `cbmp\` só os arquivos do registro antigo e as pastas que ficarem vazias.
+fn migrate_legacy(container: &Path, old: &Installed) -> AppResult<()> {
+    for f in &old.files {
+        if !safe_rel_path(&f.path) {
+            continue;
+        }
+        let path = join_rel(container, &f.path);
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if !m.is_dir() => {
+                std::fs::remove_file(&path).map_err(|e| AppError::io(&path, &e))?
+            }
+            _ => continue,
+        }
+        let mut dir = path.parent();
+        while let Some(d) = dir.filter(|d| *d != container && d.starts_with(container)) {
+            if std::fs::remove_dir(d).is_err() {
+                break;
+            }
+            dir = d.parent();
+        }
+    }
+    log::info!("mod do layout antigo ({}) removido de cbmp\\", old.version);
+    Ok(())
 }
 
 // ----- zip -----
@@ -464,7 +698,7 @@ pub fn extract_zip(zip: &Path, dest: &Path) -> AppResult<Vec<InstalledFile>> {
     Ok(files)
 }
 
-fn hash_file(path: &Path) -> std::io::Result<(String, u64)> {
+pub(crate) fn hash_file(path: &Path) -> std::io::Result<(String, u64)> {
     let mut f = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 256 * 1024];
@@ -494,6 +728,7 @@ pub struct ModInstaller {
     pubkey: String,
     retry_delay: Duration,
     http: reqwest::Client,
+    launcher_version: semver::Version,
 }
 
 impl ModInstaller {
@@ -503,7 +738,35 @@ impl ModInstaller {
             pubkey,
             retry_delay: RETRY_DELAY,
             http: hub::download_client(),
+            launcher_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("versão do pacote é semver"),
         }
+    }
+
+    /// Versão do launcher comparada com o `minLauncher` do pacote. Padrão: a deste build.
+    pub fn with_launcher_version(mut self, v: semver::Version) -> Self {
+        self.launcher_version = v;
+        self
+    }
+
+    /// Grava `mods\installed.json` (arquivo temporário + rename).
+    pub fn save_record(&self, r: &Installed) -> AppResult<()> {
+        write_record(&self.record_path(), r)
+    }
+
+    /// `mods\package\cbmp-mod.zip` (último pacote instalado, assinado).
+    pub fn package_zip(&self) -> PathBuf {
+        self.package_dir().join(PACKAGE_ZIP)
+    }
+
+    /// `mods\package\cbmp-mod.zip.sig`.
+    pub fn package_sig(&self) -> PathBuf {
+        self.package_dir().join(PACKAGE_SIG)
+    }
+
+    /// Chave pública que confere o mod.
+    pub fn pubkey(&self) -> &str {
+        &self.pubkey
     }
 
     /// Pastas e chave reais do launcher.
@@ -552,6 +815,27 @@ impl ModInstaller {
         if cancel.is_cancelled() {
             return Err(cancelled());
         }
+        let dest = mod_dir(game);
+        {
+            let d = dest.clone();
+            blocking(move || recover_mod_dir(&d).map_err(admin_if_denied)).await?;
+        }
+        // Removido nas Configurações: volta do pacote local, sem o Hub.
+        if let Some(r) = self
+            .installed()
+            .filter(|r| r.removed && r.protocol == protocol && r.game_dir == game.dir)
+        {
+            match self.repair(&r, game).await {
+                Ok(()) => {
+                    return Ok(ModState {
+                        version: r.version,
+                        protocol,
+                        changed: true,
+                    })
+                }
+                Err(e) => log::warn!("mod removido não reinstalado do pacote local: {}", e.code),
+            }
+        }
         let info = hub.mod_latest(protocol).await?.ok_or_else(|| {
             AppError::new(
                 "mod_unavailable",
@@ -562,11 +846,6 @@ impl ModInstaller {
         // Versão anunciada (não assinada): só decide se vale baixar. Instalar e registrar usam a assinada.
         let offered = semver::Version::parse(&info.version).map_err(|_| bad_offer())?;
 
-        let dest = mod_dir(game);
-        {
-            let d = dest.clone();
-            blocking(move || recover_mod_dir(&d)).await?;
-        }
         let current = self
             .installed()
             .filter(|r| r.protocol == protocol && r.game_dir == game.dir)
@@ -636,13 +915,13 @@ impl ModInstaller {
         })
     }
 
-    /// Reinstala a versão registrada a partir de `mods\package\`, conferindo a assinatura de novo.
+    /// Reinstala a versão registrada a partir de `mods\package\`, conferindo a assinatura e o `cbmp-mod.json` de
+    /// novo. Limpa `removed`.
     async fn repair(&self, r: &Installed, game: &GameInstall) -> AppResult<()> {
-        let pkg = self.package_dir();
-        let (zip, sig_path) = (pkg.join(PACKAGE_ZIP), pkg.join(PACKAGE_SIG));
+        let (zip, sig_path) = (self.package_zip(), self.package_sig());
         let sig = std::fs::read_to_string(&sig_path).map_err(|e| AppError::io(&sig_path, &e))?;
         let (pk, record, rec) = (self.pubkey.clone(), self.record_path(), r.clone());
-        let dest = mod_dir(game);
+        let (launcher, game) = (self.launcher_version.clone(), game.clone());
         blocking(move || {
             let signed = verify_mod_file(&zip, &sig, &pk)?;
             let same = signed.protocol == rec.protocol
@@ -651,8 +930,8 @@ impl ModInstaller {
             if !same {
                 return Err(signature_invalid());
             }
-            let files = extract_zip(&zip, &dest)?;
-            write_record(&record, &Installed { files, ..rec })
+            let new = install_package(&zip, &signed, &launcher, &game, Some(&rec))?;
+            write_record(&record, &new)
         })
         .await?;
         log::info!("mod {} reparado pelo pacote local", r.version);
@@ -714,29 +993,18 @@ impl ModInstaller {
 
         let record_path = self.record_path();
         let pkg = self.package_dir();
-        let dest = mod_dir(game);
-        let record_base = Installed {
-            version: signed.version.to_string(),
-            protocol,
-            game_dir: game.dir.clone(),
-            sha256: signed.sha256.clone(),
-            files: Vec::new(),
-        };
+        let prev = self.installed();
+        let (launcher, game, signed_c) =
+            (self.launcher_version.clone(), game.clone(), signed.clone());
         let sig = info.signature.clone();
         blocking(move || -> AppResult<()> {
             // Troca atômica: em qualquer falha o mod atual e o registro ficam como estavam.
-            let files = extract_zip(&zip_path, &dest)?;
+            let new = install_package(&zip_path, &signed_c, &launcher, &game, prev.as_ref())?;
             // Pacote para reparo local (falha aqui só perde o reparo, não a instalação).
             if let Err(e) = keep_package(&pkg, &zip_path, &sig) {
                 log::warn!("pacote do mod não guardado para reparo: {}", e.code);
             }
-            write_record(
-                &record_path,
-                &Installed {
-                    files,
-                    ..record_base
-                },
-            )
+            write_record(&record_path, &new)
         })
         .await?;
         log::info!("mod {} (protocolo {}) instalado", signed.version, protocol);
@@ -903,7 +1171,9 @@ fn validate_offer(info: &ModInfo, protocol: u32, hub_base: &Url) -> AppResult<Ur
 
 fn files_intact(r: &Installed, game: &GameInstall) -> bool {
     let dir = mod_dir(game);
-    !r.files.is_empty()
+    r.layout == LAYOUT
+        && !r.removed
+        && !r.files.is_empty()
         && r.files.iter().all(|f| {
             safe_rel_path(&f.path)
                 && hash_file(&join_rel(&dir, &f.path))
@@ -998,13 +1268,92 @@ mod tests {
             exe: PathBuf::from("C:/HL/HogwartsLegacy.exe"),
             store: crate::game::Store::Manual,
         };
+        let win64 = PathBuf::from("C:/HL")
+            .join("Phoenix")
+            .join("Binaries")
+            .join("Win64");
+        assert_eq!(win64_dir(&g), win64);
+        assert_eq!(container_dir(&g), win64.join("cbmp"));
+        assert_eq!(mod_dir(&g), win64.join("cbmp").join("atual"));
+    }
+
+    #[test]
+    fn historico_de_carregadores_sem_repetir_e_no_maximo_8() {
+        let mut h = Vec::new();
+        push_loader_history(&mut h, "a");
+        push_loader_history(&mut h, "b");
+        push_loader_history(&mut h, "a");
+        assert_eq!(h, ["b", "a"]);
+        for i in 0..10 {
+            push_loader_history(&mut h, &i.to_string());
+        }
+        assert_eq!(h.len(), MAX_LOADER_HISTORY);
+        assert_eq!(h.first().unwrap(), "2", "o mais velho sai");
+        assert_eq!(h.last().unwrap(), "9");
+    }
+
+    fn signed(version: &str, protocol: u32) -> SignedMod {
+        SignedMod {
+            protocol,
+            version: semver::Version::parse(version).unwrap(),
+            sha256: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn cbmp_mod_json_conferido_contra_o_assinado() {
+        let l = semver::Version::new(0, 2, 0);
+        let ok = br#"{"layout":2,"version":"0.2.0","protocol":1,"ue4ss":"3.0.1+4fb9b615","minLauncher":"0.2.0"}"#;
+        let m = check_mod_meta(ok, &signed("0.2.0", 1), &l).unwrap();
+        assert_eq!(m.ue4ss, "3.0.1+4fb9b615");
+        assert_eq!(m.min_launcher, "0.2.0");
         assert_eq!(
-            mod_dir(&g),
-            PathBuf::from("C:/HL")
-                .join("Phoenix")
-                .join("Binaries")
-                .join("Win64")
-                .join("cbmp")
+            check_mod_meta(ok, &signed("0.2.1", 1), &l)
+                .unwrap_err()
+                .code,
+            "mod_invalid"
         );
+        assert_eq!(
+            check_mod_meta(ok, &signed("0.2.0", 2), &l)
+                .unwrap_err()
+                .code,
+            "mod_invalid"
+        );
+        assert_eq!(
+            check_mod_meta(ok, &signed("0.2.0", 1), &semver::Version::new(0, 1, 3))
+                .unwrap_err()
+                .code,
+            "mod_incompatible"
+        );
+        // Sem campo obrigatório.
+        let no_ue4ss = br#"{"layout":2,"version":"0.2.0","protocol":1,"minLauncher":"0.2.0"}"#;
+        assert_eq!(
+            check_mod_meta(no_ue4ss, &signed("0.2.0", 1), &l)
+                .unwrap_err()
+                .code,
+            "mod_invalid"
+        );
+    }
+
+    #[test]
+    fn registro_antigo_le_com_os_campos_novos_no_padrao() {
+        let old = r#"{"version":"0.1.0","protocol":1,"gameDir":"C:/HL","sha256":"x","files":[]}"#;
+        let r: Installed = serde_json::from_str(old).unwrap();
+        assert_eq!(r.layout, 0);
+        assert!(r.loader.is_none() && r.loader_history.is_empty() && r.backups.is_empty());
+        assert!(!r.removed);
+    }
+
+    #[test]
+    fn permissao_negada_vira_mod_needs_admin() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let e = admin_if_denied(AppError::io(Path::new("C:/x"), &denied));
+        assert_eq!(e.code, "mod_needs_admin");
+        assert_eq!(
+            e.message,
+            "O launcher não tem permissão para instalar o mod na pasta do jogo."
+        );
+        let other = AppError::new("io_error", "x");
+        assert_eq!(admin_if_denied(other.clone()), other);
     }
 }

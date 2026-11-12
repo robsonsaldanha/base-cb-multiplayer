@@ -687,6 +687,75 @@ pub fn vdf_get(v: &Vdf, keys: &[&str]) -> Option<String> {
     }
 }
 
+// ----- jogo aberto -----
+
+/// Nomes dos executáveis em execução (injetável nos testes).
+pub trait Processes {
+    fn names(&self) -> Vec<String>;
+}
+
+/// Processos reais do sistema (`CreateToolhelp32Snapshot`).
+pub struct SystemProcesses;
+
+impl Processes for SystemProcesses {
+    #[cfg(windows)]
+    fn names(&self) -> Vec<String> {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        };
+        let mut out = Vec::new();
+        // SAFETY: snapshot fechado no fim; `PROCESSENTRY32W` com `dwSize` preenchido, como a API pede.
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snap == INVALID_HANDLE_VALUE || snap.is_null() {
+                log::warn!("lista de processos indisponível");
+                return out;
+            }
+            let mut e = PROCESSENTRY32W {
+                dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                ..Default::default()
+            };
+            let mut ok = Process32FirstW(snap, &mut e);
+            while ok != 0 {
+                let len = e
+                    .szExeFile
+                    .iter()
+                    .position(|c| *c == 0)
+                    .unwrap_or(e.szExeFile.len());
+                out.push(String::from_utf16_lossy(&e.szExeFile[..len]));
+                ok = Process32NextW(snap, &mut e);
+            }
+            CloseHandle(snap);
+        }
+        out
+    }
+
+    #[cfg(not(windows))]
+    fn names(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// Algum processo se chama `HogwartsLegacy.exe` (sem diferenciar maiúsculas).
+pub fn game_running_with(p: &dyn Processes) -> bool {
+    p.names().iter().any(|n| n.eq_ignore_ascii_case(GAME_EXE))
+}
+
+/// [`game_running_with`] com os processos reais.
+pub fn game_running() -> bool {
+    game_running_with(&SystemProcesses)
+}
+
+/// Jogo aberto: Jogar e Remover recusam.
+pub fn game_running_error() -> AppError {
+    AppError::new(
+        "game_running",
+        "O Hogwarts Legacy está aberto. Feche o jogo e tente de novo.",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

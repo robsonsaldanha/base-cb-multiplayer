@@ -24,6 +24,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+#[path = "common/modzip.rs"]
+mod modzip;
+
 const TICKET_MARK: &str = "TICKETSECRETO";
 
 fn info(content_dir: &Path) -> ConnectInfo {
@@ -420,7 +423,8 @@ impl Env {
             auth: self.auth.clone(),
             content: ContentStore::new(self.root.join("cache"), self.root.join("servers"))
                 .with_retry_delay(Duration::from_millis(5)),
-            mods: ModInstaller::new(self.root.join("mods"), self.pubkey.clone()),
+            mods: ModInstaller::new(self.root.join("mods"), self.pubkey.clone())
+                .with_launcher_version(semver::Version::new(0, 2, 0)),
             run_dir: self.root.join("run"),
             clock: shared_clock(&self.clock),
             simulate,
@@ -576,7 +580,6 @@ async fn play_e_um_por_vez() {
 #[cfg(windows)]
 #[tokio::test]
 async fn play_sem_simular_instala_o_mod_e_abre_o_jogo() {
-    use std::io::Write as _;
     let e = env().await;
     let dir = e.root.join("HL");
     let win64 = dir.join("Phoenix").join("Binaries").join("Win64");
@@ -589,12 +592,8 @@ async fn play_sem_simular_instala_o_mod_e_abre_o_jogo() {
         exe,
         store: Store::Manual,
     };
-    // Mod 1.0.0 do protocolo do servidor, assinado como no release.
-    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    w.start_file("cbmp.dll", zip::write::SimpleFileOptions::default())
-        .unwrap();
-    w.write_all(b"mod").unwrap();
-    let zip = w.finish().unwrap().into_inner();
+    // Mod 1.0.0 (layout 2) do protocolo do servidor, assinado como no release.
+    let zip = modzip::build("1.0.0", PROTOCOL, b"mod");
     let comment = format!(
         "cbmp-mod protocol={PROTOCOL} version=1.0.0 sha256={}",
         sha_hex(&zip)
@@ -632,7 +631,14 @@ async fn play_sem_simular_instala_o_mod_e_abre_o_jogo() {
         vec![format!("protocol={PROTOCOL}")]
     );
     assert_eq!(
-        std::fs::read(win64.join("cbmp").join("cbmp.dll")).unwrap(),
+        std::fs::read(
+            win64
+                .join("cbmp")
+                .join("atual")
+                .join("loader")
+                .join("dwmapi.dll")
+        )
+        .unwrap(),
         b"mod"
     );
     assert_eq!(e.connect()["ticket"], format!("{TICKET_MARK}_1"));

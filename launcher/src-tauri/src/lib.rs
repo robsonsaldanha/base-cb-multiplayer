@@ -9,6 +9,7 @@ pub mod game;
 pub mod hub;
 pub mod launch;
 pub mod logging;
+pub mod modact;
 pub mod modpkg;
 pub mod paths;
 pub mod ping;
