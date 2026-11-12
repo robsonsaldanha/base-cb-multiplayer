@@ -47,6 +47,16 @@ export const ERROR_TEXT: Readonly<Record<string, string>> = {
   mod_invalid: "O pacote do mod é inválido e foi recusado.",
   mod_signature_invalid: "O mod baixado não tem assinatura válida e foi recusado.",
   mod_altered: "Os arquivos do mod foram alterados e não puderam ser reparados.",
+  mod_conflict: "Já existe outro carregador de mods (UE4SS) na pasta do jogo.",
+  mod_folder_protected: "Pasta do jogo sem permissão de gravação.",
+  mod_folder_present: "Esta pasta do jogo ainda existe ou só está inacessível agora; ela não pode ser esquecida.",
+  mod_incompatible: "Este mod precisa de uma versão mais nova do launcher. Atualize e tente de novo.",
+  mod_activation_failed: "Não foi possível ativar o mod na pasta do jogo.",
+  game_running: "O Hogwarts Legacy está aberto. Feche o jogo e tente de novo.",
+  mod_logs_missing: "A pasta de logs do mod ainda não existe.",
+  mod_folder_unreachable: "Uma pasta anterior do jogo não está acessível agora.",
+  mod_old_folder: "O mod continua numa pasta anterior do jogo.",
+  open_folder_failed: "Não foi possível abrir a pasta.",
   // Configurações e atualização
   invalid_settings: "Configuração inválida.",
   settings_unreadable: "Não foi possível ler as configurações.",
@@ -59,6 +69,13 @@ export const ERROR_TEXT: Readonly<Record<string, string>> = {
 };
 
 export const GENERIC_ERROR = "Ocorreu um erro inesperado.";
+
+/** Texto do diálogo nativo de conflito (`modact::CONFLICT_DIALOG`), mostrado como explicação no Jogar. */
+export const MOD_CONFLICT_EXPLANATION =
+  "Encontramos outro carregador de mods (UE4SS) na pasta do jogo. Para jogar no CB Multiplayer é preciso usar o do " +
+  "launcher. Seus arquivos não são apagados: ficam em Phoenix\\Binaries\\Win64\\cbmp-backup e voltam quando você " +
+  "remover o mod do CB Multiplayer nas Configurações. Enquanto isso, seus outros mods do UE4SS ficam desligados.";
+
 
 export interface ErrorView {
   code: string;

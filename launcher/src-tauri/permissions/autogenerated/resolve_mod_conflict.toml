@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resolve-mod-conflict"
+description = "Enables the resolve_mod_conflict command without any pre-configured scope."
+commands.allow = ["resolve_mod_conflict"]
+
+[[permission]]
+identifier = "deny-resolve-mod-conflict"
+description = "Denies the resolve_mod_conflict command without any pre-configured scope."
+commands.deny = ["resolve_mod_conflict"]

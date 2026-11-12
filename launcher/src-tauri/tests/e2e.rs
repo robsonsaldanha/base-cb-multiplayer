@@ -13,6 +13,7 @@
 
 use cbmp_launcher_lib::auth::{monotonic_clock, Auth, MemoryVault};
 use cbmp_launcher_lib::content::{self, ContentStore, Limits};
+use cbmp_launcher_lib::game::SystemProcesses;
 use cbmp_launcher_lib::hub::{self, HubClient};
 use cbmp_launcher_lib::launch::{LaunchOutcome, CONNECT_TTL};
 use cbmp_launcher_lib::modpkg::ModInstaller;
@@ -286,6 +287,9 @@ async fn run(env: &DevEnv) -> Result<(), String> {
         cache_limit_bytes: 10_240 * 1024 * 1024,
         keep: HashSet::new(),
         connect_ttl: CONNECT_TTL,
+        processes: Arc::new(SystemProcesses),
+        launcher_version: env!("CARGO_PKG_VERSION").into(),
+        confirm_conflict: false,
     };
     let stages = Arc::new(Mutex::new(Vec::new()));
     let st = stages.clone();
@@ -388,6 +392,21 @@ async fn run(env: &DevEnv) -> Result<(), String> {
         || connect["port"] != detail.game_port.unwrap()
     {
         return Err("connect.json incompleto".into());
+    }
+    // IP literal (o mod não resolve nomes) e `launchId` de 32 hex.
+    if connect["host"]
+        .as_str()
+        .is_none_or(|h| h.parse::<std::net::IpAddr>().is_err())
+    {
+        return Err(format!(
+            "host do connect.json não é IP literal: {}",
+            connect["host"]
+        ));
+    }
+    if connect["launchId"].as_str().is_none_or(|id| {
+        id.len() != 32 || !id.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+    }) {
+        return Err(format!("launchId inválido: {}", connect["launchId"]));
     }
     Ok(())
 }

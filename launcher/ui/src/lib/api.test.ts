@@ -13,6 +13,7 @@ const s: Settings = {
   cacheLimitMB: 10240,
   maxServerContentMB: 2048,
   simulateLaunch: true,
+  settingsVersion: 2,
 };
 
 const editable = { favorites: ["a"], recent: [], cacheLimitMB: 10240, maxServerContentMB: 2048, simulateLaunch: true };

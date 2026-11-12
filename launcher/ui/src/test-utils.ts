@@ -38,7 +38,8 @@ export const baseSettings: Settings = {
   gameDir: null,
   cacheLimitMB: 10240,
   maxServerContentMB: 2048,
-  simulateLaunch: true,
+  simulateLaunch: false,
+  settingsVersion: 2,
 };
 
 export function server(id: string, name: string, extra: Partial<ServerListing> = {}): ServerListing {

@@ -1,17 +1,20 @@
 #pragma once
-#include <cbmp/IGame.hpp>
+#include <cbmp/client/IGame.hpp>
 #include <string>
 
-// Requer /EHa: catch(...) também pega exceções SEH (access violation etc.).
+namespace cbmp::client {
+// Roda f() e transforma qualquer falha em GameError("<what>: …"). Requer /EHa: catch(...) também pega exceções SEH
+// (access violation etc. dentro do motor). GameError passa como veio.
 template <class F>
 auto SafeCall(const char* what, F&& f) -> decltype(f()) {
     try {
         return f();
-    } catch (const cbmp::GameError&) {
+    } catch (const GameError&) {
         throw;
     } catch (const std::exception& e) {
-        throw cbmp::GameError(std::string(what) + ": " + e.what());
+        throw GameError(std::string(what) + ": " + e.what());
     } catch (...) {
-        throw cbmp::GameError(std::string(what) + ": exceção SEH (provável ponteiro inválido)");
+        throw GameError(std::string(what) + ": exceção SEH (provável ponteiro inválido)");
     }
 }
+}  // namespace cbmp::client

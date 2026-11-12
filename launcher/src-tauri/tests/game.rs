@@ -516,6 +516,13 @@ fn candidata_para_a_ui_so_tem_pasta_e_loja() {
 
 // ----- comandos: detectar e confirmar a sugestão -----
 
+/// O caminho que o launcher grava e usa para `dir`: o final (nomes curtos 8.3 e junções resolvidos, sem `\\?\`), igual
+/// para o seletor, a candidata confirmada e a instalação achada. Num runner com `%TEMP%` em nome curto
+/// (`C:\Users\RUNNER~1\…`) é diferente do caminho do `tempfile`.
+fn stored(dir: &Path) -> PathBuf {
+    game::resolve_dir(dir).expect("pasta existe")
+}
+
 fn state(tmp: &Path) -> AppState {
     AppState::load(tmp.join("dados").join("settings.json"))
 }
@@ -539,10 +546,10 @@ fn detect_game_sugere_candidata_sem_gravar_e_grava_a_confiavel() {
 
     let r = detect_game_with(&st, || game::detect_with(&reg, &roots, &Distrust(vec![])));
     assert_eq!(r.candidate, None);
-    assert_eq!(r.settings.game_dir, Some(game_dir.clone()));
+    assert_eq!(r.settings.game_dir, Some(stored(&game_dir)));
     // Com pasta válida gravada, não procura de novo.
     let r = detect_game_with(&st, || panic!("não devia procurar"));
-    assert_eq!(r.settings.game_dir, Some(game_dir));
+    assert_eq!(r.settings.game_dir, Some(stored(&game_dir)));
 }
 
 #[test]
@@ -567,16 +574,18 @@ fn confirmar_candidata_grava_como_o_seletor() {
         1,
         "diálogo nativo sempre aparece para a candidata"
     );
-    assert_eq!(s.game_dir, Some(game_dir.clone()));
-    assert_eq!(st.get_settings().game_dir, Some(game_dir.clone()));
+    let final_dir = stored(&game_dir);
+    assert_eq!(s.game_dir, Some(final_dir.clone()));
+    assert_eq!(st.get_settings().game_dir, Some(final_dir.clone()));
     // Gravado no arquivo, e o Jogar usa a pasta como uma escolhida à mão.
     let saved = cbmp_launcher_lib::settings::Settings::load(
         &tmp.path().join("dados").join("settings.json"),
     )
     .unwrap();
-    assert_eq!(saved.game_dir, Some(game_dir.clone()));
+    assert_eq!(saved.game_dir, Some(final_dir.clone()));
+    // O Jogar usa exatamente o texto gravado (nada a resolver de novo).
     let g = cbmp_launcher_lib::commands::resolve_game(&st).unwrap();
-    assert_eq!((g.store, g.dir), (Store::Manual, game_dir));
+    assert_eq!((g.store, g.dir), (Store::Manual, final_dir));
 }
 
 #[test]
@@ -651,6 +660,52 @@ fn confirmacao_recusa_instalacao_confiavel() {
     assert_eq!(st.get_settings().game_dir, None);
 }
 
+/// Nome curto 8.3 de `p` (`GetShortPathNameW`), se o volume tiver nomes curtos e ele for diferente.
+#[cfg(windows)]
+fn short_name(p: &Path) -> Option<PathBuf> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+    let w: Vec<u16> = p.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut buf = vec![0u16; 2048];
+    // SAFETY: entrada terminada em zero; saída com o tamanho informado.
+    let n = unsafe { GetShortPathNameW(w.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    let short = (n > 0 && n < buf.len())
+        .then(|| PathBuf::from(std::ffi::OsString::from_wide(&buf[..n])))?;
+    (short != p).then_some(short)
+}
+
+#[cfg(windows)]
+#[test]
+fn pasta_gravada_e_sempre_o_caminho_final() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, _, game_dir) = epic_setup(tmp.path());
+    let final_dir = stored(&game_dir);
+    let text = final_dir.to_string_lossy().to_string();
+    assert!(!text.starts_with(r"\\?\"), "{text}");
+    assert!(!text.contains('~'), "nome curto no caminho final: {text}");
+    assert_eq!(stored(&final_dir), final_dir, "o caminho final é estável");
+    // Seletor (`set_game_dir`) com o caminho do tempfile, com `\\?\` e pelo nome curto: grava sempre o mesmo texto.
+    let mut inputs = vec![
+        game_dir.clone(),
+        PathBuf::from(format!(r"\\?\{}", final_dir.display())),
+    ];
+    let short = short_name(&game_dir);
+    inputs.extend(short.clone());
+    for (i, input) in inputs.iter().enumerate() {
+        let st = state(&tmp.path().join(format!("seletor{i}")));
+        let s = st.set_game_dir(Some(input.clone())).unwrap();
+        assert_eq!(s.game_dir.as_ref(), Some(&final_dir), "{}", input.display());
+        let g = cbmp_launcher_lib::commands::resolve_game(&st).unwrap();
+        assert_eq!(g.dir, final_dir, "{}", input.display());
+        assert_eq!(g.exe, final_dir.join("HogwartsLegacy.exe"));
+    }
+    // Candidata confirmada (achada por um caminho curto) grava o mesmo texto que o seletor.
+    let via = short.unwrap_or_else(|| PathBuf::from(format!(r"\\?\{}", final_dir.display())));
+    let st = state(&tmp.path().join("candidata"));
+    let s = adopt_detected(&st, &via, candidate(&via, vec![]), |_| true).unwrap();
+    assert_eq!(s.game_dir, Some(final_dir));
+}
+
 #[cfg(windows)]
 #[test]
 fn confirmacao_compara_caminho_sem_diferenciar_maiusculas() {
@@ -662,8 +717,8 @@ fn confirmacao_compara_caminho_sem_diferenciar_maiusculas() {
         game_dir.display().to_string().to_uppercase()
     ));
     let s = adopt_detected(&st, &shown, candidate(&game_dir, vec![]), |_| true).unwrap();
-    // Grava o caminho achado pelo Rust, não o texto da UI.
-    assert_eq!(s.game_dir, Some(game_dir));
+    // Grava o caminho achado pelo Rust (no caminho final), não o texto da UI.
+    assert_eq!(s.game_dir, Some(stored(&game_dir)));
 }
 
 // ----- várias pastas não confiáveis: nenhuma sugestão (fix round 1) -----

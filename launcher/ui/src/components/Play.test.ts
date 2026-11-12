@@ -11,6 +11,7 @@ import App from "../App.svelte";
 import { auth } from "../lib/stores";
 import { stopServers } from "../lib/servers";
 import { blocked, playState } from "../lib/play";
+import { notice } from "../lib/notice";
 import { baseSettings, fakeBackend, SERVERS, type Handler } from "../test-utils";
 import type { Settings } from "../lib/api";
 
@@ -35,6 +36,7 @@ function setup(extra: Record<string, Handler> = {}) {
     cached_servers: () => null,
     ping_servers: (a) => (a!.ids as string[]).map((id) => ({ id, ms: 30 })),
     cancel_play: () => true,
+    mod_status: () => ({ state: "notInstalled", otherFolders: [], goneFolders: [] }),
     ...extra,
   });
   return { b, saved: () => saved };
@@ -254,5 +256,101 @@ describe("Jogar", () => {
     await clickPlay("Castelo Bruxo RP");
     await vi.waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/Disco cheio/));
     expect(screen.getByRole("alert")).toHaveTextContent("D:\\cache");
+  });
+});
+
+describe("Jogar — mod na pasta do jogo", () => {
+  beforeEach(() => {
+    stopServers();
+    auth.set({ status: "checking" });
+    playState.set({ status: "idle" });
+    blocked.set(new Map());
+    notice.set(null);
+  });
+  afterEach(() => stopServers());
+
+  const CONFLICT_ERR = { code: "mod_conflict", message: "Já existe outro carregador de mods (UE4SS) na pasta do jogo." };
+
+  it("conflito: explica, usa o carregador do CB Multiplayer e repete o Jogar", async () => {
+    let plays = 0;
+    const { b } = setup({
+      play: () => {
+        plays += 1;
+        if (plays === 1) throw CONFLICT_ERR;
+        return { kind: "started" };
+      },
+      resolve_mod_conflict: () => ({ state: "installed", version: "0.2.0", otherFolders: [], goneFolders: [] }),
+    });
+    render(App);
+    await clickPlay("Castelo Bruxo RP");
+    const panel = (await screen.findByRole("alert")).closest("section")!;
+    expect(panel).toHaveTextContent("Já existe outro carregador de mods (UE4SS) na pasta do jogo.");
+    expect(panel).toHaveTextContent(/Phoenix\\Binaries\\Win64\\cbmp-backup/);
+    expect(panel).toHaveTextContent(/seus outros mods do UE4SS ficam desligados/);
+    await fireEvent.click(within(panel).getByRole("button", { name: "Usar o carregador do CB Multiplayer" }));
+    await vi.waitFor(() => expect(b.calls("resolve_mod_conflict")).toHaveLength(1));
+    expect(await screen.findByText("Jogo aberto. Bom jogo!")).toBeInTheDocument();
+    expect(b.calls("play")).toEqual([{ serverId: "cb" }, { serverId: "cb" }]);
+  });
+
+  it("conflito cancelado no diálogo: não repete o Jogar", async () => {
+    const { b } = setup({
+      play: () => {
+        throw CONFLICT_ERR;
+      },
+      resolve_mod_conflict: () => ({ state: "conflict", otherFolders: [], goneFolders: [] }),
+    });
+    render(App);
+    await clickPlay("Castelo Bruxo RP");
+    const panel = (await screen.findByRole("alert")).closest("section")!;
+    await fireEvent.click(within(panel).getByRole("button", { name: "Usar o carregador do CB Multiplayer" }));
+    await vi.waitFor(() => expect(b.calls("resolve_mod_conflict")).toHaveLength(1));
+    expect(b.calls("play")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "Usar o carregador do CB Multiplayer" })).toBeInTheDocument();
+  });
+
+  it("sem permissão na pasta do jogo: explica o que fazer, sem botão de administrador", async () => {
+    const message = "O launcher não tem permissão para gravar na pasta do jogo (C:\\Program Files\\Epic Games\\HogwartsLegacy). Nesta versão de testes, instale o jogo numa pasta em que o seu usuário possa gravar (por exemplo, outra biblioteca da Steam ou outra pasta na Epic Games) e tente de novo.";
+    setup({
+      play: () => {
+        throw { code: "mod_folder_protected", message };
+      },
+    });
+    render(App);
+    await clickPlay("Castelo Bruxo RP");
+    const panel = (await screen.findByRole("alert")).closest("section")!;
+    expect(panel).toHaveTextContent("Pasta do jogo sem permissão de gravação.");
+    expect(panel).toHaveTextContent(message);
+    expect(panel).not.toHaveTextContent(/administrador/);
+    expect(within(panel).queryByRole("button", { name: "Usar o carregador do CB Multiplayer" })).toBeNull();
+    expect(within(panel).getAllByRole("button").map((b) => b.textContent)).toEqual(["Fechar"]);
+  });
+
+  it("texto vindo do Rust/servidor continua texto (sem HTML)", async () => {
+    const evil = '<img src=x onerror="alert(1)"> pasta';
+    setup({
+      play: () => {
+        throw { code: "mod_conflict", message: evil };
+      },
+    });
+    const { container } = render(App);
+    await clickPlay("Castelo Bruxo RP");
+    const panel = (await screen.findByRole("alert")).closest("section")!;
+    expect(panel).toHaveTextContent(evil);
+    expect(container.querySelector("img[src='x']")).toBeNull();
+  });
+
+  it("aviso de pasta anterior do jogo aparece sem parar nada", async () => {
+    const { b } = setup({ play: () => ({ kind: "started" }) });
+    render(App);
+    await clickPlay("Castelo Bruxo RP");
+    expect(await screen.findByText("Jogo aberto. Bom jogo!")).toBeInTheDocument();
+    b.emit("mod://warning", {
+      code: "mod_old_folder",
+      message: "O mod do CB Multiplayer continua na pasta anterior do jogo: E:\\HL.",
+    });
+    await vi.waitFor(() => expect(get(notice)?.code).toBe("mod_old_folder"));
+    expect(await screen.findByText(/E:\\HL/)).toBeInTheDocument();
+    expect(screen.getByText("Jogo aberto. Bom jogo!")).toBeInTheDocument();
   });
 });

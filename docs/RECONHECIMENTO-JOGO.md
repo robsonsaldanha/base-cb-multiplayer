@@ -1,5 +1,11 @@
 # Kit de reconhecimento do jogo (PC de casa)
 
+> **Nota (sub5a)**: o reconhecimento foi feito em **2026-11-11** (os dados ficam fora do repositório, veja
+> `docs/PENDENCIAS.md`). A partir do mod **0.2.0** o `cb-mp` é **inerte sem o launcher** (só age quando o launcher
+> deixa o bilhete) e **o teste do F8 não existe mais**: os itens do spike (o clone com F8) abaixo e na tabela de
+> resultados ficam só como histórico. O teste do mod de verdade é `docs/TESTE-NO-JOGO-5A.md`. O kit continua
+> empacotando o `cb-mp.dll` (agora inerte sem o launcher), e o passo do F8 deste roteiro está obsoleto.
+
 Roteiro para rodar **uma vez**, no PC que tem o **Hogwarts Legacy** (Steam ou Epic), o kit
 **`cbmp-kit-reconhecimento.zip`**. Ele faz duas coisas na mesma visita:
 

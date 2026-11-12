@@ -576,15 +576,20 @@ fn capability_real_so_tem_o_permitido() {
             "allow-check-update",
             "allow-clear-cache",
             "allow-detect-game",
+            "allow-forget-mod-folder",
             "allow-get-settings",
             "allow-install-update",
             "allow-list-servers",
             "allow-login",
             "allow-logout",
             "allow-me",
+            "allow-mod-status",
+            "allow-open-mod-logs",
             "allow-pick-game-dir",
             "allow-ping-servers",
             "allow-play",
+            "allow-remove-mod",
+            "allow-resolve-mod-conflict",
             "allow-set-settings",
             "allow-use-detected-game",
             "core:event:allow-listen",
@@ -645,6 +650,22 @@ fn tauri_conf_tem_os_valores_exigidos() {
 #[test]
 fn comandos_do_build_rs_batem_com_a_capability() {
     let build = read(&root().join("build.rs"));
+    let lib_rs = read(&root().join("src/lib.rs"));
+    // Nenhum comando além da lista: cada `"x",` dentro de `.commands(&[...])` está nela.
+    let listed: Vec<&str> = build
+        .split(".commands(&[")
+        .nth(1)
+        .and_then(|rest| rest.split("])").next())
+        .unwrap()
+        .split(',')
+        .map(|c| c.trim().trim_matches('"'))
+        .filter(|c| !c.is_empty())
+        .collect();
+    assert_eq!(
+        listed.len(),
+        22,
+        "comando novo precisa ser revisado aqui: {listed:?}"
+    );
     let caps = real_capabilities();
     let perms = permission_ids(&caps[0].1);
     for cmd in [
@@ -665,10 +686,19 @@ fn comandos_do_build_rs_batem_com_a_capability() {
         "list_servers",
         "cached_servers",
         "ping_servers",
+        "mod_status",
+        "remove_mod",
+        "resolve_mod_conflict",
+        "open_mod_logs",
+        "forget_mod_folder",
     ] {
         assert!(
             build.contains(&format!("\"{cmd}\"")),
             "{cmd} fora do build.rs"
+        );
+        assert!(
+            lib_rs.contains(&format!("commands::{cmd}")),
+            "{cmd} fora do generate_handler!"
         );
         let perm = format!("allow-{}", cmd.replace('_', "-"));
         assert!(perms.contains(&perm), "{perm} fora da capability");
@@ -866,4 +896,170 @@ fn feature_local_test_so_por_flag_explicita() {
             "CBMultiplayer"
         }
     );
+}
+
+#[test]
+fn valores_do_launcher_0_2_0() {
+    use cbmp_launcher_lib::{launch, modact, modpkg, play, settings};
+    assert_eq!(launch::CONNECT_TTL, std::time::Duration::from_secs(240));
+    assert_eq!(launch::POINTER_FILE, "cbmp-run.json");
+    assert_eq!(play::TICKET_RENEW_AFTER_SECS, 30);
+    assert_eq!(modact::OVERRIDE_LINE, "cbmp\\atual\\ue4ss");
+    assert_eq!(modpkg::LAYOUT, 2);
+    assert_eq!(settings::SETTINGS_VERSION, 2);
+    // Versão igual no Cargo.toml, no tauri.conf.json e na UI.
+    let manifest: toml::Table = toml::from_str(&read(&root().join("Cargo.toml"))).unwrap();
+    assert_eq!(manifest["package"]["version"].as_str(), Some("0.2.0"));
+    assert_eq!(conf()["version"], "0.2.0");
+    let ui: Value = serde_json::from_str(&read(&root().join("../ui/package.json"))).unwrap();
+    assert_eq!(ui["version"], "0.2.0");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.2.0");
+}
+
+/// O texto do diálogo de conflito mostrado pela UI (`MOD_CONFLICT_EXPLANATION`) é exatamente o do Rust.
+#[test]
+fn explicacao_do_conflito_na_ui_e_o_texto_do_dialogo() {
+    let ts = read(&root().join("../ui/src/lib/errors.ts"));
+    let decl = ts
+        .split("export const MOD_CONFLICT_EXPLANATION =")
+        .nth(1)
+        .and_then(|rest| rest.split(';').next())
+        .expect("MOD_CONFLICT_EXPLANATION em errors.ts");
+    // Concatenação de literais "…" + "…" (sem aspas dentro do texto).
+    let text: String = decl
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .collect::<Vec<_>>()
+        .concat()
+        .replace("\\\\", "\\");
+    assert_eq!(text, cbmp_launcher_lib::modact::CONFLICT_DIALOG);
+}
+
+/// Arquivos de texto sob `dir` (recursivo) com estas extensões.
+fn sources(dir: &Path, exts: &[&str], out: &mut Vec<PathBuf>) {
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        let name = p.file_name().unwrap().to_string_lossy().to_string();
+        if p.is_dir() {
+            if !matches!(name.as_str(), "node_modules" | "dist" | "target" | "gen") {
+                sources(&p, exts, out);
+            }
+        } else if exts.iter().any(|x| name.ends_with(x)) {
+            out.push(p);
+        }
+    }
+}
+
+/// O launcher nunca pede elevação (decisão do lead na revisão da Task 10): nenhum caminho de código com UAC, modo
+/// elevado, manifesto pedindo administrador ou concessão de permissão em pasta do jogo.
+#[test]
+fn launcher_nao_tem_caminho_de_elevacao() {
+    let mut files = Vec::new();
+    sources(&root().join("src"), &[".rs"], &mut files);
+    sources(
+        &root().join("capabilities"),
+        &[".json", ".toml"],
+        &mut files,
+    );
+    sources(&root().join("permissions"), &[".toml"], &mut files);
+    sources(
+        &root().join("../ui/src"),
+        &[".ts", ".svelte", ".js"],
+        &mut files,
+    );
+    for f in [
+        "build.rs",
+        "Cargo.toml",
+        "tauri.conf.json",
+        "tauri.localtest.conf.json",
+        "tauri.onlinetest.conf.json",
+    ] {
+        files.push(root().join(f));
+    }
+    files.extend(
+        std::fs::read_dir(root())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "manifest" || x == "rc")),
+    );
+    assert!(
+        files.len() > 40,
+        "poucos arquivos conferidos: {}",
+        files.len()
+    );
+    let forbidden = [
+        "runas",
+        "requireAdministrator",
+        "highestAvailable",
+        "mod-admin-setup",
+        "mod_admin_setup",
+        "admin_setup",
+        "ShellExecuteExW",
+        "ShellExecuteExA",
+        "ShellExecuteA",
+        "grant_modify",
+        "GRANT_ACCESS",
+        "SetKernelObjectSecurity",
+        "Instalar com permissão de administrador",
+    ];
+    let mut hits = Vec::new();
+    for f in &files {
+        let Ok(text) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        for word in forbidden {
+            if text.contains(word) {
+                hits.push(format!("{}: {word}", f.display()));
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "caminho de elevação no launcher: {hits:#?}"
+    );
+    // A única troca de DACL do launcher é a dos arquivos dele em `run\` (restringir ao usuário atual).
+    let launch = read(&root().join("src/launch.rs"));
+    assert_eq!(launch.matches("SetNamedSecurityInfoW(").count(), 1);
+    // `ShellExecuteW` só nos dois lugares conhecidos (abrir link no navegador, abrir a pasta de logs), cada um com o
+    // verbo fixo `"open"` montado logo antes e passado como `verb`: nada monta outro verbo (ex.: `runas` em UTF-16).
+    let mut calls = 0;
+    for f in files
+        .iter()
+        .filter(|f| f.extension().is_some_and(|x| x == "rs"))
+    {
+        let text = std::fs::read_to_string(f).unwrap_or_default();
+        for (at, _) in text.match_indices("ShellExecuteW(") {
+            calls += 1;
+            let mut start = at.saturating_sub(600);
+            while !text.is_char_boundary(start) {
+                start -= 1;
+            }
+            let mut end = (at + 200).min(text.len());
+            while !text.is_char_boundary(end) {
+                end += 1;
+            }
+            let (before, after) = (&text[start..at], &text[at..end]);
+            let verb_line = before
+                .lines()
+                .rev()
+                .find(|l| l.contains("verb") && l.contains('='))
+                .unwrap_or_else(|| panic!("{}: ShellExecuteW sem verbo antes", f.display()));
+            assert!(
+                verb_line.contains("\"open\"") && !verb_line.contains("runas"),
+                "{}: verbo do ShellExecuteW: {verb_line}",
+                f.display()
+            );
+            assert!(after.contains("verb.as_ptr()"), "{}", f.display());
+        }
+    }
+    assert_eq!(calls, 2, "chamadas de ShellExecuteW");
+    for f in &files {
+        if f.ends_with("launch.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(f).unwrap_or_default();
+        assert!(!text.contains("SetNamedSecurityInfoW"), "{}", f.display());
+    }
 }

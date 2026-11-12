@@ -1,7 +1,21 @@
 <script lang="ts">
-  // Pasta do jogo (só pelo seletor do Rust), limites, limpar cache, modo simular, versão e atualização.
+  // Pasta do jogo (só pelo seletor do Rust), mod do jogo, limites, limpar cache, avançado (modo simular), versão e
+  // atualização.
   import { onMount } from "svelte";
-  import { appVersion, checkUpdate, clearCache, installUpdate, pickGameDir, toApiError } from "../lib/api";
+  import {
+    appVersion,
+    checkUpdate,
+    clearCache,
+    forgetModFolder,
+    installUpdate,
+    modStatus,
+    openModLogs,
+    pickGameDir,
+    removeMod,
+    toApiError,
+    type FolderRemoval,
+    type ModInfo,
+  } from "../lib/api";
   import { describeError, type ErrorView } from "../lib/errors";
   import GameSuggestion from "../components/GameSuggestion.svelte";
   import { settings, updateSettings } from "../lib/settings";
@@ -13,14 +27,43 @@
   let limitsMsg = $state("");
   let confirmClear = $state(false);
   let clearMsg = $state("");
-  let busy = $state<"" | "pick" | "limits" | "clear" | "check" | "install">("");
+  let busy = $state<"" | "pick" | "limits" | "clear" | "check" | "install" | "remove" | "logs" | "forget">("");
   let updateMsg = $state("");
   let error = $state<ErrorView | null>(null);
+  let mod = $state<ModInfo | null>(null);
+  let confirmRemove = $state(false);
+  let removeMsg = $state("");
+  let removeFailures = $state<FolderRemoval[]>([]);
+  // Pasta que não existe mais à espera da confirmação de "Esquecer pasta".
+  let confirmForget = $state<string | null>(null);
+
+  const gone = $derived(new Set(mod?.goneFolders.map((g) => g.gameDir) ?? []));
+  function goneBackups(dir: string): string[] {
+    return mod?.goneFolders.find((g) => g.gameDir === dir)?.backups ?? [];
+  }
+
+  const modText = $derived(
+    !mod
+      ? ""
+      : mod.state === "installed"
+        ? `Instalado ${mod.version}`
+        : mod.state === "conflict"
+          ? "Conflito com outro carregador de mods"
+          : "Não instalado",
+  );
+  const canRemove = $derived(!!mod && (mod.state !== "notInstalled" || mod.otherFolders.length > 0));
+
+  function refreshMod() {
+    modStatus()
+      .then((m) => (mod = m))
+      .catch(() => (mod = null));
+  }
 
   onMount(() => {
     appVersion()
       .then((v) => (version = v))
       .catch(() => (version = ""));
+    refreshMod();
   });
 
   // Campos começam com o valor salvo e só são trocados quando os limites salvos mudam (mudar outra configuração,
@@ -38,7 +81,7 @@
     const box = e.currentTarget;
     const ok = await updateSettings({ simulateLaunch: box.checked });
     // Gravação recusada: a caixa volta ao valor salvo (o store não mudou, então o Svelte não redesenha sozinho).
-    if (!ok) box.checked = $settings?.simulateLaunch ?? true;
+    if (!ok) box.checked = $settings?.simulateLaunch ?? false;
   }
 
   async function run<T>(what: typeof busy, f: () => Promise<T>): Promise<T | undefined> {
@@ -56,7 +99,31 @@
 
   async function pick() {
     const s = await run("pick", pickGameDir);
-    if (s) settings.set(s);
+    if (s) {
+      settings.set(s);
+      refreshMod();
+    }
+  }
+
+  async function doRemove() {
+    removeMsg = "";
+    removeFailures = [];
+    confirmRemove = false;
+    const out = await run("remove", removeMod);
+    if (!out) return;
+    mod = out.status;
+    removeFailures = out.folders.filter((f) => f.error);
+    if (removeFailures.length === 0) removeMsg = "Mod removido do jogo.";
+  }
+
+  async function doForget(dir: string) {
+    confirmForget = null;
+    const out = await run("forget", () => forgetModFolder(dir));
+    if (out) mod = out;
+  }
+
+  async function openLogs() {
+    await run("logs", openModLogs);
   }
 
   async function saveLimits() {
@@ -105,6 +172,72 @@
     <button type="button" disabled={busy === "pick"} onclick={pick}>Escolher pasta do jogo</button>
   </section>
 
+  <section aria-labelledby="s-mod">
+    <h2 id="s-mod">Mod do jogo</h2>
+    {#if modText}<p>{modText}</p>{/if}
+    {#if mod && mod.otherFolders.length > 0}
+      <p class="warn">O mod também continua em pasta anterior do jogo:</p>
+      <ul class="paths">
+        {#each mod.otherFolders as dir (dir)}
+          <li>
+            <span class="path">{dir}</span>
+            {#if gone.has(dir)}
+              <span class="hint">Esta pasta não existe mais.</span>
+              {#if confirmForget === dir}
+                {#if goneBackups(dir).length > 0}
+                  <p class="warn">
+                    Os seus arquivos guardados pelo launcher ({goneBackups(dir).join(", ")}) estavam nesta pasta. Se
+                    ela foi apagada, o launcher não consegue devolvê-los; se foi movida, o launcher os encontra de novo no
+                    próximo Jogar a partir da pasta nova. Esquecer a pasta assim mesmo?
+                  </p>
+                {:else}
+                  <p class="warn">O launcher não guardou arquivos seus nesta pasta. Esquecer a pasta?</p>
+                {/if}
+                <div class="row">
+                  <button type="button" class="danger" disabled={busy === "forget"} onclick={() => doForget(dir)}
+                    >Esquecer pasta</button
+                  >
+                  <button type="button" onclick={() => (confirmForget = null)}>Cancelar</button>
+                </div>
+              {:else}
+                <button type="button" onclick={() => (confirmForget = dir)}>Esquecer pasta</button>
+              {/if}
+            {/if}
+          </li>
+        {/each}
+      </ul>
+    {/if}
+    {#if confirmRemove}
+      <p class="warn">
+        Feche o jogo antes de remover. Os arquivos do CB Multiplayer saem da pasta do jogo e os seus, guardados em
+        cbmp-backup, voltam para o lugar.
+      </p>
+      <div class="row">
+        <button type="button" class="danger" onclick={doRemove}>Remover agora</button>
+        <button type="button" onclick={() => (confirmRemove = false)}>Cancelar</button>
+      </div>
+    {:else}
+      <div class="row">
+        <button type="button" disabled={!canRemove || busy === "remove"} onclick={() => (confirmRemove = true)}
+          >Remover mod do jogo</button
+        >
+        <button type="button" disabled={busy === "logs"} onclick={openLogs}>Abrir pasta de logs do mod</button>
+      </div>
+    {/if}
+    {#if removeMsg}<span class="ok" role="status">{removeMsg}</span>{/if}
+    {#if removeFailures.length > 0}
+      <p class="warn">Não foi possível remover o mod de:</p>
+      <ul class="paths" aria-label="Pastas onde o mod não saiu">
+        {#each removeFailures as f (f.gameDir)}
+          <li>
+            <span class="path">{f.gameDir}</span>
+            {#if f.error}<span class="hint">{describeError(f.error).detail ?? describeError(f.error).title}</span>{/if}
+          </li>
+        {/each}
+      </ul>
+    {/if}
+  </section>
+
   <section aria-labelledby="s-limits">
     <h2 id="s-limits">Limites</h2>
     <div class="fields">
@@ -138,16 +271,16 @@
     {#if clearMsg}<span class="ok" role="status">{clearMsg}</span>{/if}
   </section>
 
-  <section aria-labelledby="s-sim">
-    <h2 id="s-sim">Modo simular</h2>
+  <section aria-labelledby="s-adv">
+    <h2 id="s-adv">Avançado</h2>
     <label class="check">
       <input
         type="checkbox"
-        checked={$settings?.simulateLaunch ?? true}
+        checked={$settings?.simulateLaunch ?? false}
         disabled={!$settings}
         onchange={toggleSimulate}
       />
-      Modo simular (baixa e confere tudo, mas não abre o jogo)
+      Modo simular: prepara tudo e não abre o jogo
     </label>
   </section>
 
@@ -198,6 +331,16 @@
   }
   p {
     margin: 0;
+  }
+  .paths {
+    margin: 0;
+    padding-left: 18px;
+    font-size: 12px;
+  }
+  .paths li {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
   }
   .path {
     font-family: Consolas, "Cascadia Mono", monospace;

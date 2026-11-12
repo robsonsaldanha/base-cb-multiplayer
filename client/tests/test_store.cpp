@@ -1,19 +1,25 @@
-#include "TestFramework.hpp"
-#include <cbmp/Store.hpp>
+#include <catch2/catch_test_macros.hpp>
+#include <cbmp/client/Store.hpp>
+#include <string>
 
-using namespace cbmp;
+using namespace cbmp::client;
 
-TEST(detecta_steam) {
-    CHECK(DetectStore(L"D:\\SteamLibrary\\steamapps\\common\\Hogwarts Legacy\\Phoenix\\Binaries\\Win64\\HogwartsLegacy.exe") == Store::Steam);
+TEST_CASE("client: DetectStore reconhece a Steam") {
+    REQUIRE(DetectStore(L"D:\\SteamLibrary\\steamapps\\common\\Hogwarts Legacy\\Phoenix\\Binaries\\Win64\\HogwartsLegacy.exe") ==
+            Store::Steam);
 }
-TEST(detecta_epic) {
-    CHECK(DetectStore(L"C:\\Program Files\\Epic Games\\HogwartsLegacy\\Phoenix\\Binaries\\Win64\\HogwartsLegacy.exe") == Store::Epic);
+
+TEST_CASE("client: DetectStore reconhece a Epic") {
+    REQUIRE(DetectStore(L"C:\\Program Files\\Epic Games\\HogwartsLegacy\\Phoenix\\Binaries\\Win64\\HogwartsLegacy.exe") ==
+            Store::Epic);
 }
-TEST(detecta_desconhecida) {
-    CHECK(DetectStore(L"E:\\Jogos\\HL\\Phoenix\\Binaries\\Win64\\HogwartsLegacy.exe") == Store::Unknown);
+
+TEST_CASE("client: DetectStore sem loja conhecida") {
+    REQUIRE(DetectStore(L"E:\\Jogos\\HL\\Phoenix\\Binaries\\Win64\\HogwartsLegacy.exe") == Store::Unknown);
 }
-TEST(nome_da_loja) {
-    CHECK_EQ(std::string(StoreName(Store::Steam)), std::string("Steam"));
-    CHECK_EQ(std::string(StoreName(Store::Epic)), std::string("Epic"));
-    CHECK_EQ(std::string(StoreName(Store::Unknown)), std::string("desconhecida"));
+
+TEST_CASE("client: StoreName") {
+    CHECK(std::string(StoreName(Store::Steam)) == "Steam");
+    CHECK(std::string(StoreName(Store::Epic)) == "Epic");
+    CHECK(std::string(StoreName(Store::Unknown)) == "desconhecida");
 }

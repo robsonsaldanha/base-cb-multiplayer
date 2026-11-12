@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-open-mod-logs"
+description = "Enables the open_mod_logs command without any pre-configured scope."
+commands.allow = ["open_mod_logs"]
+
+[[permission]]
+identifier = "deny-open-mod-logs"
+description = "Denies the open_mod_logs command without any pre-configured scope."
+commands.deny = ["open_mod_logs"]

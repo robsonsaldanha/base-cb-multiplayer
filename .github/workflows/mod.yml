@@ -1,0 +1,111 @@
+name: mod
+# Pacote do mod cb-mp (zip do layout 2). Contrato com o release.yml: execução por push/workflow_dispatch na main, concluída
+# com sucesso, com um artefato `cbmp-mod` contendo exatamente um .zip (launcher/README.md, "Contrato do mod.yml").
+# O UE4SS tem um submódulo privado (UEPseudo): sem o segredo UE4SS_SUBMODULES_TOKEN o job termina verde, sem artefato.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'client/**'
+      - 'proto/**'
+      - 'tools/package-mod.ps1'
+      - 'tools/check-mod-zip.mjs'
+      - '.github/workflows/mod.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: mod-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.vcpkg-cache,readwrite"
+  VCPKG_COMMIT: ec48c11eae9448c8c6e7739d93e06fa2433aa95f
+  UE4SS_COMMIT: 4fb9b615a24c724041ef23e2c4073f2610c4c6d0
+jobs:
+  mod:
+    runs-on: windows-2025
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: token
+        id: token
+        env:
+          UE4SS_SUBMODULES_TOKEN: ${{ secrets.UE4SS_SUBMODULES_TOKEN }}
+        run: |
+          if ([string]::IsNullOrEmpty($env:UE4SS_SUBMODULES_TOKEN)) {
+            "have=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Output "::notice title=mod.yml::UE4SS_SUBMODULES_TOKEN não configurado: o submódulo privado UEPseudo não pode ser baixado. Build do mod pulado; nenhum artefato cbmp-mod foi gerado."
+          } else {
+            "have=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+      - uses: actions/setup-node@v4
+        if: steps.token.outputs.have == 'true'
+        with:
+          node-version: 22
+      - uses: actions/cache/restore@v4
+        if: steps.token.outputs.have == 'true'
+        id: restore
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-mod-${{ hashFiles('client/vcpkg.json', 'client/vcpkg-overlays/**') }}-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-mod-${{ hashFiles('client/vcpkg.json', 'client/vcpkg-overlays/**') }}-
+            vcpkg-mod-
+      - name: vcpkg
+        if: steps.token.outputs.have == 'true'
+        run: |
+          New-Item -ItemType Directory -Force .vcpkg-cache | Out-Null
+          git clone https://github.com/microsoft/vcpkg "$env:GITHUB_WORKSPACE/vcpkg"
+          git -C "$env:GITHUB_WORKSPACE/vcpkg" checkout $env:VCPKG_COMMIT
+          & "$env:GITHUB_WORKSPACE/vcpkg/bootstrap-vcpkg.bat" -disableMetrics
+          "VCPKG_ROOT=$env:GITHUB_WORKSPACE/vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: UE4SS (commit fixo, submódulos privados)
+        if: steps.token.outputs.have == 'true'
+        env:
+          UE4SS_SUBMODULES_TOKEN: ${{ secrets.UE4SS_SUBMODULES_TOKEN }}
+        run: |
+          $dest = "client/deps/RE-UE4SS"
+          git clone https://github.com/UE4SS-RE/RE-UE4SS $dest
+          if ($LASTEXITCODE) { throw "clone do UE4SS falhou" }
+          git -C $dest checkout $env:UE4SS_COMMIT
+          if ($LASTEXITCODE) { throw "checkout do UE4SS falhou" }
+          # O .gitmodules do UE4SS usa URLs SSH (git@github.com:...): as duas formas viram HTTPS com o token. As
+          # reescritas vão só na linha de comando (git -c chega aos clones dos submódulos em todos os níveis) e nada
+          # é gravado na configuração do git em disco; o token nunca é impresso.
+          $rewrite = "url.https://x-access-token:$($env:UE4SS_SUBMODULES_TOKEN)@github.com/.insteadOf"
+          git -c "$rewrite=git@github.com:" -c "$rewrite=https://github.com/" -C $dest submodule update --init --recursive
+          if ($LASTEXITCODE) { throw "submódulos do UE4SS falharam" }
+      - name: build do mod
+        if: steps.token.outputs.have == 'true'
+        run: tools/build.ps1 -Target mod -VcpkgInstalled D:/vi-mod
+      - name: pacote
+        if: steps.token.outputs.have == 'true'
+        run: tools/package-mod.ps1
+      - name: conferir o zip
+        if: steps.token.outputs.have == 'true'
+        run: |
+          $v = (Get-Content client/VERSION -Raw).Trim()
+          node tools/check-mod-zip.mjs dist/cbmp-mod.zip --version $v --protocol 1
+          if ($LASTEXITCODE) { throw "check-mod-zip falhou" }
+      - uses: actions/upload-artifact@v4
+        if: steps.token.outputs.have == 'true'
+        with:
+          name: cbmp-mod
+          path: dist/cbmp-mod.zip
+          if-no-files-found: error
+      - name: resumo
+        if: steps.token.outputs.have == 'true'
+        run: |
+          $sha = (Get-FileHash dist/cbmp-mod.zip -Algorithm SHA256).Hash.ToLower()
+          "commit: ``$env:GITHUB_SHA``" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "cbmp-mod.zip sha256: ``$sha``" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+      - uses: actions/cache/save@v4
+        if: always() && steps.token.outputs.have == 'true'
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-mod-${{ hashFiles('client/vcpkg.json', 'client/vcpkg-overlays/**') }}-${{ github.run_id }}

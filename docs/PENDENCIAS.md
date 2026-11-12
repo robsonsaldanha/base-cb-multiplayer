@@ -4,54 +4,105 @@ Itens levantados nas revisões que não bloquearam o merge, com o momento em que
 subprojeto (ou área) sugerido como dono. Itens resolvidos saem desta lista (o histórico fica no git e nos relatórios
 das tasks).
 
-## Antes do cliente no jogo (subprojeto 5)
+## Cliente no jogo (subprojeto 5)
 
-- **Contrato do cliente por escrito**: snapshots não confiáveis em partes; descartar tick ≤ último montado; ignorar ids
-  desconhecidos; `EntityEnter/Leave` não carregam tick; reconstruir estado a partir do histórico por tick; confirmar só
-  ticks completos; adotar `Correction` (inclusive a de spawn); carência de 30 s após correções do servidor. Incluir
-  os eventos do motor: `cb:command` (payload = texto JSON) e `cb:reply`.
-- **Teste espelho fim a fim**: cliente simulado aplicando baselines/partes com perda, comparado ao estado do servidor
-  (os bots atuais confirmam ticks sem aplicar baseline).
+Etapa 5a (mod conecta e se vê): código e testes automáticos prontos; o que depende do jogo está na rodada manual
+abaixo. O contrato do cliente (snapshots em partes, descarte, histórico, ack, `EntityEnter/Leave`, `Correction`,
+carência) está escrito em `client/README.md`. Os eventos `cb:command` (payload = texto JSON) e `cb:reply` são
+**descartados** pelo cliente no 5a: dono 5c.
+
+- **Rodada manual do 5a pendente** (`docs/TESTE-NO-JOGO-5A.md`): dois testadores, servidor de teste online, mod 0.2.0
+  e launcher 0.2.0. Só depois dela o 5a está validado (passos 3, 4, 6 e 8). Cada falha dos demais passos e do
+  Anexo A do roteiro entra aqui como item novo, com o log que a prova. Depende da publicação do mod `mod-p1-v0.2.0` e
+  do launcher 0.2.0 no ambiente de teste (feita pelo controlador depois da revisão final).
+- **`mod.yml` real sem o segredo `UE4SS_SUBMODULES_TOKEN`** (a criar pelo Robson, token de leitura de uma conta GitHub
+  ligada à Epic Games, para o submódulo privado `UEPseudo` do UE4SS): sem ele o `mod.yml` termina verde **sem
+  artefato** e o `release.yml` não assina o mod: o release **oficial** do mod não sai. O build real do `mod.yml` nunca
+  rodou num runner: o caminho do Visual Studio 2022 de `tools/build.ps1` (o `windows-2025` só tem o VS 2022 17.14, gerador
+  "Visual Studio 17 2022") **nunca rodou** (só o VS 2026 local), e o `-VcpkgInstalled D:/vi-mod` do workflow presume a unidade D: do
+  runner. A primeira execução com o segredo é o teste.
+- **Fixar o sha256 de `mod-p1-v0.2.0` e `launcher-v0.2.0` em `tools/teste-online.mjs`** depois do deploy (`PUBLISHED`): hoje só as versões até a
+  0.1.3 estão fixadas; sem isso o `--check` não pega um release trocado e o `--build-releases` pode refazer a 0.2.0 com outro
+  código.
 - **Estados de movimento confiáveis**: hoje o cliente declara o estado (ex.: `Broom`, `Fall`) e com isso amplia o limite
-  de velocidade; velocidade do input é repassada sem validação. Definir quando cada estado é permitido.
-- Velocidades por estado são provisórias; calibrar com dados do jogo.
-- Quantização com NaN/inf no lado do cliente.
+  de velocidade; velocidade do input é repassada sem validação. Definir quando cada estado é permitido. **No servidor
+  de teste o cliente pode declarar `Apparate`** (limite 100 000 000 cm/s, bloco `movement` de
+  `tools/teste-online/server.cfg.json`) e se teleportar à vontade: aceito no 5a. Dono: 5e.
+- Velocidades por estado são provisórias; calibrar com dados do jogo (cada `Correction` vai para o log do mod com a
+  distância). Dono: 5e.
 - **Spawn vindo do gamemode**: `addPlayer` sempre na origem fora do modo dev; o gamemode (Lua) deveria decidir o
-  spawn (hoje só dá para teleportar depois com `cb.players.setPosition`).
+  spawn (hoje só dá para teleportar depois com `cb.players.setPosition`). No 5a o jogador aparece onde está no save
+  graças ao `Apparate` alto do servidor de teste; no menu ele conta como parado na origem. Dono: 5e.
 - **Teto com kick para cliente que nunca alcança uma correção do servidor** (spawn/teleporte): hoje a Correction é
-  reenviada uma vez e os inputs seguem ignorados. Decidir junto com o cliente real.
+  reenviada uma vez e os inputs seguem ignorados. Decidir junto com o cliente real (o cliente do 5a registra
+  `posicao_recusada` e avisa na tela uma vez).
 - **Política de teleporte**: `setState` limpa `correctionTimes`; decidir se mantém o histórico.
+- **Teleporte longo seguro e limites calibrados**: o cliente do 5a só reposiciona correções de até 20 m
+  (`TeleportLocal`); acima disso ressincroniza declarando `Apparate`. Falta um teleporte seguro de longa distância
+  (`Biped_Player.SafeTeleportTo` ficou anotado para a rodada manual) e limites de movimento calibrados com o jogo. Dono: 5e.
 - **Comandos `admin = true` pelo chat** usam `admin.admins` (lida na subida). Falta testar com o chat do cliente real e
-  decidir se admins de jogo devem ter uma lista separada da do painel. Dono: sub5.
-- **Mod real e a entrega pelo launcher** (sub4 entregou só o canal): o launcher instala o mod por `protocol` a partir
-  do Hub (`mod-pN-vX.Y.Z`, assinado). Falta o mod em si e um build que publique o zip como artefato `cbmp-mod` (um
-  único `.zip`) para o `release.yml` (`kind=mod`, `mod_run_id`) assinar e publicar. Esse build tem de ser
-  `.github/workflows/mod.yml` e o artefato usado tem de vir de um `push`/`workflow_dispatch` na `main` concluído com
-  sucesso, com o commit na `main`: o `release.yml` recusa qualquer outra execução (`MOD_WORKFLOW`, `launcher/README.md`).
-  O `mod.yml` faz checkout exatamente de `GITHUB_SHA` (sem `ref:`), não tem entradas de ref, branch ou fonte e não usa
-  `pull_request_target`. Enquanto não houver mod com
-  `protocol` compatível, o launcher fica em "Modo simular".
-- **Contrato do `connect.json` para o mod** (escrito pelo launcher em `<dados>\run\connect.json`, `launcher/README.md`):
-  `{host, port, ticket, serverId, contentDir, protocol, contentReadOnly: true}`, UTF-8, DACL só do usuário. O mod lê,
-  **apaga** o arquivo e usa o ticket uma vez (TTL de 300 s no Hub); o launcher apaga sozinho depois de 60 s se ainda
-  existir e remove sobras ao abrir. Nunca procurar o ticket em linha de comando ou variável de ambiente. `contentDir`
-  é **somente leitura** (hard links do cache verificado, compartilhados entre servidores): o mod não pode gravar nada
-  ali. Conferir `protocol` com o do mod e recusar se diferente.
-- **Pasta de dados por build** (revisão 9a, M-8): o launcher oficial usa `%LOCALAPPDATA%\CBMultiplayer` e o build
-  "Teste local" usa `%LOCALAPPDATA%\CBMultiplayer-TesteLocal` (`run\` e `mods\` inclusive); o build "Teste" (teste
-  online) usa `%LOCALAPPDATA%\CBMultiplayer-Teste`. O mod não pode fixar o nome da pasta: receber o caminho do `run\`
-  do launcher (ex.: arquivo ao lado do mod instalado) ou procurar nos três.
-- **Margem de renovação do ticket** (revisão 7, M-1): o launcher renova o ticket com mais de 240 s (TTL 300 − 60;
-  `play::TICKET_RENEW_AFTER_SECS`) antes de gravar o `connect.json`, mas o tempo entre abrir o jogo e o mod resgatar o
-  ticket não é medido. Medir com o mod real e ajustar a margem (ou renovar pelo mod).
-- **Mod na pasta do jogo sem administrador** (kit de teste em casa): o launcher roda sem elevação e grava o mod em
-  `<jogo>\Phoenix\Binaries\Win64\cbmp`. Na Steam a biblioteca costuma permitir; na **Epic** (`C:\Program Files\Epic
-  Games`) o usuário comum em geral não pode gravar e o `play` para em `permission_denied`. Decidir no subprojeto 5
-  (ex.: elevação só para instalar o mod, pasta do mod fora do jogo com o loader apontando para ela). O resultado do
-  passo 12 de `docs/TESTES-EM-CASA-SUB4.md` diz o que acontece numa instalação real.
+  decidir se admins de jogo devem ter uma lista separada da do painel. O cliente ainda não envia nem mostra nada de
+  chat (`cb:command`/`cb:reply`: 5c). Dono: sub5.
+- **Margem de renovação do ticket** (revisão 7, M-1): o launcher renova o ticket com mais de 30 s de emissão
+  (`play::TICKET_RENEW_AFTER_SECS`) e o arquivo dura `CONNECT_TTL` = 240 s, para o mod resgatar com os dois processos do
+  jogo (até 45 s de espera). O tempo real entre apertar Jogar e o `Hello enviado` não foi medido: medir com os logs da
+  rodada manual (item A27 do roteiro) e ajustar.
+- **Renovação contínua do ticket e reconexão**: sem reconexão no 5a (ticket de uso único e curto): para voltar, feche o
+  jogo e clique Jogar de novo. Quem demora mais de 4 min até o primeiro tick (shaders) perde a entrada
+  (`sem_arquivo`/`ticket_expirado`). Fora das etapas do 5.
+- **`buildHash` ainda não é recusado pelo servidor** (S6): o mod envia o sha256 do `main.dll` no `Hello`, mas não há
+  lista de builds aceitos.
+- **UE4SS sempre carregado no single-player**: o proxy `dwmapi.dll` carrega o `UE4SS.dll` toda vez que o jogo abre, mesmo
+  sem o launcher (o `cb-mp` fica inerte, o UE4SS e os ganchos dele não). Uma atualização do jogo pode quebrar o UE4SS.
+  Saída hoje: "Remover mod do jogo". Direção: carregador próprio que só arma pelo launcher (dono 5b).
+- **Enxugar os ganchos do UE4SS** (dono 5b): desligar o que o mod não usa para reduzir o risco com atualizações do jogo.
+- **Boneco = clone do jogador**: classe leve em vez do clone com 36 componentes, animação de verdade (hoje
+  `animacaoBoneco`: `velocidade`, experimento `ambulatory`, ou `off`) e aparência de cada jogador. Custo de N clones
+  medido na rodada manual (A28). Dono: 5b.
+- **Saída limpa do jogo**: não há gancho antes da saída do motor, então num fechamento normal as linhas
+  `encerrando` e `cb-mp descarregado` do log **não** aparecem (o UE4SS não descarrega o mod com o processo terminando) e
+  o servidor tira o jogador por tempo esgotado (~10 s). Uma queda só é provada por um `.dmp` em `Win64\cbmp\crash`.
+  Decidir se vale um gancho de pré-saída do motor para fechar a sessão na hora (`Session::Shutdown` já existe).
+- **Epic não verificada** (permissão, executável direto, `UE4SS.log`): numa Epic real falta conferir se a pasta do jogo
+  é gravável pelo usuário (sem elevação o launcher para em `mod_folder_protected`, veja "Instalação em pasta
+  protegida"), se o UE4SS grava o próprio `UE4SS.log` na pasta, e se abrir `HogwartsLegacy.exe` direto basta (item
+  abaixo). Roteiro: item A33 de `docs/TESTE-NO-JOGO-5A.md`.
+- **Instalação em pasta protegida (adiado)** (sub5a, revisão da Task 10): o launcher nunca pede elevação. Numa pasta do
+  jogo em que o usuário não grava (ex.: `C:\Program Files\Epic Games`), o Jogar para em `mod_folder_protected` e pede
+  para instalar o jogo numa pasta gravável. A instalação elevada "uma vez" foi **retirada** do 5a porque o próprio
+  desenho era uma escalada de privilégio: dar ao jogador permissão de gravar em `Win64\cbmp` deixa gravável por uma
+  conta o código que o jogo de **todas** as contas carrega (`override.txt` → `cbmp\atual\ue4ss`); o processo elevado
+  agia por nome em pastas que quem o chamou controlava (junção trocada depois da conferência → ACL, movimento e
+  exclusão como administrador em qualquer lugar); o hash do "carregador nosso anterior" vinha do chamador; e não havia
+  remoção elevada. As instalações vistas até agora (Steam em `Program Files (x86)`, Epic) já são graváveis pelo
+  usuário. Direção para um desenho futuro: (1) o processo elevado faz a instalação **inteira** sozinho, toda vez (pacote
+  em `cbmp\atual` incluso), conferindo a assinatura pelo mesmo handle que lê; (2) **nada** na pasta do jogo fica
+  gravável pelo jogador; (3) ponteiro, logs, `crash\` e `cb-mp.json` vão para uma pasta por usuário, que o mod acha por
+  um arquivo só leitura e de dono administrador na pasta do jogo contendo um caminho com variável de ambiente (ex.:
+  `%LOCALAPPDATA%\CBMultiplayer\run`); (4) remoção também elevada (e conflito só com remoção elevada pronta); (5)
+  operações por handle (pastas presas sem `FILE_SHARE_DELETE`, criação/renomeação relativas ao handle, DACL pelo
+  handle), recusa de pasta do jogo gravável pelo chamador; (6) "carregador nosso anterior" só por evidência assinada
+  (ex.: hashes anteriores no `cbmp-mod.json` assinado). O resultado do passo 12 de `docs/TESTES-EM-CASA-SUB4.md` diz o
+  que acontece numa instalação real. **Resíduo de um kit com o modo elevado** (commit `98d15eb` da branch
+  `sub5a-launcher`, se algum build dele chegou a um testador e o botão foi usado): `Win64\cbmp` ficou com uma ACE de
+  Modificar herdável para o usuário e `Win64\dwmapi.dll`/`override.txt`/`cbmp-backup\` com dono administrador. Limpeza
+  manual num prompt de administrador: `icacls "<jogo>\Phoenix\Binaries\Win64\cbmp" /remove:g <usuário> /T` e, se for
+  remover o mod, apagar esses arquivos como administrador (os backups do jogador estão em `cbmp-backup\`).
 - **Abrir `HogwartsLegacy.exe` direto** (sem argumentos): na Steam o jogo costuma se reabrir pela Steam; na Epic pode
-  exigir os parâmetros de autenticação que o launcher da Epic passa. Conferir no subprojeto 5 (passo 12 do roteiro
-  em casa).
+  exigir os parâmetros de autenticação que o launcher da Epic passa. Conferir na rodada manual do 5a (item A33; antes
+  era o passo 12 do roteiro em casa do sub4).
+- **Textos de status e `TeleportLocal` definidos pelo plano, a confirmar no jogo**: as frases de "CB Multiplayer:
+  conectado/desconectado — …" (as de `servidor_invalido`, `servidor_incompativel`, `erro_interno`,
+  `arquivo_invalido` e `protocolo_diferente` não vinham da spec) e a escolha de `Actor.K2_TeleportTo` (reserva
+  `K2_SetActorLocation`) para a correção local. Se o `UIManager.AddTextTickerNotification` não aceitar texto livre, o
+  status fica só no log (`statusNaTela: false`).
+- **Mod de teste local 0.1.0 só no modo simular**: `tools/dev-env.mjs` e `tools/make-test-kit.mjs` publicam o
+  `mod-p1-v0.1.0` (só um LEIA-ME), que o launcher 0.2.0 recusa (`mod_invalid`) fora do modo simular; `tools/dev-env.mjs`
+  tem `--mod-zip` para o pacote real, mas o kit de teste (`tools/make-test-kit.mjs`, sub4) continua **sem mod real**.
+- **Kit de reconhecimento** (`tools/make-recon-kit.mjs`, `recon-kit/`): o passo do F8 do roteiro
+  (`docs/RECONHECIMENTO-JOGO.md`) está obsoleto (o `cb-mp.dll` do kit agora é inerte sem o launcher), e o
+  `INSTALAR.bat` do kit **falha ao detectar a pasta do jogo da Steam sozinho**. O reconhecimento em si já foi feito
+  (2026-11-11).
 
 ## Servidor: resíduos do subprojeto 3 (Lua / MySQL / admin)
 
@@ -214,14 +265,11 @@ Decisões registradas e limites aceitos; o comportamento atual está documentado
 - Hub: migrar para zod 4; revisar erros em inglês do Fastify.
 - Domínio, hospedagem do Hub e repositório/releases públicos.
 
-## Mod do jogo (spike)
+## Mod do jogo
 
-- Teste do spike (F8 clone) **e reconhecimento do jogo** juntos no kit `dist/cbmp-kit-reconhecimento.zip`
-  (`node tools/make-recon-kit.mjs`; roteiro `docs/RECONHECIMENTO-JOGO.md`), aguardando a visita ao PC de casa. Ele
-  substitui o `dist/cb-mp-spike.zip` (mesmo UE4SS e mesmo `cb-mp.dll`). Só no jogo dá para confirmar: que o UE4SS
-  carrega nesta versão do jogo; o critério de "jogador no mundo" do `cb-recon` (Character estável 45 s num mundo sem
-  nome de menu); quanto tempo cada dumper leva e se algum derruba o jogo; e os nomes de propriedades lidos no
-  relatório (`SkeletalMesh`, `AnimClass`, `CharacterMovement` etc. são os do UE 4.27 padrão).
+- **Guarda do núcleo**: `client/core` é C++ puro: não inclui UE4SS, Unreal nem `Windows.h` (há teste de guarda,
+  `client/tests/test_guard.cpp`). Só `client/src/game` fala com o Unreal; `client/src/platform` usa Win32 sem UE4SS. O
+  `client/headless` é uma ferramenta de teste e **pode** incluir `windows.h`.
 - **Dados do jogo são privados**: o zip do COLETAR (`cbmp-recon-*.zip`) fica em `OneDrive\CasteloBruxoRP\cbmp-dumps\`,
   fora do repositório. Nada derivado dele (dumps, cabeçalhos, relatório, listas de nomes copiadas em massa) entra no
   repositório público; o `.gitignore` bloqueia os nomes conhecidos, mas a regra vale para qualquer formato. O que o

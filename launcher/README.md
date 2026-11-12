@@ -65,9 +65,9 @@ perfil de teste (`127.0.0.1:8787`, `Teste local`, `localtest`, `TesteLocal`, e d
 Os dois builds registram o esquema `cbmp://`: com os dois instalados, o login cai no que foi instalado por último.
 Mantenha só um instalado (ou reinstale o que vai usar). Isso fica em `docs/PENDENCIAS.md`.
 
-**Pasta de dados diferente no Teste local**: `run\connect.json` e `mods\` ficam em
-`%LOCALAPPDATA%\CBMultiplayer-TesteLocal` nesse build. O mod do jogo (subprojeto 5) não pode fixar o nome da pasta:
-precisa receber do launcher onde está o `run\` ou conhecer os dois nomes (em `docs/PENDENCIAS.md`).
+**Pasta de dados de cada build**: `run\connect.json` e `mods\` ficam na pasta de dados do build (tabela acima). O mod
+não conhece esses nomes: o launcher grava o **ponteiro** `Win64\cbmp\cbmp-run.json` com o caminho do `run\` do build
+que abriu o jogo (veja "Jogo, mod e Jogar").
 
 ## Desenvolvimento com Hub local (`tools/dev-env.mjs`)
 
@@ -77,6 +77,7 @@ cadastrado como **"Castelo Bruxo (teste)"** em destaque:
 
 ```bash
 node tools/dev-env.mjs --build-releases   # launcher "Teste local" 0.1.0 e 0.1.1 + mod de teste, assinados com a chave dev
+node tools/dev-env.mjs --build-releases --mod-zip dist/cbmp-mod.zip   # idem, com o mod real 0.2.0 (mod-p1-v0.2.0)
 node tools/dev-env.mjs --run              # Hub em http://127.0.0.1:8787 + cb-server na porta 30500; Ctrl+C encerra
 node tools/dev-env.mjs --stop             # encerra o que um --run anterior deixou rodando
 node tools/dev-env.mjs --help
@@ -232,8 +233,8 @@ environment acontece antes do job `sign`, depois do build e dos testes.
   espaço no nome: o GitHub troca espaços em nomes de asset).
 - `kind=mod`, `version=X.Y.Z`, `protocol=N`, `mod_run_id=<id da execução que gerou o artefato "cbmp-mod">`: baixa o
   zip (no job `sign`), assina com o comentário confiável exato `cbmp-mod protocol=N version=X.Y.Z sha256=<hex>`, confere e cria o
-  Release `mod-pN-vX.Y.Z` com `cbmp-mod-pN-vX.Y.Z.zip`, `.zip.sig` e `.zip.sha256`. O build que gera o artefato
-  `cbmp-mod` é do subprojeto 5.
+  Release `mod-pN-vX.Y.Z` com `cbmp-mod-pN-vX.Y.Z.zip`, `.zip.sig` e `.zip.sha256`. O artefato `cbmp-mod` vem do
+  `mod.yml` (veja "Publicar o mod" abaixo).
   - **Proveniência (falha fechado):** antes de baixar, o workflow consulta a execução `mod_run_id` na API e só segue
     se ela for deste repositório (código e fork incluídos), do workflow `.github/workflows/mod.yml`, disparada por
     `push` ou `workflow_dispatch` (nunca `pull_request`/`pull_request_target`) na `main` e concluída com sucesso.
@@ -250,6 +251,29 @@ assinatura que não confere. Assinar fica em `launcher/release-signer` (núcleo 
 e conferir em `examples/release_sign.rs` (`examples/common/verify.rs`); os dois são testados no `cargo test` com
 pares gerados no teste. O `examples/dev_sign_mod.rs` (mod de teste do dev-env) usa o mesmo código
 (`examples/common/`).
+
+## Publicar o mod
+
+O mod (`cb-mp` + UE4SS) é um zip assinado, `cbmp-mod-p<protocolo>-v<versão>.zip`, no layout 2 (`cbmp-mod.json`,
+`loader/dwmapi.dll`, `ue4ss/...`, `licenses/`, `LEIA-ME.txt`; detalhes e build em `client/README.md`). Versão atual:
+mod `0.2.0`, protocolo `1`, tag `mod-p1-v0.2.0`.
+
+- **`mod.yml` real** (`.github/workflows/mod.yml`; contrato em "Publicar um release"): roda em `push` na `main` (caminhos
+  `client/**`, `proto/**`, `tools/package-mod.ps1`, `tools/check-mod-zip.mjs` e o próprio arquivo) e por
+  `workflow_dispatch` sem entradas, em `windows-2025`. Compila o UE4SS (commit fixo) e o mod, monta o zip
+  (`tools/package-mod.ps1`), confere (`tools/check-mod-zip.mjs`) e envia o artefato `cbmp-mod` com exatamente um `.zip`.
+- **Segredo `UE4SS_SUBMODULES_TOKEN`**: o UE4SS tem um submódulo privado (`UEPseudo`, só para contas GitHub ligadas à
+  Epic Games). O dono do repositório precisa criar esse segredo (token só de leitura). **Sem ele o job termina verde,
+  sem artefato e com um aviso**, e o `release.yml` não tem o que assinar: o release oficial do mod **não sai**. O build
+  real do `mod.yml` ainda **não foi verificado** num runner (só o caminho do Visual Studio 2026 local rodou; o
+  `tools/build.ps1` escolhe o gerador do VS 2022 17.13+ no `windows-2025`, mas esse caminho nunca rodou).
+- **Release oficial**: com uma execução verde do `mod.yml` na `main`, rode o `release.yml` com `kind=mod`, `version=0.2.0`,
+  `protocol=1` e `mod_run_id=<id da execução>` (environment `release`, chave de produção).
+- **Release de teste (chave dev)**: `node tools/teste-online.mjs --build-releases --mod-zip dist/cbmp-mod.zip` (o zip vem
+  do artefato do `mod.yml` por `gh run download`, ou do build local: `tools\build.ps1 -Target mod` e
+  `tools\package-mod.ps1`); confere o zip (`checkModZip`), assina com `examples/dev_sign_mod.rs --zip` e gera
+  `mod-p1-v0.2.0`; depois `--deploy` e `--check` (`docs/AMBIENTE-TESTE-ONLINE.md`). O ambiente local
+  (`tools/dev-env.mjs --build-releases --mod-zip <zip>`) faz o mesmo para o Hub local.
 
 ## Instalação e SmartScreen
 
@@ -280,27 +304,93 @@ O instalador NSIS é por usuário (sem administrador). Ele **não** tem assinatu
   `cbmp-mod protocol=<N> version=<X.Y.Z> sha256=<hex>` e bater com o protocolo pedido, a versão anunciada e o zip
   (senão `mod_signature_invalid`); a versão registrada e comparada é a assinada. O zip é validado inteiro antes de
   gravar (sem `..`, absolutos, `\`, `:`, links, criptografia; cada arquivo até 512 MiB declarados) e instalado de
-  forma atômica em `<jogo>\Phoenix\Binaries\Win64\cbmp\`: extrai em `cbmp.staging`, relê os hashes e só então troca
-  (`cbmp` → `cbmp.old` → apagado); qualquer falha antes da troca deixa o mod atual intacto, e sobras de uma queda são
-  resolvidas na próxima vez. `mods\installed.json` guarda versão, protocolo e sha256 de cada arquivo; o zip assinado e
-  o `.sig` ficam em `mods\package\` para reparo: arquivo alterado → reinstala do pacote local (assinatura conferida de
-  novo) ou baixa de novo. Nunca faz downgrade: se o Hub oferecer versão menor que a instalada no mesmo protocolo, a
-  instalada fica (`mod_altered` se ela estiver alterada e não houver pacote local para reparar).
+  forma atômica em `<jogo>\Phoenix\Binaries\Win64\cbmp\atual\` (layout 2, veja abaixo): extrai em `atual.staging`, relê
+  os hashes e só então troca (`atual` → `atual.old`, `atual.staging` → `atual`, `atual.old` apagado); qualquer falha
+  antes da troca deixa o mod atual intacto, e sobras de uma queda são resolvidas na próxima vez.
+  `mods\installed.json` guarda versão, protocolo, pasta do jogo, sha256 de cada arquivo, o carregador e os backups; o
+  zip assinado e o `.sig` ficam em `mods\package\` para reparo: arquivo alterado → reinstala do pacote local
+  (assinatura conferida de novo) ou baixa de novo. Nunca faz downgrade: se o Hub oferecer versão menor que a instalada
+  no mesmo protocolo, a instalada fica (`mod_altered` se ela estiver alterada e não houver pacote local para
+  reparar). O pacote precisa de `cbmp-mod.json` com `layout 2`, `version` e `protocol` iguais aos assinados e
+  `minLauncher` ≤ versão do launcher (senão `mod_invalid` ou `mod_incompatible`: "Este mod precisa de uma versão mais
+  nova do launcher. Atualize e tente de novo."). Zip antigo (layout 1, arquivos direto em `cbmp\`) migra: os arquivos
+  listados no registro antigo saem antes da primeira instalação em `atual\`.
+- **Layout na pasta do jogo** (`Win64` = `<jogo>\Phoenix\Binaries\Win64`):
+
+  | Onde | O quê |
+  |---|---|
+  | `Win64\cbmp\atual\` | o zip inteiro (troca atômica; anterior em `atual.old` só durante a troca) |
+  | `Win64\cbmp\cbmp-run.json` | ponteiro do launcher para o mod, regravado a cada Jogar |
+  | `Win64\cbmp\logs\`, `crash\`, `cb-mp.json` | do mod e do jogador; o launcher nunca grava nem apaga ali (a remoção os mantém) |
+  | `Win64\dwmapi.dll` | cópia de `atual\loader\dwmapi.dll`, só se ausente ou já nossa (sha256 atual ou do histórico do registro) |
+  | `Win64\override.txt` | uma linha, `cbmp\atual\ue4ss` (aponta o carregador para a pasta do UE4SS dentro de `atual`) |
+  | `Win64\cbmp-backup\` (+ `cbmp-backup.json`) | arquivos do jogador movidos com confirmação; o manifesto viaja com a pasta |
+
+  A pasta `Win64\ue4ss` do próprio jogador (outro UE4SS) nunca é tocada.
+- **Ativação conferida em todo Jogar** (depois de instalar): hash do `Win64\dwmapi.dll` e conteúdo do `override.txt`.
+  **Conflito** (`mod_conflict`): `dwmapi.dll` ou `override.txt` que não são nossos (ou `xinput1_3.dll` junto de
+  `UE4SS.dll`, um UE4SS antigo: sem saída automática, o erro volta e o jogador remove à mão). A UI explica e o Rust
+  confirma num diálogo nativo ("Encontramos outro carregador de mods (UE4SS) na pasta do jogo… Seus arquivos não são
+  apagados: ficam em Phoenix\Binaries\Win64\cbmp-backup e voltam quando você remover o mod…", botões "Usar o
+  carregador do CB Multiplayer" e "Cancelar"). Aceito, os dois arquivos são **movidos** (rename no mesmo volume; nome
+  repetido ganha `.1`, `.2`…), nunca apagados nem sobrescritos, com o registro gravado **antes** de mover.
+- **Remover mod do jogo** (Configurações; jogo fechado, senão `game_running`): apaga `dwmapi.dll` e `override.txt`
+  **se forem os nossos**, devolve o que está em `cbmp-backup\` (só para destino vazio), apaga `cbmp\atual*` e o
+  ponteiro; mantém `cbmp\logs\`, `crash\`, `cb-mp.json`, o pacote em `mods\package\` e a versão mínima no registro (o
+  anti-downgrade não zera). Configurações mostra o estado ("Não instalado", "Instalado X.Y.Z", "Conflito com outro
+  carregador de mods") e os botões "Remover mod do jogo" e "Abrir pasta de logs do mod" (abre `Win64\cbmp\logs`;
+  `mod_logs_missing` se ainda não existe).
+- **Erros novos do mod** (código → mensagem): `mod_conflict` → "Já existe outro carregador de mods (UE4SS) na pasta do
+  jogo."; `mod_incompatible` (acima); `mod_activation_failed` → "Não foi possível ativar o mod na pasta do jogo.";
+  `game_running` → "O Hogwarts Legacy está aberto. Feche o jogo e tente de novo." (Jogar e Remover recusam com
+  `HogwartsLegacy.exe` rodando); `mod_folder_protected` (abaixo); `mod_folder_unreachable` → "A pasta do jogo <pasta> não
+  está acessível agora. O mod continua registrado lá e sai na próxima vez."; `mod_folder_present` (Esquecer pasta numa
+  pasta que ainda existe); e o aviso não bloqueante `mod_old_folder` (evento `mod://warning`): "O mod do CB
+  Multiplayer continua na pasta anterior do jogo: <pastas>…".
+- **Sem elevação, nunca**: o launcher não pede administrador nem muda permissões de nenhuma pasta do jogo. Antes de
+  baixar o mod ele confere se dá para gravar em `Phoenix\Binaries\Win64` (cria e apaga um arquivo de teste); sem
+  permissão (ex.: Epic em `C:\Program Files`), instalar, ativar e remover param em `mod_folder_protected` ("…instale o
+  jogo numa pasta em que o seu usuário possa gravar…"). O jogo aberto é conferido antes (`game_running`), para um
+  `dwmapi.dll` em uso não parecer falta de permissão. A instalação elevada foi retirada do subprojeto 5a (motivo e
+  direção futura em `docs/PENDENCIAS.md`, "Instalação em pasta protegida"); `config_guard` garante que não há caminho
+  de elevação no código.
+- **Junções**: a pasta escolhida pode passar por junções/links (biblioteca da Steam movida); o launcher a resolve uma
+  vez para o caminho final e trabalha nele (um registro do mod gravado antes pelo caminho da junção passa ao caminho
+  final, sem tirar e pôr o mod de novo). Dentro de `cbmp\` e `cbmp-backup\` links/junções são recusados (nada é
+  gravado, movido ou devolvido através deles), como nas entradas do zip.
+- **Backups do jogador e pastas anteriores**: arquivos de outro carregador (`dwmapi.dll`, `override.txt`) vão para
+  `Win64\cbmp-backup\` com um manifesto `cbmp-backup.json` dentro da própria pasta do jogo (viaja com ela se a pasta for
+  movida). Pasta anterior que não existe mais e tinha backups fica registrada; nas Configurações aparece "Esquecer
+  pasta", com uma confirmação que lista os arquivos do jogador que estavam lá (o comando só aceita, texto igual, uma
+  pasta do registro; outro caminho vindo da UI nunca chega ao disco). O aviso de pasta anterior
+  (`mod://warning`) aparece no máximo uma vez por execução do launcher.
 - **Jogar** (`play(serverId)`, um por vez; outro pedido → `busy`; `cancel_play` interrompe, inclusive pedidos ao Hub
   em andamento): detalhe do servidor → ticket → manifest (validado) → download → montagem (+ limite do cache, sem
   desmontar o servidor atual) → mod (só fora do modo simular) → `run\connect.json` → abrir. Etapas em `play://stage`
   (`{serverId, stage}`, com `stage` em `ticket|manifest|download|mount|mod|connect|launch`). Ticket com mais de
-  240 s é renovado antes de gravar a conexão. `clear_cache` usa a mesma trava, mas o launcher não acompanha o jogo
+  30 s (`play::TICKET_RENEW_AFTER_SECS`) é renovado antes de gravar a conexão, para o ticket gravado ter pelo menos 270 s
+  de validade (o arquivo dura `CONNECT_TTL` = 240 s). Antes do `connect.json`, o `host` do servidor é resolvido e
+  conferido pela regra de endereços do build e gravado como IP literal. `game_running` vem antes de qualquer
+  mudança no mod. `clear_cache` usa a mesma trava, mas o launcher não acompanha o jogo
   depois de abri-lo: limpar o cache com o jogo aberto pode apagar arquivos em uso (a UI deve avisar).
-- **`run\connect.json`** (lido e apagado pelo mod; o launcher apaga após 60 s se ainda existir; sobra antiga sai na
-  abertura): `{host, port, ticket, serverId, contentDir, protocol, contentReadOnly: true}`. A pasta `run\` e o arquivo
-  têm DACL protegida só do usuário atual. **`contentDir` é somente leitura para o mod**: os arquivos de
+- **`run\connect.json`** (lido e apagado pelo mod; o launcher apaga após `CONNECT_TTL` = 240 s se ainda existir, e o
+  ponteiro junto, se ainda for o dele; sobra antiga sai na abertura):
+  `{host, port, ticket, serverId, contentDir, protocol, contentReadOnly: true, launchId}`. A pasta `run\` e o arquivo
+  têm DACL protegida só do usuário atual. O prazo de 240 s cobre os dois processos que o jogo abre (cerca de 33 s de
+  diferença; o mod só resgata o arquivo depois de até 45 s).
+- **Ponteiro `Win64\cbmp\cbmp-run.json`** (sem segredo; gravado depois do `connect.json`, por arquivo temporário +
+  rename, a cada Jogar): `{ "v": 1, "runDir": "<absoluto>", "launchId": "<32 hex>", "writtenAt": <Unix s>,
+  "launcher": "0.2.0" }`, até 4 KiB. É o que ativa o mod: ele procura o arquivo subindo no máximo 5 pastas a partir do
+  `main.dll`, e só age se o ponteiro tem no máximo 600 s (futuro: 120 s) e o `launchId` bate com o do `connect.json`.
+  Sem ponteiro válido (jogo aberto pela Steam/Epic sem o launcher) o mod fica **inerte**. O `launchId` aleatório
+  impede que um ponteiro velho case com o arquivo de outro Jogar. **`contentDir` é somente leitura para o mod**: os arquivos de
   `servers\<id>` são hard links do cache verificado (compartilhados com outros servidores); escrever neles
   corromperia o cache.
 - **Abrir**: o executável do jogo é aberto direto, sem argumentos e sem variáveis novas (o ticket nunca vai para
-  linha de comando nem ambiente). No **modo simular** (padrão enquanto não houver mod) o jogo não é aberto e o `play`
-  devolve `{kind: "simulated", preview}` com o conteúdo da conexão sem o ticket; o `connect.json` (com o ticket) é
-  gravado mesmo assim e apagado em 60 s, para testar um mod/cliente à mão.
+  linha de comando nem ambiente). No **modo simular** (Configurações → Avançado; **desligado por padrão** desde o
+  0.2.0, e o valor salvo por versões anteriores é desligado uma vez) o jogo não é aberto e o `play` devolve
+  `{kind: "simulated", preview}` com o conteúdo da conexão sem o ticket; o mod **não** é instalado nem ativado, e o
+  `connect.json` (com o ticket) é gravado mesmo assim e apagado em `CONNECT_TTL`, para testar um mod/cliente à mão.
 
 ## Rede: conteúdo e ping sem proxy
 
@@ -315,7 +405,10 @@ lista, updates, mod) continua respeitando o proxy.
 
 `logs\launcher.log` na pasta de dados (rotação em 2 MiB, 5 arquivos antigos). Nada de tokens, tickets, códigos OAuth,
 verifier ou chaves: tudo passa por `logging::redact`, e `tests/logging.rs` falha se um `log::*!` do código usar uma
-variável com esses nomes. É o arquivo a mandar quando algo der errado.
+variável com esses nomes. É o arquivo a mandar quando algo der errado. Os logs do **mod** são outros: ficam na pasta do
+jogo, `Win64\cbmp\logs\cb-mp-<aaaammdd-hhmmss>-<pid>.log` (um por processo; ficam os 10 mais novos), com os `.dmp` de
+falha em `Win64\cbmp\crash\` e o `UE4SS.log` dentro de `Win64\cbmp\atual\ue4ss\`; o botão "Abrir pasta de logs do
+mod" abre a primeira. Roteiro de coleta: `docs/TESTE-NO-JOGO-5A.md`.
 
 ## Login
 

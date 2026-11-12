@@ -1,9 +1,9 @@
 name: native
 on:
   push:
-    paths: ['proto/**', 'server/**', 'bots/**', 'CMakeLists.txt', 'CMakePresets.json', 'vcpkg.json', 'vcpkg-overlays/**', 'vcpkg-triplets/**', 'packages/contracts/test-vectors/**', 'resources.example/**', 'tools/loadtest.py', 'docs/RESOURCES.md', '.github/workflows/native.yml']
+    paths: ['proto/**', 'server/**', 'bots/**', 'CMakeLists.txt', 'CMakePresets.json', 'vcpkg.json', 'vcpkg-overlays/**', 'vcpkg-triplets/**', 'packages/contracts/test-vectors/**', 'resources.example/**', 'tools/loadtest.py', 'docs/RESOURCES.md', 'client/core/**', 'client/tests/**', 'client/headless/**', 'client/src/platform/**', 'tools/client-e2e.py', '.github/workflows/native.yml']
   pull_request:
-    paths: ['proto/**', 'server/**', 'bots/**', 'CMakeLists.txt', 'CMakePresets.json', 'vcpkg.json', 'vcpkg-overlays/**', 'vcpkg-triplets/**', 'packages/contracts/test-vectors/**', 'resources.example/**', 'tools/loadtest.py', 'docs/RESOURCES.md', '.github/workflows/native.yml']
+    paths: ['proto/**', 'server/**', 'bots/**', 'CMakeLists.txt', 'CMakePresets.json', 'vcpkg.json', 'vcpkg-overlays/**', 'vcpkg-triplets/**', 'packages/contracts/test-vectors/**', 'resources.example/**', 'tools/loadtest.py', 'docs/RESOURCES.md', 'client/core/**', 'client/tests/**', 'client/headless/**', 'client/src/platform/**', 'tools/client-e2e.py', '.github/workflows/native.yml']
 concurrency:
   group: native-${{ github.ref }}
   cancel-in-progress: true
@@ -59,6 +59,14 @@ jobs:
       - name: libmariadb ligada dinamicamente (LGPL)
         run: ldd build-native/linux-asan/server/cb-server | tee /dev/stderr | grep -q 'libmariadb\.so'
       - run: ctest --test-dir build-native/linux-asan --output-on-failure
+      # Núcleo do cliente (mod) contra o cb-server real: dois cbmp-headless se vendo andar, com perda e servidor caindo.
+      - run: python3 tools/client-e2e.py --case all --out-dir client-e2e-out
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: client-e2e-linux
+          path: client-e2e-out
+          if-no-files-found: ignore
       - name: integração MySQL 8 (caching_sha2_password; TLS sem verificação, certificado autoassinado)
         run: 'ctest --test-dir build-native/linux-asan --output-on-failure -R "^mysql: "'
         env:
@@ -92,6 +100,14 @@ jobs:
         shell: pwsh
       - run: ctest --test-dir build-native/windows-ci -C Release --output-on-failure
         shell: pwsh
+      - run: python tools/client-e2e.py --case all --out-dir client-e2e-out
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: client-e2e-windows
+          path: client-e2e-out
+          if-no-files-found: ignore
       # Debug só do cbscript (vigia/sandbox do Lua): /Od + /RTC aumentam os quadros e mudam o desenrolar de erros do Lua;
       # foi só em Debug que apareceu a pilha estourada pelos 200 níveis C do Lua (revisão final do sub3, I2). Os testes de
       # tempo (p99) do cbserver ficam de fora: não fazem sentido sem otimização.

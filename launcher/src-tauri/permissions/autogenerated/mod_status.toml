@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mod-status"
+description = "Enables the mod_status command without any pre-configured scope."
+commands.allow = ["mod_status"]
+
+[[permission]]
+identifier = "deny-mod-status"
+description = "Denies the mod_status command without any pre-configured scope."
+commands.deny = ["mod_status"]

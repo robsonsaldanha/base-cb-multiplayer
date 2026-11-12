@@ -2,6 +2,7 @@
 import { get, writable } from "svelte/store";
 import {
   cancelPlay,
+  onModWarning,
   onPlayStage,
   onProgress,
   play,
@@ -12,6 +13,7 @@ import {
   type Progress,
 } from "./api";
 import { blocksPlay } from "./errors";
+import { notify } from "./notice";
 import { pushRecent } from "./settings";
 import { auth } from "./stores";
 
@@ -54,6 +56,8 @@ export async function initPlayEvents(): Promise<() => void> {
       ),
     ),
     onProgress((p) => playState.update((s) => (s.status === "running" ? { ...s, progress: p } : s))),
+    // Mod numa pasta anterior do jogo: aviso geral, sem parar o Jogar.
+    onModWarning((w) => notify(w)),
   ]);
   return () => offs.forEach((off) => off());
 }

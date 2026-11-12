@@ -4,11 +4,12 @@ Obrigado por testar! Você só vai instalar um programa: o launcher **CB Multipl
 Node, servidor nem nada técnico. O teste leva uns 20 minutos.
 
 **O que este teste cobre**: instalar o launcher, entrar com o seu Discord, ver o servidor de teste na lista, apertar
-**Jogar** em **modo simular** (o launcher baixa e confere o conteúdo do servidor, mas **não abre o jogo** e **não mexe
-na pasta do jogo**) e a atualização automática do launcher.
+**Jogar** em **modo simular** (o launcher baixa e confere o conteúdo do servidor, mas **não abre o jogo**, **não
+instala o mod** e **não mexe na pasta do jogo**) e a atualização automática do launcher.
 
-**O que ainda NÃO dá para testar**: jogar de verdade com outras pessoas. O mod do jogo ainda é um arquivo de exemplo;
-abrir o Hogwarts Legacy pelo launcher não conecta a nada. Por isso **deixe sempre o Modo simular ligado**.
+**O que este teste NÃO cobre**: jogar de verdade com outras pessoas. Isso é outro roteiro, para duas pessoas com o
+jogo instalado: [`TESTE-NO-JOGO-5A.md`](TESTE-NO-JOGO-5A.md) (launcher 0.2.0 + mod 0.2.0). **Neste guia, deixe sempre o
+Modo simular ligado** (passo 5): com ele desligado o launcher instala o mod na pasta do jogo e abre o jogo.
 
 Precisa de: Windows 10 ou 11 (64 bits), conta no Discord, internet. Ter o Hogwarts Legacy instalado ajuda no passo 6,
 mas não é obrigatório.
@@ -29,18 +30,18 @@ mas não é obrigatório.
 
 ## 2. Atualização automática
 
-Assim que abre, o launcher procura atualização. A versão atual é a **0.1.3** (detecção do jogo na Epic com
-confirmação). O instalador do passo 1 já é a 0.1.3; quem instalou antes (0.1.0, 0.1.1 ou 0.1.2) recebe a 0.1.3 por
-aqui.
+Assim que abre, o launcher procura atualização. A versão atual é a **0.2.0** (instala e ativa o mod que conecta ao
+servidor). O instalador do passo 1 já é a 0.2.0; quem instalou antes (0.1.0 a 0.1.3) recebe a 0.2.0 por aqui.
+**Atenção**: ao atualizar para a 0.2.0 o launcher **desmarca** o Modo simular uma vez; marque-o de novo no passo 5.
 
-1. Se você está numa versão anterior: no menu lateral aparece **Atualização 0.1.3 disponível**. Clique nele (ou
+1. Se você está numa versão anterior: no menu lateral aparece **Atualização 0.2.0 disponível**. Clique nele (ou
    **Configurações** → **Procurar atualização**).
-2. Aparece "Versão 0.1.3 disponível." com a nota "Versão de teste 0.1.3 do launcher CB Multiplayer (Teste)".
+2. Aparece "Versão 0.2.0 disponível." com a nota "Versão de teste 0.2.0 do launcher CB Multiplayer (Teste)".
 3. Clique em **Instalar atualização**.
 
 **Esperado**: "Baixando e conferindo a atualização…"; o instalador roda sozinho (sem perguntas e sem SmartScreen) e o
-launcher reabre. Em **Configurações** → **Versão** aparece **v0.1.3**, e **Procurar atualização** diz "Você já está
-na versão mais recente." Se você instalou direto a 0.1.3, só confira a versão e o "Você já está na versão mais
+launcher reabre. Em **Configurações** → **Versão** aparece **v0.2.0**, e **Procurar atualização** diz "Você já está
+na versão mais recente." Se você instalou direto a 0.2.0, só confira a versão e o "Você já está na versão mais
 recente."
 
 ## 3. Entrar com o Discord
@@ -67,7 +68,8 @@ pare aqui.
 
 ## 5. Jogar (modo simular)
 
-1. Em **Configurações**, confira que **Modo simular** está **marcado** (é o padrão). **Não desmarque.**
+1. Em **Configurações** → **Avançado**, **marque** "Modo simular: prepara tudo e não abre o jogo" (no 0.2.0 ele vem
+   desmarcado). **Não desmarque** durante este guia.
 2. Em **Servidores**, clique em **Jogar** no cartão de destaque.
 
 **Esperado**:
@@ -113,7 +115,7 @@ Copie a tabela, marque **OK** ou **FALHOU** e mande junto com o log (passo 8):
 | Passo | Resultado | Observação |
 |---|---|---|
 | 1. Instalar (SmartScreen, instalador, janela) | | |
-| 2. Atualização para 0.1.3 (ou já instalado na 0.1.3) | | |
+| 2. Atualização para 0.2.0 (ou já instalado na 0.2.0) | | |
 | 3. Login com Discord (e continua logado ao reabrir) | | |
 | 4. Lista, destaque, ping, filtros, favoritos | | |
 | 5. Jogar (modo simular): painel "Pronto para abrir" e pasta `hello-client` | | |
@@ -138,4 +140,6 @@ Discord e o caminho das pastas no seu PC.
 4. Opcional: no Discord, **Configurações de usuário** → **Aplicativos autorizados** → remova o app de teste do CB
    Multiplayer.
 
-Nada foi gravado na pasta do jogo (com o Modo simular ligado), então não há nada para desfazer nela.
+Nada foi gravado na pasta do jogo (com o Modo simular ligado), então não há nada para desfazer nela. Se você
+desmarcou o Modo simular e apertou **Jogar**, o mod foi instalado: remova-o em **Configurações** → **Remover mod do
+jogo** antes de desinstalar (passo 9 de [`TESTE-NO-JOGO-5A.md`](TESTE-NO-JOGO-5A.md)).

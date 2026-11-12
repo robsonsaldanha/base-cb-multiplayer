@@ -1,0 +1,23 @@
+CB Multiplayer - mod cb-mp 0.2.0
+
+O que é
+  O mod que liga o Hogwarts Legacy ao servidor do CB Multiplayer: você conecta e vê os outros jogadores.
+  Ele usa o UE4SS 3.0.1 (UE4SS.dll e o carregador dwmapi.dll), incluído neste pacote.
+
+Como é instalado
+  Pelo launcher do CB Multiplayer, não à mão. O launcher baixa este pacote, confere a assinatura e copia os arquivos
+  para a pasta do jogo (Phoenix\Binaries\Win64\cbmp\atual). Não extraia este zip dentro da pasta do jogo.
+  Sem o launcher aberto (jogo iniciado direto pela Steam ou pela Epic) o mod fica inativo e não faz nada.
+
+Como remover
+  Pelo launcher: Configurações > Remover mod do jogo. O launcher desfaz a ativação e devolve os arquivos que ele tinha
+  guardado. Feche o jogo antes.
+
+Onde ficam os logs
+  Phoenix\Binaries\Win64\cbmp\logs\cb-mp-AAAAMMDD-HHMMSS-<pid>.log
+  Se o jogo fechar sozinho, o relatório de falha (.dmp) fica em Phoenix\Binaries\Win64\cbmp\crash.
+  Mande esses arquivos a quem estiver
+  acompanhando o teste.
+
+Licenças
+  Veja a pasta licenses (UE4SS-LICENSE.txt e THIRD-PARTY-NOTICES.txt).
