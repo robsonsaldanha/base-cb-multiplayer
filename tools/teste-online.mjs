@@ -66,6 +66,8 @@ const PUBLISHED = {
 const sha256File = (f) => createHash('sha256').update(readFileSync(f)).digest('hex');
 const MOD_PROTOCOL = 1;
 const MOD_VERSION = '0.2.0';
+// sha256 do zip do mod já publicado para os testadores (mesma regra do PUBLISHED): mudou o mod, sobe a versão.
+const MOD_PUBLISHED = { '0.2.0': '2d00d5bd4d47531b7ac29e1daa430acff636618cc2a1dbce3053ec18e906ce3e' };
 const OVERLAY = join(REPO, 'launcher', 'src-tauri', 'tauri.onlinetest.conf.json');
 
 const log = (m) => console.log(`[teste-online] ${m}`);
@@ -122,7 +124,12 @@ function buildMod(rel, key, o) {
   const tag = `mod-p${MOD_PROTOCOL}-v${MOD_VERSION}`;
   const out = join(rel, tag);
   const zip = `cbmp-mod-p${MOD_PROTOCOL}-v${MOD_VERSION}.zip`;
-  if (!o.force && [zip, `${zip}.sig`, `${zip}.sha256`].every((f) => existsSync(join(out, f)))) { log(`${tag}: já existe`); return; }
+  if (!o.force && [zip, `${zip}.sig`, `${zip}.sha256`].every((f) => existsSync(join(out, f)))) {
+    const sha = sha256File(join(out, zip));
+    if (MOD_PUBLISHED[MOD_VERSION] && sha !== MOD_PUBLISHED[MOD_VERSION]) fail(`${tag}: sha256 ${sha} difere do publicado ${MOD_PUBLISHED[MOD_VERSION]}`);
+    log(`${tag}: já existe`);
+    return;
+  }
   if (!o.modZip) {
     fail(`${tag} ainda não existe em ${rel}: gere o zip do mod com tools/build.ps1 -Target mod e tools/package-mod.ps1 e passe --mod-zip dist/cbmp-mod.zip`);
   }
@@ -331,6 +338,7 @@ async function check() {
     must(d.status === 200, `download HTTP ${d.status}`);
     must(createHash('sha256').update(d.buf).digest('hex') === m.sha256, 'sha256 do zip difere');
     must(m.version === MOD_VERSION, `oferece o mod ${m.version}, esperado ${MOD_VERSION}`);
+    must(!MOD_PUBLISHED[m.version] || m.sha256 === MOD_PUBLISHED[m.version], `sha256 ${m.sha256} difere do publicado ${MOD_PUBLISHED[m.version]}`);
     const problems = checkModZip(d.buf, { version: MOD_VERSION, protocol: MOD_PROTOCOL });
     must(problems.length === 0, `layout do zip: ${problems.join('; ')}`);
     return `v${m.version}, ${d.buf.length} bytes, layout do zip ok`;

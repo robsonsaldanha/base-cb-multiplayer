@@ -21,9 +21,9 @@ carência) está escrito em `client/README.md`. Os eventos `cb:command` (payload
   rodou num runner: o caminho do Visual Studio 2022 de `tools/build.ps1` (o `windows-2025` só tem o VS 2022 17.14, gerador
   "Visual Studio 17 2022") **nunca rodou** (só o VS 2026 local), e o `-VcpkgInstalled D:/vi-mod` do workflow presume a unidade D: do
   runner. A primeira execução com o segredo é o teste.
-- **Fixar o sha256 de `mod-p1-v0.2.0` e `launcher-v0.2.0` em `tools/teste-online.mjs`** depois do deploy (`PUBLISHED`): hoje só as versões até a
-  0.1.3 estão fixadas; sem isso o `--check` não pega um release trocado e o `--build-releases` pode refazer a 0.2.0 com outro
-  código.
+- **Fixar o sha256 de `launcher-v0.2.0` em `tools/teste-online.mjs`** (`PUBLISHED`) quando sair a próxima versão do launcher: a mais
+  nova é refeita quando o código muda, então só entra na lista ao deixar de ser a mais nova. O zip do mod 0.2.0 publicado em
+  2026-11-12 já está fixado (`MOD_PUBLISHED`); mudou o mod, sobe a versão.
 - **Estados de movimento confiáveis**: hoje o cliente declara o estado (ex.: `Broom`, `Fall`) e com isso amplia o limite
   de velocidade; velocidade do input é repassada sem validação. Definir quando cada estado é permitido. **No servidor
   de teste o cliente pode declarar `Apparate`** (limite 100 000 000 cm/s, bloco `movement` de
