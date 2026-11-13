@@ -58,6 +58,10 @@ MAX_PUPPET_DIST_CM = 60.0
 LAG_MIN_S, LAG_MAX_S = 0.1, 0.3
 MAX_STEP_CM = 40.0
 MAX_DESTROY_DELAY_S = 15.0
+# Com perda, o adeus de A pode se perder: o servidor só solta o jogador pelo tempo limite da conexão (~10 s do GNS)
+# e o aviso ainda é retransmitido até B. B fica mais tempo no ar para que esse atraso seja medido de verdade.
+MAX_DESTROY_DELAY_LOSS_S = 25.0
+B_SECONDS, B_SECONDS_LOSS = 34, 46
 MIN_INPUTS_A = 150
 KILL_AFTER_ONLINE_S = 8.0
 INVALID_MOVE = "movimento inválido"
@@ -281,7 +285,7 @@ def dist_to_window(p: tuple, path: list, times: list, t0: float, t1: float) -> f
 
 # ------------------------------------------------------------------------------------------------- critérios
 
-def check_walk(a: dict, b: dict, server_logs: dict[str, str]) -> list[str]:
+def check_walk(a: dict, b: dict, server_logs: dict[str, str], max_destroy_s: float = MAX_DESTROY_DELAY_S) -> list[str]:
     v = []
     if not a.get("online"):
         v.append(f"A não chegou a Online (estado {a.get('state')}, motivo '{a.get('reason')}')")
@@ -330,8 +334,8 @@ def check_walk(a: dict, b: dict, server_logs: dict[str, str]) -> list[str]:
     destroyed = pup.get("destroyedAt")
     if destroyed is None:
         v.append("o boneco de A não foi destruído em B")
-    elif destroyed - a.get("endedAt", 0) > MAX_DESTROY_DELAY_S:
-        v.append(f"boneco destruído {destroyed - a['endedAt']:.1f} s depois do fim de A (> {MAX_DESTROY_DELAY_S})")
+    elif destroyed - a.get("endedAt", 0) > max_destroy_s:
+        v.append(f"boneco destruído {destroyed - a['endedAt']:.1f} s depois do fim de A (> {max_destroy_s})")
     return v
 
 
@@ -367,13 +371,14 @@ def case_walk(env: Env, name: str, loss: int) -> list[str]:
     try:
         srv.wait_ready()
         loss_args = ["--loss", str(loss)] if loss else []
+        b_secs = B_SECONDS_LOSS if loss else B_SECONDS
         tickets = [make_ticket(env.bots_bin, seed, i) for i in (0, 1)]
-        log(f"{name}: servidor na porta {srv.port}; A anda 20 m depois de 6 s (16 s), B parado (34 s)"
+        log(f"{name}: servidor na porta {srv.port}; A anda 20 m depois de 6 s (16 s), B parado ({b_secs} s)"
             + (f"; perda falsa de {loss}%" if loss else ""))
         a = Client(env.headless_bin, "A", work, srv.port, tickets[0], START_A, 16,
                    ["--walk-after", "6", "--walk-cm", "2000", "--speed", "300"] + loss_args)
         clients.append(a)
-        b = Client(env.headless_bin, "B", work, srv.port, tickets[1], START_B, 34, ["--walk-cm", "0"] + loss_args)
+        b = Client(env.headless_bin, "B", work, srv.port, tickets[1], START_B, b_secs, ["--walk-cm", "0"] + loss_args)
         clients.append(b)
         codes = [c.wait() for c in clients]
     finally:
@@ -381,7 +386,7 @@ def case_walk(env: Env, name: str, loss: int) -> list[str]:
             c.close()
         rc = srv.stop()
     ra, rb = clients[0].report(), clients[1].report()
-    v = check_walk(ra, rb, srv.log_texts())
+    v = check_walk(ra, rb, srv.log_texts(), MAX_DESTROY_DELAY_LOSS_S if loss else MAX_DESTROY_DELAY_S)
     for c, code in zip(clients, codes):
         if code != 0:
             v.append(f"{c.name} saiu com código {code} (ver {c.out_path})")
